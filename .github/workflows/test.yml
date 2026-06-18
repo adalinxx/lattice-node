@@ -1,0 +1,63 @@
+name: Build & Test
+
+on:
+  merge_group:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # Primary gate: macOS build + full test suite on the newest runner's Apple
+  # toolchain (Xcode 26 / Apple Swift 6.2+) — has both the relaxed concurrency
+  # the code needs and Apple's XCTest/Foundation the tests use.
+  test-macos:
+    runs-on: macos-26
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Swift version
+        run: swift --version
+
+      - name: Resolve dependencies
+        run: swift package resolve
+
+      - name: Verify dependency pins
+        run: swift test --filter SupplyChainGateTests
+
+      - name: Build
+        run: swift build -c release
+
+      - name: Build test targets
+        run: swift build --build-tests
+
+      - name: Run tests
+        run: swift test
+
+      - name: Verify executable runs
+        run: swift run LatticeNode --help
+
+  # Linux build is informational: several tests use macOS-only XCTest/Foundation
+  # APIs (XCTExpectFailure, URLSession.shared) and are not Linux-portable.
+  test-linux:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    container: swift:6.2-jammy
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies for Linux
+        run: apt-get update && apt-get install -y --no-install-recommends libjavascriptcoregtk-4.1-dev libsqlite3-dev
+      - name: Build
+        run: swift build -c release
+
+  # Auxiliary (non-blocking) signal.
+  strict-concurrency-macos:
+    runs-on: macos-26
+    continue-on-error: true
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Strict concurrency build
+        run: swift build -Xswiftc -strict-concurrency=complete

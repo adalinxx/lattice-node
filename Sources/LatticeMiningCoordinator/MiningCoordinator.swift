@@ -1,0 +1,573 @@
+import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
+import Lattice
+import LatticeMinerCore
+import UInt256
+
+public struct MiningCoordinatorWork: Sendable, Equatable {
+    public let workId: String
+    public let blockHex: String
+    public let targetHex: String
+    public let staleToken: String
+
+    public init(workId: String, blockHex: String, targetHex: String, staleToken: String? = nil) {
+        self.workId = workId
+        self.blockHex = blockHex
+        self.targetHex = targetHex
+        self.staleToken = staleToken ?? workId
+    }
+
+    public init?(template: TemplateResponse) {
+        guard let workId = template.workId, !workId.isEmpty else { return nil }
+        let targetHex: String
+        if let effectiveTarget = template.effectiveTarget, !effectiveTarget.isEmpty {
+            targetHex = effectiveTarget
+        } else if let data = Data(hex: template.blockHex), let block = Block(data: data) {
+            targetHex = max(block.target, ChainSpec.minimumTarget).toHexString()
+        } else {
+            return nil
+        }
+        // Prefer the node's stable staleToken (tip hash); fall back to workId for
+        // older nodes that don't emit it (designated-init default does this when
+        // staleToken is nil).
+        self.init(workId: workId, blockHex: template.blockHex, targetHex: targetHex, staleToken: template.staleToken)
+    }
+}
+
+public struct MiningWorkerResult: Sendable, Equatable {
+    public let workerId: String
+    public let workId: String
+    public let nonce: UInt64
+    public let hash: String?
+
+    public init(workerId: String, workId: String, nonce: UInt64, hash: String? = nil) {
+        self.workerId = workerId
+        self.workId = workId
+        self.nonce = nonce
+        self.hash = hash
+    }
+}
+
+public struct MiningSolutionSubmission: Sendable, Equatable {
+    public let accepted: Bool
+    public let status: String
+    public let blockHash: String?
+    public let height: UInt64?
+
+    public init(accepted: Bool, status: String, blockHash: String? = nil, height: UInt64? = nil) {
+        self.accepted = accepted
+        self.status = status
+        self.blockHash = blockHash
+        self.height = height
+    }
+}
+
+public enum MiningCoordinatorNodeClientError: Error, Sendable, Equatable {
+    case nonHTTPResponse
+    case unauthorized(statusCode: Int)
+    case invalidSubmissionResponse(statusCode: Int)
+}
+
+public struct MiningRewardIdentity: Sendable, Equatable {
+    public let rewardAddress: String?
+
+    public init(rewardAddress: String? = nil) {
+        self.rewardAddress = rewardAddress
+    }
+}
+
+public protocol MiningCoordinatorNodeClient: Sendable {
+    func fetchWork() async throws -> MiningCoordinatorWork?
+    func fetchStaleToken() async throws -> String?
+    func submit(workId: String, nonce: UInt64, hash: String?) async throws -> MiningSolutionSubmission
+}
+
+public extension MiningCoordinatorNodeClient {
+    func fetchStaleToken() async throws -> String? {
+        try await fetchWork()?.staleToken
+    }
+}
+
+public struct MiningCoordinatorWorker: Sendable, Equatable {
+    public let id: String
+    private let searchImpl: @Sendable (MiningCoordinatorWork, NonceSearchRange) async throws -> MiningWorkerResult?
+
+    public init(
+        id: String,
+        search: @escaping @Sendable (MiningCoordinatorWork, NonceSearchRange) async throws -> MiningWorkerResult?
+    ) {
+        self.id = id
+        self.searchImpl = search
+    }
+
+    public static func == (lhs: MiningCoordinatorWorker, rhs: MiningCoordinatorWorker) -> Bool {
+        lhs.id == rhs.id
+    }
+
+    public func search(work: MiningCoordinatorWork, range: NonceSearchRange) async throws -> MiningWorkerResult? {
+        try await searchImpl(work, range)
+    }
+
+    public static func local(id: String = "local") -> MiningCoordinatorWorker {
+        MiningCoordinatorWorker(id: id) { work, range in
+            guard let data = Data(hex: work.blockHex),
+                  let block = Block(data: data),
+                  let target = MinerLoopLogic.parseTarget(work.targetHex) else {
+                return nil
+            }
+            let midstate = ProofOfWork.midstate(for: block)
+            guard let nonce = ProofOfWork.searchBatch(
+                midstate: midstate,
+                target: max(target, ChainSpec.minimumTarget),
+                startNonce: range.startNonce,
+                count: range.count
+            ) else {
+                return nil
+            }
+            let sealed = ProofOfWork.withNonce(block, nonce: nonce)
+            return MiningWorkerResult(
+                workerId: id,
+                workId: work.workId,
+                nonce: nonce,
+                hash: sealed.proofOfWorkHash().toHexString()
+            )
+        }
+    }
+}
+
+public struct MiningCoordinatorMetrics: Sendable, Equatable {
+    public var currentWorkId: String?
+    public var activeWorkerCount: Int = 0
+    public var assignedRangeCount: UInt64 = 0
+    public var staleAbortCount: UInt64 = 0
+    public var workerFailureCount: UInt64 = 0
+    public var acceptedSolutionCount: UInt64 = 0
+    public var rejectedSolutionCount: UInt64 = 0
+    public var retryBackoffCount: UInt64 = 0
+
+    public init() {}
+}
+
+public enum MiningCoordinatorCycleResult: Sendable, Equatable {
+    case backoff
+    case nodeFailed(error: String)
+    case noSolution(workId: String)
+    case stale(workId: String)
+    case workerFailed(workId: String, workerId: String, error: String)
+    case submitted(workId: String, nonce: UInt64, submission: MiningSolutionSubmission)
+}
+
+public actor MiningCoordinator {
+    private let nodeClient: any MiningCoordinatorNodeClient
+    private let workers: [MiningCoordinatorWorker]
+    private let totalBatchSize: UInt64
+    private let staleProbeEnabled: Bool
+    private let retryBackoffDelay: Duration
+    private let maxSubmitRetries: Int
+    private var nextNonceOffset: UInt64
+    private var nonceWorkId: String?
+    private var loopTask: Task<Void, Never>?
+    private var metricsState = MiningCoordinatorMetrics()
+
+    public init(
+        nodeClient: any MiningCoordinatorNodeClient,
+        workers: [MiningCoordinatorWorker],
+        totalBatchSize: UInt64,
+        nonceOffset: UInt64 = 0,
+        staleProbeEnabled: Bool = true,
+        retryBackoffDelay: Duration = .milliseconds(250),
+        maxSubmitRetries: Int = 3
+    ) {
+        self.nodeClient = nodeClient
+        self.workers = workers.isEmpty ? [.local()] : workers
+        self.totalBatchSize = max(totalBatchSize, 1)
+        self.nextNonceOffset = nonceOffset
+        self.staleProbeEnabled = staleProbeEnabled
+        self.retryBackoffDelay = retryBackoffDelay
+        self.maxSubmitRetries = max(maxSubmitRetries, 0)
+    }
+
+    public func metrics() -> MiningCoordinatorMetrics {
+        metricsState
+    }
+
+    @discardableResult
+    public func start() -> Bool {
+        guard loopTask == nil else { return false }
+        loopTask = Task { [weak self] in
+            guard let self else { return }
+            await self.runLoop()
+        }
+        return true
+    }
+
+    public func stop() async {
+        guard let task = loopTask else { return }
+        task.cancel()
+        await task.value
+        loopTask = nil
+    }
+
+    public func shutdown() async {
+        await stop()
+    }
+
+    private func runLoop() async {
+        while !Task.isCancelled {
+            let result = await runBatch()
+            guard !Task.isCancelled else { break }
+            if case .backoff = result {
+                do {
+                    try await Task.sleep(for: retryBackoffDelay)
+                } catch {
+                    break
+                }
+            } else if case .nodeFailed = result {
+                do {
+                    try await Task.sleep(for: retryBackoffDelay)
+                } catch {
+                    break
+                }
+            }
+        }
+    }
+
+    public func runBatch() async -> MiningCoordinatorCycleResult {
+        let work: MiningCoordinatorWork
+        do {
+            guard let fetched = try await nodeClient.fetchWork() else {
+                metricsState.retryBackoffCount += 1
+                return .backoff
+            }
+            work = fetched
+        } catch {
+            metricsState.retryBackoffCount += 1
+            if Self.isFatalNodeClientError(error) {
+                return .nodeFailed(error: String(describing: error))
+            }
+            return .backoff
+        }
+
+        metricsState.currentWorkId = work.workId
+        if let nonceWorkId, nonceWorkId != work.workId {
+            nextNonceOffset = 0
+        }
+        nonceWorkId = work.workId
+        metricsState.activeWorkerCount = workers.count
+        let ranges = assignRanges(workerCount: workers.count)
+        metricsState.assignedRangeCount = UInt64(ranges.count)
+
+        enum Event: Sendable {
+            case unchanged
+            case stale
+            case workerFailed(workerId: String, error: String)
+            case solution(MiningWorkerResult)
+        }
+
+        return await withTaskGroup(of: Event.self) { group in
+            for (worker, range) in zip(workers, ranges) {
+                group.addTask {
+                    do {
+                        guard let result = try await worker.search(work: work, range: range),
+                              result.workId == work.workId else {
+                            return .unchanged
+                        }
+                        return .solution(result)
+                    } catch {
+                        return .workerFailed(workerId: worker.id, error: String(describing: error))
+                    }
+                }
+            }
+
+            if staleProbeEnabled {
+                group.addTask { [nodeClient] in
+                    // Best-effort freshness probe only; submit-work remains the
+                    // authoritative stale/tip check. This must stay cheap:
+                    // recursive merged-mining templates rebuild descendant
+                    // candidates, so probing by fetchWork() doubles the hottest
+                    // path and can starve easy-target smoke/dev mining.
+                    let latest = try? await nodeClient.fetchStaleToken()
+                    guard let latest else { return .unchanged }
+                    return latest == work.staleToken ? .unchanged : .stale
+                }
+            }
+
+            for await event in group {
+                switch event {
+                case .unchanged:
+                    continue
+                case .stale:
+                    group.cancelAll()
+                    metricsState.staleAbortCount += 1
+                    return .stale(workId: work.workId)
+                case .workerFailed(let workerId, let error):
+                    group.cancelAll()
+                    metricsState.workerFailureCount += 1
+                    return .workerFailed(workId: work.workId, workerId: workerId, error: error)
+                case .solution(let result):
+                    group.cancelAll()
+                    if staleProbeEnabled, await isStale(work) {
+                        metricsState.staleAbortCount += 1
+                        return .stale(workId: work.workId)
+                    }
+                    return await submitWithRetry(work: work, result: result)
+                }
+            }
+
+            return .noSolution(workId: work.workId)
+        }
+    }
+
+    /// Submit a solved block, retrying on transient submit failures (5xx /
+    /// network / non-decodable response) before discarding. Retries are
+    /// STALENESS-BOUNDED: between attempts the coordinator re-checks whether the
+    /// template/tip the solution extends is still current; once it is superseded
+    /// the solution is abandoned (a clean discard, no infinite loop). A clean
+    /// `accepted:false` is a definitive answer (not transient) and is never
+    /// retried; a fatal auth failure (401/403) abandons immediately.
+    private func submitWithRetry(
+        work: MiningCoordinatorWork,
+        result: MiningWorkerResult
+    ) async -> MiningCoordinatorCycleResult {
+        var attempt = 0
+        while true {
+            do {
+                let submission = try await nodeClient.submit(
+                    workId: result.workId,
+                    nonce: result.nonce,
+                    hash: result.hash
+                )
+                if submission.accepted {
+                    metricsState.acceptedSolutionCount += 1
+                } else {
+                    metricsState.rejectedSolutionCount += 1
+                }
+                return .submitted(workId: work.workId, nonce: result.nonce, submission: submission)
+            } catch {
+                // 401/403 are fatal — do not retry, surface to stop the loop.
+                if Self.isFatalNodeClientError(error) {
+                    metricsState.workerFailureCount += 1
+                    return .nodeFailed(error: String(describing: error))
+                }
+                // Transient (5xx / network / non-decodable): retry, bounded by a
+                // small attempt count AND by supersession of the work being mined.
+                attempt += 1
+                if attempt > maxSubmitRetries {
+                    metricsState.rejectedSolutionCount += 1
+                    return .submitted(
+                        workId: work.workId,
+                        nonce: result.nonce,
+                        submission: MiningSolutionSubmission(accepted: false, status: "submitFailed")
+                    )
+                }
+                metricsState.retryBackoffCount += 1
+                do {
+                    try await Task.sleep(for: retryBackoffDelay)
+                } catch {
+                    // Cancellation: abandon without a duplicate POST.
+                    return .submitted(
+                        workId: work.workId,
+                        nonce: result.nonce,
+                        submission: MiningSolutionSubmission(accepted: false, status: "submitFailed")
+                    )
+                }
+                // Abandon the moment the solution is superseded (tip moved on).
+                if await isStale(work) {
+                    metricsState.staleAbortCount += 1
+                    return .stale(workId: work.workId)
+                }
+            }
+        }
+    }
+
+    private func isStale(_ work: MiningCoordinatorWork) async -> Bool {
+        guard let latest = try? await nodeClient.fetchStaleToken() else { return false }
+        return latest != work.staleToken
+    }
+
+    private static func isFatalNodeClientError(_ error: Error) -> Bool {
+        guard let error = error as? MiningCoordinatorNodeClientError else { return false }
+        switch error {
+        case .unauthorized:
+            return true
+        case .nonHTTPResponse, .invalidSubmissionResponse:
+            return false
+        }
+    }
+
+    private func assignRanges(workerCount: Int) -> [NonceSearchRange] {
+        let ranges = Self.allocateRanges(
+            totalBatchSize: totalBatchSize,
+            workerCount: workerCount,
+            nonceOffset: nextNonceOffset
+        )
+        let assigned = ranges.reduce(UInt64(0)) { $0 &+ $1.count }
+        nextNonceOffset = nextNonceOffset &+ assigned
+        return ranges
+    }
+
+    public nonisolated static func allocateRanges(
+        totalBatchSize: UInt64,
+        workerCount: Int,
+        nonceOffset: UInt64
+    ) -> [NonceSearchRange] {
+        ProofOfWork.nonceSearchRanges(
+            totalBatchSize: totalBatchSize,
+            workerCount: workerCount,
+            nonceOffset: nonceOffset
+        )
+    }
+}
+
+public final class HTTPMiningCoordinatorNodeClient: MiningCoordinatorNodeClient {
+    private let apiBaseURL: URL
+    private let chainPath: [String]?
+    private let childNodes: [String]
+    private let childNodeAuth: [String: String]
+    private let rewardIdentity: MiningRewardIdentity?
+    private let session: URLSession
+    private let authToken: String?
+
+    public init(
+        apiBaseURL: URL,
+        chainPath: [String]? = nil,
+        childNodes: [String] = [],
+        childNodeAuth: [String: String] = [:],
+        rewardIdentity: MiningRewardIdentity? = nil,
+        authToken: String? = nil,
+        session: URLSession = .shared
+    ) {
+        self.apiBaseURL = apiBaseURL
+        self.chainPath = chainPath
+        self.childNodes = childNodes
+        self.childNodeAuth = childNodeAuth
+        self.rewardIdentity = rewardIdentity
+        self.authToken = authToken
+        self.session = session
+    }
+
+    public func fetchWork() async throws -> MiningCoordinatorWork? {
+        var request = URLRequest(url: apiBaseURL.appendingPathComponent("chain/template"))
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        applyAuth(to: &request)
+        var payload: [String: Any] = ["childNodes": childNodes]
+        if let chainPath {
+            payload["chainPath"] = chainPath
+        }
+        if !childNodeAuth.isEmpty {
+            payload["childNodeAuth"] = childNodeAuth
+        }
+        if let rewardIdentity {
+            if let rewardAddress = rewardIdentity.rewardAddress {
+                payload["rewardAddress"] = rewardAddress
+            }
+        }
+        request.httpBody = try JSONSerialization.data(withJSONObject: payload)
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw MiningCoordinatorNodeClientError.nonHTTPResponse
+        }
+        if http.statusCode == 401 || http.statusCode == 403 {
+            throw MiningCoordinatorNodeClientError.unauthorized(statusCode: http.statusCode)
+        }
+        guard http.statusCode == 200 else { return nil }
+        return MiningCoordinatorWork(template: try JSONDecoder().decode(TemplateResponse.self, from: data))
+    }
+
+    public func fetchStaleToken() async throws -> String? {
+        var request = URLRequest(url: apiBaseURL.appendingPathComponent("chain/info"))
+        request.httpMethod = "GET"
+        applyAuth(to: &request)
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw MiningCoordinatorNodeClientError.nonHTTPResponse
+        }
+        if http.statusCode == 401 || http.statusCode == 403 {
+            throw MiningCoordinatorNodeClientError.unauthorized(statusCode: http.statusCode)
+        }
+        guard http.statusCode == 200 else { return nil }
+
+        struct ChainInfoResponse: Decodable {
+            struct Chain: Decodable {
+                let chainPath: [String]?
+                let directory: String
+                let tip: String
+            }
+            let chains: [Chain]
+            let nexus: String?
+        }
+
+        guard let decoded = try? JSONDecoder().decode(ChainInfoResponse.self, from: data) else {
+            throw MiningCoordinatorNodeClientError.invalidSubmissionResponse(statusCode: http.statusCode)
+        }
+        let selected: ChainInfoResponse.Chain?
+        if let chainPath, !chainPath.isEmpty {
+            selected = decoded.chains.first { $0.chainPath == chainPath }
+        } else if let nexus = decoded.nexus {
+            selected = decoded.chains.first { $0.chainPath == [nexus] || $0.directory == nexus }
+        } else {
+            selected = decoded.chains.first
+        }
+        guard let tip = selected?.tip, !tip.isEmpty else { return nil }
+        return tip
+    }
+
+    public func submit(workId: String, nonce: UInt64, hash: String?) async throws -> MiningSolutionSubmission {
+        var request = URLRequest(url: apiBaseURL.appendingPathComponent("chain/submit-work"))
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        applyAuth(to: &request)
+        var payload: [String: Any] = [
+            "workId": workId,
+            "nonce": nonce
+        ]
+        if let chainPath {
+            payload["chainPath"] = chainPath
+        }
+        if !childNodes.isEmpty {
+            payload["childNodes"] = childNodes
+        }
+        if !childNodeAuth.isEmpty {
+            payload["childNodeAuth"] = childNodeAuth
+        }
+        if let hash { payload["hash"] = hash }
+        request.httpBody = try JSONSerialization.data(withJSONObject: payload)
+
+        let (data, response) = try await session.data(for: request)
+        return try Self.decodeSubmission(data: data, response: response)
+    }
+
+    private func applyAuth(to request: inout URLRequest) {
+        guard let token = authToken?.trimmingCharacters(in: .whitespacesAndNewlines), !token.isEmpty else {
+            return
+        }
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+    }
+
+    static func decodeSubmission(data: Data, response: URLResponse) throws -> MiningSolutionSubmission {
+        guard let http = response as? HTTPURLResponse else {
+            throw MiningCoordinatorNodeClientError.nonHTTPResponse
+        }
+        if http.statusCode == 401 || http.statusCode == 403 {
+            throw MiningCoordinatorNodeClientError.unauthorized(statusCode: http.statusCode)
+        }
+        struct Response: Decodable {
+            let accepted: Bool
+            let status: String
+            let blockHash: String?
+            let height: UInt64?
+        }
+        guard let response = try? JSONDecoder().decode(Response.self, from: data) else {
+            throw MiningCoordinatorNodeClientError.invalidSubmissionResponse(statusCode: http.statusCode)
+        }
+        return MiningSolutionSubmission(
+            accepted: response.accepted,
+            status: response.status,
+            blockHash: response.blockHash,
+            height: response.height
+        )
+    }
+}

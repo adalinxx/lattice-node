@@ -1,0 +1,21 @@
+.build/
+.swiftpm/
+*.xcodeproj/
+xcuserdata/
+DerivedData/
+.DS_Store
+*.key
+Packages/
+deploy/keys/*.json
+!deploy/keys/.gitkeep
+
+# Claude Code agent worktrees
+.claude/worktrees/
+
+# Scratch test scripts
+SmokeTests/check-*.mjs
+.build-linux/
+
+# Smoke test JS deps
+SmokeTests/node_modules/
+.build-i1/

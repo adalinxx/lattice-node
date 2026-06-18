@@ -1,0 +1,17 @@
+included:
+  - Sources
+  - Tests
+
+excluded:
+  - .build
+  - .build-linux
+
+only_rules:
+  - custom_rules
+
+custom_rules:
+  network_typed_integer_load:
+    included: "Sources/LatticeNode/Network/.*\\.swift"
+    regex: "\\.load\\(as:\\s*(UInt16|UInt32|UInt64|Int16|Int32|Int64)\\.self\\)"
+    message: "Use loadUnaligned or explicit byte parsing for network wire-format integers."
+    severity: error
