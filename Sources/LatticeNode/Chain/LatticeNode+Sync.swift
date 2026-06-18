@@ -1,0 +1,1563 @@
+import Lattice
+import LatticeNodeWire
+import Foundation
+import Ivy
+import Tally
+import cashew
+import VolumeBroker
+import UInt256
+
+func sleepUnlessCancelled(_ duration: Duration) async -> Bool {
+    do {
+        try await Task.sleep(for: duration)
+        return !Task.isCancelled
+    } catch {
+        return false
+    }
+}
+
+extension LatticeNode {
+
+    public var isSyncing: Bool {
+        !syncTasks.isEmpty || !unhealthyChains.isEmpty
+    }
+
+    func isChainSyncing(chainPath: [String]) -> Bool {
+        syncTasks[chainKey(forPath: chainPath)] != nil
+    }
+
+    func isChainSyncing(directory: String) -> Bool {
+        isChainSyncing(chainPath: chainPath(forDirectory: directory))
+    }
+
+    func isChainUnhealthy(chainPath: [String]) -> Bool {
+        unhealthyChains.contains(chainKey(forPath: chainPath))
+    }
+
+    func isChainUnhealthy(directory: String) -> Bool {
+        isChainUnhealthy(chainPath: chainPath(forDirectory: directory))
+    }
+
+    func isChainUnavailable(chainPath: [String]) -> Bool {
+        if isChainUnhealthy(chainPath: chainPath) { return true }
+        // Fail closed only for deep/initial syncs (gap unknown = .max). Shallow
+        // catch-ups within the finality window keep only that chain readable
+        // and mining (the documented shallowSyncThreshold intent);
+        // announce-driven gap=1 syncs would otherwise blank reads and stall
+        // mining for the whole sync tail. A forged small-gap announcement at
+        // worst keeps the node serving its own canonical state.
+        let key = chainKey(forPath: chainPath)
+        return syncTasks[key] != nil
+            && (activeSyncGaps[key] ?? UInt64.max) > shallowSyncThreshold
+    }
+
+    func isChainUnavailable(directory: String) -> Bool {
+        isChainUnavailable(chainPath: chainPath(forDirectory: directory))
+    }
+
+    func updateSyncActiveMetric() {
+        metrics.set("lattice_sync_active", value: syncTasks.isEmpty ? 0 : 1)
+    }
+
+    // Ethereum go-ethereum uses 32 blocks before handing off to the downloader.
+    // Gaps ≤ this are handled by direct gossip block acceptance; gaps > this
+    // trigger headersFirst sync. Raising from 2→32 matches SOTA and avoids
+    // triggering expensive syncs for small natural variance between peers.
+    var catchUpSyncThreshold: UInt64 { config.tuning.sync.catchUpThreshold }
+
+    // Syncs within this gap are considered shallow: mining stays running since
+    // the reorg will be tiny and the finality window (1000 blocks) is not at risk.
+    var shallowSyncThreshold: UInt64 { config.tuning.sync.shallowThreshold }
+
+    /// A node that owns the ROOT chain receives child blocks only through the
+    /// per-process candidate/submit pipeline (chain/submit-child-block forwarding
+    /// to the owning child process) — it must never headers-first-sync a child
+    /// path from a peer: the child PoW lives on a cross-chain anchor path, and
+    /// the proof-carrying sync path would loop on a peer's bare child headers.
+    /// Per-process child nodes don't own the root and sync their chain normally.
+    /// (Named for the historical in-process mode; the guard's effect — root
+    /// owners never child-sync — is unchanged under per-process.)
+    func producesChildInProcess(network: ChainNetwork) -> Bool {
+        guard network.chainPath.count >= 2, let root = network.chainPath.first else { return false }
+        return self.network(forPath: [root]) != nil
+    }
+
+    /// Lightweight sync check used when block data isn't available yet —
+    /// only checks height gap (no work comparison, no PoW check).
+    func checkSyncNeeded(
+        peerBlock: Block?,
+        peerTipCID: String,
+        peerHeight: UInt64,
+        network: ChainNetwork,
+        sourcePeer: PeerID? = nil,
+        announceOnly: Bool = false
+    ) async -> Bool {
+        guard !producesChildInProcess(network: network) else { return false }
+        // No block data here — the announced (cid, height) is entirely
+        // unvalidated, so it must NOT be recorded into knownPeerTips: a forged
+        // announcement would poison best-peer/best-tip sync selection. Tips are
+        // recorded on the full-block path after PoW validation; the sync started
+        // below still targets sourcePeer directly for the immediate attempt.
+        let syncKey = chainKey(forPath: network.chainPath)
+        guard syncTasks[syncKey] == nil else { return true }
+        guard let chainState = await chain(forPath: network.chainPath) else { return false }
+        let localHeight = await chainState.getHighestBlockHeight()
+        let gap = peerHeight > localHeight ? peerHeight - localHeight : 0
+        let localTip = await chainState.getMainChainTip()
+        // Exact ties hold the incumbent — only a higher peer tip (gap > 0) is
+        // worth an announce-driven sync; equal-height siblings are not adopted.
+        let shouldSync = announceOnly ? gap > 0 : gap > catchUpSyncThreshold
+        guard shouldSync else { return false }
+        guard !isRefusedSyncTip(peerTipCID, localTip: localTip) else { return false }
+        guard syncTasks[syncKey] == nil else { return true }
+        startSync(peerTipCID: peerTipCID, network: network, gap: gap, sourcePeer: sourcePeer, peerTipHeight: peerHeight)
+        return true
+    }
+
+    func checkSyncNeeded(
+        peerBlock: Block,
+        peerTipCID: String,
+        network: ChainNetwork,
+        sourcePeer: PeerID? = nil
+    ) async -> Bool {
+        guard !producesChildInProcess(network: network) else { return false }
+        if let sourcePeer {
+            recordPeerTip(chainPath: network.chainPath, peerKey: sourcePeer.publicKey, tipCID: peerTipCID, height: peerBlock.height)
+        }
+        let syncKey = chainKey(forPath: network.chainPath)
+        guard syncTasks[syncKey] == nil else { return true }
+        guard let chainState = await chain(forPath: network.chainPath) else { return false }
+        let localHeight = await chainState.getHighestBlockHeight()
+        let gap = peerBlock.height > localHeight ? peerBlock.height - localHeight : 0
+
+        // Nakamoto consensus: the canonical chain is the one with the most
+        // cumulative proof-of-work, not necessarily the longest by block count.
+        // Trigger a sync if EITHER:
+        //   1. The peer is significantly ahead by height (normal catch-up), OR
+        //   2. The peer appears to have more cumulative work even at equal/lower
+        //      height — this handles forks where one branch mined harder blocks.
+        guard peerBlock.target > UInt256.zero else { return false }
+        let localWork = await localCumulativeWork(chainPath: network.chainPath)
+        let peerWorkPerBlock = workForTarget(peerBlock.target)
+        let peerChainDepth = UInt256(peerBlock.height + 1)
+        let estimatedPeerWork = peerWorkPerBlock * peerChainDepth
+
+        let aheadByHeight = gap > catchUpSyncThreshold
+        // Require the peer to have at least one full block's worth more work to
+        // avoid spurious syncs from estimation rounding at equal target.
+        let aheadByWork = localWork > UInt256.zero && estimatedPeerWork > localWork + peerWorkPerBlock
+
+        // Exact ties hold the incumbent (docs/protocol.md §fork-choice,
+        // docs/whitepaper.md): only a STRICTLY heavier fork is worth syncing.
+        // Equal-work siblings are never adopted on receipt — the next block to
+        // extend either fork makes it strictly heavier and the network converges
+        // on that, so there is no permanent-fork hazard while mining continues.
+        let localTip = await chainState.getMainChainTip()
+
+        guard aheadByHeight || aheadByWork else { return false }
+
+        // Pre-check: if estimated peer work is clearly less than ours, skip the
+        // bandwidth cost — the sync would fail with insufficientWork anyway.
+        if localWork > UInt256.zero && estimatedPeerWork < localWork {
+            return false
+        }
+
+        // A tip we already fully synced and refused stays refused while our own
+        // tip is unchanged — re-syncing it every announce round is pure churn.
+        guard !isRefusedSyncTip(peerTipCID, localTip: localTip) else { return false }
+
+        // Re-check: another task may have started a sync during our awaits above.
+        guard syncTasks[syncKey] == nil else { return true }
+        startSync(peerTipCID: peerTipCID, network: network, gap: gap, sourcePeer: sourcePeer, peerTipHeight: peerBlock.height)
+        return true
+    }
+
+    var syncTimeout: Duration { config.tuning.sync.timeout }
+
+    func startSync(peerTipCID: String, network: ChainNetwork, gap: UInt64 = UInt64.max, sourcePeer: PeerID? = nil, peerTipHeight: UInt64? = nil, retryCount: Int = 0) {
+        let syncKey = chainKey(forPath: network.chainPath)
+        guard syncTasks[syncKey] == nil else { return }
+        let syncTimeout = self.syncTimeout
+        activeSyncGaps[syncKey] = gap
+        let task = Task { [weak self] in
+            guard let self = self else { return }
+            await withTaskGroup(of: Void.self) { group in
+                group.addTask {
+                    await self.performHeadersFirstSync(
+                        peerTipCID: peerTipCID,
+                        network: network,
+                        sourcePeer: sourcePeer,
+                        peerTipHeight: peerTipHeight
+                    )
+                }
+                group.addTask {
+                    _ = await sleepUnlessCancelled(syncTimeout)
+                }
+                await group.next()
+                group.cancelAll()
+            }
+            if Task.isCancelled {
+                let log = NodeLogger("sync")
+                log.warn("Sync timed out — will retry on next peer block")
+            }
+
+            // Transient-failure retry. A sync that downloaded a strictly-heavier
+            // peer chain but could not materialize its content — e.g. the source
+            // peer JUST restarted (a partition heal) and was not serving its
+            // volumes yet — leaves the local tip unchanged WITHOUT marking the tip
+            // refused. The trigger to retry is normally "next peer block / new
+            // announcement", but an announce-driven target is intentionally not
+            // recorded in `knownPeerTips` (unvalidated), and a stopped/idle source
+            // never re-announces — so the node would otherwise wait forever on a
+            // gap that is one fetch away from closing. Re-attempt the SAME target
+            // with bounded backoff; a genuinely-unreachable peer simply exhausts
+            // the budget, and a work-refused tip is skipped (it IS marked refused).
+            if let peerTipHeight, retryCount < Self.maxSyncRetries, !Task.isCancelled,
+               let chainState = await self.chain(forPath: network.chainPath) {
+                let localHeight = await chainState.getHighestBlockHeight()
+                let localTip = await chainState.getMainChainTip()
+                if localHeight < peerTipHeight, !(await self.isRefusedSyncTip(peerTipCID, localTip: localTip)) {
+                    await self.clearSyncTaskForRetry(network: network)
+                    let backoffSeconds = UInt64(min(30, 1 << min(retryCount, 5)))   // 1,2,4,8,16,30…
+                    guard await sleepUnlessCancelled(.seconds(backoffSeconds)) else { return }
+                    await self.startSync(peerTipCID: peerTipCID, network: network, gap: gap, sourcePeer: sourcePeer, peerTipHeight: peerTipHeight, retryCount: retryCount + 1)
+                    return
+                }
+            }
+            await self.clearSyncTask(completedNetwork: network)
+        }
+        syncTasks[syncKey] = task
+        updateSyncActiveMetric()
+    }
+
+    /// Clear just enough sync-task state to re-arm a transient-failure retry
+    /// (see `startSync`) without running `clearSyncTask`'s post-sync re-broadcast
+    /// + known-peer re-check, which would race the pending backoff retry.
+    func clearSyncTaskForRetry(network: ChainNetwork) {
+        let syncKey = chainKey(forPath: network.chainPath)
+        syncTasks[syncKey] = nil
+        activeSyncGaps.removeValue(forKey: syncKey)
+        updateSyncActiveMetric()
+    }
+
+    /// Bounded transient-sync-failure retries (see `startSync`): enough backoff
+    /// budget (1+2+4+8+16+30×… ≈ a couple minutes) to outlast a source peer
+    /// coming back up after a restart, without retrying a truly-dead peer forever.
+    static let maxSyncRetries = 8
+
+    func clearSyncTask(completedNetwork: ChainNetwork? = nil) async {
+        if let completedNetwork {
+            let syncKey = chainKey(forPath: completedNetwork.chainPath)
+            syncTasks[syncKey] = nil
+            activeSyncGaps.removeValue(forKey: syncKey)
+        } else {
+            syncTasks.removeAll()
+            activeSyncGaps.removeAll()
+        }
+        failedSyncTips.removeAll()
+        updateSyncActiveMetric()
+
+        // Replay gossip blocks that arrived while sync was running. These were
+        // cached per-chain (keyed by ChainNetwork identity) rather than discarded
+        // so that a node that syncs to height N while the peer mines to N+17 can
+        // apply the buffered gossip immediately without a redundant sync.
+        let buffered: [ObjectIdentifier: [PendingGossipBlock]]
+        if let completedNetwork {
+            let completedID = ObjectIdentifier(completedNetwork)
+            buffered = pendingGossipBlocks.removeValue(forKey: completedID).map { [completedID: $0] } ?? [:]
+        } else {
+            buffered = pendingGossipBlocks
+            pendingGossipBlocks.removeAll()
+        }
+
+        // Replay buffered gossip blocks first — they extend the chains already
+        // synced, and the peer-tip check below handles chains that were
+        // announced but not yet synced (e.g. child chains). This is deliberately
+        // structured in the clearing task so stop/cancel observes the replay.
+        for (_, blocks) in buffered {
+            for entry in blocks {
+                // Internal re-delivery, not a fresh network arrival: drop the
+                // gossip-dedup timestamp first, or a sync that completes inside
+                // blockDeduplicationWindow dedup-drops its own buffered blocks.
+                clearBlockTime(key: entry.cid)
+                await chainNetwork(entry.network, didReceiveBlock: entry.cid, data: entry.data, from: entry.peer)
+            }
+        }
+        // Active reconciliation: after syncing to the best tip we knew about,
+        // announce that resulting tip. Any peer still ahead already responds
+        // with its higher tip, closing the race where final announcements arrive
+        // during the just-finished sync or are missed by the data channel.
+        if let completedDirectory = completedNetwork?.directory {
+            await broadcastChainTip(directory: completedDirectory)
+            guard await sleepUnlessCancelled(.milliseconds(500)) else { return }
+            await broadcastChainTip(directory: completedDirectory)
+            guard await sleepUnlessCancelled(.milliseconds(500)) else { return }
+        }
+        // Re-check all known peer tips. Chain announcements that arrived during
+        // sync or in response to the post-sync heartbeat are recorded in
+        // knownPeerTips; snapshot after the heartbeat retry window so the final
+        // mined tip cannot be stranded behind the pre-broadcast snapshot.
+        let peerTips = knownPeerTips
+        // Check all recorded peer tips for any chain still behind.
+        for (pathKey, tips) in peerTips {
+            guard syncTasks[pathKey] == nil else { continue }
+            let chainPath = pathKey.split(separator: "/").map(String.init)
+            guard let network = network(forPath: chainPath) else { continue }
+            for (_, entry) in tips {
+                guard syncTasks[pathKey] == nil else { break }
+                _ = await checkSyncNeeded(
+                    peerBlock: nil,
+                    peerTipCID: entry.tipCID,
+                    peerHeight: entry.height,
+                    network: network,
+                    announceOnly: true
+                )
+            }
+        }
+    }
+
+    func performHeadersFirstSync(peerTipCID: String, network: ChainNetwork, sourcePeer: PeerID? = nil, peerTipHeight: UInt64? = nil) async {
+        let log = NodeLogger("sync")
+        log.info("Starting headers-first sync from \(String(peerTipCID.prefix(16)))...")
+
+        let fetcher = network.ivyFetcher
+        let headerChain = HeaderChain()
+        var attemptedTip = peerTipCID
+        var statePrefetchTask: Task<Void, Never>? = nil
+
+        do {
+            let localWork = await localCumulativeWork(chainPath: network.chainPath)
+            let (activeTip, activeSourcePeer) = await bestConnectedPeerTipWithPeer(
+                defaultTipCID: peerTipCID,
+                defaultTipHeight: peerTipHeight,
+                network: network,
+                preferredPeer: sourcePeer
+            )
+            attemptedTip = activeTip
+
+            // Stateful nodes: fetch the tip state trie in parallel with headers.
+            // resolveRecursive pulls every sub-volume into the local CAS by CID,
+            // so the state is available immediately for gossip block validation
+            // after sync completes.
+            if config.storageMode == .stateful {
+                let prefetchSource = IvyContentSource(network.ivyFetcher)
+                let tipCIDForPrefetch = activeTip
+                statePrefetchTask = Task {
+                    guard let tipBlock = try? await VolumeImpl<Block>(rawCID: tipCIDForPrefetch)
+                        .resolve(source: prefetchSource).node else { return }
+                    _ = try? await tipBlock.postState.resolveRecursive(source: prefetchSource)
+                }
+            }
+
+            // Child chain (chainPath deeper than the root): headers must arrive with
+            // their anchoring proofs and be PoW-verified against the cross-chain root,
+            // never self-hashed. expectedChildPath is the proof's root-exclusive path.
+            let chainPath = network.chainPath
+            let expectedChildPath: [String]? = chainPath.count >= 2 ? Array(chainPath.dropFirst()) : nil
+            let headers = try await headerChain.downloadHeaders(
+                peerTipCID: activeTip,
+                fetcher: fetcher,
+                genesisBlockHash: genesisResult.blockHash,
+                localWork: localWork,
+                network: network,
+                sourcePeer: activeSourcePeer,
+                expectedChildPath: expectedChildPath,
+                progress: { current, total in
+                    if current % 100 == 0 {
+                        log.info("Headers: \(current)/\(total)")
+                    }
+                }
+            )
+
+            // Wait for state prefetch before finalizing so gossip validation
+            // has state available immediately after sync completes.
+            if let prefetch = statePrefetchTask {
+                await prefetch.value
+            }
+
+            log.info("Downloaded \(headers.count) headers, applying to chain...")
+
+            // Build SyncResult directly from the downloaded headers rather than
+            // re-walking via IvyFetcher. syncSnapshot's second pass re-fetches
+            // every block through IvyFetcher → DiskBroker, which fails if any
+            // DiskBroker write was lost under load (SQLite I/O error), causing
+            // invalidBlock(N). downloadHeaders already verified PoW and state
+            // chain continuity — the second pass is pure redundant I/O.
+            let syncer = ChainSyncer(
+                fetcher: fetcher,
+                store: { _, _ in },
+                genesisBlockHash: genesisResult.blockHash,
+                chainPath: config.fullChainPath ?? [genesisConfig.directory],
+                retentionDepth: config.retentionDepth,
+                validateBlockConsensus: true
+            )
+            let headersForSync = HeaderChain.headersByInheritingMissingSpecCIDs(
+                headers,
+                initialSpecCID: genesisResult.block.spec.rawCID
+            )
+            let result = try await syncer.syncFromHeaders(
+                headersForSync,
+                cumulativeWork: headerChain.totalWork,
+                localCumulativeWork: localWork
+            )
+
+            log.info("Sync complete: height \(result.tipBlockHeight), applying to chain...")
+
+            var syncedParentAnchors: [String: ParentAnchor] = [:]
+            if expectedChildPath != nil {
+                let directory = network.directory
+                let syncedProofs = await headerChain.acceptedProofs
+                syncedParentAnchors = try await validateSyncedParentAnchorConsistency(
+                    directory: directory,
+                    headers: headers,
+                    proofs: syncedProofs,
+                    fetcher: fetcher
+                )
+            }
+
+            let finalized = await finalizeSyncResult(result, localWork: localWork, network: network, fetcher: fetcher, sourcePeer: activeSourcePeer)
+
+            // F5-4: child blocks just synced carry verified anchoring proofs. Persist
+            // each (so this node can serve it onward) and fold its securing work into
+            // fork choice — the same accumulate→reevaluate the live ingestion runs, so
+            // sync is not a special path for inherited weight.
+            // Gated on finalize: a refused or failed finalize never committed
+            // the segment, so persisting "accepted" proofs or applying inherited
+            // weight for it would leave durable state for blocks we never adopted.
+            if finalized, expectedChildPath != nil {
+                let directory = network.directory
+                let syncedProofs = await headerChain.acceptedProofs
+                await recordSyncedChildProofs(
+                    directory: directory,
+                    headers: headers,
+                    proofs: syncedProofs,
+                    parentAnchors: syncedParentAnchors,
+                    source: IvyContentSource(fetcher)
+                )
+            }
+
+            log.info("Headers-first sync complete")
+
+        } catch {
+            let peerCount2 = await network.ivy.directPeerCount
+            if peerCount2 > 0 {
+                recordFailedSyncTip(attemptedTip)
+            }
+            if let prefetch = statePrefetchTask {
+                prefetch.cancel()
+                await prefetch.value
+            }
+            log.error("Headers-first sync failed: \(error)")
+        }
+    }
+
+    /// Is `rootCID` (at `rootHeight`) canonical on `directory`'s chain?
+    /// Used by callers that explicitly need root-chain canonicity:
+    ///   1. In-memory main chain — authoritative and reorg-correct for blocks we still hold.
+    ///   2. Present but off the main chain → a real side fork, not the canonical anchor.
+    ///   3. Absent in memory → the root's body was pruned (it's below retention, hence
+    ///      finalized). An anchor above our own tip can't be canonical for us; otherwise
+    ///      fall back to the durable height→hash commitment (`block_index`), which is kept
+    ///      beyond body pruning precisely so deep anchors stay verifiable without the body.
+    /// Any chain can be a root here — the check is identical regardless of depth.
+    func isCanonicalRoot(directory: String, rootCID: String, rootHeight: UInt64) async -> Bool {
+        if let rootChain = await chain(for: directory) {
+            if await rootChain.isOnMainChain(hash: rootCID) { return true }
+            if await rootChain.getConsensusBlock(hash: rootCID) != nil { return false }
+            if rootHeight > (await rootChain.getHighestBlockHeight()) { return false }
+        }
+        if let rootStore = stateStore(for: directory) {
+            return rootStore.getBlockHash(atHeight: rootHeight) == rootCID
+        }
+        // Per-process child node: it does not own the root chain, so it can't
+        // consult a root-chain state store. Instead it tracks verified parent
+        // (root) headers via the parent-chain subscription, persisted under its own
+        // chain's store. A root CID present as a verified parent-header edge is one
+        // this node has independently PoW-verified from parent gossip — sufficient to
+        // anchor an inbound child block's committing parent.
+        for store in stateStores.values where store.getParentHeader(parentHash: rootCID) != nil {
+            return true
+        }
+        return false
+    }
+
+    /// Persist each synced child block's anchoring proof and fold its inherited
+    /// (securing) work into fork choice. The proofs were already anchored-verified by
+    /// HeaderChain during download, so this mirrors the live ingestion's
+    /// persist→accumulate→reevaluate exactly — sync is not special. Keyed by block hash,
+    /// so a re-delivered block (gossip overlap) stays exactly-once in the accumulator.
+    private func recordSyncedChildProofs(
+        directory: String,
+        headers: [SyncBlockHeader],
+        proofs: [String: Data],
+        parentAnchors: [String: ParentAnchor],
+        source: any ContentSource
+    ) async {
+        for header in headers {
+            guard let proofData = proofs[header.cid],
+                  let decodedProofs = ChildBlockProofEnvelope.deserialize(proofData) else { continue }
+            for proof in decodedProofs {
+                await persistAcceptedBlockProof(directory: directory, height: header.height, blockHash: header.cid, proof: proof)
+            }
+            if let anchor = parentAnchors[header.cid] {
+                do {
+                    try await persistAcceptedChildParentAnchor(
+                        directory: directory,
+                        blockHash: header.cid,
+                        height: header.height,
+                        parentAnchor: anchor,
+                        replaceExisting: true
+                    )
+                } catch {
+                    NodeLogger("sync").error("\(directory): persistChildParentAnchor failed at height \(header.height): \(error)")
+                }
+            }
+            for proof in decodedProofs {
+                guard await applyInheritedWeight(directory: directory, blockHash: header.cid, proof: proof, source: source) else {
+                    return
+                }
+            }
+        }
+    }
+
+    func validateSyncedParentAnchorConsistency(
+        directory: String,
+        headers: [SyncBlockHeader],
+        proofs: [String: Data],
+        fetcher: Fetcher
+    ) async throws -> [String: ParentAnchor] {
+        guard let store = stateStores[chainKey(forDirectory: directory)] else { return [:] }
+        var anchorsByChild: [String: [ParentAnchor]] = [:]
+        for header in headers where header.height > 0 {
+            guard let proofData = proofs[header.cid],
+                  let decodedProofs = ChildBlockProofEnvelope.deserialize(proofData),
+                  !decodedProofs.isEmpty else {
+                NodeLogger("sync").warn("\(directory): synced child header \(String(header.cid.prefix(16)))… has no usable parent proof envelope")
+                throw HeaderChain.HeaderChainError.invalidPoW(header.cid)
+            }
+            var anchors: [ParentAnchor] = []
+            for proof in decodedProofs {
+                guard let anchor = await persistCommittingParentEdgeFromVerifiedProof(directory: directory, proof: proof) else {
+                    NodeLogger("sync").warn("\(directory): synced child header \(String(header.cid.prefix(16)))… has an unusable parent proof")
+                    throw HeaderChain.HeaderChainError.invalidPoW(header.cid)
+                }
+                anchors.append(anchor)
+            }
+            anchorsByChild[header.cid] = anchors.canonicalAnchorSorted()
+        }
+
+        var pendingChildAnchors: [String: String] = [:]
+        var selectedAnchors: [String: ParentAnchor] = [:]
+        for header in headers where header.height > 0 {
+            guard let orderedAnchors = anchorsByChild[header.cid], !orderedAnchors.isEmpty else {
+                throw HeaderChain.HeaderChainError.invalidPoW(header.cid)
+            }
+            let canonicalAtHeight = store.getBlockHash(atHeight: header.height) == header.cid
+            var selected: ParentAnchor?
+            if let existing = store.getChildParentAnchor(childHash: header.cid) {
+                if let matching = orderedAnchors.first(where: { $0.blockHash == existing }) {
+                    selected = matching
+                } else {
+                    if !canonicalAtHeight {
+                        NodeLogger("sync").debug("\(directory): ignoring stale noncanonical parent anchor for synced child header \(String(header.cid.prefix(16)))…")
+                    } else {
+                        NodeLogger("sync").warn("\(directory): synced canonical child header \(String(header.cid.prefix(16)))… conflicts with existing parent anchor")
+                        throw HeaderChain.HeaderChainError.invalidPoW(header.cid)
+                    }
+                }
+            }
+
+            if selected == nil, header.height > 1 {
+                selected = orderedAnchors.first
+            } else if selected == nil {
+                guard let first = orderedAnchors.first else {
+                    throw HeaderChain.HeaderChainError.invalidPoW(header.cid)
+                }
+                selected = first
+            }
+
+            guard let selected else {
+                throw HeaderChain.HeaderChainError.invalidPoW(header.cid)
+            }
+            if let previousChild = header.previousBlockCID, header.height > 1 {
+                guard let currentRoot = selected.prevStateCID,
+                      let previousChildData = try? await fetcher.fetch(rawCid: previousChild),
+                      let previousChildBlock = Block(data: previousChildData),
+                      try VolumeImpl<Block>(node: previousChildBlock).rawCID == previousChild else {
+                    NodeLogger("sync").warn("\(directory): synced child header \(String(header.cid.prefix(16)))… cannot resolve previous child block for parent state root continuity")
+                    throw HeaderChain.HeaderChainError.invalidPoW(header.cid)
+                }
+                let previousRoot = previousChildBlock.parentState.rawCID
+                let alreadyContinuous = await parentStateRootIsContinuous(
+                    previousRoot: previousRoot,
+                    currentRoot: currentRoot,
+                    directory: directory
+                )
+                let backfilled: Bool
+                if alreadyContinuous {
+                    backfilled = true
+                } else {
+                    backfilled = await backfillSyncedParentStatePath(
+                        directory: directory,
+                        previousRoot: previousRoot,
+                        currentRoot: currentRoot,
+                        committingParentHash: selected.blockHash,
+                        fetcher: fetcher
+                    )
+                }
+                guard backfilled,
+                      await parentStateRootIsContinuous(
+                        previousRoot: previousChildBlock.parentState.rawCID,
+                        currentRoot: currentRoot,
+                        directory: directory
+                      ) else {
+                    NodeLogger("sync").warn("\(directory): synced child header \(String(header.cid.prefix(16)))… breaks parent state root continuity")
+                    throw HeaderChain.HeaderChainError.invalidPoW(header.cid)
+                }
+            }
+            pendingChildAnchors[header.cid] = selected.blockHash
+            selectedAnchors[header.cid] = selected
+        }
+        return selectedAnchors
+    }
+
+    /// Historical child sync receives a proof for each child block's committing
+    /// parent carrier, but not necessarily every parent block between two child
+    /// commitments. The child does not import parent blocks into its own view; it
+    /// only records verified parent state transitions needed for continuity.
+    func backfillSyncedParentStatePath(
+        directory: String,
+        previousRoot: String,
+        currentRoot: String,
+        committingParentHash: String,
+        fetcher: Fetcher,
+        maxDepth: Int = 2048,
+        requireProofOfWork: Bool = false
+    ) async -> Bool {
+        guard previousRoot != currentRoot,
+              let store = stateStores[chainKey(forDirectory: directory)] else {
+            return previousRoot == currentRoot
+        }
+
+        let parentFetcher: Fetcher
+        if let parentStateFetcher = parentStateFetchers[directory] {
+            // Byte-identical mirror of the prior per-CID composite (primary
+            // `fetcher`, fallback `parentStateFetcher`): same precedence. These
+            // are local-broker/parent-subscription tiers (not the dominant network
+            // ivy path), so bridging each via FetcherContentSource is
+            // semantics-exact (no wave-batching to forfeit here).
+            parentFetcher = CoalescingFetcher(CompositeContentSource([
+                FetcherContentSource(fetcher),
+                FetcherContentSource(parentStateFetcher),
+            ]))
+        } else {
+            parentFetcher = fetcher
+        }
+
+        var cursor: String? = committingParentHash
+        var seen = Set<String>()
+        var depth = 0
+        while let hash = cursor, !hash.isEmpty, depth < maxDepth {
+            guard seen.insert(hash).inserted else { return false }
+            guard let data = try? await parentFetcher.fetch(rawCid: hash),
+                  let block = Block(data: data),
+                  // known-valid local node; CID cannot fail
+                  try! VolumeImpl<Block>(node: block).rawCID == hash else {
+                NodeLogger("sync").warn("\(directory): parent-state backfill could not fetch verified parent block \(String(hash.prefix(16)))…")
+                return false
+            }
+            // Callers that walk a less-trusted ancestry (a miner-supplied candidate
+            // carrier, vs. a sync proof's verified committing parent) require each
+            // walked parent block to carry valid PoW before its state transition is
+            // recorded as a continuity fact — a state edge attests "this transition
+            // happened", which only PoW-backed work may assert.
+            if requireProofOfWork {
+                let rootHash = block.proofOfWorkHash()
+                guard block.validateProofOfWork(nexusHash: rootHash) else {
+                    NodeLogger("sync").warn("\(directory): parent-state backfill rejected parent block \(String(hash.prefix(16)))… with invalid PoW")
+                    return false
+                }
+            }
+
+            await persistVerifiedParentStateEdge(directory: directory, parentBlock: block)
+            if store.hasParentStatePath(from: previousRoot, to: currentRoot) {
+                return true
+            }
+            cursor = block.parent?.rawCID
+            depth += 1
+        }
+
+        return store.hasParentStatePath(from: previousRoot, to: currentRoot)
+    }
+
+    private func reprocessSyncedBlocksForChildChains(
+        persisted: PersistedChainState,
+        fetcher: Fetcher,
+        network: ChainNetwork
+    ) async -> Bool {
+        // Child blocks at all depths live in child-chain CAS stores, not the nexus CAS.
+        // Build a composite fetcher that falls back through all registered child networks
+        // so grandchild (and deeper) block data can be resolved during replay.
+        _ = fetcher
+        let durableFetcher = network.canonicalContentFetcher()
+        let allChildFetchers = networks.values.compactMap { $0 === network ? nil : $0.canonicalContentFetcher() as Fetcher }
+        // Byte-identical mirror of the prior per-CID composite (durable broker
+        // primary, child-broker fallbacks): durable broker first, then each child
+        // broker in order. LOCAL-BROKER tiers (canonicalContentFetcher, not network
+        // ivy), so bridging each via FetcherContentSource is semantics-exact —
+        // no network wave-batching to gain.
+        let compositeSource: any ContentSource = allChildFetchers.isEmpty
+            ? FetcherContentSource(durableFetcher)
+            : CompositeContentSource([FetcherContentSource(durableFetcher)] + allChildFetchers.map { FetcherContentSource($0) })
+
+        let sortedBlocks = persisted.blocks.sorted { $0.blockHeight < $1.blockHeight }
+
+        for blockMeta in sortedBlocks {
+            let stub = VolumeImpl<Block>(rawCID: blockMeta.blockHash, node: nil, encryptionInfo: nil)
+            do {
+                // Migrate this durable-presence check onto the source API
+                // (resolve(paths:source:)) to complete the fetcher→ContentSource
+                // cutover. This is a LOCAL-BROKER site (canonicalContentFetcher,
+                // not network ivy), so there is no network wave-batching to gain:
+                // bridging the EXACT composite fetcher via FetcherContentSource
+                // is byte-identical to the prior resolution (sequential per-CID over
+                // the local broker; no network round-trips to batch). This is an
+                // API-consistency bridge, not a perf win — that win lives only on
+                // the network tier (#287).
+                guard (try await stub.resolve(paths: Block.contentResolutionPaths, source: compositeSource).node) != nil else {
+                    await markChainStorageDegraded(directory: network.directory, reason: "synced child canonical content not durable")
+                    return false
+                }
+            } catch {
+                NodeLogger("sync").error("\(network.directory): synced canonical block \(String(blockMeta.blockHash.prefix(16)))… missing from durable CAS during child reprocess: \(error)")
+                await markChainStorageDegraded(directory: network.directory, reason: "synced child canonical content not durable")
+                return false
+            }
+        }
+        return true
+    }
+
+
+    /// After sync replaces the nexus chain, ensure each existing child
+    /// chain's tipSnapshot reflects the new nexus state. If the synced
+    /// nexus blocks don't embed a particular child chain (e.g. syncing to
+    /// a fork that predates the child's deployment), the child's tip must
+    /// be updated to match whatever state the Lattice reorg left it in.
+    private func reconcileChildChainStatesAfterSync(
+        persisted: PersistedChainState,
+        fetcher: Fetcher,
+        currentMutationKey: String
+    ) async {
+        let log = NodeLogger("sync")
+
+        // P-502: two-phase reconciliation — collect all (dir, tip, fetcher) tuples
+        // on the LatticeNode actor, then resolve tip blocks for all child chains
+        // concurrently (CAS fetches are independent), then apply results sequentially.
+        struct WorkItem: Sendable {
+            let dir: String
+            let newTip: String
+            let chain: ChainState
+            let blockFetcher: Fetcher
+        }
+        var work: [WorkItem] = []
+        for (childDir, _) in networks where childDir != genesisConfig.directory {
+            guard let childChain = await chain(for: childDir) else { continue }
+            let newTip = await childChain.getMainChainTip()
+            guard !newTip.isEmpty else { continue }
+            let blockFetcher: Fetcher
+            if let childNet = network(for: childDir) {
+                // Byte-identical mirror of the prior per-CID composite (primary
+                // `fetcher`, fallback `childNet.ivyFetcher`): passed-in sync fetcher
+                // first, then the child network ivy. Bridge `fetcher` (a sync/local
+                // tier, not necessarily network ivy) exactly; use the native
+                // IvyContentSource for the child ivy fallback.
+                blockFetcher = CoalescingFetcher(CompositeContentSource([
+                    FetcherContentSource(fetcher),
+                    IvyContentSource(childNet.ivyFetcher),
+                ]))
+            } else {
+                blockFetcher = fetcher
+            }
+            work.append(WorkItem(dir: childDir, newTip: newTip, chain: childChain, blockFetcher: blockFetcher))
+        }
+
+        // Resolve all tip blocks concurrently — each is an independent CAS fetch
+        var resolved: [(WorkItem, Block)] = []
+        await withTaskGroup(of: (WorkItem, Block?).self) { group in
+            for item in work {
+                group.addTask {
+                    let stub = VolumeImpl<Block>(rawCID: item.newTip, node: nil, encryptionInfo: nil)
+                    return (item, try? await stub.resolve(fetcher: item.blockFetcher).node)
+                }
+            }
+            for await (item, tipBlock) in group {
+                if let b = tipBlock { resolved.append((item, b)) }
+            }
+        }
+
+        // Apply results — back on LatticeNode actor
+        for (item, tipBlock) in resolved {
+            let itemKey = chainKey(forDirectory: item.dir)
+            let applyResolvedChildTip: () async -> Void = { [self] in
+                await item.chain.updateTipSnapshot(block: tipBlock)
+                // Publish the child's canonical chain atomically (block_index + tip marker)
+                // instead of moving the tip marker alone, so the child commitment can't diverge.
+                do {
+                    try await reconcileBlockIndex(directory: item.dir, tipStateRoot: tipBlock.postState.rawCID)
+                } catch {
+                    log.error("\(item.dir): failed to publish post-sync child commitment: \(error)")
+                    return
+                }
+                log.info("\(item.dir): post-sync tip at height \(tipBlock.height)")
+                tipCaches[chainKey(forDirectory: item.dir)]?.update(item.newTip)
+                postStateCaches[chainKey(forDirectory: item.dir)]?.invalidate()
+            }
+            if itemKey == currentMutationKey {
+                await applyResolvedChildTip()
+            } else {
+                await withChainMutation(itemKey) {
+                    await applyResolvedChildTip()
+                }
+            }
+        }
+        // Tip cache update for dirs that didn't resolve
+        for item in work where !resolved.contains(where: { $0.0.dir == item.dir }) {
+            let itemKey = chainKey(forDirectory: item.dir)
+            let applyUnresolvedChildTip: () async -> Void = { [self] in
+                tipCaches[chainKey(forDirectory: item.dir)]?.update(item.newTip)
+                postStateCaches[chainKey(forDirectory: item.dir)]?.invalidate()
+            }
+            if itemKey == currentMutationKey {
+                await applyUnresolvedChildTip()
+            } else {
+                await withChainMutation(itemKey) {
+                    await applyUnresolvedChildTip()
+                }
+            }
+        }
+    }
+
+    // DESIGN CONSTRAINT: Every chain behaves identically. A chain that is a
+    // child of Nexus behaves exactly as Nexus does for its own children.
+    // finalizeSyncResult is chain-agnostic — `network` identifies which chain
+    // was just synced. After applying the result, child chains are synced
+    // recursively via the same performHeadersFirstSync path.
+    static func shouldAdmitSyncedChain(peerWork: UInt256, localWork: UInt256) -> Bool {
+        peerWork > localWork
+    }
+
+    func recordRefusedSyncTip(_ peerTip: String, localTip: String) {
+        if refusedSyncTipPairs.count > 512 { refusedSyncTipPairs.removeAll() }
+        refusedSyncTipPairs.insert("\(peerTip)|\(localTip)")
+    }
+
+    /// Was `peerTip` already fully synced and refused while our tip was `localTip`?
+    /// Re-syncing it is pure churn until either tip changes.
+    func isRefusedSyncTip(_ peerTip: String, localTip: String) -> Bool {
+        refusedSyncTipPairs.contains("\(peerTip)|\(localTip)")
+    }
+
+    enum SyncAdmissionDecision {
+        case admit
+        /// Deterministic refusal (less work, or equal-work tiebreak keeps the
+        /// local tip) — safe to memoize until either tip changes.
+        case refuse
+    }
+
+    /// Admission decision for a fully-validated synced chain, evaluated against
+    /// the chain's CURRENT state (never a pre-download snapshot).
+    ///
+    /// Only a STRICTLY heavier `trueCumWork` tip admits; an exact tie holds the
+    /// incumbent (docs/protocol.md §fork-choice, docs/whitepaper.md). Equal-work
+    /// forks are not switched on receipt — the next block to extend either fork
+    /// makes it strictly heavier and the network converges on that. Admission
+    /// stays verify-not-trust: the synced chain passed full PoW + consensus
+    /// validation in the header path before reaching here.
+    private func admitSyncedChainAgainstCurrentChain(
+        _ result: SyncResult,
+        chainState: ChainState,
+        chainPath: [String]
+    ) async -> SyncAdmissionDecision {
+        let localWork = await localCumulativeWork(chainPath: chainPath)
+        if Self.shouldAdmitSyncedChain(peerWork: result.cumulativeWork, localWork: localWork) { return .admit }
+        return .refuse
+    }
+
+    /// Returns true only when the synced segment was durably published AND
+    /// projected into ChainState. Callers running accepted-only side effects
+    /// (e.g. persisting child proofs / folding inherited weight) MUST gate on
+    /// this — a refused or failed finalize means the segment was
+    /// never committed.
+    @discardableResult
+    func finalizeSyncResult(_ result: SyncResult, localWork: UInt256, network: ChainNetwork, fetcher: Fetcher, sourcePeer: PeerID? = nil) async -> Bool {
+        let key = chainKey(forPath: network.chainPath)
+        return await withChainMutation(key) {
+            await finalizeSyncResultUnlocked(
+                result,
+                localWork: localWork,
+                network: network,
+                fetcher: fetcher,
+                sourcePeer: sourcePeer
+            )
+        }
+    }
+
+    @discardableResult
+    private func finalizeSyncResultUnlocked(_ result: SyncResult, localWork: UInt256, network: ChainNetwork, fetcher: Fetcher, sourcePeer: PeerID? = nil) async -> Bool {
+        let log = NodeLogger("sync")
+        let directory = network.directory
+        guard let chainState = await chain(for: directory) else { return false }
+
+        // Gate against the CURRENT chain, not the caller's pre-download
+        // `localWork` snapshot: a block mined or accepted during the sync must
+        // never be rolled back by an equal/lower-work synced chain.
+        switch await admitSyncedChainAgainstCurrentChain(result, chainState: chainState, chainPath: network.chainPath) {
+        case .admit:
+            break
+        case .refuse:
+            log.warn("\(directory): sync refused: peer work \(result.cumulativeWork) does not beat the current local chain")
+            recordRefusedSyncTip(result.tipBlockHash, localTip: await chainState.getMainChainTip())
+            return false
+        }
+
+        let sortedBlocks = result.persisted.blocks.sorted { $0.blockHeight < $1.blockHeight }
+        guard let store = stateStores[chainKey(forDirectory: directory)],
+              let lowest = sortedBlocks.first,
+              let tipMeta = sortedBlocks.last else {
+            log.error("\(directory): cannot publish sync without StateStore and a non-empty canonical segment")
+            return false
+        }
+
+        guard let materialized = await materializeSyncedCanonicalContent(
+            blocks: sortedBlocks,
+            tipHash: tipMeta.blockHash,
+            network: network,
+            fetcher: fetcher,
+            sourcePeer: sourcePeer
+        ) else {
+            log.warn("\(directory): could not materialize synced canonical content; retrying before durable publish")
+            return false
+        }
+        let tipBlock = materialized.tipBlock
+        let oldTip = await chainState.getMainChainTip()
+
+        // Materialization fetches remote content and can take seconds — re-run
+        // the admission gate against the chain as it stands NOW, so a chain
+        // that advanced mid-sync is never durably replaced by a stale result.
+        guard case .admit = await admitSyncedChainAgainstCurrentChain(result, chainState: chainState, chainPath: network.chainPath) else {
+            log.info("\(directory): sync abandoned after materialization: local chain advanced past the synced chain")
+            return false
+        }
+
+        // Publish the synced canonical chain as ONE atomic segment commit before
+        // mutating ChainState. StateStore is authoritative; ChainState is only the
+        // in-memory projection of this durable commit.
+        let connectsBelow = lowest.blockHeight == 0
+            || store.getBlockHash(atHeight: lowest.blockHeight - 1) == lowest.parentBlockHash
+        let syncedTransition = await syncedCanonicalTransition(
+            oldTip: oldTip,
+            newTip: tipMeta.blockHash,
+            syncedBlocks: sortedBlocks,
+            connectsBelow: connectsBelow,
+            chain: chainState
+        )
+        let segment = CanonicalSegment(
+            blocks: sortedBlocks.map {
+                CanonicalSegmentBlock(
+                    height: $0.blockHeight, hash: $0.blockHash,
+                    stateRoot: $0.blockHash == tipMeta.blockHash ? tipBlock.postState.rawCID : nil)
+            },
+            connectsBelow: connectsBelow)
+
+        guard let preparedEffects = await prepareSyncedCanonicalEffects(
+            blocks: sortedBlocks,
+            materializedBlocks: materialized.blocksByHeight,
+            directory: directory,
+            fetcher: fetcher
+        ) else {
+            return false
+        }
+
+        do {
+            try await advanceStateRetainedRoots(
+                directory: directory,
+                network: network,
+                tipHeight: tipMeta.blockHeight,
+                tipHash: tipMeta.blockHash,
+                materializedBlocks: materialized.blocksByHeight,
+                preserveExistingRoots: true
+            )
+        } catch {
+            log.error("\(directory): failed to pre-protect synced state retained roots before sync publish: \(error)")
+            await markChainStorageDegraded(directory: directory, reason: "failed to advance synced state retained roots")
+            return false
+        }
+
+        for meta in sortedBlocks {
+            let owner = "\(network.ownerNamespace):\(meta.blockHeight)"
+            do {
+                let pinRoots = materialized.blocksByHeight[meta.blockHeight].map {
+                    consensusPinRoots(block: $0)
+                } ?? [meta.blockHash]
+                try await network.pinBatchDurably(roots: pinRoots, owner: owner)
+            } catch {
+                log.error("\(directory): failed to pre-pin synced block \(String(meta.blockHash.prefix(16)))… at height \(meta.blockHeight): \(error)")
+                await markChainStorageDegraded(directory: directory, reason: "failed to pin synced canonical content before durable commit")
+                return false
+            }
+        }
+
+        do {
+            try await store.commitCanonicalSegment(
+                segment,
+                blockEffects: preparedEffects.map(\.storeEffects)
+            )
+        } catch {
+            log.error("\(directory): failed to publish synced canonical segment: \(error)")
+            return false
+        }
+
+        for meta in sortedBlocks {
+            let storedRoots = materialized.rootsByHeight[meta.blockHeight] ?? [meta.blockHash]
+            do {
+                try await store.persistStoredRoots(height: meta.blockHeight, roots: storedRoots)
+            } catch {
+                log.error("\(directory): failed to persist synced stored roots for \(String(meta.blockHash.prefix(16)))… at height \(meta.blockHeight): \(error)")
+                await markChainStorageDegraded(directory: directory, reason: "failed to persist synced canonical content roots after durable commit")
+                return false
+            }
+        }
+
+        do {
+            try await advanceStateRetainedRoots(
+                directory: directory,
+                network: network,
+                tipHeight: tipMeta.blockHeight,
+                tipHash: tipMeta.blockHash,
+                materializedBlocks: materialized.blocksByHeight
+            )
+        } catch {
+            log.warn("\(directory): failed to shrink synced state retained roots after publish; retaining previous roots until the next successful advance: \(error)")
+        }
+
+        do {
+            try await chainState.resetFrom(result.persisted, retentionDepth: config.retentionDepth)
+        } catch {
+            log.error("\(directory): failed to project synced state into ChainState: \(error)")
+            await markChainUnhealthy(directory: directory, reason: "failed to project synced state after durable commit")
+            return false
+        }
+        await chainState.updateTipSnapshot(block: tipBlock)
+
+        tipCaches[chainKey(forDirectory: directory)]?.update(result.tipBlockHash)
+        postStateCaches[chainKey(forDirectory: directory)]?.invalidate()
+
+        await persistChainState(directory: directory)
+
+        guard await publishPreparedSyncedCanonicalSideEffects(
+            preparedEffects,
+            directory: directory,
+            fetcher: fetcher,
+            chain: chainState,
+            oldTip: oldTip,
+            newTip: result.tipBlockHash,
+            transition: syncedTransition
+        ) else {
+            return false
+        }
+
+        // Parent sync must not rewrite descendant fork choice. Child chains are
+        // independent proof-validated chains; parent canonicity only changes the
+        // local parent data available to prove future child work.
+        guard await reprocessSyncedBlocksForChildChains(persisted: result.persisted, fetcher: fetcher, network: network) else {
+            return false
+        }
+        await reconcileChildChainStatesAfterSync(
+            persisted: result.persisted,
+            fetcher: fetcher,
+            currentMutationKey: chainKey(forDirectory: directory)
+        )
+        await verifySyncWithPeers(tipCID: result.tipBlockHash, tipHeight: result.tipBlockHeight, network: network)
+
+        await syncSubscribedChildren(of: directory)
+        return true
+    }
+
+    private func syncedCanonicalTransition(
+        oldTip: String,
+        newTip: String,
+        syncedBlocks: [PersistedBlockMeta],
+        connectsBelow: Bool,
+        chain: ChainState
+    ) async -> BoundedReorgWalkResult? {
+        guard !oldTip.isEmpty, oldTip != newTip else { return nil }
+        var newChainHashes = Set(syncedBlocks.map(\.blockHash))
+        if connectsBelow, let lowerParent = syncedBlocks.first?.parentBlockHash, !lowerParent.isEmpty {
+            newChainHashes.insert(lowerParent)
+        }
+        let walked = await Self.walkOrphansToCommonAncestor(
+            oldTip: oldTip,
+            newChainHashes: newChainHashes,
+            retentionDepth: config.retentionDepth
+        ) { hash in
+            await chain.getConsensusBlock(hash: hash)?.parentBlockHash
+        }
+        return BoundedReorgWalkResult(
+            orphaned: walked.orphans,
+            promoted: syncedBlocks.reversed().map { (hash: $0.blockHash, height: $0.blockHeight) },
+            newChainHashes: newChainHashes,
+            foundCommonAncestor: walked.foundCommonAncestor
+        )
+    }
+
+    /// Prepare the same deterministic block effects used by live acceptance
+    /// before the synced segment is published. This keeps consensus data
+    /// (transaction actions and declared state roots) ahead of local projections
+    /// (receipts, tx_history, nonce floors) and lets StateStore commit the
+    /// canonical segment plus query indexes atomically.
+    private func prepareSyncedCanonicalEffects(
+        blocks: [PersistedBlockMeta],
+        materializedBlocks: [UInt64: Block],
+        directory: String,
+        fetcher: Fetcher
+    ) async -> [PreparedAcceptedBlockEffects]? {
+        let txSource = await buildMempoolAwareSource(directory: directory, baseFetcher: fetcher)
+        var prepared: [PreparedAcceptedBlockEffects] = []
+        prepared.reserveCapacity(blocks.count)
+        for meta in blocks {
+            guard let block = materializedBlocks[meta.blockHeight] else {
+                NodeLogger("sync").error("\(directory): synced canonical block \(String(meta.blockHash.prefix(16)))…@\(meta.blockHeight) was not materialized for effect preparation")
+                await markChainUnhealthy(directory: directory, reason: "failed to materialize synced canonical effects")
+                return nil
+            }
+            guard let transactions = await resolveCompleteSyncedBlockTransactions(
+                block: block,
+                blockHash: meta.blockHash,
+                blockHeight: meta.blockHeight,
+                directory: directory,
+                source: txSource
+            ) else {
+                await markChainUnhealthy(directory: directory, reason: "failed to resolve synced canonical transactions")
+                return nil
+            }
+            guard await verifySyncedStateTransition(
+                block: block,
+                blockHash: meta.blockHash,
+                blockHeight: meta.blockHeight,
+                directory: directory,
+                transactions: transactions,
+                source: txSource
+            ) else {
+                await markChainUnhealthy(directory: directory, reason: "failed to verify synced canonical state transition")
+                return nil
+            }
+            guard let effects = await prepareAcceptedBlockEffects(
+                block: block,
+                blockHash: meta.blockHash,
+                txEntries: transactions.entriesByKey,
+                directory: directory,
+                allowLowerHeightReplay: true
+            ) else {
+                NodeLogger("sync").error("\(directory): synced canonical block \(String(meta.blockHash.prefix(16)))…@\(meta.blockHeight) could not prepare canonical effects")
+                await markChainUnhealthy(directory: directory, reason: "failed to prepare synced canonical effects")
+                return nil
+            }
+            prepared.append(effects)
+        }
+        return prepared
+    }
+
+    private struct SyncedBlockTransactions {
+        let entriesByKey: [String: VolumeImpl<Transaction>]
+        let orderedBodies: [TransactionBody]
+    }
+
+    private func resolveCompleteSyncedBlockTransactions(
+        block: Block,
+        blockHash: String,
+        blockHeight: UInt64,
+        directory: String,
+        source: any ContentSource
+    ) async -> SyncedBlockTransactions? {
+        guard let txDict = try? await block.transactions.resolveRecursive(source: source).node,
+              let orderedEntries = try? txDict.sortedKeysAndValues() else {
+            NodeLogger("sync").error("\(directory): synced canonical block \(String(blockHash.prefix(16)))…@\(blockHeight) has unresolved transaction dictionary")
+            return nil
+        }
+        var orderedBodies: [TransactionBody] = []
+        orderedBodies.reserveCapacity(orderedEntries.count)
+        for (key, txHeader) in orderedEntries {
+            guard let tx = txHeader.node, let body = tx.body.node else {
+                NodeLogger("sync").error("\(directory): synced canonical block \(String(blockHash.prefix(16)))…@\(blockHeight) has unresolved transaction \(key)")
+                return nil
+            }
+            orderedBodies.append(body)
+        }
+        return SyncedBlockTransactions(
+            entriesByKey: Dictionary(uniqueKeysWithValues: orderedEntries),
+            orderedBodies: orderedBodies
+        )
+    }
+
+    private func verifySyncedStateTransition(
+        block: Block,
+        blockHash: String,
+        blockHeight: UInt64,
+        directory: String,
+        transactions: SyncedBlockTransactions,
+        source: any ContentSource
+    ) async -> Bool {
+        let fetcher = CoalescingFetcher(source)
+        do {
+            let prevState = try await block.prevState.resolve(fetcher: fetcher)
+            let bodies = transactions.orderedBodies
+            let (updatedState, _) = try await prevState.proveAndUpdateState(
+                allAccountActions: bodies.flatMap(\.accountActions),
+                allActions: bodies.flatMap(\.actions),
+                allDepositActions: bodies.flatMap(\.depositActions),
+                allGenesisActions: bodies.flatMap(\.genesisActions),
+                allReceiptActions: bodies.flatMap(\.receiptActions),
+                allWithdrawalActions: bodies.flatMap(\.withdrawalActions),
+                transactionBodies: bodies,
+                fetcher: fetcher
+            )
+            let updatedHeader = try LatticeStateHeader(node: updatedState)
+            guard updatedHeader.rawCID == block.postState.rawCID else {
+                NodeLogger("sync").error("\(directory): synced canonical block \(String(blockHash.prefix(16)))…@\(blockHeight) computed postState \(String(updatedHeader.rawCID.prefix(16)))… but declares \(String(block.postState.rawCID.prefix(16)))…")
+                return false
+            }
+            return true
+        } catch {
+            NodeLogger("sync").error("\(directory): synced canonical block \(String(blockHash.prefix(16)))…@\(blockHeight) failed Cashew state replay: \(error)")
+            return false
+        }
+    }
+
+    /// Publish the non-SQLite side effects for an already-committed synced
+    /// canonical segment. The canonical segment, receipts, tx_history, and
+    /// applied-through marker have already moved together in StateStore.
+    @discardableResult
+    private func publishPreparedSyncedCanonicalSideEffects(
+        _ preparedEffects: [PreparedAcceptedBlockEffects],
+        directory: String,
+        fetcher: Fetcher,
+        chain: ChainState,
+        oldTip: String,
+        newTip: String,
+        transition: BoundedReorgWalkResult?
+    ) async -> Bool {
+        let source = FetcherContentSource(fetcher)
+        if let transition, oldTip != newTip {
+            await recoverOrphanedTransactions(
+                transition: transition,
+                oldTip: oldTip,
+                newTip: newTip,
+                directory: directory,
+                source: source
+            )
+        }
+
+        for effects in preparedEffects {
+            await applyPreparedAcceptedBlockEffects(effects, recoverReplacedCanonicalBlock: false)
+        }
+        if let tipBlock = preparedEffects.last?.block {
+            await chain.updateTipSnapshot(block: tipBlock)
+        }
+        tipCaches[chainKey(forDirectory: directory)]?.update(newTip)
+        postStateCaches[chainKey(forDirectory: directory)]?.invalidate()
+        return true
+    }
+
+    private func materializeSyncedCanonicalContent(
+        blocks: [PersistedBlockMeta],
+        tipHash: String,
+        network: ChainNetwork,
+        fetcher: Fetcher,
+        sourcePeer: PeerID? = nil
+    ) async -> (tipBlock: Block, rootsByHeight: [UInt64: [String]], blocksByHeight: [UInt64: Block])? {
+        let log = NodeLogger("sync")
+        var syncedTip: Block?
+        var rootsByHeight: [UInt64: [String]] = [:]
+        var blocksByHeight: [UInt64: Block] = [:]
+
+        for meta in blocks {
+            let blockHeader = VolumeImpl<Block>(rawCID: meta.blockHash, node: nil, encryptionInfo: nil)
+            // The sync source peer is a guaranteed holder of every synced block
+            // and its sub-volumes. Bind it the same way the gossip path does
+            // (bindBlockRoots) so content resolution hops straight to the peer
+            // instead of burning the 15s untargeted DHT-walk timeout per missing
+            // provider record — which overruns the sync window and aborts an
+            // otherwise valid sync.
+            if let sourcePeer {
+                await network.ivyFetcher.bindPinner(rootCID: meta.blockHash, peer: sourcePeer)
+                if let stub = try? await blockHeader.resolve(fetcher: fetcher).node {
+                    await network.ivyFetcher.bindBlockRoots(stub, peer: sourcePeer)
+                }
+            }
+            // Headers-first sync delivered only the block ROOT node. Fetch the
+            // block's whole CONTENT closure — the block volume, the spec volume,
+            // and each transaction-body volume — one shot per volume by root CID,
+            // so resolution finds every internal trie node in the local CAS.
+            // Object-grain storage keeps internal nodes as non-root entries that
+            // are never fetched individually over the wire.
+            //
+            // A received volume is a locality bundle, not a completeness claim:
+            // resolution below IS the JIT verification. If it fails, the bundle
+            // some peer served was deficient — report its server (Tally demotion,
+            // provider-record removal), then refetch the bundles from OTHER peers
+            // and retry. Without this, a first-responder stub (e.g. a headers-only
+            // tracker answering a volume want with a bare root) wedges sync
+            // permanently against the same peer mix. Trust is local.
+            var bundleRoots = await prefetchBlockContentClosure(blockHash: meta.blockHash, network: network)
+            var resolved: VolumeImpl<Block>?
+            for attempt in 0..<3 {
+                do {
+                    // Stage 2c: resolve over the batched Ivy ContentSource. Each
+                    // resolution wave is served from local CAS; misses are Volume
+                    // boundary roots fetched as whole attributed bundles — so any
+                    // boundary the warm-up prefetch above didn't know about (it
+                    // enumerates types by hand) is still fetched at the right
+                    // grain, on demand, by resolution itself.
+                    await network.ivyFetcher.beginVolumeTrace()
+                    resolved = try await blockHeader.resolve(
+                        paths: Block.contentResolutionPaths,
+                        source: IvyContentSource(network.ivyFetcher)
+                    )
+                    _ = await network.ivyFetcher.takeVolumeTrace()
+                    break
+                } catch {
+                    // JIT verification failed: the bundles we fetched did not
+                    // resolve into a complete block. Accumulate every root fetched
+                    // this attempt — INCLUDING deep boundaries the hand-enumerated
+                    // prefetch can't see, discovered by the resolution trace — and
+                    // punish their servers, which also suppresses them per-root in
+                    // Ivy so the forced refetch routes around them. Punishing the
+                    // whole accumulated set (not just the traced subset) is the
+                    // safe direction: a deficient bundle that was PREFETCHED (not
+                    // re-fetched during resolve) won't be in `traced`, so narrowing
+                    // would let that liar escape suppression and be re-served by the
+                    // same peer. Over-punishing an honest peer on a benign eviction
+                    // is self-healing (30s suppression + advisory fallback).
+                    let traced = await network.ivyFetcher.takeVolumeTrace()
+                    var seen = Set(bundleRoots)
+                    for root in traced where seen.insert(root).inserted { bundleRoots.append(root) }
+                    let punished = await network.ivyFetcher.reportDeficientVolumes(roots: bundleRoots)
+                    if punished.isEmpty {
+                        if attempt == 2 {
+                            log.warn("\(network.directory): synced block content \(String(meta.blockHash.prefix(16)))… unresolved with no attributable deficient server; retrying on next sync")
+                            return nil
+                        }
+                        log.warn("\(network.directory): synced block content \(String(meta.blockHash.prefix(16)))… unresolved with no attributable deficient server; refetching before retry")
+                        let refetched = await prefetchBlockContentClosure(
+                            blockHash: meta.blockHash, network: network, force: true)
+                        var refetchedSet = Set(refetched)
+                        for root in bundleRoots where refetchedSet.insert(root).inserted {
+                            await network.ivyFetcher.fetchVolumeBundle(rootCID: root, force: true)
+                        }
+                        continue
+                    }
+                    if attempt == 2 {
+                        log.error("\(network.directory): failed to resolve synced block content \(String(meta.blockHash.prefix(16)))…: \(error)")
+                        return nil
+                    }
+                    log.warn("\(network.directory): synced block content \(String(meta.blockHash.prefix(16)))… did not resolve from served bundles; punished \(punished.count) peer(s), refetching")
+                    // Force-refetch the FULL accumulated set — the hand-enumerated
+                    // closure AND every trace-discovered deep boundary — so a
+                    // deficient/evicted DEEP bundle is re-sourced (routed around the
+                    // punished peer) instead of re-trusted from the local cache,
+                    // which the non-force short-circuit in fetchVolumeBundle would
+                    // otherwise return. Without this, an adversary lying only on a
+                    // deep boundary stalls the victim's sync indefinitely.
+                    let refetched = await prefetchBlockContentClosure(
+                        blockHash: meta.blockHash, network: network, force: true)
+                    var refetchedSet = Set(refetched)
+                    for root in bundleRoots where refetchedSet.insert(root).inserted {
+                        await network.ivyFetcher.fetchVolumeBundle(rootCID: root, force: true)
+                    }
+                }
+            }
+            guard let resolvedHeader = resolved else {
+                log.error("\(network.directory): failed to resolve synced block content \(String(meta.blockHash.prefix(16)))… after deficiency retries")
+                return nil
+            }
+            guard let block = resolvedHeader.node else {
+                log.error("\(network.directory): synced block content \(String(meta.blockHash.prefix(16)))… resolved without a block node")
+                return nil
+            }
+
+            var blockToStore = block
+            if config.storageMode != .stateless {
+                do {
+                    let postState = try await block.postState.resolveRecursive(fetcher: fetcher)
+                    blockToStore = Block(
+                        version: block.version,
+                        parent: block.parent,
+                        transactions: block.transactions,
+                        target: block.target,
+                        nextTarget: block.nextTarget,
+                        spec: block.spec,
+                        parentState: block.parentState,
+                        prevState: block.prevState,
+                        postState: postState,
+                        children: block.children,
+                        height: block.height,
+                        timestamp: block.timestamp,
+                        nonce: block.nonce
+                    )
+                } catch {
+                    log.error("\(network.directory): failed to resolve synced state \(String(meta.blockHash.prefix(16)))…: \(error)")
+                    return nil
+                }
+            }
+
+            if config.storageMode != .stateless {
+                guard let storedRoots = await storeBlockData(blockToStore, network: network) else {
+                    log.error("\(network.directory): failed to store synced block content \(String(meta.blockHash.prefix(16)))…")
+                    return nil
+                }
+                rootsByHeight[meta.blockHeight] = storedRoots
+            }
+
+            if meta.blockHash == tipHash {
+                syncedTip = blockToStore
+            }
+            blocksByHeight[meta.blockHeight] = blockToStore
+        }
+
+        guard let syncedTip else { return nil }
+        return (syncedTip, rootsByHeight, blocksByHeight)
+    }
+
+    /// Recursive multi-chain sync wave. A chain syncs and finalizes itself first;
+    /// only then do its direct subscribed children start syncing, in parallel. Each
+    /// child runs this same method after finalizing, so arbitrary-depth trees sync
+    /// parent-before-child without serializing independent siblings.
+    func syncSubscribedChildren(of parentDirectory: String) async {
+        struct ChildSyncCandidate: Sendable {
+            let network: ChainNetwork
+            let tipCID: String
+        }
+
+        var candidates: [ChildSyncCandidate] = []
+        let childNetworks = networks.values.filter { $0.parentDirectory == parentDirectory }
+        for childNetwork in childNetworks {
+            guard !producesChildInProcess(network: childNetwork) else { continue }
+            guard let childChain = await chain(for: childNetwork.directory) else { continue }
+            let localHeight = await childChain.getHighestBlockHeight()
+            guard let tips = knownPeerTips[chainKey(forPath: childNetwork.chainPath)] else { continue }
+            guard let best = tips.values
+                .filter({ $0.height > localHeight })
+                .max(by: { $0.height < $1.height }) else { continue }
+            candidates.append(ChildSyncCandidate(network: childNetwork, tipCID: best.tipCID))
+        }
+
+        guard !candidates.isEmpty else { return }
+        await withTaskGroup(of: Void.self) { group in
+            for candidate in candidates {
+                group.addTask { [weak self] in
+                    await self?.performHeadersFirstSync(
+                        peerTipCID: candidate.tipCID,
+                        network: candidate.network
+                    )
+                }
+            }
+        }
+    }
+
+    /// Returns the best connected, tally-allowed tip CID plus the PeerID for bulk header requests.
+    /// `defaultTipHeight` is the announced height of `defaultTipCID` when the caller
+    /// got the tip from an (unvalidated, deliberately unrecorded) announcement.
+    func bestConnectedPeerTipWithPeer(
+        defaultTipCID: String,
+        defaultTipHeight: UInt64? = nil,
+        network: ChainNetwork,
+        preferredPeer: PeerID? = nil
+    ) async -> (String, PeerID?) {
+        let connectedPeers = await network.ivy.connectedPeers
+        let connectedPreferred = preferredPeer.flatMap { p in
+            connectedPeers.first(where: { $0.publicKey == p.publicKey })
+        }
+        guard let tips = knownPeerTips[chainKey(forPath: network.chainPath)], !tips.isEmpty else {
+            return (defaultTipCID, connectedPreferred)
+        }
+        let tally = await network.ivy.tally
+        var best: (key: String, height: UInt64, tipCID: String, peer: PeerID)? = nil
+        for peer in connectedPeers {
+            guard let entry = tips[peer.publicKey] else { continue }
+            guard tally.shouldAllow(peer: peer) else { continue }
+            guard !failedSyncTips.contains(entry.tipCID) else { continue }
+            if best == nil || entry.height > best!.height {
+                best = (key: peer.publicKey, height: entry.height, tipCID: entry.tipCID, peer: peer)
+            }
+        }
+        // Announce-driven syncs pass the just-announced tip as the default. It is
+        // deliberately NOT recorded into knownPeerTips (it's unvalidated — recording
+        // would poison best-tip selection), so when it claims a height above every
+        // recorded connected-peer tip the sync must target it directly. Otherwise
+        // every announce-driven catch-up re-syncs a stale recorded tip, gets refused
+        // for insufficient work, and the node never reaches the announced height.
+        // Targeting it is safe: the headers-first path fully validates (PoW +
+        // cumulative work) before any adoption.
+        if let defaultTipHeight,
+           !failedSyncTips.contains(defaultTipCID),
+           best == nil || defaultTipHeight > best!.height {
+            return (defaultTipCID, connectedPreferred)
+        }
+        if let preferredPeer,
+           let connectedPreferred = connectedPeers.first(where: { $0.publicKey == preferredPeer.publicKey }),
+           let preferredEntry = tips[preferredPeer.publicKey],
+           tally.shouldAllow(peer: connectedPreferred),
+           !failedSyncTips.contains(preferredEntry.tipCID),
+           best == nil || preferredEntry.height >= best!.height {
+            // Preferred peer is a source hint for this announced tip, not fork
+            // choice. Header validation and cumulative work still decide adoption.
+            return (preferredEntry.tipCID, connectedPreferred)
+        }
+        return (best?.tipCID ?? defaultTipCID, best?.peer)
+    }
+
+    func verifySyncWithPeers(tipCID: String, tipHeight: UInt64, network: ChainNetwork) async {
+        let log = NodeLogger("sync")
+        let peerCount = await network.ivy.directPeerCount
+        if peerCount < 2 {
+            log.warn("Sync completed with only \(peerCount) peer(s) — insufficient for cross-verification")
+            return
+        }
+
+        let verifyStub = VolumeImpl<Block>(rawCID: tipCID, node: nil, encryptionInfo: nil)
+        if let block = try? await verifyStub.resolve(fetcher: network.ivyFetcher).node {
+            let valid = block.height == tipHeight
+            if valid {
+                log.info("Sync verified: tip at height \(tipHeight) with \(peerCount) connected peers")
+            } else {
+                log.warn("Sync tip height mismatch: expected \(tipHeight), got \(block.height)")
+            }
+        } else {
+            log.warn("Sync verification: could not resolve tip block from CAS")
+        }
+    }
+
+    func isChildChainSyncing(directory: String) -> Bool {
+        isChainSyncing(directory: directory) || isChainUnhealthy(directory: directory)
+    }
+
+    func isChildChainSyncing(chainPath: [String]) -> Bool {
+        isChainSyncing(chainPath: chainPath) || isChainUnhealthy(chainPath: chainPath)
+    }
+
+
+    /// Sum the proof-of-work for all blocks in the local retention window.
+    /// Underestimates when blocks have been pruned beyond `retentionDepth`,
+    /// but any positive floor is strictly safer than passing UInt256.zero
+    /// to the syncer (which disables the work comparison entirely).
+    func localCumulativeWork(for directory: String) async -> UInt256 {
+        await localCumulativeWork(chainPath: chainPath(forDirectory: directory))
+    }
+
+    func localCumulativeWork(chainPath: [String]) async -> UInt256 {
+        // P-801: one actor hop instead of O(retentionDepth) sequential hops.
+        // getCumulativeWork walks hashToBlock entirely inside the ChainState actor.
+        guard let chainState = await chain(forPath: chainPath) else { return UInt256.zero }
+        return await chainState.getCumulativeWork(limit: config.retentionDepth)
+    }
+}

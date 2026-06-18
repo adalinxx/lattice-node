@@ -1,0 +1,154 @@
+# Getting Started with Lattice Node
+
+## Installation
+
+### From Source (macOS)
+
+```bash
+git clone https://github.com/adalinxx/lattice-node.git
+cd lattice-node
+swift build -c release
+```
+
+The binary is at `.build/release/LatticeNode`.
+
+### Docker
+
+```bash
+docker pull ghcr.io/adalinxx/lattice-node:main
+docker run -v lattice-data:/home/lattice/.lattice ghcr.io/adalinxx/lattice-node:main
+```
+
+## Quick Start
+
+### Run a Node
+
+```bash
+# Join the Nexus network
+lattice-node --autosize --rpc-port 8080
+
+# Or with explicit resource settings
+lattice-node --memory 0.5 --disk 20 --rpc-port 8080
+```
+
+#### Resource footprint
+
+A node runs to an explicit budget — it does not grow without bound:
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--memory <GB>` | `0.25` | in-memory CAS/cache budget |
+| `--disk <GB>` | `1.0` | on-disk CAS budget (bounded, evicting) |
+| `--autosize` | — | size budgets to the host, capped by `--max-memory` / `--max-disk` |
+| `--stateless` | off | force the disk CAS budget to `0` |
+
+Storage is bounded and evicting: when the budget fills, data is dropped and
+**refetched from peers on demand** (CAS is content-addressed, so any peer can
+serve it and the result is self-verifying). This is why the footprint stays
+small even as the chain grows.
+
+**Stateless nodes are first-class.** `--stateless` keeps *no* local chain data,
+yet the node still **both validates and mines** — it fetches the state subtrees
+it needs from peers on demand, exactly as it validates. Combined with external
+mining (below), a contributor can run and mine the Nexus on minimal hardware.
+
+Throughput-heavy workloads don't change this: they run on **child chains** with
+their own (faster/larger) `ChainSpec`, whose cost is borne only by that child's
+participants — the Nexus node stays light.
+
+The node will:
+1. Generate a keypair (Ed25519, stored in `~/.lattice/identity.json`)
+2. Connect to bootstrap peers
+3. Sync the chain
+
+The node does **not** run a nonce-search loop. Run the external coordinator
+against the node's RPC address; it fans nonce ranges out to `lattice-miner`
+worker processes when given `--worker-executable`:
+
+```bash
+lattice-mining-coordinator \
+  --node http://127.0.0.1:8080/api \
+  --rpc-cookie-file ~/.lattice/.cookie \
+  --worker-executable "$(command -v lattice-miner)" \
+  --workers 2 \
+  --batch-size 128 \
+  --once
+```
+
+### Generate Keys
+
+```bash
+# Generate a new keypair
+lattice-node keys generate
+
+# Save to file
+lattice-node keys generate --output my-key.json
+
+# Derive address from public key
+lattice-node keys address <public-key-hex>
+```
+
+### Local Development Network
+
+```bash
+# Start a single-node devnet with fast blocks
+lattice-node devnet --mining --block-time 1000 --rpc-port 8080
+
+# Start a 3-node cluster
+lattice-node cluster --nodes 3 --mine Nexus --base-port 4001
+```
+
+> `devnet`/`cluster` `--mining`/`--mine` run a **local test-only** embedded miner
+> for convenience. The production target is the E15 role split: node-owned
+> seal/publish/validation, coordinator-owned work scheduling, and
+> `LatticeMiner` workers that only search assigned nonces. See
+> [Mining role boundaries](./design/mining-role-boundaries.md).
+
+> **Note:** `--block-time 1000` (1 second) is for local devnet only. The Nexus
+> production block-time target is 1 hour (`3600000` ms). Child chains run
+> per-process and inherit their own cadence.
+
+### Query the Chain
+
+A couple of canonical reads to confirm the node is up:
+
+```bash
+# Chain status (height, tip, target)
+curl http://localhost:8080/api/chain/info
+
+# Account balance
+curl http://localhost:8080/api/balance/<address>
+```
+
+Other real endpoints include `/api/proof`, `/api/deposit` / `/api/deposits`,
+and `/api/chain/deploy`. There is no order book / DEX API. See
+[rpc-api.md](./rpc-api.md) for the full API reference.
+
+## CLI Reference
+
+The full command and flag listing lives in the
+[README "CLI reference"](../README.md#cli-reference). Environment variables and
+operational tuning are documented in [operations.md](./operations.md).
+
+## Data Directory
+
+```
+~/.lattice/
+├── identity.json          # Node keypair (Ed25519)
+├── peers.json             # Known peers
+├── anchors.json           # Anchor peers for eclipse protection
+├── mempool.json           # Persisted pending transactions
+├── .cookie                # RPC auth token for privileged endpoints
+├── volumes.sqlite         # Shared content-addressed store (CAS) for all chains
+└── Nexus/
+    ├── chain_state.json   # Chain consensus state
+    └── state.db           # Per-chain state SQLite database
+```
+
+## Next Steps
+
+- [rpc-api.md](./rpc-api.md) — full HTTP/RPC API reference
+- [design/mining-role-boundaries.md](./design/mining-role-boundaries.md) — node/coordinator/worker mining contract
+- [operations.md](./operations.md) — running, monitoring, and tuning a node
+- [development.md](./development.md) — building and contributing
+- [deploy/README.md](../deploy/README.md) — production deployment

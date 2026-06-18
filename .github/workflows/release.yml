@@ -1,0 +1,144 @@
+name: Release Artifacts
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version label
+        required: true
+        type: string
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/release.yml'
+      - '.github/scripts/build-release-artifacts.sh'
+      - 'docs/release-verification.md'
+
+permissions:
+  contents: read
+
+jobs:
+  build-linux-release-artifacts:
+    runs-on: ubuntu-latest
+    container: swift:6.1-jammy
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        run: |
+          apt-get update && apt-get install -y --no-install-recommends libjavascriptcoregtk-4.1-dev libsqlite3-dev jq
+
+      - name: Build release artifacts
+        id: build
+        env:
+          RELEASE_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || github.event.inputs.version || github.sha }}
+          RELEASE_PLATFORM: linux-amd64
+        run: .github/scripts/build-release-artifacts.sh
+
+      - name: Verify release artifact bindings
+        run: .github/scripts/check-release-artifact-bindings.sh --self-test "${{ steps.build.outputs.manifest_path }}"
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: lattice-node-linux-amd64-release-artifacts
+          path: |
+            ${{ steps.build.outputs.archive_path }}
+            ${{ steps.build.outputs.checksum_path }}
+            ${{ steps.build.outputs.sbom_path }}
+            ${{ steps.build.outputs.manifest_path }}
+          if-no-files-found: error
+
+      - name: Attest release archive provenance
+        if: github.event_name != 'pull_request'
+        uses: actions/attest@v4
+        with:
+          subject-path: ${{ steps.build.outputs.archive_path }}
+
+      - name: Attest release SBOM
+        if: github.event_name != 'pull_request'
+        uses: actions/attest@v4
+        with:
+          subject-path: ${{ steps.build.outputs.archive_path }}
+          sbom-path: ${{ steps.build.outputs.sbom_path }}
+
+  build-macos-release-artifacts:
+    runs-on: macos-15
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_16.3.app/Contents/Developer
+
+      - name: Verify jq
+        run: jq --version
+
+      - name: Build release artifacts
+        id: build
+        env:
+          RELEASE_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || github.event.inputs.version || github.sha }}
+          RELEASE_PLATFORM: macos-arm64
+        run: .github/scripts/build-release-artifacts.sh
+
+      - name: Verify release artifact bindings
+        run: .github/scripts/check-release-artifact-bindings.sh --self-test "${{ steps.build.outputs.manifest_path }}"
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: lattice-node-macos-arm64-release-artifacts
+          path: |
+            ${{ steps.build.outputs.archive_path }}
+            ${{ steps.build.outputs.checksum_path }}
+            ${{ steps.build.outputs.sbom_path }}
+            ${{ steps.build.outputs.manifest_path }}
+          if-no-files-found: error
+
+      - name: Attest release archive provenance
+        if: github.event_name != 'pull_request'
+        uses: actions/attest@v4
+        with:
+          subject-path: ${{ steps.build.outputs.archive_path }}
+
+      - name: Attest release SBOM
+        if: github.event_name != 'pull_request'
+        uses: actions/attest@v4
+        with:
+          subject-path: ${{ steps.build.outputs.archive_path }}
+          sbom-path: ${{ steps.build.outputs.sbom_path }}
+
+  publish-release:
+    needs:
+      - build-linux-release-artifacts
+      - build-macos-release-artifacts
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+          merge-multiple: true
+
+      - name: Publish GitHub release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "$TAG" --notes "Lattice Node $TAG release artifacts."
+          gh release upload "$TAG" release-artifacts/* --clobber

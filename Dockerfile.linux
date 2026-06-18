@@ -1,0 +1,11 @@
+# Local reproduction of the CI `test-linux` job (.github/workflows/test.yml).
+# CSQLite links libsqlite3, so use the same container image CI uses.
+#
+#   docker build -t lattice-linux -f Dockerfile.linux .
+# or just run  scripts/linux-build.sh  which wraps this.
+FROM swift:6.1-jammy
+RUN apt-get update -qq \
+ && apt-get install -y --no-install-recommends \
+      libsqlite3-dev \
+ && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
