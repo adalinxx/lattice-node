@@ -169,7 +169,7 @@ final class BlockHashPrefixTests: XCTestCase {
             let expected = block.proofOfWorkHash()
 
             var input = proofOfWorkHashPrefix(block)
-            input.append(contentsOf: String(nonce).utf8)
+            input.append(contentsOf: Block.proofOfWorkNonceBytes(nonce))
             let computed = UInt256.hash(input)
 
             XCTAssertEqual(expected, computed, "Hash mismatch for nonce \(nonce)")
@@ -190,9 +190,9 @@ final class BlockHashPrefixTests: XCTestCase {
 
         let prefix = proofOfWorkHashPrefix(block)
         var input0 = prefix
-        input0.append(contentsOf: "0".utf8)
+        input0.append(contentsOf: Block.proofOfWorkNonceBytes(0))
         var input1 = prefix
-        input1.append(contentsOf: "1".utf8)
+        input1.append(contentsOf: Block.proofOfWorkNonceBytes(1))
 
         XCTAssertNotEqual(UInt256.hash(input0), UInt256.hash(input1))
     }
@@ -207,7 +207,7 @@ final class BlockHashPrefixTests: XCTestCase {
 
         let expected = genesis.proofOfWorkHash()
         var input = proofOfWorkHashPrefix(genesis)
-        input.append(contentsOf: "0".utf8)
+        input.append(contentsOf: Block.proofOfWorkNonceBytes(0))
         let computed = UInt256.hash(input)
 
         XCTAssertEqual(expected, computed)

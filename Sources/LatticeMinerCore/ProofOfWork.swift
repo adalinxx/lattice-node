@@ -48,17 +48,11 @@ public enum ProofOfWork {
     }
 
     public static func hash(midstate: SHA256, nonce: UInt64) -> UInt256 {
-        var nonceBuf: (UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
-                       UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8) =
-            (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
-        let nonceLen = writeDecimalNonce(nonce, into: &nonceBuf)
         var hasher = midstate
-        withUnsafePointer(to: &nonceBuf) { ptr in
-            hasher.update(bufferPointer: UnsafeRawBufferPointer(
-                start: UnsafeRawPointer(ptr),
-                count: nonceLen
-            ))
-        }
+        // Fixed-width 8-byte big-endian nonce — must match
+        // Block.proofOfWorkNonceBytes (the consensus encoding).
+        var beNonce = nonce.bigEndian
+        withUnsafeBytes(of: &beNonce) { hasher.update(bufferPointer: $0) }
         let digest = hasher.finalize()
         return digest.withUnsafeBytes { raw in
             let p = raw.bindMemory(to: UInt64.self)
@@ -153,22 +147,14 @@ public enum ProofOfWork {
         let end = startNonce &+ count
         var nonce = startNonce
 
-        var nonceBuf: (UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
-                       UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8) =
-            (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
-
         while nonce < end {
             if nonce & 0x3FF == 0 && Task.isCancelled { return nil }
 
-            let nonceLen = writeDecimalNonce(nonce, into: &nonceBuf)
-
             var hasher = midstate
-            withUnsafePointer(to: &nonceBuf) { ptr in
-                hasher.update(bufferPointer: UnsafeRawBufferPointer(
-                    start: UnsafeRawPointer(ptr),
-                    count: nonceLen
-                ))
-            }
+            // Fixed-width 8-byte big-endian nonce — must match
+            // Block.proofOfWorkNonceBytes (the consensus encoding).
+            var beNonce = nonce.bigEndian
+            withUnsafeBytes(of: &beNonce) { hasher.update(bufferPointer: $0) }
             let digest = hasher.finalize()
             let hash: UInt256 = digest.withUnsafeBytes { raw in
                 let p = raw.bindMemory(to: UInt64.self)
@@ -185,36 +171,6 @@ public enum ProofOfWork {
         return nil
     }
 
-    private static func writeDecimalNonce(
-        _ nonce: UInt64,
-        into nonceBuf: inout (UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
-                              UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8)
-    ) -> Int {
-        if nonce == 0 {
-            nonceBuf.0 = 0x30
-            return 1
-        }
-        var n = nonce
-        var digitCount = 0
-        withUnsafeMutablePointer(to: &nonceBuf) { ptr in
-            let buf = UnsafeMutableRawPointer(ptr).assumingMemoryBound(to: UInt8.self)
-            while n > 0 {
-                buf[digitCount] = UInt8(0x30 &+ (n % 10))
-                n /= 10
-                digitCount &+= 1
-            }
-            var lo = 0
-            var hi = digitCount &- 1
-            while lo < hi {
-                let tmp = buf[lo]
-                buf[lo] = buf[hi]
-                buf[hi] = tmp
-                lo &+= 1
-                hi &-= 1
-            }
-        }
-        return digitCount
-    }
 }
 
 private struct SendableSearchArgs: @unchecked Sendable {
