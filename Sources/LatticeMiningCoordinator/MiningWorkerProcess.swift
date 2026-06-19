@@ -60,7 +60,7 @@ public struct MiningWorkerProcessClient: Sendable {
             "--target", work.targetHex,
             "--start-nonce", String(range.startNonce),
             "--count", String(range.count),
-        ]
+        ] + (work.prefixHex.isEmpty ? [] : ["--prefix-hex", work.prefixHex])
 
         let stdout = Pipe()
         let stderr = Pipe()

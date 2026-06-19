@@ -39,8 +39,14 @@ public enum ProofOfWork {
     }
 
     public static func midstate(for block: Block) -> SHA256 {
-        let prefixBytes = proofOfWorkHashPrefixBytes(block)
-        return prefixBytes.withUnsafeBufferPointer { ptr in
+        midstate(prefixBytes: Array(proofOfWorkHashPrefixBytes(block)))
+    }
+
+    /// Midstate from the raw nonce-independent prefix bytes, so a worker can mine
+    /// from a coordinator-supplied `--prefix-hex` without parsing the block (no
+    /// Lattice dependency) — the contract external miners implement.
+    public static func midstate(prefixBytes: [UInt8]) -> SHA256 {
+        prefixBytes.withUnsafeBufferPointer { ptr in
             var hasher = SHA256()
             hasher.update(bufferPointer: UnsafeRawBufferPointer(ptr))
             return hasher

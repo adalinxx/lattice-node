@@ -168,7 +168,8 @@ final class MiningRoleContractTests: XCTestCase {
             "blockHex",
             "Block(data: blockData)",
             "ProofOfWork.midstate(for: block)",
-            "ProofOfWork.withNonce(block, nonce: nonce)",
+            "ProofOfWork.midstate(prefixBytes:",
+            "ProofOfWork.hash(midstate: midstate, nonce: nonce)",
             "target",
             "startNonce",
             "ProofOfWork.searchBatch"
