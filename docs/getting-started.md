@@ -2,34 +2,52 @@
 
 ## Installation
 
-### From Source (macOS)
+### Docker (recommended — no build, any platform)
+
+The published image is multi-arch (`linux/amd64` + `linux/arm64`), so this just downloads and runs:
+
+```bash
+docker run -d --name lattice-node --pull always --user root \
+  -p 127.0.0.1:8080:8080 -v lattice-data:/data \
+  ghcr.io/adalinxx/lattice-node:main \
+  lattice-node --rpc-bind 0.0.0.0 --data-dir /data --min-peer-key-bits 16 --autosize
+```
+
+Then `curl http://localhost:8080/api/chain/info`. Notes: `--user root` lets the node
+write the named volume; `--min-peer-key-bits 16` is **required** to peer with the live
+network (see *Run a Node*).
+
+### From source
+
+Requires **Swift 6.1** — the toolchain the network is built and run on.
 
 ```bash
 git clone https://github.com/adalinxx/lattice-node.git
 cd lattice-node
-swift build -c release
+swift build -c release   # binary at .build/release/LatticeNode
 ```
 
-The binary is at `.build/release/LatticeNode`.
-
-### Docker
-
-```bash
-docker pull ghcr.io/adalinxx/lattice-node:main
-docker run -v lattice-data:/home/lattice/.lattice ghcr.io/adalinxx/lattice-node:main
-```
+> **macOS 26 caveat:** macOS 26's only SDK is paired with Swift 6.3.2, which has a
+> concurrency bug that aborts the node during chain sync. Until it's fixed upstream,
+> run via **Docker** on macOS; build natively only on Linux with Swift 6.1.
 
 ## Quick Start
 
 ### Run a Node
 
 ```bash
-# Join the Nexus network
-lattice-node --autosize --rpc-port 8080
+# Join the Nexus (mainnet). --min-peer-key-bits 16 is required to peer with the seeds.
+lattice-node --autosize --rpc-port 8080 --min-peer-key-bits 16
 
 # Or with explicit resource settings
-lattice-node --memory 0.5 --disk 20 --rpc-port 8080
+lattice-node --memory 0.5 --disk 20 --rpc-port 8080 --min-peer-key-bits 16
 ```
+
+> **First boot grinds an identity key** (anti-Sybil PoW) before the RPC binds — at
+> the 24-bit default this takes minutes and can look like a hang. The live seed
+> nodes use 16-bit identities, so a joining node must set `--min-peer-key-bits 16`
+> (this also sets your own grind difficulty). Without it the node connects but
+> rejects the seeds and never syncs.
 
 #### Resource footprint
 
@@ -74,6 +92,12 @@ lattice-mining-coordinator \
   --batch-size 128 \
   --once
 ```
+
+`--worker-executable` is the seam for **any** miner implementing the
+[Mining Worker Protocol](./mining-worker-protocol.md). The bundled `lattice-miner`
+is a CPU worker; for GPU mining point it at
+[`lattice-miner-gpu`](https://github.com/adalinxx/lattice-miner-gpu) (Apple
+Silicon / Metal) and raise `--batch-size` so each GPU dispatch is large.
 
 ### Generate Keys
 
