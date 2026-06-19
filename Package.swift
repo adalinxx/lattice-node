@@ -18,7 +18,7 @@ let package = Package(
         // Lattice 14.0.0 = 13.6.0 + positional directory: ChainSpec.directory
         // removed, genesis anchor stores header/identity (CID) only, child
         // validates its own genesis (#98, #99).
-        .package(url: "https://github.com/adalinxx/Lattice.git", exact: "14.0.0"),
+        .package(url: "https://github.com/adalinxx/Lattice.git", exact: "15.0.0"),
         // cashew 3.2.0 = 3.1.0 + Overlay/Composite ContentSource composition
         // adapters (Module 2: generic adapters co-located with the protocol).
         // cashew 3.3.0 = 3.2.0 + Header.walkOwnedSubtree (Module 11: generic
