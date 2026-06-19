@@ -114,7 +114,7 @@ final class SignedSeedSetTests: XCTestCase {
         XCTAssertFalse(DNSSeeds.isTestnetBootstrapConfigured)
         XCTAssertTrue(DNSSeeds.testnetSources.isEmpty)
         XCTAssertTrue(DNSSeeds.testnetHostnames.isEmpty)
-        XCTAssertTrue(BootstrapPeers.testnet.isEmpty)  // no default seeds ship in public source; supply via --peer/DNS
+        XCTAssertFalse(BootstrapPeers.testnet.isEmpty)  // testnet ships hardcoded seeds until DNS signed-seed-sets are pinned
         let resolved = await DNSSeeds.resolveTestnet()
         XCTAssertTrue(resolved.isEmpty)
     }
