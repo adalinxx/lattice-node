@@ -11,7 +11,7 @@ public enum TestnetGenesis {
     // Provide it at runtime via your deployment's secret store (never commit it).
 
     public static let ownerPublicKeyHex =
-        "ed01eaafa425d4b00116a955e4323ed59431d82c11be4b1d715477a7b52e4bee0ea0"
+        "ed012379ebdca02a0e1b6803c44308fa7be2987f1d9035d91565f04f103d018c754c"
 
     public static let ownerAddress = CryptoUtils.createAddress(from: ownerPublicKeyHex)
 
@@ -32,7 +32,7 @@ public enum TestnetGenesis {
     // Any change to the spec, premine owner, or timestamp shifts this CID and MUST
     // update it here. verifyGenesis() enforces the match.
 
-    public static let expectedBlockHash: String? = "bafyreibwtxhjf7p2mmtgmavd3x4nrvtcvy7r5xh3zjvrmy4ao2jsctddyi"
+    public static let expectedBlockHash: String? = "bafyreigazmtn3pffzsrdhqag5qw2vphcnu3krpk2tgpiddgekgoj5yv4ca"
 
     // MARK: - Genesis Configuration
 

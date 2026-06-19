@@ -35,6 +35,7 @@ COPY --from=builder /build/.build/release/LatticeNode /usr/local/bin/lattice-nod
 # dispatches on the first arg (`lattice-node` / `lattice-miner`), defaulting to
 # the node so existing `docker run <image> --flags` call sites keep working.
 COPY --from=builder /build/.build/release/LatticeMiner /usr/local/bin/lattice-miner
+COPY --from=builder /build/.build/release/LatticeMiningCoordinatorTool /usr/local/bin/lattice-mining-coordinator
 COPY deploy/entrypoint.sh /usr/local/bin/lattice-entrypoint
 RUN chmod +x /usr/local/bin/lattice-entrypoint
 
