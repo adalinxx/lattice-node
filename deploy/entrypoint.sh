@@ -25,7 +25,7 @@ start_colocated_miner() {
     sleep 3
     exec lattice-mining-coordinator \
       --node http://127.0.0.1:8080/api \
-      --node-rpc-cookie-file /data/.cookie \
+      --rpc-cookie-file /data/.cookie \
       --worker-executable /usr/local/bin/lattice-miner \
       --workers "$COLOCATED_MINER_WORKERS"
   ) &
