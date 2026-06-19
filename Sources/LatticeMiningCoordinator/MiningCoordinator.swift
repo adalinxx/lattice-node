@@ -11,12 +11,23 @@ public struct MiningCoordinatorWork: Sendable, Equatable {
     public let blockHex: String
     public let targetHex: String
     public let staleToken: String
+    /// Nonce-independent PoW preimage prefix (hex), computed once from the block so
+    /// workers in any language need only SHA-256 it into a midstate and append the
+    /// 8-byte nonce — no block parsing / Lattice dependency. Empty if blockHex is
+    /// unparseable (workers then fall back to --block-hex).
+    public let prefixHex: String
 
     public init(workId: String, blockHex: String, targetHex: String, staleToken: String? = nil) {
         self.workId = workId
         self.blockHex = blockHex
         self.targetHex = targetHex
         self.staleToken = staleToken ?? workId
+        if let data = Data(hex: blockHex), let block = Block(data: data) {
+            self.prefixHex = Block.makeProofOfWorkPreimagePrefix(block: block)
+                .map { String(format: "%02x", $0) }.joined()
+        } else {
+            self.prefixHex = ""
+        }
     }
 
     public init?(template: TemplateResponse) {
