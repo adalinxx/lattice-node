@@ -12,5 +12,6 @@
 case "$1" in
   lattice-node)  shift; exec lattice-node  "$@" ;;
   lattice-miner) shift; exec lattice-miner "$@" ;;
+  lattice-mining-coordinator) shift; exec lattice-mining-coordinator "$@" ;;
   *)             exec lattice-node "$@" ;;
 esac
