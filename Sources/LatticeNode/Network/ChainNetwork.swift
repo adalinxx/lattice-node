@@ -334,7 +334,9 @@ public actor ChainNetwork: IvyDelegate, IvyDataSource {
             baseThresholdMultiplier: config.baseThresholdMultiplier,
             maxFrameSize: config.maxFrameSize,
             minPeerKeyBits: config.minPeerKeyBits,
-            externalAddress: config.externalAddress
+            externalAddress: config.externalAddress,
+            relayEnabled: config.relayEnabled,
+            knownRelays: config.knownRelays
         )
         let ivy = Ivy(config: ivyConfig, tally: sharedTally)
 

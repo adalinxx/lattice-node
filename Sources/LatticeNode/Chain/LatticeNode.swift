@@ -625,7 +625,10 @@ public actor LatticeNode: ChainNetworkDelegate {
                 signingKey: Data(hex: config.privateKey) ?? Data(),
                 baseThresholdMultiplier: UInt64.max,
                 maxFrameSize: config.maxFrameSize,
-                minPeerKeyBits: config.minPeerKeyBits
+                minPeerKeyBits: config.minPeerKeyBits,
+                externalAddress: config.externalAddress,
+                relayEnabled: config.relayEnabled,
+                knownRelays: config.knownRelays
             ),
             resources: resourcesWithIdentity,
             chainCount: chainCount,
