@@ -72,16 +72,17 @@ final class PeerKeyWorkGateTests: XCTestCase {
 
     /// requires the non-zero security default to live in the canonical config
     /// layer, not only in the CLI. The Decision-15 default is exposed as
-    /// `LatticeNodeConfig.defaultMinPeerKeyBits` (raised to 24), is what
-    /// the production CLI/daemon path passes, and wires through to the live Ivy
-    /// gate. Every remote default-config node applies this same gate to OUR
-    /// identify key, which is why the CLI grinds the node's own identity to these
-    /// bits at load (`loadOrCreateIdentity(minKeyBits:)` — see the identity-grind
-    /// tests below). This test constructs the config directly with a random key
-    /// (grinding a 24-bit key, ~2^24 keygens, would be minutes of test time); the
-    /// in-process node never dials a gated remote here.
+    /// `LatticeNodeConfig.defaultMinPeerKeyBits` (16 — the NETWORK-INTEROP value
+    /// every deployed mainnet/testnet node runs; see the invariant comment on the
+    /// constant), is what the production CLI/daemon path passes, and wires through
+    /// to the live Ivy gate. Every remote default-config node applies this same
+    /// gate to OUR identify key, which is why the CLI grinds the node's own
+    /// identity to these bits at load (`loadOrCreateIdentity(minKeyBits:)` — see
+    /// the identity-grind tests below). This test constructs the config directly
+    /// with a random key (no grind needed); the in-process node never dials a
+    /// gated remote here.
     func testCanonicalDefaultMinPeerKeyBitsIsNonZeroAndWires() async throws {
-        XCTAssertEqual(LatticeNodeConfig.defaultMinPeerKeyBits, 24,
+        XCTAssertEqual(LatticeNodeConfig.defaultMinPeerKeyBits, 16,
             "the canonical security default must be the mainnet value")
 
         let kp = CryptoUtils.generateKeyPair()
@@ -97,7 +98,7 @@ final class PeerKeyWorkGateTests: XCTestCase {
             enableLocalDiscovery: false,
             minPeerKeyBits: LatticeNodeConfig.defaultMinPeerKeyBits
         )
-        XCTAssertEqual(config.minPeerKeyBits, 24)
+        XCTAssertEqual(config.minPeerKeyBits, 16)
 
         let node = try await LatticeNode(config: config, genesisConfig: testGenesis())
         defer { Task { await node.stop() } }
@@ -107,7 +108,7 @@ final class PeerKeyWorkGateTests: XCTestCase {
         }
         let ivy = await network.ivy
         let wired = await ivy.config.minPeerKeyBits
-        XCTAssertEqual(wired, 24, "the canonical default must reach the live Ivy config")
+        XCTAssertEqual(wired, 16, "the canonical default must reach the live Ivy config")
     }
 
     /// The initializer default is the canonical non-zero security gate, so a node
