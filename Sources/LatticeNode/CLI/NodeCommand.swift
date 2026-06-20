@@ -52,6 +52,9 @@ struct NodeCommand: AsyncParsableCommand {
     @Option(name: .long, help: "RPC bind address")
     var rpcBind: String = "127.0.0.1"
 
+    @Option(name: .long, help: "Public P2P address to advertise to peers (host:port). Required for cloud/NAT nodes whose locally-observed address is not externally dialable (e.g. fly 172.x). Without it peers learn an unreachable address and cannot join.")
+    var externalAddress: String?
+
     @Option(name: .long, help: "CORS allowed origin")
     var rpcAllowedOrigin: String = "http://127.0.0.1"
 
@@ -379,6 +382,19 @@ struct NodeCommand: AsyncParsableCommand {
         }
         print("  Public key:  \(String(identity.publicKey.prefix(32)))...")
 
+        // Parse --external-address (host:port) into the advertised endpoint.
+        let parsedExternalAddress: (host: String, port: UInt16)? = externalAddress.flatMap { raw in
+            guard let idx = raw.lastIndex(of: ":"),
+                  let p = UInt16(raw[raw.index(after: idx)...]) else { return nil }
+            let h = String(raw[..<idx])
+            return h.isEmpty ? nil : (host: h, port: p)
+        }
+        if externalAddress != nil && parsedExternalAddress == nil {
+            print("  WARNING: --external-address '\(externalAddress!)' is not host:port — ignoring")
+        } else if let ext = parsedExternalAddress {
+            print("  External:    advertising \(ext.host):\(ext.port) to peers")
+        }
+
         let nodeConfig = LatticeNodeConfig(
             publicKey: identity.publicKey,
             privateKey: privateKey,
@@ -403,7 +419,8 @@ struct NodeCommand: AsyncParsableCommand {
             isTestnet: effectiveTestnet,
             fullChainPath: chainPath.map { $0.split(separator: "/").map(String.init) },
             minPeerKeyBits: effectiveMinPeerKeyBits,
-            coinbaseAddress: coinbaseAddress
+            coinbaseAddress: coinbaseAddress,
+            externalAddress: parsedExternalAddress
         )
 
         // Per-process child chain bootstrap: if --genesis-hex is provided, decode the

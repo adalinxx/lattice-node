@@ -84,7 +84,15 @@ public struct LatticeNodeConfig: Sendable {
     /// once per data dir, not per start. Dev/test topologies opt out explicitly:
     /// smoke (`--min-peer-key-bits 0`), devnet, and cluster/MultiNodeClient all
     /// pass 0.
-    public static let defaultMinPeerKeyBits: Int = 24
+    ///
+    /// NETWORK-INTEROP INVARIANT: this default MUST equal the key-PoW level the
+    /// network's nodes actually run, otherwise a default joiner rejects the
+    /// network's peers (it requires ≥default bits; the peers present fewer) and
+    /// can never connect — observed as peerCount 0 / no sync. All current
+    /// mainnet+testnet deployments run `--min-peer-key-bits 16`, so the default
+    /// is 16. (Treat this as a per-network constant; raising it requires raising
+    /// every deployed node in lockstep.)
+    public static let defaultMinPeerKeyBits: Int = 16
 
     /// Public payout address that the node credits in the block-template coinbase
     /// (Mechanism A). The node signs the coinbase with a
@@ -94,6 +102,11 @@ public struct LatticeNodeConfig: Sendable {
     /// Defaults to nil (no coinbase is built — the miner still searches the nonce
     /// over an empty-reward template).
     public let coinbaseAddress: String?
+
+    /// Operator-declared public P2P endpoint (host, port) advertised to peers,
+    /// overriding STUN/observed addresses. Required for cloud/NAT nodes (e.g. fly)
+    /// whose observed address is private and not externally dialable.
+    public let externalAddress: (host: String, port: UInt16)?
 
     public init(
         publicKey: String,
@@ -120,7 +133,8 @@ public struct LatticeNodeConfig: Sendable {
         isTestnet: Bool = false,
         fullChainPath: [String]? = nil,
         minPeerKeyBits: Int = LatticeNodeConfig.defaultMinPeerKeyBits,
-        coinbaseAddress: String? = nil
+        coinbaseAddress: String? = nil,
+        externalAddress: (host: String, port: UInt16)? = nil
     ) {
         self.publicKey = publicKey
         self.privateKey = privateKey
@@ -147,5 +161,6 @@ public struct LatticeNodeConfig: Sendable {
         self.fullChainPath = fullChainPath
         self.minPeerKeyBits = minPeerKeyBits
         self.coinbaseAddress = coinbaseAddress
+        self.externalAddress = externalAddress
     }
 }
