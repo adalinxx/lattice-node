@@ -35,7 +35,8 @@ let package = Package(
         // eviction keyed on the observed socket address, per-peer findNode token
         // bucket + PEX accept-cap/responder-score-floor, and an optional
         // Tally-score ranking on selectDiversePeers.
-        .package(url: "https://github.com/adalinxx/Ivy.git", exact: "6.7.0"),
+        // Ivy 6.8.0 = 6.7.0 + externalAddress advertise (operator-declared public P2P address).
+        .package(url: "https://github.com/adalinxx/Ivy.git", exact: "6.8.0"),
         // VolumeBroker 3.10.0: retained-root merge for historical state
         // retention, plus retained-root scopes and serve-gate/eviction pins.
         .package(url: "https://github.com/adalinxx/VolumeBroker.git", from: "3.10.0"),

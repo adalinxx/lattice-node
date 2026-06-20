@@ -333,7 +333,8 @@ public actor ChainNetwork: IvyDelegate, IvyDataSource {
             signingKey: config.signingKey,
             baseThresholdMultiplier: config.baseThresholdMultiplier,
             maxFrameSize: config.maxFrameSize,
-            minPeerKeyBits: config.minPeerKeyBits
+            minPeerKeyBits: config.minPeerKeyBits,
+            externalAddress: config.externalAddress
         )
         let ivy = Ivy(config: ivyConfig, tally: sharedTally)
 
