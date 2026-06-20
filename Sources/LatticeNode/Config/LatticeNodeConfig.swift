@@ -107,6 +107,10 @@ public struct LatticeNodeConfig: Sendable {
     /// overriding STUN/observed addresses. Required for cloud/NAT nodes (e.g. fly)
     /// whose observed address is private and not externally dialable.
     public let externalAddress: (host: String, port: UInt16)?
+    /// Serve as a circuit relay for NAT'd peers (Phase 1 NAT traversal).
+    public let relayEnabled: Bool
+    /// Relay peers to route through when a direct dial fails.
+    public let knownRelays: [PeerEndpoint]
 
     public init(
         publicKey: String,
@@ -134,7 +138,9 @@ public struct LatticeNodeConfig: Sendable {
         fullChainPath: [String]? = nil,
         minPeerKeyBits: Int = LatticeNodeConfig.defaultMinPeerKeyBits,
         coinbaseAddress: String? = nil,
-        externalAddress: (host: String, port: UInt16)? = nil
+        externalAddress: (host: String, port: UInt16)? = nil,
+        relayEnabled: Bool = false,
+        knownRelays: [PeerEndpoint] = []
     ) {
         self.publicKey = publicKey
         self.privateKey = privateKey
@@ -162,5 +168,7 @@ public struct LatticeNodeConfig: Sendable {
         self.minPeerKeyBits = minPeerKeyBits
         self.coinbaseAddress = coinbaseAddress
         self.externalAddress = externalAddress
+        self.relayEnabled = relayEnabled
+        self.knownRelays = knownRelays
     }
 }

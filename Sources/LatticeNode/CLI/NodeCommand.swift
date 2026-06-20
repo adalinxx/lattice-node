@@ -55,6 +55,12 @@ struct NodeCommand: AsyncParsableCommand {
     @Option(name: .long, help: "Public P2P address to advertise to peers (host:port). Required for cloud/NAT nodes whose locally-observed address is not externally dialable (e.g. fly 172.x). Without it peers learn an unreachable address and cannot join.")
     var externalAddress: String?
 
+    @Flag(name: .long, help: "Serve as a circuit relay: forward traffic for peers that cannot connect directly (NAT). Defaults on when --external-address is set (public/backbone nodes).")
+    var relay: Bool = false
+
+    @Option(name: .long, parsing: .singleValue, help: "Relay peer to route through when a direct dial fails (pubKey@host:port, repeatable).")
+    var useRelay: [String] = []
+
     @Option(name: .long, help: "CORS allowed origin")
     var rpcAllowedOrigin: String = "http://127.0.0.1"
 
@@ -395,6 +401,12 @@ struct NodeCommand: AsyncParsableCommand {
             print("  External:    advertising \(ext.host):\(ext.port) to peers")
         }
 
+        // Circuit relay: serve by default when we advertise a public address.
+        let effectiveRelay = relay || parsedExternalAddress != nil
+        let parsedRelays = useRelay.compactMap { parsePeer($0) }
+        if effectiveRelay { print("  Relay:       serving as a circuit relay") }
+        if !parsedRelays.isEmpty { print("  Relays:      \(parsedRelays.count) known relay(s) for fallback") }
+
         let nodeConfig = LatticeNodeConfig(
             publicKey: identity.publicKey,
             privateKey: privateKey,
@@ -420,7 +432,9 @@ struct NodeCommand: AsyncParsableCommand {
             fullChainPath: chainPath.map { $0.split(separator: "/").map(String.init) },
             minPeerKeyBits: effectiveMinPeerKeyBits,
             coinbaseAddress: coinbaseAddress,
-            externalAddress: parsedExternalAddress
+            externalAddress: parsedExternalAddress,
+            relayEnabled: effectiveRelay,
+            knownRelays: parsedRelays
         )
 
         // Per-process child chain bootstrap: if --genesis-hex is provided, decode the
