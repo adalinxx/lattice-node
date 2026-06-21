@@ -20,5 +20,10 @@
 // Driving it live would require a test-only fast cadence knob in Sources/, which
 // is out of scope for this delta; the unit test is the authoritative coverage.
 
-console.log('SKIP: covered by StaleTipDetectionTests unit test (see header for why no live loopback run)')
-process.exit(0)
+// Exit 77 = self-skip: the harness reports this as SKIP, NOT a green PASS (which
+// is what exit 0 did — false confidence). A live run needs a fast-cadence test
+// knob (stale threshold / refresh interval) and a non-loopback multi-netgroup
+// topology; see the header. Detection is unit-tested (StaleTipDetectionTests);
+// a real recovery scenario is a tracked follow-up.
+console.log('SKIP: needs fast-cadence knob + non-loopback netgroups; detection covered by StaleTipDetectionTests')
+process.exit(77)
