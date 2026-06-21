@@ -140,6 +140,14 @@ public struct NodeTuning: Sendable {
         public var evictGraceSeconds: Int = 600
         /// Height window over which a node keeps its own tx pins.
         public var ownTxPinWindow: UInt64 = 4_096
+        /// How long an unconfirmed transaction may sit in the mempool before the
+        /// periodic prune drops it. INVARIANT: this MUST exceed the chain's block
+        /// interval by a wide margin, otherwise valid txs expire before any block
+        /// can include them (the old hardcoded 600s was shorter than a single
+        /// block on a low-hashrate network, so funded txs never confirmed). The
+        /// mempool byte budget + fee-rate eviction bound memory independently, so
+        /// a long TTL is safe. Env: MEMPOOL_TX_EXPIRY_SECONDS.
+        public var mempoolTxExpirySeconds: Int = 86_400
         public init() {}
     }
 
@@ -180,6 +188,7 @@ public struct NodeTuning: Sendable {
         int("EXTRACTOR_MAX_PENDING_TASKS") { t.parentExtractor.maxPendingExtractionTasks = $0 }
 
         int("EVICT_GRACE_SECONDS") { t.storage.evictGraceSeconds = $0 }
+        int("MEMPOOL_TX_EXPIRY_SECONDS") { t.storage.mempoolTxExpirySeconds = $0 }
 
         return t
     }

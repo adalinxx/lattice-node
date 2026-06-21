@@ -1291,9 +1291,12 @@ public actor LatticeNode: ChainNetworkDelegate {
 
     // MARK: - Mempool Maintenance
 
-    public func pruneExpiredTransactions(olderThan age: Duration = .seconds(600)) async {
+    public func pruneExpiredTransactions(olderThan age: Duration? = nil) async {
+        // Default to the configured mempool TTL (must exceed the block interval —
+        // see NodeTuning.Storage.mempoolTxExpirySeconds), not a hardcoded 600s.
+        let effectiveAge = age ?? .seconds(config.tuning.storage.mempoolTxExpirySeconds)
         for (_, network) in networks {
-            await network.nodeMempool.pruneExpired(olderThan: age)
+            await network.nodeMempool.pruneExpired(olderThan: effectiveAge)
         }
     }
 
