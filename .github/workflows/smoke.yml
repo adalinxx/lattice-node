@@ -43,6 +43,9 @@ jobs:
           - name: liveness
             workers: 1
             tags: liveness
+          - name: adversarial
+            workers: 2
+            tags: adversarial
 
     steps:
       - uses: actions/checkout@v4

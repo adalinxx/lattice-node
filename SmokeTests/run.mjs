@@ -377,10 +377,23 @@ async function runOne(test, { stream = false } = {}) {
   clearTimeout(timer)
   const ms = Date.now() - start
 
+  // Self-skip convention: a scenario exits 77 to declare itself non-applicable
+  // here (e.g. it needs a cadence knob or a non-loopback topology this harness
+  // can't provide). Reported as SKIP — never an inflated PASS or a FAIL.
+  if (code === 77 && !timedOut) {
+    const line = (stdout + stderr).split('\n').reverse().find((l) => l.includes('SKIP:'))
+    const reason = line ? line.replace(/^.*SKIP:\s*/, '').trim() : 'self-skip'
+    return { ok: true, skipped: true, reason, code, timedOut, ms, stdout, stderr, root }
+  }
+
   return { ok: code === 0 && !timedOut, code, timedOut, ms, stdout, stderr, root }
 }
 
 function printResult(test, r) {
+  if (r.skipped) {
+    console.log(`- ${test.name.padEnd(28)}  SKIP  (${r.reason})`)
+    return
+  }
   if (r.ok) {
     console.log(`✓ ${test.name.padEnd(28)}  PASS  ${fmtMs(r.ms)}`)
   } else {
