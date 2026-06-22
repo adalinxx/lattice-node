@@ -21,7 +21,7 @@
 
 import { rmSync, mkdirSync } from 'node:fs'
 import { allocPorts, smokeRoot } from 'lattice-node-sdk/env'
-import { LatticeNode, LatticeNetwork, LatticeMiner, sleep, waitFor, genKeypair, computeAddress, peerCount } from 'lattice-node-sdk'
+import { LatticeNode, LatticeNetwork, LatticeMiner, sleep, waitFor, genKeypair, computeAddress, peers } from 'lattice-node-sdk'
 
 const ROOT = smokeRoot('orphaned-withdrawal-pending')
 rmSync(ROOT, { recursive: true, force: true })
@@ -201,14 +201,21 @@ const restoredBTip = await waitFor(async () => {
   return bt ? bt : null
 }, "B restored fork provider", { timeoutMs: 60_000, intervalMs: 500 })
 
+// Reconnect gate: require a genuinely ADMITTED peer on A (the node that must
+// pull B's longer fork), not merely a peerCount. Per the SDK, a peer still
+// mid-identify is listed under a transient `inbound-<uuid>` id with host
+// 'unknown'; peerCount includes those, so the old `ap>=1 || bp>=1` gate could
+// pass on a dial that never completes identify — leaving A with no usable peer
+// to fetch the fork from, so the adoption wait below expired (the observed
+// flake). There is no re-dial RPC, so we must not proceed until A has admitted B.
 await waitFor(async () => {
-  const [ap, bp, at] = await Promise.all([
-    peerCount(A).catch(() => 0),
-    peerCount(B).catch(() => 0),
+  const [aPeers, at] = await Promise.all([
+    peers(A).catch(() => []),
     A.tip(nexusDir).catch(() => null),
   ])
-  return ap >= 1 || bp >= 1 || at === restoredBTip ? { ap, bp, at } : null
-}, 'A-B reconnected for fork sync', { timeoutMs: 90_000, intervalMs: 500 })
+  const admitted = aPeers.filter((p) => !String(p.publicKey).startsWith('inbound-') && p.host !== 'unknown')
+  return admitted.length >= 1 || at === restoredBTip ? { admitted: admitted.length, at } : null
+}, 'A admitted B for fork sync', { timeoutMs: 90_000, intervalMs: 500 })
 
 await waitFor(async () => {
   const at = await A.tip(nexusDir)
