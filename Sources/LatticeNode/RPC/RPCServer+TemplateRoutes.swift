@@ -462,14 +462,24 @@ extension RPCRoutes {
         }
         let rewardMaterial = nodeFallbackReward
         if let rewardMaterial {
-            let mempoolFetcherForCoinbase = CoalescingFetcher(await node.buildMempoolAwareSource(directory: dir, baseFetcher: network.ivyFetcher))
+            let coinbaseSource = await node.buildMempoolAwareSource(directory: dir, baseFetcher: network.ivyFetcher)
+            let mempoolFetcherForCoinbase = CoalescingFetcher(coinbaseSource)
+            // Announce deployed-but-unannounced direct children of this chain into
+            // the coinbase so peers discover them (idempotent against the tip's
+            // committed genesisState; opaque-anchor only — no content fetch).
+            let childGenesisActions = await node.pendingChildGenesisActions(
+                parentChainPath: chain.path,
+                tipBlock: tipBlock,
+                source: coinbaseSource
+            )
             if let coinbase = try? await BlockProducer.buildCoinbaseTransaction(
                 spec: specNode,
                 identity: rewardMaterial.identity,
                 chainPath: chain.path,
                 previousBlock: tipBlock, mempoolTransactions: selectedTxs,
                 fetcher: mempoolFetcherForCoinbase,
-                recipientAddress: rewardMaterial.recipientAddress
+                recipientAddress: rewardMaterial.recipientAddress,
+                genesisActions: childGenesisActions
             ) {
                 selectedTxs.append(coinbase)
                 appendedCoinbase = true
@@ -933,7 +943,8 @@ extension RPCRoutes {
         } else {
             parentChainBlock = nil
         }
-        let mempoolFetcher = CoalescingFetcher(await node.buildMempoolAwareSource(directory: dir, baseFetcher: network.ivyFetcher))
+        let candidateMempoolSource = await node.buildMempoolAwareSource(directory: dir, baseFetcher: network.ivyFetcher)
+        let mempoolFetcher = CoalescingFetcher(candidateMempoolSource)
         // A child chain's own fork choice is independent of parent canonicity,
         // but mining still has to extend from a child block whose parent-state
         // root is continuous with the parent carrier's prevState. Same-root
@@ -961,6 +972,14 @@ extension RPCRoutes {
                 recipientAddress: candidateBody?.rewardAddress ?? $0
             )
         }
+        // Announce deployed-but-unannounced direct children of this chain into the
+        // candidate coinbase (idempotent against the tip's committed genesisState;
+        // opaque-anchor only — no content fetch).
+        let childGenesisActions = await node.pendingChildGenesisActions(
+            parentChainPath: chain.path,
+            tipBlock: baseTipBlock,
+            source: candidateMempoolSource
+        )
         if let nodeReward,
            let coinbase = try? await BlockProducer.buildCoinbaseTransaction(
                spec: specNode,
@@ -969,7 +988,8 @@ extension RPCRoutes {
                previousBlock: baseTipBlock,
                mempoolTransactions: selectedTxs,
                fetcher: mempoolFetcher,
-               recipientAddress: nodeReward.recipientAddress
+               recipientAddress: nodeReward.recipientAddress,
+               genesisActions: childGenesisActions
            ) {
             selectedTxs.append(coinbase)
             appendedCoinbase = true

@@ -1259,6 +1259,50 @@ extension LatticeNode {
         ))
     }
 
+    /// GenesisActions announcing this node's deployed-but-unannounced direct
+    /// children of `parentChainPath` into the next parent block. A child is
+    /// announced exactly once: skipped as soon as its directory is present in the
+    /// parent tip's committed `genesisState`. The action carries ONLY
+    /// `{directory, blockCID}` (blockCID = the child genesis block CID) — an
+    /// opaque anchor. The parent never resolves or validates the child's genesis
+    /// content (verify-not-trust). Emitted into the authorization-free coinbase,
+    /// so no external signer/fee/nonce is required.
+    func pendingChildGenesisActions(
+        parentChainPath: [String],
+        tipBlock: Block,
+        source: any ContentSource
+    ) async -> [GenesisAction] {
+        // Direct children of `parentChainPath`: chainPath == parentChainPath + [dir].
+        let candidates = deployedChildChains.values.filter {
+            $0.chainPath.count == parentChainPath.count + 1
+                && Array($0.chainPath.dropLast()) == parentChainPath
+        }
+        guard !candidates.isEmpty else { return [] }
+        // Read the directories already committed to the parent tip's genesisState.
+        // genesisState is a merkle dict (directory → genesis blockCID); resolve it
+        // recursively so its keys are readable. A resolution failure fails closed
+        // (announce nothing) rather than risk a duplicate-directory block, which
+        // genesis-state transform rejects as conflictingActions.
+        let announced: Set<String>
+        if let stateNode = try? await tipBlock.postState.resolve(source: source).node,
+           let genesisDict = try? await stateNode.genesisState.resolveRecursive(source: source).node,
+           let keys = try? genesisDict.allKeys() {
+            announced = keys
+        } else if tipBlock.postState.rawCID.isEmpty {
+            announced = []
+        } else {
+            return []
+        }
+        // Dedup by directory across the actions emitted in THIS block too: a single
+        // block may not carry two actions for the same directory.
+        var emitted = Set<String>()
+        var actions: [GenesisAction] = []
+        for child in candidates where !announced.contains(child.directory) && emitted.insert(child.directory).inserted {
+            actions.append(GenesisAction(directory: child.directory, blockCID: child.genesisHash))
+        }
+        return actions
+    }
+
     func nearestLocalNetwork(forPath chainPath: [String]) -> ChainNetwork? {
         var path = chainPath
         while !path.isEmpty {
