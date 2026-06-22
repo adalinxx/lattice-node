@@ -78,21 +78,17 @@ The node autosizes to its host. On startup, it inspects available RAM and disk, 
 ```bash
 swift build -c release
 
-# Run a node (the node never mines in-process)
+# Run a node (serves block templates; never mines in-process)
 swift run LatticeNode --rpc-port 8080
 
-# In another shell, run the external coordinator against the node. The E15
-# target role split is node-owned seal/publish, coordinator-owned scheduling,
-# and miner-owned nonce search only. The coordinator fans nonce ranges out to
-# LatticeMiner worker processes when given --worker-executable.
+# Mine against it. Bundled LatticeMiner is a CPU worker; for GPU use
+# lattice-miner-gpu (auto-detects CUDA / Metal / OpenCL).
 swift build
 swift run LatticeMiningCoordinatorTool \
   --node http://127.0.0.1:8080/api \
   --rpc-cookie-file ~/.lattice/.cookie \
   --worker-executable .build/debug/LatticeMiner \
-  --workers 2 \
-  --batch-size 128 \
-  --once
+  --workers 2
 
 # Join an existing network
 swift run LatticeNode --port 4002 --peer <pubkey>@192.168.1.10:4001
