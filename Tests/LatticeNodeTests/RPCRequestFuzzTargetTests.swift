@@ -49,6 +49,17 @@ final class RPCRequestFuzzTargetTests: XCTestCase {
         XCTAssertEqual(RPCRequestBodyCodecs.decodePrepareTransaction(prepare)?.nonce, 1)
         RPCRequestFuzzTarget.exercise(prepare)
 
+        // General key-value actions (timestamping / anchoring) decode into the body.
+        let prepareActions = Data(#"{"nonce":1,"signers":["alice"],"fee":0,"accountActions":[],"actions":[{"key":"doc-hash","oldValue":null,"newValue":"stamp"}],"chainPath":["Nexus"]}"#.utf8)
+        let decodedActions = RPCRequestBodyCodecs.decodePrepareTransaction(prepareActions)?.actions
+        XCTAssertEqual(decodedActions?.count, 1)
+        XCTAssertEqual(decodedActions?.first?.key, "doc-hash")
+        XCTAssertNil(decodedActions?.first?.oldValue)
+        XCTAssertEqual(decodedActions?.first?.newValue, "stamp")
+        // Backward-compatible: omitting `actions` decodes to nil, not a failure.
+        XCTAssertNil(RPCRequestBodyCodecs.decodePrepareTransaction(prepare)?.actions)
+        RPCRequestFuzzTarget.exercise(prepareActions)
+
         let deploy = Data(#"{"directory":"Child","parentDirectory":"Nexus","targetBlockTime":1000,"initialReward":1,"halvingInterval":100,"premine":0,"maxTransactionsPerBlock":100,"maxStateGrowth":1000,"maxBlockSize":1000000,"retargetWindow":10}"#.utf8)
         XCTAssertEqual(RPCRequestBodyCodecs.decodeDeployChain(deploy)?.directory, "Child")
         RPCRequestFuzzTarget.exercise(deploy)

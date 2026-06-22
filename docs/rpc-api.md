@@ -259,6 +259,24 @@ Submit a signed transaction.
 Build and serialize an unsigned transaction body from structured action inputs.
 Returns `{"bodyCID", "bodyData", "signingPreimage"}` ready to sign and submit.
 
+**Request:**
+```json
+{
+  "nonce": 1,
+  "signers": ["<address>"],
+  "fee": 1,
+  "accountActions": [{"owner": "<address>", "delta": -1}],
+  "actions": [{"key": "<key>", "oldValue": null, "newValue": "<value>"}],
+  "chainPath": ["Nexus"]
+}
+```
+`accountActions`/`depositActions`/`receiptActions`/`withdrawalActions` are optional
+financial actions. **`actions`** are general key-value state changes applied to the
+chain's isolated `GeneralState` dictionary (never balances) — use them to record
+arbitrary data, e.g. **timestamping / proof-of-existence** (key = a content hash):
+`oldValue: null` inserts (fails if the key exists), a matching `oldValue` updates
+(compare-and-set), `newValue: null` deletes.
+
 ### GET /api/transaction/{txCID}
 Full decoded transaction (actions, signers, signatures, block context).
 

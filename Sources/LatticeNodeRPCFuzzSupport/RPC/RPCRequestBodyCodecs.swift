@@ -82,11 +82,18 @@ public struct PrepareWithdrawalInput: Decodable, Equatable {
     public let amountWithdrawn: UInt64
 }
 
+public struct PrepareGeneralActionInput: Decodable, Equatable {
+    public let key: String
+    public let oldValue: String?
+    public let newValue: String?
+}
+
 public struct PrepareTransactionRequestBody: Decodable, Equatable {
     public let nonce: UInt64
     public let signers: [String]
     public let fee: UInt64
     public let accountActions: [PrepareAccountActionInput]
+    public let actions: [PrepareGeneralActionInput]?
     public let depositActions: [PrepareDepositInput]?
     public let receiptActions: [PrepareReceiptInput]?
     public let withdrawalActions: [PrepareWithdrawalInput]?
