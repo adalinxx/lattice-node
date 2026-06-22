@@ -13,16 +13,24 @@
 // victim stays alive and serving RPC.
 //
 // ── What this asserts (the observable signal) ─────────────────────────────────
-//   GET /api/peers (helper `peerCount`) returns the victim's CONNECTED peers
-//   (Ivy `connectedPeerEndpoints`). A peer refused at the identify gate never
-//   reaches that set, so the victim's connected-peer count must stay 0. We also
-//   assert the VICTIM process stays alive throughout, so the test cannot pass by
-//   the victim simply dying.
+//   GET /api/peers (helper `peers`) lists the victim's connections as
+//   { publicKey, host, port }. A peer that DIALS in is briefly held under a
+//   temporary `inbound-<uuid>` id (endpoint host "unknown", port 0) for the
+//   duration of the identify handshake — BEFORE the key-work gate runs. So the
+//   raw peer COUNT can transiently be 1 even for a peer that is about to be
+//   refused; that count is a measurement artifact, not an admission. Admission is
+//   therefore measured by IDENTITY, not count: a connection is re-keyed off the
+//   `inbound-*` placeholder to the peer's REAL public key only after identify
+//   clears the gate (Ivy `didIdentifyPeer`), which a ~0-bit key never does. We
+//   assert that no peer carrying a real (non-`inbound-*`) identity — in this
+//   topology, only the attacker — ever appears, while the VICTIM stays alive and
+//   serving RPC (so the test cannot pass by the victim simply dying).
 //
 //   Positive control (manually verified, see commit message): two NORMAL nodes
-//   (gate = 0) booted the same way peer successfully and both report peerCount==1
-//   — so a count of 0 here is genuinely the gate refusing the low-work identity,
-//   not a wiring failure that would keep ANY peer out.
+//   (gate = 0) booted the same way peer successfully and each lists the other's
+//   real public key — so the attacker's identity NOT appearing here is genuinely
+//   the gate refusing the low-work key, not a wiring failure that keeps ANY peer
+//   out.
 //
 // ── KNOWN LIMITATION / GAP (pre-existing, NOT introduced here) ────────────────
 //   When the gate refuses a handshake, the refused-handshake teardown currently
@@ -31,12 +39,11 @@
 //   project memory "smoke-heap-corruption-preexisting"). In the attacker-dials-
 //   victim topology used here, the ATTACKER (the initiator running the rejected
 //   handshake) is the side that crashes — within ~1s, before it can retry. The
-//   VICTIM is unaffected and keeps serving. Consequently this scenario does NOT
-//   assert attacker liveness, and the strength of the "stays 0" assertion is
-//   bounded by the fact that the attacker crashes shortly after the first refused
-//   dial. The victim-side invariant (never admits a low-work peer, stays alive)
-//   is what is firmly asserted. Fixing the crash in the rejection path is
-//   Sources/ work and out of scope for SmokeTests.
+//   VICTIM is unaffected and keeps serving, which is the invariant asserted here.
+//   Consequently this scenario does NOT assert attacker liveness. The victim-side
+//   invariant (never admits a low-work identity, stays alive) is what is firmly
+//   asserted. Fixing the crash in the rejection path is Sources/ work and out of
+//   scope for SmokeTests.
 //
 // ── Loopback constraint ───────────────────────────────────────────────────────
 //   netgroup / IPv6-prefix diversity attacks cannot be exercised on 127.0.0.1
@@ -45,7 +52,7 @@
 
 import { readFileSync } from 'node:fs'
 import { allocPorts, smokeRoot } from 'lattice-node-sdk/env'
-import { LatticeNode, LatticeNetwork, sleep, peerCount } from 'lattice-node-sdk'
+import { LatticeNode, LatticeNetwork, sleep, peers } from 'lattice-node-sdk'
 
 const ROOT = smokeRoot('low-work-identity-rejected')
 const [v, x] = await allocPorts(2, { seed: 96 })
@@ -84,28 +91,37 @@ console.log(`  attacker pubkey: ${attackerIdent.publicKey.slice(0, 32)}...`)
 const victimAlive = () =>
   VICTIM.proc && VICTIM.proc.exitCode === null && VICTIM.proc.signalCode === null
 
-console.log(`\n[3] Asserting the attacker NEVER becomes a connected peer of the victim...`)
-// Poll for a generous window: a real connection (if the gate failed) would form
-// within a few seconds; we keep checking that the victim's connected-peer count
-// stays at the baseline 0 the whole time AND that the victim is still alive.
+const attackerKeyPrefix = attackerIdent.publicKey.slice(0, 16)
+
+console.log(`\n[3] Asserting the attacker's IDENTITY never joins the victim's peer set...`)
+// Poll for a generous window: a real admission (if the gate failed) would form
+// within a few seconds and persist. We tolerate a transient `inbound-*`
+// placeholder (a peer mid-identify, before the gate runs) and fail only if a
+// peer carrying a REAL identity appears — i.e. one re-keyed off the placeholder,
+// which only happens after identify clears the key-work gate. We also require the
+// victim to stay alive throughout so the test cannot pass by the victim dying.
 const POLL_MS = 20_000
 const start = Date.now()
-let maxObserved = 0
+let sawTransient = false
 while (Date.now() - start < POLL_MS) {
   if (!victimAlive()) {
-    console.error('  ✗ victim process died during the poll window')
+    console.error('\n  ✗ victim process died during the poll window')
     net.teardown()
     process.exit(1)
   }
-  const vc = await peerCount(VICTIM)
-  maxObserved = Math.max(maxObserved, vc)
-  if (vc > 0) {
-    console.error(`  ✗ victim has ${vc} connected peer(s); low-work attacker was admitted`)
+  const vps = await peers(VICTIM)
+  // A genuinely admitted peer is identified: its connection is keyed to a real
+  // public key, NOT the `inbound-<uuid>` placeholder held during the handshake.
+  const admitted = vps.find((p) => !p.publicKey.startsWith('inbound-'))
+  if (admitted) {
+    const matches = admitted.publicKey.startsWith(attackerKeyPrefix) ? ' (matches attacker)' : ''
+    console.error(`\n  ✗ low-work identity admitted as a peer: ${admitted.publicKey} @ ${admitted.host}:${admitted.port}${matches}`)
     net.teardown()
     process.exit(1)
   }
+  if (vps.length > 0) sawTransient = true
   const elapsed = Math.round((Date.now() - start) / 1000)
-  process.stdout.write(`\r  victim peers=${vc} victim-alive=${victimAlive()} (${elapsed}s)   `)
+  process.stdout.write(`\r  victim peers=${vps.length} (admitted=0) victim-alive=${victimAlive()} (${elapsed}s)   `)
   await sleep(1000)
 }
 
@@ -114,7 +130,7 @@ if (!victimAlive()) {
   net.teardown()
   process.exit(1)
 }
-console.log(`\n  ✓ victim alive and connected-peer count stayed at 0 for ${POLL_MS / 1000}s (max observed ${maxObserved})`)
+console.log(`\n  ✓ victim alive; attacker identity never entered the peer set over ${POLL_MS / 1000}s (transient pre-identify dial observed: ${sawTransient})`)
 
 console.log('\n✓ low-work peer-identity rejection smoke test passed.')
 net.teardown()
