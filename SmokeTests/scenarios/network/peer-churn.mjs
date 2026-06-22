@@ -40,11 +40,17 @@ const nexus = info.json.nexus
 await waitFor(async () => (await peerCount(A)) >= 1 && (await peerCount(B)) >= 1,
   'A-B connected', { timeoutMs: 15_000 })
 await startMining(A, nexus)
-await sleep(500)
 
-const midTip = await tipInfo(A)
-console.log(`  A at height=${midTip.height} after 500ms mining`)
-if (midTip.height < 2) { console.error('  ✗ A failed to mine'); net.teardown(); process.exit(1) }
+// Mining is the external lattice-miner: spawn + first-template + PoW has
+// startup latency that, under CI contention, can exceed a fixed wall-clock
+// budget. Poll with a load-aware deadline (the repo anti-flake convention)
+// instead of a fixed sleep, so a green run returns the instant A reaches
+// height 2 and only a genuine stall surfaces as a failure.
+const midTip = await waitFor(async () => {
+  const t = await tipInfo(A)
+  return t && t.height >= 2 ? t : null
+}, 'A mined to height >= 2', { timeoutMs: 15_000 })
+console.log(`  A at height=${midTip.height} after mining`)
 
 console.log('\n[2] B disconnects (simulates churn)...')
 await B.stop()
