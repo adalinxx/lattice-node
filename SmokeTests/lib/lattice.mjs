@@ -793,4 +793,4 @@ export async function latticeTest(testName, { nodes = [] } = {}) {
 export { sleep, waitFor } from './waitFor.mjs'
 export { genKeypair, computeAddress, sign } from './wallet.mjs'
 export { submitTx } from './tx.mjs'
-export { dirSizeBytes, rssBytes, peerCount } from './probe.mjs'
+export { dirSizeBytes, rssBytes, peerCount, peers } from './probe.mjs'

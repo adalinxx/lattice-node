@@ -20,3 +20,15 @@ export async function peerCount(node) {
   if (Array.isArray(r.json.peers)) return r.json.peers.length
   return 0
 }
+
+// The victim's connected peers as { publicKey, host, port } objects (publicKey
+// is truncated to a 16-hex prefix by the node). A peer still mid-identify is
+// listed under a temporary `inbound-<uuid>` id with host "unknown"; only after
+// identify clears is it re-keyed to its real public key. Callers that need to
+// distinguish a genuinely admitted peer from a transient pre-identify dial use
+// this instead of `peerCount`.
+export async function peers(node) {
+  const r = await node.rpc('GET', '/api/peers')
+  if (!r.ok || !Array.isArray(r.json.peers)) return []
+  return r.json.peers
+}
