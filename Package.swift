@@ -38,7 +38,11 @@ let package = Package(
         // Ivy 6.9.0 = 6.8.0 + circuit relay for NAT traversal (Phase 1): relayed
         // connections that carry identify/want/sync transparently, served by
         // relay-enabled nodes, with a direct-then-relay connect fallback.
-        .package(url: "https://github.com/adalinxx/Ivy.git", exact: "6.9.0"),
+        // Ivy 6.10.0 = 6.9.0 + relay continuation correlation fix: pending relay
+        // requests keyed by (relayPeer, nonce) so concurrent connects through one
+        // relay no longer overwrite each other's continuation; relay continuations
+        // also drained on teardown.
+        .package(url: "https://github.com/adalinxx/Ivy.git", exact: "6.10.0"),
         // VolumeBroker 3.10.0: retained-root merge for historical state
         // retention, plus retained-root scopes and serve-gate/eviction pins.
         .package(url: "https://github.com/adalinxx/VolumeBroker.git", from: "3.10.0"),
