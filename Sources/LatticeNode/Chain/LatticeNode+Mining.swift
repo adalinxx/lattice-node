@@ -63,6 +63,21 @@ extension LatticeNode {
               let chainState = await chain(for: nexusDir) else { return false }
         let key = chainKey(forDirectory: nexusDir)
         let minerIdentity = identity ?? coinbaseAuthority
+        // Announce any deployed-but-unannounced child of the nexus into this
+        // block's coinbase so peers discover it (idempotent against the tip's
+        // committed genesisState). Derived against the tip the producer actually
+        // resolves (passed as `previousBlock`), not a snapshot taken here: the
+        // producer re-resolves the tip independently, so freezing the set against a
+        // separately-read tip is a TOCTOU — a tip that advanced to commit a child's
+        // directory would leave a now-already-present GenesisAction in the coinbase
+        // and break every template build that round.
+        let genesisActionsProvider: @Sendable (Block) async -> [GenesisAction] = { [weak self] previousBlock in
+            guard let self else { return [] }
+            let source = await self.buildMempoolAwareSource(directory: nexusDir, baseFetcher: network.ivyFetcher)
+            return await self.pendingChildGenesisActions(
+                parentChainPath: [nexusDir], tipBlock: previousBlock, source: source
+            )
+        }
         let producer = BlockProducer(
             chainState: chainState,
             mempool: network.nodeMempool,
@@ -73,7 +88,8 @@ extension LatticeNode {
             coinbaseRecipientAddress: identity?.address ?? config.coinbaseAddress ?? nodeAddress,
             batchSize: config.resources.miningBatchSize,
             tipCache: tipCaches[key],
-            timestampOverride: timestampOverride
+            timestampOverride: timestampOverride,
+            genesisActionsProvider: genesisActionsProvider
         )
         guard let produced = try? await producer.produceBlock() else { return false }
         guard produced.rootClearsTarget else { return false }
