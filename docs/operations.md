@@ -90,6 +90,7 @@ The legacy in-process model — one process hosting the whole tree — is retain
 2. Check peer count — block propagation needs at least 1 peer
 3. Check mempool: if full (`lattice_mempool_size` at cap), transactions may be rejected
 4. Check the template endpoint isn't returning 503 (returned while the node is still syncing), and check the `target` — an initial `target` that is too small (too hard) can stall progress
+5. If a specific transaction must be included but blocks are slow (high `target`), it can **expire from the mempool before any block includes it** — a pending tx older than `MEMPOOL_TX_EXPIRY_SECONDS` (default 24h) is pruned. Raise that TTL on the mining nodes (the ones building templates), or re-submit the tx periodically, so it survives until inclusion.
 
 ### Local Mining Coordinator Gate
 
@@ -129,6 +130,34 @@ That test starts a local `LatticeNode` RPC server, runs the
 worker processes, verifies stale-work cancellation and stale node rejection,
 and checks the coordinator/worker sources stay free of gossip, child-proof, and
 private-key responsibilities.
+
+### GPU Mining
+
+For real hashrate, replace the CPU `LatticeMiner` worker with
+[`lattice-miner-gpu`](https://github.com/adalinxx/lattice-miner-gpu), which
+implements the same worker protocol and auto-detects the backend: **Metal**
+(Apple Silicon, default), **CUDA** (NVIDIA), or **OpenCL** (AMD/Intel). Point the
+coordinator at it via `--worker-executable`:
+
+```bash
+LatticeMiningCoordinatorTool \
+  --node http://127.0.0.1:8080/api \
+  --rpc-cookie-file <data-dir>/.cookie \
+  --worker-executable /path/to/lattice-miner-gpu \
+  --workers 1 --batch-size 2000000000
+```
+
+One worker drives the whole GPU; a large `--batch-size` amortizes per-invocation
+kernel setup. CUDA/OpenCL require the matching build feature; the stock build is
+Metal + CPU.
+
+**Self-starting deployment (cloud GPUs).** For hands-off rental GPUs, bake the
+node, coordinator, and GPU worker into one container whose entrypoint starts the
+node, waits for it to sync from the bootstrap seeds (`/api/chain/info` reports
+`"syncing": false`), then launches the coordinator. The node discovers the network
+via its baked-in seeds (no `--peer` needed); the image needs only a CUDA-runtime
+base plus `libcurl4` and `libxml2` for the node. Booting the container then mines
+with zero manual setup.
 
 ### Full Wipe and Resync
 
@@ -171,6 +200,7 @@ rm /data/lattice/*/chain_state.json
 | `PIN_ANNOUNCE_EXPIRY` | 86400 | Pin announcement TTL (seconds) |
 | `REANNOUNCE_INTERVAL` | 86400 | Reannounce pinned CIDs interval (seconds) |
 | `EVICTION_INTERVAL` | 21600 | Expired pin eviction interval (seconds) |
+| `MEMPOOL_TX_EXPIRY_SECONDS` | 86400 | Mempool transaction TTL (seconds); a pending tx is pruned once older than this. **Raise it on chains with long block times** (e.g. early-life or high-`target` chains) so transactions aren't evicted before they can be mined. |
 
 ## Security
 
