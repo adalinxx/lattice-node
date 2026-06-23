@@ -25,21 +25,6 @@ public actor BlockProducer {
     private let chainPath: [String]
     private let identity: MinerIdentity?
     private let coinbaseRecipientAddress: String?
-    /// Child-chain genesis announcements to embed in this block's coinbase, so a
-    /// deployed child is anchored into the parent and discoverable by peers. The
-    /// node computes these (deployed-but-unannounced direct children); empty for
-    /// chains with no local children. See LatticeNode.pendingChildGenesisActions.
-    ///
-    /// Derived against the tip THIS producer actually resolves (`resolveCurrentTip`),
-    /// not a frozen snapshot from construction: the producer re-resolves the tip
-    /// independently of the caller, so a tip that advanced to commit a child's
-    /// directory into `genesisState` between the caller's snapshot and the resolve
-    /// would otherwise leave a now-already-present `GenesisAction` in the coinbase,
-    /// which the genesis-state transform rejects (insertion proof on a present key)
-    /// — failing every template build that round. The provider re-derives the set
-    /// against the resolved `previousBlock` so the announce set always matches the
-    /// tip the block extends. When `nil`, no announcements are embedded.
-    private let genesisActionsProvider: (@Sendable (Block) async -> [GenesisAction])?
     private let batchSize: UInt64
     private let tipCache: TipCache?
     private let timestampOverride: Int64?
@@ -134,7 +119,6 @@ public actor BlockProducer {
         batchSize: UInt64 = 10_000,
         tipCache: TipCache? = nil,
         timestampOverride: Int64? = nil,
-        genesisActionsProvider: (@Sendable (Block) async -> [GenesisAction])? = nil,
         nowProvider: (@Sendable () -> Int64)? = nil
     ) {
         self.chainState = chainState
@@ -144,7 +128,6 @@ public actor BlockProducer {
         self.chainPath = chainPath
         self.identity = identity
         self.coinbaseRecipientAddress = coinbaseRecipientAddress
-        self.genesisActionsProvider = genesisActionsProvider
         self.batchSize = batchSize
         self.tipCache = tipCache
         self.timestampOverride = timestampOverride
@@ -445,8 +428,7 @@ public actor BlockProducer {
         mempoolTransactions: [Transaction],
         fetcher: Fetcher,
         cachedLatestNonce: UInt64? = nil,
-        recipientAddress: String? = nil,
-        genesisActions: [GenesisAction] = []
+        recipientAddress: String? = nil
     ) async throws -> Transaction? {
         let reward = spec.rewardAtBlock(previousBlock.height + 1)
         var totalFees: UInt64 = 0
@@ -506,7 +488,7 @@ public actor BlockProducer {
             accountActions: [accountAction],
             actions: [],
             depositActions: [],
-            genesisActions: genesisActions,
+            genesisActions: [],
             receiptActions: [],
             withdrawalActions: [],
             signers: [identity.address],
@@ -542,11 +524,6 @@ public actor BlockProducer {
         } else {
             cachedNonce = nil
         }
-        // Re-derive the genesis announce set against the tip we are actually
-        // extending (`previousBlock`), so an announcement already committed into
-        // the resolved tip's `genesisState` is dropped here rather than carried
-        // into a coinbase that the genesis-state transform would reject.
-        let genesisActions = await genesisActionsProvider?(previousBlock) ?? []
         return try await Self.buildCoinbaseTransaction(
             spec: spec,
             identity: identity,
@@ -555,8 +532,7 @@ public actor BlockProducer {
             mempoolTransactions: mempoolTransactions,
             fetcher: fetcher,
             cachedLatestNonce: cachedNonce,
-            recipientAddress: coinbaseRecipientAddress,
-            genesisActions: genesisActions
+            recipientAddress: coinbaseRecipientAddress
         )
     }
 
