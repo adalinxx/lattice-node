@@ -100,7 +100,9 @@ The canonical tip is the one of greatest **`trueCumWork`** — a block's forward
 
 ### 2.3 Target Adjustment (Retargeting)
 
-The target adjusts every block using the `retargetWindow` (default: 120 blocks for Nexus). If blocks are faster than `targetBlockTime`, the target decreases (harder to satisfy); if slower, it increases (easier to satisfy). The adjustment rate is bounded to prevent extreme swings.
+The target adjusts every block from a time-weighted average of solve times over the `retargetWindow` (default: 120 blocks for Nexus; `targetBlockTime` is 1 h). If blocks are faster than `targetBlockTime` the target decreases (harder); if slower it increases (easier). Each step is clamped to at most **2× in either direction** (`maxTargetChange`) so a timestamp grind cannot swing difficulty by an unbounded factor in one block. There is no separate time-based easing of the *current* block's target — a block is mined at its parent's scheduled `nextTarget`.
+
+**Stall recovery.** If hashrate drops sharply (e.g. miners diverted elsewhere), blocks stop and the difficulty stays pinned where it was. The chain climbs back out on its own: each slow block, being far over `targetBlockTime`, halves the difficulty for the next, so it converges to the live hashrate in roughly `log₂(difficulty / sustainable difficulty)` blocks (the first block is the hardest; adding hashrate shortens it). No reset or intervention is needed — just continued mining.
 
 ### 2.4 Block Reward
 
@@ -113,6 +115,14 @@ The coinbase transaction has fee=0. It credits the chain's configured payout add
 ### 2.5 Merged Mining
 
 A block may contain child chain blocks in its `children` field (a merkle dictionary keyed by parent-relative directory edge). Child blocks inherit proof-of-work through the content-addressed proof that a parent block committed them — no additional mining is required. Each child chain has its own ChainSpec, state, and target, and is validated against its *own* target: a single PoW hash that misses the parent's target may still satisfy a child's higher (easier) one. Validation always recurses into `children`, so a grandchild can be accepted even when the intermediate block is not. Child blocks anchor to parent state roots through `parentState` and state-root continuity proofs; they do not depend on the parent block remaining canonical.
+
+### 2.6 Child Chain Creation & Discovery
+
+A child chain is *created* by a **`GenesisAction`** that records `{directory, blockCID}` into the parent's `genesisState` — a MerkleDictionary mapping a parent-relative directory edge to the child's genesis block CID. The parent stores only that opaque anchor; it never fetches or validates the child genesis content (verify-not-trust — recording an unverified anchor is correct, judging it is the attack surface). A node **discovers** a child as soon as it accepts a parent block whose post-state commits that `GenesisAction`; no restart or DHT lookup is needed.
+
+The `GenesisAction` travels in an **ordinary signed transaction** (`genesisActions`, built via [`/api/transaction/prepare`](rpc-api.md#post-apitransactionprepare)). Because it is a normal mempool transaction it gossips to every node and **any** miner can include it in the next block — the announcement is not tied to the deploying node winning a block, and survives that node going offline. Anyone with a funded account may announce any directory; first writer on the canonical chain wins the name (the parent does not arbitrate which CIDs are "valuable").
+
+This is distinct from the per-block **anchoring** of §2.5: `genesisState` records that a child *exists* (creation/discovery), while a parent block's `children` field commits each individual child *block* (merged-mining proof). Deploying a child locally (`POST /api/chain/deploy`) only seeds its genesis and process; it is announced — and thus discoverable — only once a `GenesisAction` for it lands in the parent chain.
 
 In the per-process topology, a child process does not mine its own blocks: it subscribes to its parent's P2P gossip, extracts its embedded block from each parent block's `children` via a sparse content-addressed proof (`ChildBlockProof`), and validates it against the parent's PoW root hash. See §5.6.
 

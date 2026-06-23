@@ -132,6 +132,50 @@ lattice-node cluster --nodes 3 --mine Nexus --base-port 4001
 > production block-time target is 1 hour (`3600000` ms). Child chains run
 > per-process and inherit their own cadence.
 
+### Deploy & Announce a Child Chain
+
+Deploying a child is two steps — **seed it**, then **announce it** so other nodes discover it.
+
+```bash
+# 1. Deploy (privileged) — seeds the child locally, returns its genesis.
+#    maxBlockSize must be <= the node's --max-frame-size (default 4 MiB) - 1024.
+curl -X POST http://localhost:8080/api/chain/deploy \
+  -H "Authorization: Bearer $(cat ~/.lattice/.cookie)" -H 'Content-Type: application/json' \
+  -d '{"directory":"Etch","parentDirectory":"Nexus","targetBlockTime":3600000,
+       "initialReward":1048576,"halvingInterval":876600,"premine":0,
+       "maxTransactionsPerBlock":5000,"maxStateGrowth":3000000,
+       "maxBlockSize":1000000,"retargetWindow":120}'
+# -> { "genesisHash": "<child-genesis-CID>", "genesisHex": "...", "chainP2PAddress": "..." }
+
+# 2. Announce it into the parent. This is a NORMAL transaction that carries a
+#    genesisAction (genesisActions is just an action type, like accountActions) — the
+#    same prepare -> sign -> submit flow as any tx. Use a FUNDED key; replace <addr>/<pubkey>.
+
+#  2a. Build the unsigned body. fee >= 1 per serialized byte (~400 here); the matching
+#      negative accountAction debits it so balances conserve; signers is the ADDRESS.
+curl -s "http://localhost:8080/api/nonce/<addr>?chainPath=Nexus"          # -> {"nonce": N}
+curl -s -X POST http://localhost:8080/api/transaction/prepare -H 'Content-Type: application/json' -d '{
+  "nonce": N, "signers": ["<addr>"], "fee": 400,
+  "accountActions": [{"owner": "<addr>", "delta": -400}],
+  "genesisActions": [{"directory": "Etch", "blockCID": "<genesisHash>"}],
+  "chainPath": ["Nexus"] }'                                              # -> {bodyCID, bodyData, signingPreimage}
+
+#  2b. Sign  "lattice-tx-v1:" + signingPreimage  with your ed25519 key, then submit:
+curl -s -X POST http://localhost:8080/api/transaction -H 'Content-Type: application/json' -d '{
+  "signatures": {"<pubkey>": "<sig-hex>"}, "bodyCID": "<bodyCID>",
+  "bodyData": "<bodyData>", "chainPath": ["Nexus"] }'
+
+# 3. Run the child process; it boots from the seeded genesis and subscribes to the parent.
+lattice-node node --genesis-hex "<genesisHex>" --chain-directory Etch \
+  --chain-path Nexus/Etch --subscribe-p2p "<chainP2PAddress>" \
+  --port 4002 --rpc-port 8081 --data-dir ./etch-data
+```
+
+The announcement is an ordinary mempool transaction, so it gossips and **any** miner can
+include it — the child becomes discoverable even if your node never wins a block. Until a
+block carries the genesis action, the child exists only locally. See
+[Protocol §2.6](./protocol.md) for the creation/discovery model.
+
 ### Query the Chain
 
 A couple of canonical reads to confirm the node is up:

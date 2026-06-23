@@ -142,6 +142,12 @@ see [Privileged endpoints](#privileged-endpoints).
 
 **Response:** `{"directory", "parentDirectory", "genesisHash", "genesisHex", "chainP2PAddress"}`
 
+> **Constraint:** `maxBlockSize` must be **≤ the node's Ivy `maxFrameSize` − 1024**
+> (default frame size 4 MiB, set with `--max-frame-size`); a larger spec is
+> rejected at deploy. Deploy only sets the child up locally and returns its
+> `genesisHex` — to make the child **discoverable** by other nodes, announce it
+> with a `genesisActions` transaction (see [`/api/transaction/prepare`](#post-apitransactionprepare)).
+
 #### GET /api/chain/candidate · POST /api/chain/candidate
 Returns this chain's pending candidate block for a parent-chain miner to embed.
 `POST` accepts `{"parentBlockHex": "...", "childNodes": ["http://..."], "childNodeAuth"?: {"http://...": "<token>"}}` to set
@@ -267,6 +273,7 @@ Returns `{"bodyCID", "bodyData", "signingPreimage"}` ready to sign and submit.
   "fee": 1,
   "accountActions": [{"owner": "<address>", "delta": -1}],
   "actions": [{"key": "<key>", "oldValue": null, "newValue": "<value>"}],
+  "genesisActions": [{"directory": "<name>", "blockCID": "<child-genesis-CID>"}],
   "chainPath": ["Nexus"]
 }
 ```
@@ -276,6 +283,23 @@ chain's isolated `GeneralState` dictionary (never balances) — use them to reco
 arbitrary data, e.g. **timestamping / proof-of-existence** (key = a content hash):
 `oldValue: null` inserts (fails if the key exists), a matching `oldValue` updates
 (compare-and-set), `newValue: null` deletes.
+
+**`genesisActions`** announce a child chain into the parent's `genesisState`
+(creation + discovery — see [Protocol §2.6](protocol.md)). Each records only the
+opaque `{directory, blockCID}` anchor; the parent never resolves the child genesis
+content (verify-not-trust). Submit one in an ordinary signed transaction so it
+**gossips and any miner can include it** — not tied to the deploying node. Building
+one trips three validator rules worth calling out:
+
+- **`signers` is the account address**, not the public key (signatures stay keyed
+  by public key in `POST /api/transaction`).
+- A non-zero `fee` needs a matching **debit**: `accountActions: [{owner, delta: -fee}]`
+  (conservation requires `debits == credits + fee`).
+- The fee floor is **1 per byte of the serialized body**, not just the global
+  `MINIMUM_TRANSACTION_FEE` of 1 — a ~360-byte announcement needs `fee ≥ 360`.
+
+The signer must be a **funded** account (it pays the fee); a node's coinbase
+*authority* key is not the same as its configured payout address.
 
 ### GET /api/transaction/{txCID}
 Full decoded transaction (actions, signers, signatures, block context).
