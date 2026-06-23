@@ -59,7 +59,20 @@ workloads belong on child chains with their own `ChainSpec`, not on the Nexus.
 
 ### Child Chains
 
-In production, child chains run as **separate processes** that subscribe to their parent (Nexus) for blocks. Nexus stays the control plane (`/api/chain/deploy`, `/api/chain/register-rpc`); an orchestrator spawns each child with `--genesis-hex --chain-directory --subscribe-p2p`. See [`../deploy/README.md`](../deploy/README.md) ("Per-process child chains") for the full deploy → genesis-hex → spawn → register-rpc runbook.
+In production, child chains run as **separate processes** that subscribe to their parent (Nexus) for blocks. Nexus stays the control plane (`/api/chain/deploy`, `/api/chain/register-rpc`); an orchestrator deploys the child's genesis on the parent, then spawns the child process from it:
+
+```bash
+LatticeNode node \
+  --genesis-hex "$GENESIS_HEX" \    # genesisHex from POST /api/chain/deploy
+  --chain-directory toy \           # the child's own directory
+  --chain-path Nexus/toy \          # the child's FULL ancestral path — see note
+  --subscribe-p2p "$PARENT_P2P" \   # parent node's pubkey@host:port
+  --port 4002 --rpc-port 8081 --data-dir ./toy-data
+```
+
+**Always pass `--chain-path` with the child's full ancestral path** (`Nexus/toy`, or `Nexus/toy/toytoy` for a grandchild). It is optional, but omitting it is a trap: the node then advertises only its leaf directory (`["toy"]`) — it still runs and mines, but it no longer knows it descends from Nexus, and `/health` cannot report its true lineage. Worse, **a leaf-only node can be addressed *only* by its leaf**: `tx --chain-path toy` works, but `tx --chain-path Nexus/toy` is rejected as `Unknown chain path`, because relative to a node that thinks its root is `toy`, the path `Nexus/toy` reads as a non-existent descendant `toy/Nexus/toy`. Passing the full path makes both the leaf (`toy`) and absolute (`Nexus/toy`) forms resolve, and lets the parent route to it.
+
+> **Addressing a chain in `tx` / RPC.** `--chain-path` (and `?chainPath=`) is resolved **relative to the node's own chain path**: a path that shares the node's root is taken as absolute; a path that matches a trailing suffix of the node's path names the node's own chain; anything else is treated as a descendant and prepended. So on the **Nexus node**, address a child as `Nexus/<child>`; on a **child node that was given its full `--chain-path`**, either the full path or its own leaf works; on a **leaf-only child node**, use the leaf directory.
 
 The legacy in-process model — one process hosting the whole tree — is retained only for tests and compatibility harnesses (constructed programmatically, not via a CLI flag). Production deployments use per-process chains so parent processes never own child fork-choice views.
 
