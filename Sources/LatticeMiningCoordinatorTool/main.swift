@@ -64,20 +64,31 @@ struct LatticeMiningCoordinatorTool: AsyncParsableCommand {
             throw ValidationError("Invalid --node URL: \(node)")
         }
         let workerCount = max(workers, 1)
-        let authToken = try Self.resolveAuthToken(token: rpcToken, cookieFile: rpcCookieFile, flag: "--rpc-cookie-file")
-        let childAuth = try Self.resolveChildAuth(
-            childNodes: childNode,
-            tokens: childRPCToken,
-            cookieFiles: childRPCCookieFile
-        )
+        // Validate auth config once at startup (fail fast on a missing/unreadable/empty
+        // cookie), then re-read it on EVERY request via providers below — so a node that
+        // regenerates its RPC cookie on restart is picked up automatically, instead of the
+        // coordinator spinning forever on a stale token.
+        _ = try Self.resolveAuthToken(token: rpcToken, cookieFile: rpcCookieFile, flag: "--rpc-cookie-file")
+        _ = try Self.resolveChildAuth(childNodes: childNode, tokens: childRPCToken, cookieFiles: childRPCCookieFile)
+        let rpcTokenValue = rpcToken
+        let rpcCookieFileValue = rpcCookieFile
+        let childNodeValue = childNode
+        let childRPCTokenValue = childRPCToken
+        let childRPCCookieFileValue = childRPCCookieFile
+        let authTokenProvider: @Sendable () -> String? = {
+            Self.currentAuthToken(token: rpcTokenValue, cookieFile: rpcCookieFileValue)
+        }
+        let childNodeAuthProvider: @Sendable () -> [String: String] = {
+            Self.currentChildAuth(childNodes: childNodeValue, tokens: childRPCTokenValue, cookieFiles: childRPCCookieFileValue)
+        }
         let rewardIdentity = try identityFile.map(Self.loadRewardIdentity(path:))
         let client = HTTPMiningCoordinatorNodeClient(
             apiBaseURL: apiBaseURL,
             chainPath: chainPath.isEmpty ? nil : chainPath,
             childNodes: childNode,
-            childNodeAuth: childAuth,
+            childNodeAuthProvider: childNodeAuthProvider,
             rewardIdentity: rewardIdentity,
-            authToken: authToken
+            authTokenProvider: authTokenProvider
         )
 
         let coordinatorWorkers = try makeWorkers(count: workerCount)
@@ -220,6 +231,26 @@ struct LatticeMiningCoordinatorTool: AsyncParsableCommand {
             if let resolved = try resolveAuthToken(token: token, cookieFile: cookieFile, flag: "--child-rpc-cookie-file") {
                 auth[childNode] = resolved
             }
+        }
+        return auth
+    }
+
+    /// Non-throwing re-read for the runtime auth providers: returns the current
+    /// token (static token, else the cookie file's current contents), or nil.
+    static func currentAuthToken(token: String?, cookieFile: String?) -> String? {
+        if let token = token?.trimmingCharacters(in: .whitespacesAndNewlines), !token.isEmpty { return token }
+        guard let cookieFile, !cookieFile.isEmpty,
+              let data = try? String(contentsOfFile: cookieFile, encoding: .utf8) else { return nil }
+        let cookie = data.trimmingCharacters(in: .whitespacesAndNewlines)
+        return cookie.isEmpty ? nil : cookie
+    }
+
+    static func currentChildAuth(childNodes: [String], tokens: [String], cookieFiles: [String]) -> [String: String] {
+        var auth: [String: String] = [:]
+        for (idx, childNode) in childNodes.enumerated() {
+            let token = idx < tokens.count ? tokens[idx] : nil
+            let cookieFile = idx < cookieFiles.count ? cookieFiles[idx] : nil
+            if let resolved = currentAuthToken(token: token, cookieFile: cookieFile) { auth[childNode] = resolved }
         }
         return auth
     }

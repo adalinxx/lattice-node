@@ -105,9 +105,10 @@ final class MiningCoordinatorEndToEndTests: XCTestCase {
         let fixture = try await startNodeWithRPC()
         defer { fixture.shutdown() }
 
+        let fixtureAuthToken = fixture.authToken
         let httpClient = HTTPMiningCoordinatorNodeClient(
             apiBaseURL: fixture.apiBaseURL,
-            authToken: fixture.authToken
+            authTokenProvider: { fixtureAuthToken }
         )
         let advancingClient = AdvancingNodeClient(inner: httpClient, node: fixture.node)
         let slowWorker = MiningCoordinatorWorker(id: "slow-worker") { work, _ in
