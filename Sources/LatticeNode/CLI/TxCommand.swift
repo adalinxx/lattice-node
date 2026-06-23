@@ -100,8 +100,25 @@ struct TxCommand: AsyncParsableCommand {
         for a in generalActions { printKeyValue("Set", "\(a.key)=\(a.newValue ?? "null")") }
         for g in genesisActions { printKeyValue("Create chain", "\(g.directory) @ \(g.blockCID)") }
 
-        let nonce = try await fetchJSON("\(rpc)/api/nonce/\(signer)")["nonce"] as? UInt64 ?? 0
-        let balance = try await fetchJSON("\(rpc)/api/balance/\(signer)")["balance"] as? UInt64 ?? 0
+        // Read the nonce + balance on the SAME chain this tx targets (not the
+        // node's default chain), and fail loudly if the node can't be reached: a
+        // swallowed fetch must never masquerade as "balance 0" and block a funded
+        // transaction. A successful query always carries the field, so an absent
+        // field means the request failed (timeout / wrong chain / node error).
+        // Keep '/' (the server splits the path on it) but encode characters that
+        // would otherwise be read as query syntax, since directory names are not
+        // charset-constrained.
+        var chainPathAllowed = CharacterSet.urlQueryAllowed
+        chainPathAllowed.remove(charactersIn: "&=+")
+        let chainQuery = chainPath.addingPercentEncoding(withAllowedCharacters: chainPathAllowed) ?? chainPath
+        guard let nonce = try await fetchJSON("\(rpc)/api/nonce/\(signer)?chainPath=\(chainQuery)")["nonce"] as? UInt64 else {
+            printError("Could not read nonce for \(signer) on chain '\(chainPath)' — node unreachable or unknown chain path?")
+            throw ExitCode.failure
+        }
+        guard let balance = try await fetchJSON("\(rpc)/api/balance/\(signer)?chainPath=\(chainQuery)")["balance"] as? UInt64 else {
+            printError("Could not read balance for \(signer) on chain '\(chainPath)' — node unreachable or unknown chain path?")
+            throw ExitCode.failure
+        }
 
         // Conservation: debits == credits + fee. The signer is debited the transfer
         // amount plus the fee; the recipient (if any) is credited the amount.
