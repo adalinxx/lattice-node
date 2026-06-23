@@ -82,6 +82,12 @@ extension RPCRoutes {
         // General key-value state changes (e.g. timestamping/anchoring). These
         // apply to the isolated GeneralState dictionary, never to balances.
         let generalActions = (body.actions ?? []).map { Action(key: $0.key, oldValue: $0.oldValue, newValue: $0.newValue) }
+        // Child-chain creation/discovery announcements. A genesis action records an
+        // opaque {directory, blockCID} anchor in the parent's genesisState; the
+        // parent never resolves the child genesis content (verify-not-trust). Exposing
+        // this here lets a deployed child be announced via a gossiped mempool tx
+        // (included by ANY miner), not only the deploying node's coinbase.
+        let genesisActions = (body.genesisActions ?? []).map { GenesisAction(directory: $0.directory, blockCID: $0.blockCID) }
         var depositActions: [DepositAction] = []
         for d in (body.depositActions ?? []) {
             guard let nonce = UInt128(d.nonce, radix: 16) else { return jsonError("Invalid deposit nonce hex: \(d.nonce)") }
@@ -120,7 +126,7 @@ extension RPCRoutes {
             accountActions: accountActions,
             actions: generalActions,
             depositActions: depositActions,
-            genesisActions: [],
+            genesisActions: genesisActions,
             receiptActions: receiptActions,
             withdrawalActions: withdrawalActions,
             signers: body.signers,

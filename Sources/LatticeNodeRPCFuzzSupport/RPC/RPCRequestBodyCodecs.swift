@@ -88,12 +88,18 @@ public struct PrepareGeneralActionInput: Decodable, Equatable {
     public let newValue: String?
 }
 
+public struct PrepareGenesisActionInput: Decodable, Equatable {
+    public let directory: String
+    public let blockCID: String
+}
+
 public struct PrepareTransactionRequestBody: Decodable, Equatable {
     public let nonce: UInt64
     public let signers: [String]
     public let fee: UInt64
     public let accountActions: [PrepareAccountActionInput]
     public let actions: [PrepareGeneralActionInput]?
+    public let genesisActions: [PrepareGenesisActionInput]?
     public let depositActions: [PrepareDepositInput]?
     public let receiptActions: [PrepareReceiptInput]?
     public let withdrawalActions: [PrepareWithdrawalInput]?

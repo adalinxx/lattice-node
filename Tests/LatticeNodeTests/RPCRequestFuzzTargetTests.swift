@@ -60,6 +60,18 @@ final class RPCRequestFuzzTargetTests: XCTestCase {
         XCTAssertNil(RPCRequestBodyCodecs.decodePrepareTransaction(prepare)?.actions)
         RPCRequestFuzzTarget.exercise(prepareActions)
 
+        // Genesis actions (child-chain creation/discovery) decode into the body —
+        // a deployed child can be announced via a gossiped mempool tx, not just the
+        // deploying node's coinbase.
+        let prepareGenesis = Data(#"{"nonce":0,"signers":["alice"],"fee":0,"accountActions":[],"genesisActions":[{"directory":"Etch","blockCID":"bafyreibcryxhl4"}],"chainPath":["Nexus"]}"#.utf8)
+        let decodedGenesis = RPCRequestBodyCodecs.decodePrepareTransaction(prepareGenesis)?.genesisActions
+        XCTAssertEqual(decodedGenesis?.count, 1)
+        XCTAssertEqual(decodedGenesis?.first?.directory, "Etch")
+        XCTAssertEqual(decodedGenesis?.first?.blockCID, "bafyreibcryxhl4")
+        // Backward-compatible: omitting `genesisActions` decodes to nil, not a failure.
+        XCTAssertNil(RPCRequestBodyCodecs.decodePrepareTransaction(prepare)?.genesisActions)
+        RPCRequestFuzzTarget.exercise(prepareGenesis)
+
         let deploy = Data(#"{"directory":"Child","parentDirectory":"Nexus","targetBlockTime":1000,"initialReward":1,"halvingInterval":100,"premine":0,"maxTransactionsPerBlock":100,"maxStateGrowth":1000,"maxBlockSize":1000000,"retargetWindow":10}"#.utf8)
         XCTAssertEqual(RPCRequestBodyCodecs.decodeDeployChain(deploy)?.directory, "Child")
         RPCRequestFuzzTarget.exercise(deploy)
