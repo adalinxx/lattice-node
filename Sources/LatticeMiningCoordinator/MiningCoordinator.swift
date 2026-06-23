@@ -436,26 +436,29 @@ public final class HTTPMiningCoordinatorNodeClient: MiningCoordinatorNodeClient 
     private let apiBaseURL: URL
     private let chainPath: [String]?
     private let childNodes: [String]
-    private let childNodeAuth: [String: String]
+    private let childNodeAuthProvider: @Sendable () -> [String: String]
     private let rewardIdentity: MiningRewardIdentity?
     private let session: URLSession
-    private let authToken: String?
+    private let authTokenProvider: @Sendable () -> String?
 
+    /// Designated init. Auth is supplied as providers re-evaluated on every
+    /// request so a node that regenerates its RPC cookie on restart is picked up
+    /// without restarting the coordinator (which otherwise spins on a stale token).
     public init(
         apiBaseURL: URL,
         chainPath: [String]? = nil,
         childNodes: [String] = [],
-        childNodeAuth: [String: String] = [:],
+        childNodeAuthProvider: @escaping @Sendable () -> [String: String] = { [:] },
         rewardIdentity: MiningRewardIdentity? = nil,
-        authToken: String? = nil,
+        authTokenProvider: @escaping @Sendable () -> String? = { nil },
         session: URLSession = .shared
     ) {
         self.apiBaseURL = apiBaseURL
         self.chainPath = chainPath
         self.childNodes = childNodes
-        self.childNodeAuth = childNodeAuth
+        self.childNodeAuthProvider = childNodeAuthProvider
         self.rewardIdentity = rewardIdentity
-        self.authToken = authToken
+        self.authTokenProvider = authTokenProvider
         self.session = session
     }
 
@@ -468,6 +471,7 @@ public final class HTTPMiningCoordinatorNodeClient: MiningCoordinatorNodeClient 
         if let chainPath {
             payload["chainPath"] = chainPath
         }
+        let childNodeAuth = childNodeAuthProvider()
         if !childNodeAuth.isEmpty {
             payload["childNodeAuth"] = childNodeAuth
         }
@@ -541,6 +545,7 @@ public final class HTTPMiningCoordinatorNodeClient: MiningCoordinatorNodeClient 
         if !childNodes.isEmpty {
             payload["childNodes"] = childNodes
         }
+        let childNodeAuth = childNodeAuthProvider()
         if !childNodeAuth.isEmpty {
             payload["childNodeAuth"] = childNodeAuth
         }
@@ -552,7 +557,7 @@ public final class HTTPMiningCoordinatorNodeClient: MiningCoordinatorNodeClient 
     }
 
     private func applyAuth(to request: inout URLRequest) {
-        guard let token = authToken?.trimmingCharacters(in: .whitespacesAndNewlines), !token.isEmpty else {
+        guard let token = authTokenProvider()?.trimmingCharacters(in: .whitespacesAndNewlines), !token.isEmpty else {
             return
         }
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
