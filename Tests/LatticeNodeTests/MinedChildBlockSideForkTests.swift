@@ -22,7 +22,7 @@ final class MinedChildBlockSideForkTests: XCTestCase {
 
     /// Boot a per-process child node rooted at Nexus ⊃ Mid (the leaf chain this
     /// node serves), and a separate Nexus fixture CAS to build proof carriers.
-    private func makeChildNode() async throws -> (node: LatticeNode, fixture: TestBrokerFetcher, nexusGenesis: Block, midGenesis: Block) {
+    private func makeChildNode(nexusTarget: UInt256 = .max) async throws -> (node: LatticeNode, fixture: TestBrokerFetcher, nexusGenesis: Block, midGenesis: Block) {
         let kp = CryptoUtils.generateKeyPair()
         let tmp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let node = try await LatticeNode(
@@ -50,7 +50,7 @@ final class MinedChildBlockSideForkTests: XCTestCase {
         let ts = midGenesis.timestamp
         try await storeBlockFixtureTree(midGenesis, to: fixture)
         let nexusGenesis = try await BlockBuilder.buildGenesis(
-            spec: testSpec("Nexus"), timestamp: ts, target: UInt256.max, fetcher: fixture
+            spec: testSpec("Nexus"), timestamp: ts, target: nexusTarget, fetcher: fixture
         )
         return (node, fixture, nexusGenesis, midGenesis)
     }
@@ -194,6 +194,141 @@ final class MinedChildBlockSideForkTests: XCTestCase {
         XCTAssertNotEqual(
             b1AnnouncedTip, b1.midCID,
             "a mined child that lost fork choice (B1) must NOT be announced as the chain tip"
+        )
+    }
+
+    /// Fix: child-block VALIDITY is per-chain PoW (`MinedChildBlockSelection.accepts`),
+    /// NOT inherited parent work. In merged mining the Nexus carrier is mined to
+    /// clear only the embedded child's EASY target, not the parent's HARD target.
+    /// `ChildBlockProof.securingWork()` credits a level's inherited work only when
+    /// the blocktree hash clears THAT level's own target — so a carrier that does
+    /// not clear the parent's hard target yields `securingWork() == .zero`. The
+    /// child is still valid (its own PoW clears the CHILD target, proven by
+    /// `accepts`), so a `securingWork() > .zero` validity gate wrongly rejected
+    /// children mined at their own difficulty.
+    ///
+    /// This is reachable ONLY with a hard (non-`UInt256.max`) parent target —
+    /// every other test uses a max-target Nexus genesis, which masks it by always
+    /// crediting nonzero inherited work.
+    ///
+    /// RED before the fix: `verifiedCommittingParentAnchor` required
+    /// `await proof.securingWork() > .zero`, so this zero-inherited-work child was
+    /// `.rejected` and never became the canonical tip.
+    func testChildMinedAtOwnDifficultyUnderHardTargetParentIsAccepted() async throws {
+        // A hard Nexus target the carrier's PoW hash will NOT clear, so the
+        // proof's inherited work is genuinely zero — the exact bug condition.
+        let (node, fixture, nexusGenesis, midGenesis) = try await makeChildNode(nexusTarget: UInt256(1_000))
+        let chainMaybe = await node.chain(for: "Mid")
+        let chain = try XCTUnwrap(chainMaybe)
+        let ts = midGenesis.timestamp
+
+        let mined = try await minedChild(
+            node: node, fixture: fixture, previousMid: midGenesis,
+            nexusGenesis: nexusGenesis, nexusNonce: 1, ts: ts + 1_000
+        )
+
+        // The carrier does not clear the hard Nexus target → zero inherited work.
+        // (If this is ever non-zero the chosen parent target is too easy.)
+        let w = await mined.proof.securingWork()
+        XCTAssertEqual(
+            w, .zero,
+            "carrier must not clear the hard Nexus target — inherited work must be zero (the bug condition)"
+        )
+
+        // Validity is per-chain PoW: the carrier clears the CHILD (Mid) target, so
+        // `accepts` passes and the zero-inherited-work child must be accepted.
+        let r = await node.submitProvenChildBlock(
+            chainPath: ["Nexus", "Mid"], block: mined.block, proof: mined.proof
+        )
+        XCTAssertEqual(
+            r.status, .accepted,
+            "a child mined at its own difficulty under a hard-target parent must be accepted"
+        )
+        let tip = await chain.getMainChainTip()
+        XCTAssertEqual(
+            tip, mined.midCID,
+            "the accepted child must become the canonical tip"
+        )
+    }
+
+    /// Fix (gossip/inbound-parent-proof path, depth ≥3): the SAME
+    /// zero-inherited-work-is-not-invalid principle as
+    /// `testChildMinedAtOwnDifficultyUnderHardTargetParentIsAccepted`, but for the
+    /// OTHER admission path — the inbound-parent-proof relay in
+    /// `ParentChainBlockExtractor.handle(...)`, reached at chain depth ≥3 where
+    /// `requiresInboundParentProof()` is true (`expectedParentPath.count > 1`).
+    ///
+    /// Scenario: a node serving "Stable" (path `["Nexus","Mid","Stable"]`,
+    /// `expectedParentPath == ["Nexus","Mid"]`) receives a "Mid" parent block whose
+    /// inbound proof roots at the Nexus carrier. When that Nexus carrier is mined to
+    /// clear only Mid's EASY target (not Nexus's HARD target), the proof's
+    /// `securingWork()` is legitimately `.zero` — yet the Mid block is valid (its own
+    /// PoW clears the carrier root, proven by `MinedChildBlockSelection.accepts`).
+    ///
+    /// RED before the fix: `verifiedInboundParentProofs` and `verifiedParentAnchor`
+    /// each required `await proofForParent.securingWork() > .zero`, so this
+    /// zero-inherited-work proof was filtered out → `verifiedProofs.isEmpty` →
+    /// `handle(...)` `return`ed, dropping the WHOLE relay (anchor + continuity edge +
+    /// downstream "Stable" child extraction) and stalling the deep child.
+    ///
+    /// GREEN after the fix: both gate only on `accepts(...)`; the proof is admitted
+    /// and the parent anchor is produced. (Union-weight zero-exclusion is handled
+    /// downstream in `recordVerifiedWorkContributions`, not on this admission gate.)
+    func testInboundParentProofAtDepth3WithZeroSecuringWorkIsAdmitted() async throws {
+        // Hard Nexus target the carrier's PoW hash will NOT clear → zero inherited work.
+        let (node, fixture, nexusGenesis, midGenesis) = try await makeChildNode(nexusTarget: UInt256(1_000))
+        let ts = midGenesis.timestamp
+
+        // A Mid child embedded in a Nexus carrier, with the single-hop `["Mid"]`
+        // proof rooted at that carrier — exactly the inbound parent block + proof a
+        // node one level deeper (serving "Stable") receives over the relay.
+        let mined = try await minedChild(
+            node: node, fixture: fixture, previousMid: midGenesis,
+            nexusGenesis: nexusGenesis, nexusNonce: 1, ts: ts + 1_000
+        )
+
+        // The carrier does not clear the hard Nexus target → zero inherited work.
+        // (If this is ever non-zero the chosen parent target is too easy and the test
+        // would no longer exercise the bug condition.)
+        let w = await mined.proof.securingWork()
+        XCTAssertEqual(
+            w, .zero,
+            "carrier must not clear the hard Nexus target — inherited work must be zero (the bug condition)"
+        )
+
+        // An extractor for a deeper chain: serving "Stable" under parent path
+        // ["Nexus","Mid"], so `requiresInboundParentProof()` is true (count 2 > 1)
+        // and the inbound-parent-proof admission path runs.
+        let extractor = ParentChainBlockExtractor(
+            childDirectory: "Stable",
+            parentDirectory: "Mid",
+            parentChainPath: ["Nexus", "Mid"],
+            extractor: LatticeChildBlockExtractor(),
+            node: node
+        )
+
+        // Drive the two gates that the fix removed the `securingWork() > .zero`
+        // conjunct from. The parent block is the Mid child; its CID is the relayed
+        // parent CID. With the gates present (RED) both filter this zero-work proof
+        // out; with the gates removed (GREEN) `accepts(...)` admits it.
+        let verified = await extractor.verifiedInboundParentProofsForTesting(
+            cid: mined.midCID, parentBlock: mined.block, node: node, inboundProofs: [mined.proof]
+        )
+        XCTAssertFalse(
+            verified.isEmpty,
+            "a depth-3 inbound parent proof with zero inherited work must NOT be filtered out (its child PoW is valid)"
+        )
+
+        let anchor = await extractor.verifiedParentAnchorForTesting(
+            cid: mined.midCID, parentBlock: mined.block, node: node, inboundProofs: verified
+        )
+        let producedAnchor = try XCTUnwrap(
+            anchor,
+            "the parent anchor must be produced from the zero-inherited-work inbound proof (relay must NOT be dropped)"
+        )
+        XCTAssertEqual(
+            producedAnchor.blockHash, mined.midCID,
+            "the produced anchor must bind to the relayed parent block CID"
         )
     }
 }

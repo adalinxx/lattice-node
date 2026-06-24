@@ -649,14 +649,19 @@ public actor ParentChainBlockExtractor: IvyDelegate {
                     targeting: expectedParentPath
                 ),
                 let root = await proofForParent.anchorRoot() else { return nil }
+                // Validity is per-chain PoW via `accepts`; a parent/carrier mined at
+                // its own difficulty under a harder-target ancestor legitimately has
+                // zero inherited work. The union-weight zero-exclusion is applied
+                // downstream (recordVerifiedWorkContributions), not here; gating
+                // admission/continuity/extraction on it wrongly dropped valid deep
+                // merged-mined parent relays — same fix as verifiedCommittingParentAnchor.
                 guard await MinedChildBlockSelection.accepts(
                     chainPath: expectedParentPath,
                     block: parentBlock,
                     childCID: cid,
                     rootHash: root.hash,
                     proof: proofForParent
-                ),
-                await proofForParent.securingWork() > .zero else { return nil }
+                ) else { return nil }
             }
         } else {
             let rootHash = parentBlock.proofOfWorkHash()
@@ -687,14 +692,15 @@ public actor ParentChainBlockExtractor: IvyDelegate {
                 targeting: expectedParentPath
             ),
             let root = await proofForParent.anchorRoot(),
+                  // Zero inherited work is legitimate (see verifiedParentAnchor); the
+                  // union-weight zero-exclusion is handled downstream, not here.
                   await MinedChildBlockSelection.accepts(
                     chainPath: expectedParentPath,
                     block: parentBlock,
                     childCID: cid,
                     rootHash: root.hash,
                     proof: proofForParent
-                  ),
-                  await proofForParent.securingWork() > .zero else { continue }
+                  ) else { continue }
             verified.append(proof)
         }
         return ChildBlockProofEnvelope.deserialize(ChildBlockProofEnvelope.serialize(verified)) ?? verified
@@ -1184,6 +1190,24 @@ public actor ParentChainBlockExtractor: IvyDelegate {
     }
     func ingestForTesting(cid: String, data: Data, ivy: Ivy, from peer: PeerID) async {
         await handle(cid: cid, data: data, ivy: ivy, from: peer)
+    }
+    func verifiedInboundParentProofsForTesting(
+        cid: String,
+        parentBlock: Block,
+        node: LatticeNode,
+        inboundProofs: [ChildBlockProof]
+    ) async -> [ChildBlockProof] {
+        await verifiedInboundParentProofs(
+            cid: cid, parentBlock: parentBlock, node: node, inboundProofs: inboundProofs)
+    }
+    func verifiedParentAnchorForTesting(
+        cid: String,
+        parentBlock: Block,
+        node: LatticeNode,
+        inboundProofs: [ChildBlockProof]
+    ) async -> ParentAnchor? {
+        await verifiedParentAnchor(
+            cid: cid, parentBlock: parentBlock, node: node, inboundProofs: inboundProofs)
     }
     func registerPendingHeaderRequestForTesting(
         requestID: Data,

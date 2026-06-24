@@ -157,14 +157,21 @@ extension LatticeNode {
         proof: ChildBlockProof
     ) async -> ParentAnchor? {
         guard let root = await proof.anchorRoot() else { return nil }
+        // Validity is per-chain PoW: `accepts` proves the carrier's blocktree hash
+        // clears THIS child's target. A child mined at its own difficulty under a
+        // harder-target parent legitimately inherits ZERO parent work — the carrier
+        // did not clear the parent's target — which is correct per-level crediting,
+        // not an invalid block. Gating validity on `securingWork() > .zero` wrongly
+        // rejected such children; it is reachable only with a real (non-max) parent
+        // target, so max-target test genesis masked it. Inherited weight remains a
+        // fork-choice quantity applied separately; zero is legitimate here.
         guard await MinedChildBlockSelection.accepts(
             chainPath: chainPath,
             block: childBlock,
             childCID: childCID,
             rootHash: root.hash,
             proof: proof
-        ),
-        await proof.securingWork() > .zero else {
+        ) else {
             return nil
         }
         guard let committedParent = await proof.committingParentBlock() else { return nil }
