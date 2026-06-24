@@ -72,9 +72,25 @@ LatticeNode node \
 
 **Always pass `--chain-path` with the child's full ancestral path** (`Nexus/toy`, or `Nexus/toy/toytoy` for a grandchild). It is optional, but omitting it is a trap: the node then advertises only its leaf directory (`["toy"]`) — it still runs and mines, but it no longer knows it descends from Nexus, and `/health` cannot report its true lineage. Worse, **a leaf-only node can be addressed *only* by its leaf**: `tx --chain-path toy` works, but `tx --chain-path Nexus/toy` is rejected as `Unknown chain path`, because relative to a node that thinks its root is `toy`, the path `Nexus/toy` reads as a non-existent descendant `toy/Nexus/toy`. Passing the full path makes both the leaf (`toy`) and absolute (`Nexus/toy`) forms resolve, and lets the parent route to it.
 
-> **Addressing a chain in `tx` / RPC.** `--chain-path` (and `?chainPath=`) is resolved **relative to the node's own chain path**: a path that shares the node's root is taken as absolute; a path that matches a trailing suffix of the node's path names the node's own chain; anything else is treated as a descendant and prepended. So on the **Nexus node**, address a child as `Nexus/<child>`; on a **child node that was given its full `--chain-path`**, either the full path or its own leaf works; on a **leaf-only child node**, use the leaf directory.
+> **Addressing a chain in `tx` / RPC.** `--chain-path` (and `?chainPath=`) is resolved **relative to the node's own chain path**: a path that shares the node's root is taken as absolute; a path that matches a trailing suffix of the node's path names the node's own chain; anything else is treated as a descendant and prepended. So on the **Nexus node**, address a child as `Nexus/<child>`; on a **child node given its full `--chain-path`**, the leaf resolves for *reads* (balance/nonce), but a **`tx` submit must use the full path** (`Nexus/toy`) — the transaction body's chain path is matched for exact equality against the node's. On a **leaf-only child node**, use the leaf directory.
 
 The legacy in-process model — one process hosting the whole tree — is retained only for tests and compatibility harnesses (constructed programmatically, not via a CLI flag). Production deployments use per-process chains so parent processes never own child fork-choice views.
+
+> **`--chain-path` is fixed at genesis — it cannot be changed later.** A chain is mined either as a root or as a parent-anchored child, decided by the `--chain-path` it is *first* spawned with. Spawn a child without `--chain-path` and its entire history is built as a root; re-spawning it later *with* a path makes its next block try to anchor to the parent's state, which the history never established, so consensus rejects it: `breaks parent state root continuity`. Always spawn children with their full `--chain-path` from the very first block.
+
+### Cross-Chain Swaps
+
+A chain and its **direct parent** can run a trustless atomic swap of their native coins — e.g. sell a child chain's coin for its parent chain's coin — via three actions exposed by `tx`:
+
+| Leg | Signer | Chain | `tx` flag |
+|-----|--------|-------|-----------|
+| Lock coin in escrow at a price | seller (`demander`) | child | `--deposit amountDeposited:amountDemanded:swapNonce` |
+| Pay the seller in parent coin | buyer (`withdrawer`) | parent | `--receipt sellerAddr:amountDemanded:swapNonce:childDirectory` |
+| Claim the escrowed child coin | buyer (`withdrawer`) | child | `--withdraw amountWithdrawn:sellerAddr:amountDemanded:swapNonce` |
+
+The `swapNonce` (a `UInt128`) ties the three legs together; the rate is free (`amountDeposited` need not equal `amountDemanded`). Atomicity is structural: the withdrawal validates only if **both** the deposit (child state) and the receipt (parent state) exist, so the buyer cannot take the child coin unless the parent-coin payment has settled. The seller is auto-credited the instant the receipt is mined — no separate claim is needed.
+
+**Both chains must be parent-anchored** (spawned with `--chain-path` from genesis, per the note above). Deposits and withdrawals are rejected on a root chain (`not allowed on the nexus chain`); receipts are accepted on any chain, including the root, since a receipt is just an ordinary debit of the buyer in favor of the seller.
 
 ## Recovery Procedures
 
@@ -171,6 +187,63 @@ node, waits for it to sync from the bootstrap seeds (`/api/chain/info` reports
 via its baked-in seeds (no `--peer` needed); the image needs only a CUDA-runtime
 base plus `libcurl4` and `libxml2` for the node. Booting the container then mines
 with zero manual setup.
+
+### Merge-Mining Child Chains
+
+One mining stack can advance the parent **and** its children at once. The
+coordinator fetches a *merged* template from the parent that embeds each child's
+candidate block, searches the **single easiest target** across the whole subtree,
+and the node grades every solution **per chain** — so a child block is accepted on
+its own proof-of-work the moment a nonce clears *that child's* target, with no
+requirement to also clear the (harder) parent target. **Each child advances at its
+own difficulty.**
+
+Two wiring steps beyond running the chains ([Child Chains](#child-chains)):
+
+1. **Register each child's RPC with the parent**, so a child block the parent
+   mines is delivered back to the process that owns that child:
+   ```bash
+   NEXUS_COOKIE=$(cat <nexus-data>/.cookie); TOY_COOKIE=$(cat <toy-data>/.cookie)
+   curl -s -X POST http://127.0.0.1:8080/api/chain/register-rpc \
+     -H "Authorization: Bearer $NEXUS_COOKIE" -H 'Content-Type: application/json' \
+     -d "{\"chainPath\":[\"Nexus\",\"toy\"],\"endpoint\":\"http://127.0.0.1:8087/api\",\"authToken\":\"$TOY_COOKIE\"}"
+   ```
+   Without it the parent can mine a valid child block but has nowhere to deliver
+   it.
+
+2. **Run the coordinator with one `--child-node` per child**, each with that
+   child's auth token (the parent fetches the child's candidate, an admin-gated
+   call):
+   ```bash
+   LatticeMiningCoordinatorTool \
+     --node http://127.0.0.1:8080/api --rpc-cookie-file <nexus-data>/.cookie \
+     --child-node http://127.0.0.1:8087/api --child-rpc-token "$TOY_COOKIE" \
+     --child-node http://127.0.0.1:8086/api --child-rpc-token "$(cat <etch-data>/.cookie)" \
+     --workers 1 --batch-size 100000
+   ```
+   (`--child-rpc-cookie-file <path>` reads the token from a file, re-read each
+   round, instead of a fixed `--child-rpc-token`.)
+
+> **URL forms differ between the two CLIs.** The coordinator's `--node` /
+> `--child-node` take the API base **with** `/api` (`http://host:8080/api`); the
+> `tx` CLI's `--rpc` takes the bare host **without** `/api` — it appends the path
+> itself. The wrong form surfaces as `node unreachable or unknown chain path`.
+
+> **Provision hashrate for the child's `targetBlockTime`.** A child mined far
+> faster than its target block time retargets *harder* each window; a burst of
+> cheap blocks (e.g. an easy genesis target cleared by a fast worker) can outrun
+> the retarget and push difficulty past what the available hardware can clear,
+> stalling the child (see [Chain Height Stalled](#symptom-chain-height-stalled)).
+> Size the worker to the child's intended block time from the first block.
+
+**Coinbase ≠ premine.** Give every mining node a dedicated `--coinbase-address`
+that is **not** the premine/treasury address. Block rewards credit the node's
+`--coinbase-address`; point it at the premine and mining income pools into the
+treasury, conflating spendable operating funds with the treasury irreversibly.
+Generate an operating account up front and pass it to every node:
+```bash
+LatticeNode keys generate --output coinbase.json   # then --coinbase-address <its address>
+```
 
 ### Full Wipe and Resync
 
