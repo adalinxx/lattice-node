@@ -539,6 +539,31 @@ extension RPCRoutes {
             do {
                 _ = try await supervisor.spawn(spec.launch(nodeExecutable: ChildProcessSupervisor.selfExecutableURL()))
                 log.info("deployChain: supervised spawn of '\(dir)' (p2p \(childPort), rpc \(childRPCPort))")
+                // Register the child's RPC with this parent so merged-mined child
+                // blocks get forwarded to it (forwardMinedChildBlockIfRegistered).
+                // Without registration the child's store never receives its own
+                // blocks, so nothing holds the chain and its headers-first sync
+                // fails ("child sync requires a source peer"). The child writes its
+                // admin cookie when its RPC comes up, so read it (briefly polling)
+                // then register endpoint + token. Endpoint includes "/api" because
+                // the mined-block forwarder appends "/chain/..." to it.
+                let regChainPath = childChainPath
+                let regEndpoint = "http://127.0.0.1:\(childRPCPort)/api"
+                let regCookiePath = URL(fileURLWithPath: childDataDir).appendingPathComponent(".cookie")
+                let regDir = dir
+                Task {
+                    let regLog = NodeLogger("supervisor")
+                    for _ in 0..<120 {  // up to ~30s for the child RPC to come up + write its cookie
+                        if let token = try? String(contentsOf: regCookiePath, encoding: .utf8)
+                            .trimmingCharacters(in: .whitespacesAndNewlines), !token.isEmpty {
+                            await node.registerRPCEndpoint(chainPath: regChainPath, endpoint: regEndpoint, authToken: token)
+                            regLog.info("registered supervised child '\(regDir)' RPC \(regEndpoint) for mined-block delivery")
+                            return
+                        }
+                        try? await Task.sleep(nanoseconds: 250_000_000)
+                    }
+                    regLog.error("could not register supervised child '\(regDir)' RPC — cookie never appeared; its mined blocks won't be forwarded")
+                }
             } catch {
                 log.error("deployChain: supervised spawn of '\(dir)' failed: \(error)")
             }
