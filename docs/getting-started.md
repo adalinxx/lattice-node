@@ -112,6 +112,26 @@ lattice-node keys generate --output my-key.json
 lattice-node keys address <public-key-hex>
 ```
 
+### Send Funds & Transact
+
+These talk to a running node's RPC — point `--rpc` at any node serving the API.
+
+```bash
+# Simple transfer. --fee defaults to 1; --chain-path defaults to Nexus.
+lattice-node send <recipient-address> 1000 --key my-key.json --rpc http://localhost:8080
+
+# The general tx builder: a transfer with an auto-computed fee (clears the per-byte floor)...
+lattice-node tx --key my-key.json --to <recipient-address> --amount 1000 --rpc http://localhost:8080
+
+# ...or a key/value write on a chain that allows it (repeat --set for multiple keys):
+lattice-node tx --key my-key.json --set greeting=hello --rpc http://localhost:8080
+```
+
+`send`/`tx` fetch the signer's nonce and balance, sign locally with the key file, and
+submit through `/api/transaction`. The transaction is mined by whichever miner includes
+it; balances update once a block carries it (`lattice-node query balance` or
+`curl /api/balance/<addr>` to confirm).
+
 ### Local Development Network
 
 ```bash
@@ -134,7 +154,30 @@ lattice-node cluster --nodes 3 --mine Nexus --base-port 4001
 
 ### Deploy & Announce a Child Chain
 
-Deploying a child is two steps — **seed it**, then **announce it** so other nodes discover it.
+Deploying a child is two steps — **seed it**, then **announce it** so other nodes
+discover it. The `chain deploy` command does both in one signed call and prints the
+command to start the child process:
+
+```bash
+# Seeds the child genesis, submits the genesisAction announce tx (signed by --key),
+# and prints the `lattice-node node ...` start command. --key must be a FUNDED key.
+# Add --wait to poll until the announce tx is mined.
+lattice-node chain deploy \
+  --rpc http://localhost:8080 --cookie-file ~/.lattice/.cookie --key my-key.json \
+  --directory Etch --parent-directory Nexus \
+  --target-block-time 3600000 --initial-reward 1048576
+
+# Then fetch a child's staged genesis, or register/unregister a running child's RPC
+# endpoint with the parent (privileged):
+lattice-node chain genesis --rpc http://localhost:8080 --chain-path Nexus/Etch
+lattice-node chain attach  --rpc http://localhost:8080 --cookie-file ~/.lattice/.cookie \
+  --chain-path Nexus/Etch --child-rpc http://localhost:8081 --child-cookie-file ./etch-data/.cookie
+lattice-node chain detach  --rpc http://localhost:8080 --cookie-file ~/.lattice/.cookie \
+  --chain-path Nexus/Etch
+```
+
+<details>
+<summary>Equivalent raw RPC (what <code>chain deploy</code> does under the hood)</summary>
 
 ```bash
 # 1. Deploy (privileged) — seeds the child locally, returns its genesis.
@@ -171,10 +214,86 @@ lattice-node node --genesis-hex "<genesisHex>" --chain-directory Etch \
   --port 4002 --rpc-port 8081 --data-dir ./etch-data
 ```
 
+</details>
+
 The announcement is an ordinary mempool transaction, so it gossips and **any** miner can
 include it — the child becomes discoverable even if your node never wins a block. Until a
 block carries the genesis action, the child exists only locally. See
 [Protocol §2.6](./protocol.md) for the creation/discovery model.
+
+### Join & Merge-Mine an Existing Child Chain
+
+To run and merge-mine a child that **already exists** (deployed by someone else, announced
+on-chain) — say `Nexus/toy` — you don't redeploy it. Lattice is process-per-chain: you run
+a separate node process for `toy` that extracts toy's blocks from your Nexus node's gossip
+and verifies them itself (it doesn't trust the parent), then point one mining coordinator
+at both chains. There is no "subscribe" verb — joining *is* running that process.
+
+Because you didn't deploy `toy`, the one thing you must obtain is its **genesis bytes** (a
+child process can't boot without them).
+
+```bash
+# 1. Fetch toy's genesis from any node that already tracks it (the deployer, a seed, or
+#    your own node if you deployed it) -> { genesisHex, genesisHash, chainP2PAddress }.
+lattice-node chain genesis --rpc http://<node-with-toy>:8080 --chain-path Nexus/toy
+
+#    Your Nexus node's P2P address (the --subscribe-p2p value below) is its p2pAddress:
+curl http://localhost:8080/api/chain/info
+
+# 2. Run the toy process, subscribed to your Nexus. --subscribe-p2p makes it extract toy's
+#    blocks from Nexus gossip and sync to the current tip; --peer (another toy node) is
+#    optional and only speeds historical backfill.
+lattice-node \
+  --genesis-hex <toyGenesisHex> \
+  --chain-directory toy --chain-path Nexus/toy \
+  --subscribe-p2p <nexusPubKey@host:port> \
+  --peer <anotherToyNode@host:port> \
+  --port 4002 --rpc-port 8081 --data-dir ./toy-data
+
+# 3. Merge-mine Nexus + toy with ONE coordinator. The Nexus node builds the merged block
+#    template (Nexus block + toy candidate, via state access); the coordinator only does
+#    PoW + submit-work. One solution advances BOTH chains. Repeat --child-node per child.
+LatticeMiningCoordinatorTool \
+  --node       http://localhost:8080/api --rpc-cookie-file       ~/.lattice/.cookie \
+  --child-node http://localhost:8081/api --child-rpc-cookie-file ./toy-data/.cookie \
+  --worker-executable .build/debug/LatticeMiner --workers 2
+```
+
+`/api/chain/genesis` serves the genesis from a tracking node's deployed-children records,
+or transparently proxies to toy's registered RPC endpoint. Merged mining is opt-in — you
+choose which existing children to carry, and a child out-running its own hashrate is the
+operator's choice, not a consensus gap. See
+[Mining role boundaries](./design/mining-role-boundaries.md) for the node/coordinator/worker
+split and [operations.md](./operations.md) for the full mining stack (incl. GPU workers).
+
+### Cross-Chain Swaps
+
+Atomically trade child-coin for parent-coin with no trusted intermediary. The flow is
+deposit → receipt → withdrawal: the **seller** escrows child-coin, the **buyer** pays the
+seller on the parent (minting a receipt), then the buyer withdraws the escrow on the child
+by proving that receipt. The CLI drives all three legs.
+
+```bash
+# 1. Seller escrows child-coin and demands parent-coin in return. Prints the swap-id.
+lattice-node swap sell --rpc http://localhost:8081 --key seller-key.json \
+  --deposit 1000 --demand 100
+# -> swap-id: Etch:<nonce>:<seller>:100:1000
+
+# 2. Buyer pays the seller on the PARENT, waits for the receipt to be visible to the
+#    child, then withdraws the escrow on the child — all from the one swap-id.
+#    The payment is irreversible: --yes skips the confirmation prompt.
+lattice-node swap buy --child-rpc http://localhost:8081 --rpc http://localhost:8080 \
+  --key buyer-key.json --swap-id "Etch:<nonce>:<seller>:100:1000" --yes
+
+# 3. Inspect a swap's progress at any time (deposit / receipt / withdrawal legs).
+lattice-node swap status --child-rpc http://localhost:8081 --rpc http://localhost:8080 \
+  --swap-id "Etch:<nonce>:<seller>:100:1000"
+```
+
+`swap buy` sizes the child withdrawal fee from the child's fee policy automatically; pass
+`--withdrawal-fee-rate` only to override it (it must stay at or above the child's
+`--min-fee-rate`, or the withdrawal is rejected *after* the irreversible payment). See
+[Protocol](./protocol.md) for the deposit/receipt/withdrawal model.
 
 ### Query the Chain
 
@@ -187,6 +306,19 @@ curl http://localhost:8080/api/chain/info
 # Account balance
 curl http://localhost:8080/api/balance/<address>
 ```
+
+You can also read **persisted state directly off disk** — no running node — with the
+offline subcommands (point `--storage-path` at the node's `--data-dir`):
+
+```bash
+lattice-node status --storage-path ~/.lattice --directory Nexus   # tip, height, block counts
+lattice-node query height --storage-path ~/.lattice               # just the height
+lattice-node query tip    --storage-path ~/.lattice               # the tip CID
+lattice-node identity --data-dir ~/.lattice --public-key-only      # the node's identity key
+```
+
+(`query balance` is intentionally a no-op offline — it points you at a running node's
+`/api/balance/<address>`, since balances need resolved state.)
 
 Other real endpoints include `/api/proof`, `/api/deposit` / `/api/deposits`,
 and `/api/chain/deploy`. There is no order book / DEX API. See
@@ -219,4 +351,4 @@ operational tuning are documented in [operations.md](./operations.md).
 - [design/mining-role-boundaries.md](./design/mining-role-boundaries.md) — node/coordinator/worker mining contract
 - [operations.md](./operations.md) — running, monitoring, and tuning a node
 - [development.md](./development.md) — building and contributing
-- [deploy/README.md](../deploy/README.md) — production deployment
+- [Deployment](../README.md#deployment) — production deployment, including cloud/NAT nodes

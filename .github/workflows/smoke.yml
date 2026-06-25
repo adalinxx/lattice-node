@@ -31,6 +31,9 @@ jobs:
           - name: swap
             workers: 2
             tags: swap
+          - name: cli
+            workers: 2
+            tags: cli
           - name: safety-a
             workers: 2
             tags: safety-a

@@ -116,6 +116,9 @@ const TESTS = [
     { name: 'receipt-derived-transfer', file: 'scenarios/swap/receipt-derived-transfer.mjs', timeoutMs: 10 * 60_000 },
     { name: 'grandchild-swap',       file: 'scenarios/swap/grandchild-swap.mjs',          timeoutMs: 480_000 },
   ]),
+  ...group('cli', [
+    { name: 'operator-journey',      file: 'scenarios/cli/operator-journey.mjs',          timeoutMs: 10 * 60_000 },
+  ]),
   ...group('safety-a', [
     { name: 'tx-throughput',         file: 'scenarios/safety/tx-throughput.mjs',          timeoutMs: 360_000 },
     { name: 'wallet-under-attack',   file: 'scenarios/safety/wallet-under-attack.mjs',    timeoutMs: 240_000 },

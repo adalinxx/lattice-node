@@ -22,8 +22,8 @@ swift run LatticeNode --rpc-port 8080  # a node (does not mine in-process)
 swift run LatticeMiningCoordinatorTool --node http://127.0.0.1:8080/api --rpc-cookie-file .lattice/.cookie
 ```
 
-See [getting-started.md](getting-started.md) for first-run details and
-[../deploy/README.md](../deploy/README.md) for multi-node and per-process child chains.
+See [getting-started.md](getting-started.md) for first-run details and child chains,
+and [Deployment](../README.md#deployment) for multi-node and cloud/NAT setups.
 Mining code should follow the E15 [Mining role boundaries](design/mining-role-boundaries.md):
 `LatticeNode` owns chain state, sealing, validation, persistence, and gossip;
 `MiningCoordinator` owns work lifecycle and range fan-out; `LatticeMiner`
