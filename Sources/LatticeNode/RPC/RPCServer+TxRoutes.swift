@@ -57,13 +57,20 @@ extension RPCRoutes {
             return jsonError("Transaction body not found. Provide bodyData or ensure bodyCID is in the CAS.")
         }
         let tx = Transaction(signatures: sub.signatures, body: try HeaderImpl<TransactionBody>(node: body))
+        // Contract 1 (transaction-ID): the CANONICAL txCID is the VolumeImpl<Transaction>
+        // CID — the exact key blocks use when wrapping txs (BlockBuilder) and the key
+        // receipts/tx-history are indexed under (BlockSideEffects). Return it as `txCID`
+        // so /api/receipt/{txCID} lookups resolve; expose `bodyCID` separately for the
+        // mempool dedup identity. (Map-key order is canonical via cashew's length-first
+        // sort, so this CID is deterministic across nodes for multi-signer txs.)
+        let canonicalTxCID = (try? VolumeImpl<Transaction>(node: tx).rawCID) ?? sub.bodyCID
         let result = await node.submitTransactionWithReason(chainPath: chainPath, transaction: tx)
-        struct R: Encodable { let accepted: Bool; let txCID: String; let error: String? }
+        struct R: Encodable { let accepted: Bool; let txCID: String; let bodyCID: String; let error: String? }
         switch result {
-        case .success: return json(R(accepted: true, txCID: sub.bodyCID, error: nil))
+        case .success: return json(R(accepted: true, txCID: canonicalTxCID, bodyCID: sub.bodyCID, error: nil))
         case .failure(let r):
-            log.info("Transaction rejected (\(sub.bodyCID)): \(r)")
-            return json(R(accepted: false, txCID: sub.bodyCID, error: r), status: .badRequest)
+            log.info("Transaction rejected (body \(sub.bodyCID)): \(r)")
+            return json(R(accepted: false, txCID: canonicalTxCID, bodyCID: sub.bodyCID, error: r), status: .badRequest)
         }
     }
 

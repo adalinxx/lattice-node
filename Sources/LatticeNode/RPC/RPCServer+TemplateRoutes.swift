@@ -488,6 +488,18 @@ extension RPCRoutes {
             guard childURLs.allSatisfy(validLoopbackHTTPBaseURL) else {
                 return jsonError("Invalid childNodes: expected loopback http(s) base URLs", status: .badRequest)
             }
+            // Normalize to API-base so topology/candidate calls reach /api/chain/...
+            let childURLs = childURLs.map { $0.hasSuffix("/api") ? $0 : $0 + "/api" }
+            // Auth map keys must match the normalized URLs (bearerToken uses exact/path-aware match).
+            // Use a loop to avoid crashing when a caller sends both bare and /api forms of the same key.
+            let childNodeAuth: [String: String]? = body.childNodeAuth.map { dict in
+                var result: [String: String] = [:]
+                for (k, v) in dict {
+                    let bare = k.hasSuffix("/") ? String(k.dropLast()) : k
+                    result[bare.hasSuffix("/api") ? bare : bare + "/api"] = v
+                }
+                return result
+            }
             let session = childFanoutSession()
             defer { session.invalidateAndCancel() }
 
@@ -557,7 +569,7 @@ extension RPCRoutes {
                 parentCarrierHex: thisParentCarrierHex,
                 parentHomesteadVolume: parentHomesteadVolume,
                 timestampMs: templateTimestampMs,
-                childNodeAuth: body.childNodeAuth,
+                childNodeAuth: childNodeAuth,
                 session: session
             )
             children = fanout.children
@@ -1003,6 +1015,18 @@ extension RPCRoutes {
             guard gcURLs.allSatisfy(validLoopbackHTTPBaseURL) else {
                 return jsonError("Invalid childNodes: expected loopback http(s) base URLs", status: .badRequest)
             }
+            // Normalize to API-base so topology/candidate calls reach /api/chain/...
+            let gcURLs = gcURLs.map { $0.hasSuffix("/api") ? $0 : $0 + "/api" }
+            // Auth map keys must match the normalized URLs (bearerToken uses exact/path-aware match).
+            // Use a loop to avoid crashing when a caller sends both bare and /api forms of the same key.
+            let gcAuth: [String: String]? = candidateBody?.childNodeAuth.map { dict in
+                var result: [String: String] = [:]
+                for (k, v) in dict {
+                    let bare = k.hasSuffix("/") ? String(k.dropLast()) : k
+                    result[bare.hasSuffix("/api") ? bare : bare + "/api"] = v
+                }
+                return result
+            }
             let provisionalParentCarrier: Block
             do {
                 let assembled = try await TemplateAssembly.buildWithFallback(
@@ -1058,7 +1082,7 @@ extension RPCRoutes {
                 parentCarrierHex: thisParentCarrierHex,
                 parentHomesteadVolume: parentHomesteadVolume,
                 timestampMs: candidateTimestampMs,
-                childNodeAuth: candidateBody?.childNodeAuth,
+                childNodeAuth: gcAuth,
                 session: session
             )
             grandchildren = fanout.children

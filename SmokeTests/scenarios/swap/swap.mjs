@@ -61,19 +61,18 @@ const childNode = await nexusNode.spawnChild({
 })
 net.add(childNode)
 
-// Internal miner for Nexus (earns coinbase on Nexus); LatticeMiner for child chain advancement.
-await nexusNode.startMining(nexusDir)
-await waitFor(async () => (await nexusNode.height(nexusDir)) >= 5,
-  'nexus height 5 (coinbase earned)', { timeoutMs: WARMUP_WAIT_MS, intervalMs: 500 })
-await nexusNode.stopMining(nexusDir)
-
-// Switch to LatticeMiner for merged mining (advances both Nexus + FastTest).
+// One merged-mining coordinator advances BOTH Nexus and FastTest — including
+// state-access txs like receipts. The node builds each template with full state
+// access; the coordinator only does PoW. (No separate Nexus-only miner: merged
+// mining confirms parent state txs directly — see scenarios/swap/swap-cli.mjs.)
 const miner = new LatticeMiner(nexusNode, [childNode])
 net.addMiner(miner)
 await miner.start()
 
+// 10 blocks from genesis under one miner (~30s/block) needs more than a single
+// WARMUP window; the original split this across two miners. Give it room.
 await waitFor(async () => (await nexusNode.height(nexusDir)) >= 10,
-  'nexus height 10', { timeoutMs: WARMUP_WAIT_MS, intervalMs: 500 })
+  'nexus height 10 (merged miner advancing both chains)', { timeoutMs: 2 * WARMUP_WAIT_MS, intervalMs: 500 })
 console.log(`${CHILD} deployed and mining`)
 
 const funderNexusBal = await nexusNode.balance(funder.address, nexusDir)
@@ -147,14 +146,12 @@ async function stageFund(chain) {
 console.log(`staging fund txs (${fundAmount} on each chain)...`)
 await stageFund(nexusDir)
 await stageFund(CHILD)
-// Internal Nexus miner handles Nexus fund tx (needs full state access).
-// LatticeMiner then mines the child chain fund tx via child's /api/chain/candidate.
-console.log(`resuming mining (Nexus: internal miner, ${CHILD}: LatticeMiner)`)
-await nexusNode.startMining(nexusDir)
+// The merged miner confirms BOTH the Nexus fund tx (parent state-access) and the
+// child fund tx (via the child candidate) — one coordinator, both chains.
+console.log(`resuming merged mining to confirm fund txs`)
+await miner.start()
 await waitFor(async () => (await nexusNode.balance(user.address, nexusDir)) >= fundAmount,
   'user Nexus balance funded', { timeoutMs: MINING_WAIT_MS, intervalMs: 1_000 })
-await nexusNode.stopMining(nexusDir)
-await miner.start()  // LatticeMiner handles child fund tx via candidate
 
 console.log(`waiting for child fund inclusion...`)
 await waitFor(async () => (await childNode.balance(user.address, CHILD)) >= fundAmount,
@@ -175,16 +172,15 @@ const nexusBal0 = await nexusNode.balance(user.address, nexusDir)
 const childBal0 = await childNode.balance(user.address, CHILD)
 console.log(`user balances  Nexus=${nexusBal0}  ${CHILD}=${childBal0}`)
 
-// Helper: mine a Nexus tx using internal miner (LatticeMiner can't process Nexus
-// txs that need state trie access). LatticeMiner continues for child chain advancement.
+// Confirm a Nexus state tx under the merged miner. Stop-for-stable-tip keeps the
+// pre-submit balance deterministic; the merged miner then confirms the tx (the node
+// builds the template with full state access) while advancing the child too.
 async function mineNexusTx(submitFn, confirmFn, desc) {
   await miner.stop()
   await awaitStableChains(`before ${desc}`)
-  await nexusNode.startMining(nexusDir)
   await submitFn()
-  await waitFor(confirmFn, desc, { timeoutMs: MINING_WAIT_MS, intervalMs: 1_000 })
-  await nexusNode.stopMining(nexusDir)
   await miner.start()
+  await waitFor(confirmFn, desc, { timeoutMs: MINING_WAIT_MS, intervalMs: 1_000 })
 }
 
 const swapNonceHex = Date.now().toString(16).padStart(32, '0').slice(-32)
@@ -216,7 +212,7 @@ const depState = await waitFor(async () => {
 }, 'deposit state visible', { timeoutMs: MINING_WAIT_MS, intervalMs: 1_000 })
 console.log(`  ✓ deposit in state: amountDeposited=${depState.amountDeposited}`)
 
-// [2/3] Receipt on parent — uses internal miner (Nexus tx needs state trie access).
+// [2/3] Receipt on parent — confirmed by the merged miner (parent state-access tx).
 console.log(`\n[2/3] Receipt on ${nexusDir}`)
 let recNonce
 await mineNexusTx(

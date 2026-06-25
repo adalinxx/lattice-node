@@ -635,6 +635,14 @@ struct NodeCommand: AsyncParsableCommand {
         // via buildGenesis + storeBlockRecursively. No external bootstrap pinning needed.
         try await node.start()
 
+        // Item 2: start the continuous supervised-child reconcile loop. It drives every
+        // non-detached deployed child to REGISTERED — adopting a child still alive after
+        // a parent crash, recovering a dead one, and force-restarting a wedged one past
+        // the health grace — re-evaluating each interval rather than once at startup.
+        if superviseChildren, !effectiveDiscoveryOnly {
+            await node.startSupervisedReconcileLoop()
+        }
+
         if !effectiveDiscoveryOnly {
             let mempoolLoader = MempoolPersistence(dataDir: dataDirURL)
             let savedTxs = mempoolLoader.load()

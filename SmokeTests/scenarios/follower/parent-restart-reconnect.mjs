@@ -178,6 +178,8 @@ await waitRPC(swapPorts.rpcPort, 'SwapTest')
 await waitFor(() => logCount(`${ROOT}/SwapTest.log`, 'connected to parent peer') >= 1 ? true : null,
   'SwapTest parent subscription connected', { timeoutMs: 30_000, intervalMs: 300 })
 const swapEndpoint = `http://127.0.0.1:${swapPorts.rpcPort}`
+// Registered endpoints are stored in API-base form (trailing /api); normalize before compare.
+const normEndpoint = (u) => (u ?? '').replace(/\/api\/?$/, '')
 const swapAuthToken = readFileSync(`${ROOT}/SwapTest/.cookie`, 'utf8').trim()
 const registerSwap = await rpc(nexusPorts.rpcPort, 'POST', '/api/chain/register-rpc', {
   chainPath: [nexusDir, 'SwapTest'],
@@ -187,7 +189,7 @@ const registerSwap = await rpc(nexusPorts.rpcPort, 'POST', '/api/chain/register-
 if (!registerSwap.ok) throw new Error(`register SwapTest RPC failed: ${JSON.stringify(registerSwap.json)}`)
 await waitFor(async () => {
   const r = await rpc(nexusPorts.rpcPort, 'GET', '/api/chain/map')
-  return r.ok && r.json?.[swapPath] === swapEndpoint ? r.json : null
+  return r.ok && normEndpoint(r.json?.[swapPath]) === normEndpoint(swapEndpoint) ? r.json : null
 }, 'Nexus chain/map registered SwapTest route', { timeoutMs: 30_000, intervalMs: 500 })
 await sleep(3000)
 console.log('  SwapTest up')
@@ -237,7 +239,7 @@ console.log('  Nexus restarted')
 
 await waitFor(async () => {
   const r = await rpc(nexusPorts.rpcPort, 'GET', '/api/chain/map')
-  return r.ok && r.json?.[swapPath] === swapEndpoint ? r.json : null
+  return r.ok && normEndpoint(r.json?.[swapPath]) === normEndpoint(swapEndpoint) ? r.json : null
 }, 'Nexus chain/map restored SwapTest route after restart', { timeoutMs: 30_000, intervalMs: 500 })
 console.log(`  Nexus chain/map restored ${swapPath} -> ${swapEndpoint}`)
 

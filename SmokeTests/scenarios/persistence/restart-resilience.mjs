@@ -182,13 +182,14 @@ async function fundAccount(addr, fundAmount, {
   }
 }
 
+// Confirm a Nexus state tx under the merged miner. Stop-for-stable-tip keeps the
+// pre-submit state deterministic; the merged miner (node builds the template with
+// full state access) then confirms the tx while advancing the child too.
 async function mineNexusTx(submitFn, confirmFn, desc) {
   await miner.stop()
-  await nexusNode.startMining(nexusDir)
   await submitFn()
-  await waitFor(confirmFn, desc, { timeoutMs: MINING_WAIT_MS, intervalMs: 1_000 })
-  await nexusNode.stopMining(nexusDir)
   await restartMiner()
+  await waitFor(confirmFn, desc, { timeoutMs: MINING_WAIT_MS, intervalMs: 1_000 })
 }
 
 async function fetchDeposit(user, amountDemanded, swapNonceHex, expectedKey = null) {

@@ -356,6 +356,10 @@ public actor LatticeNode: ChainNetworkDelegate {
     private var evictionTask: Task<Void, Never>?
     private var storageMaintenanceTask: Task<Void, Never>?
     private var unhealthyRecoveryTask: Task<Void, Never>?
+    // Item 2 (supervisor reconciler): the continuous reconcile loop and per-child
+    // health-grace tracking (first time a tracked-but-RPC-dead child was seen wedged).
+    var supervisedReconcileTask: Task<Void, Never>?
+    var supervisedRPCDownSince: [String: Date] = [:]
     public var feeEstimators: [String: FeeEstimator]
     public let subscriptions: SubscriptionManager
     public let anchorPeers: AnchorPeers
@@ -393,6 +397,41 @@ public actor LatticeNode: ChainNetworkDelegate {
         public let genesisHash: String
         public let genesisHex: String
         public let timestamp: Int64
+        // Contract 4 (supervised lifecycle): set when the operator explicitly detaches
+        // this child via unregister-rpc. A detached child is never auto-respawned on
+        // restart or by idempotent deploy; re-deploying the same path clears it.
+        public var detached: Bool
+
+        public init(chainPath: [String], directory: String, parentDirectory: String,
+                    genesisHash: String, genesisHex: String, timestamp: Int64,
+                    detached: Bool = false) {
+            self.chainPath = chainPath
+            self.directory = directory
+            self.parentDirectory = parentDirectory
+            self.genesisHash = genesisHash
+            self.genesisHex = genesisHex
+            self.timestamp = timestamp
+            self.detached = detached
+        }
+
+        // Persisted files are protocol formats, not internal structs: decode tolerantly.
+        // A NEW field (here `detached`) must default when absent so metadata written by
+        // an older schema still decodes — Swift's synthesized Codable does NOT apply
+        // stored-property defaults to missing non-optional keys (it throws keyNotFound),
+        // which would otherwise silently wipe a parent's deployed-child set on upgrade.
+        enum CodingKeys: String, CodingKey {
+            case chainPath, directory, parentDirectory, genesisHash, genesisHex, timestamp, detached
+        }
+        public init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            chainPath = try c.decode([String].self, forKey: .chainPath)
+            directory = try c.decode(String.self, forKey: .directory)
+            parentDirectory = try c.decode(String.self, forKey: .parentDirectory)
+            genesisHash = try c.decode(String.self, forKey: .genesisHash)
+            genesisHex = try c.decode(String.self, forKey: .genesisHex)
+            timestamp = try c.decode(Int64.self, forKey: .timestamp)
+            detached = try c.decodeIfPresent(Bool.self, forKey: .detached) ?? false
+        }
     }
     var deployedChildChains: [String: DeployedChainMetadata]
     var registeredRPCEndpoints: [String: String]
@@ -404,6 +443,13 @@ public actor LatticeNode: ChainNetworkDelegate {
         if let token = authToken?.trimmingCharacters(in: .whitespacesAndNewlines), !token.isEmpty {
             registeredRPCAuthTokens[key] = token
         }
+        persistRegisteredRPCRegistrations()
+    }
+
+    public func unregisterRPCEndpoint(chainPath: [String]) {
+        let key = chainKey(forPath: chainPath)
+        registeredRPCEndpoints.removeValue(forKey: key)
+        registeredRPCAuthTokens.removeValue(forKey: key)
         persistRegisteredRPCRegistrations()
     }
 
@@ -1042,6 +1088,12 @@ public actor LatticeNode: ChainNetworkDelegate {
     }
 
     public func stop() async {
+        // Stop the reconcile loop before quiescing so it can't respawn a child we
+        // are about to tear down.
+        supervisedReconcileTask?.cancel()
+        let reconcileTask = supervisedReconcileTask
+        supervisedReconcileTask = nil
+        await reconcileTask?.value
         // Quiesce the supervised subtree first: each child's own SIGTERM path
         // quiesces ITS children in turn, so stopping the root stops the tree.
         if let childSupervisor { await childSupervisor.quiesce() }

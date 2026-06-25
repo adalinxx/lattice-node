@@ -36,15 +36,13 @@ net.add(childNode)
 const minerAddr = childNode._keypair.address
 const minerKP = { privateKey: childNode._identity.privateKey, publicKey: childNode._identity.publicKey }
 
-// Mine Nexus solo first so the child syncs the parent chain from genesis; then
-// merge-mine so the child advances via extracted candidates.
-await node.startMining(nexusDir)
-await node.waitForHeight(5, nexusDir, { timeoutMs: 180_000 })
-await node.stopMining(nexusDir)
-
+// One merged miner advances both chains from genesis; the child syncs the parent and
+// advances via extracted candidates. (No separate Nexus-only warm-up: the node builds
+// each template with full state access.)
 const miner = new LatticeMiner(node, [childNode])
 await miner.start()
 net.addMiner(miner)
+await node.waitForHeight(5, nexusDir, { timeoutMs: 2 * 180_000 })
 await childNode.waitForHeight(5, CHILD, { timeoutMs: 180_000 })
 await miner.stop()
 await childNode.awaitQuiesced(CHILD)

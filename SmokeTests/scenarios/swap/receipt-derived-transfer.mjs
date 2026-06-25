@@ -119,11 +119,12 @@ async function fundChild(address, amount) {
 }
 
 console.log('\n[1] Mine initial funds and fund the role accounts...')
-await nexusNode.startMining(nexusDir)
-await waitFor(async () => (await nexusNode.height(nexusDir)) >= 5,
-  'nexus height 5', { timeoutMs: 180_000, intervalMs: 500 })
-await nexusNode.stopMining(nexusDir)
-await nexusNode.awaitQuiesced(nexusDir)
+// One merged miner advances BOTH chains and confirms the Nexus role-funding txs
+// (the node builds the template with full state access). The funder is the coinbase
+// recipient, so let it accrue Nexus coinbase before it can fund the roles.
+await miner.start()
+await waitFor(async () => (await nexusNode.balance(funder.address, nexusDir)) >= FUND * 2 + 10,
+  'funder nexus coinbase', { timeoutMs: 2 * 180_000, intervalMs: 500 })
 
 async function nexusRolesFunded() {
   const [w, d] = await Promise.all([
@@ -137,19 +138,22 @@ let fundedRoles = null
 for (let attempt = 1; attempt <= 3 && !fundedRoles; attempt++) {
   await fundNexusRoles(FUND)
   try {
-    await nexusNode.mineUntil(nexusRolesFunded, nexusDir, {
+    await miner.mineUntil(nexusRolesFunded, {
       desc: `nexus role accounts funded (attempt ${attempt})`,
-      timeoutMs: 180_000,
+      timeoutMs: 2 * 180_000,
       intervalMs: 500,
       progress: async () => String(await nexusNode.height(nexusDir)),
     })
   } catch (err) {
     if (attempt === 3) throw err
   }
-  await nexusNode.stopMining(nexusDir)
+  await miner.stop()
   await nexusNode.awaitQuiesced(nexusDir)
   fundedRoles = await nexusRolesFunded()
-  if (!fundedRoles) console.log(`  Nexus role funding reorged out; restaging (attempt ${attempt})`)
+  if (!fundedRoles) {
+    console.log(`  Nexus role funding reorged out; restaging (attempt ${attempt})`)
+    await miner.start()
+  }
 }
 if (!fundedRoles) throw new Error('nexus role accounts funding did not remain canonical')
 
@@ -242,12 +246,12 @@ if (!receipt.ok) {
   process.exit(1)
 }
 
-await nexusNode.startMining(nexusDir)
+await miner.start()  // merged miner confirms the receipt (parent state-access tx)
 await waitFor(async () => {
   const r = await nexusNode.getReceipt(demander.address, AMOUNT, swapNonce, CHILD)
   return r.exists ? r : null
-}, 'receipt visible on Nexus', { timeoutMs: 120_000, intervalMs: 500 })
-await nexusNode.stopMining(nexusDir)
+}, 'receipt visible on Nexus', { timeoutMs: 2 * 120_000, intervalMs: 500 })
+await miner.stop()
 await nexusNode.awaitQuiesced(nexusDir)
 
 const nexusWithdrawerAfter = await nexusNode.balance(withdrawer.address, nexusDir)

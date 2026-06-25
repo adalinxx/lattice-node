@@ -87,7 +87,7 @@ final class ChildNodeURLValidationTests: XCTestCase {
         let proxyRouter = Router()
         proxyRouter.get("api/chain/info") { request, _ in
             await RPCRoutes.proxyRegisteredRPC(
-                endpoint: "http://127.0.0.1:\(targetPort)",
+                endpoint: "http://127.0.0.1:\(targetPort)/api",
                 request: request,
                 authToken: "child-token"
             )

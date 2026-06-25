@@ -8,6 +8,10 @@ public struct RegisterChainRPCRequestBody: Decodable, Equatable {
     public let authToken: String?
 }
 
+public struct UnregisterChainRPCRequestBody: Decodable, Equatable {
+    public let chainPath: [String]
+}
+
 public struct ChainTemplateRequestBody: Decodable, Equatable {
     public let chain: String?
     public let chainPath: [String]?
@@ -132,6 +136,11 @@ public enum RPCRequestBodyCodecs {
     public static func decodeRegisterChainRPC(_ data: Data) -> RegisterChainRPCRequestBody? {
         guard data.count <= 4_096 else { return nil }
         return try? decoder.decode(RegisterChainRPCRequestBody.self, from: data)
+    }
+
+    public static func decodeUnregisterChainRPC(_ data: Data) -> UnregisterChainRPCRequestBody? {
+        guard data.count <= 4_096 else { return nil }
+        return try? decoder.decode(UnregisterChainRPCRequestBody.self, from: data)
     }
 
     public static func decodeChainTemplate(_ data: Data) -> ChainTemplateRequestBody? {

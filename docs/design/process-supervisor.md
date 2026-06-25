@@ -92,6 +92,35 @@ This handles the child-death case; the parent-death case (child
 re-attach after the *parent* restarts) already works via `--subscribe-p2p`
 reconnect and is exercised by the `parent-restart-reconnect` scenario.
 
+### Reconcile on restart (deployed-child lifecycle)
+
+Deployed children are persisted metadata, not just live processes. On startup a
+supervising parent **reconciles** every non-detached deployed child rather than
+blindly respawning, because a parent that crashed/was `SIGKILL`ed cannot have
+quiesced its children — one may still be alive holding its deterministic ports.
+Each child is brought to one of:
+
+- **DEPLOYED** — staged genesis recorded.
+- **RUNNING** — process alive (probe answers HTTP on its RPC port).
+- **REGISTERED** — RUNNING and an authenticated `GET /api/chain/auth-check` against
+  it returns 200, so the parent has re-registered its live RPC endpoint + cookie
+  for mined-block delivery.
+- **DETACHED** — the operator ran `unregister-rpc`; persisted as `detached`. Never
+  auto-respawned. Re-deploying the same chain path clears the flag (reattach).
+
+The reconcile probe distinguishes three cases against the persisted endpoint:
+
+| Probe result | Meaning | Action |
+|---|---|---|
+| 200 | alive, token valid | **adopt** — re-register, no spawn |
+| HTTP but 401/other | alive, cookie rotated | re-read on-disk cookie, re-probe; adopt if it authenticates, else log + skip (never spawn into the occupied port) |
+| connection refused / timeout | dead, port free | **recover** — delete stale cookie, spawn, register only after the fresh process authenticates |
+
+The stale cookie is deleted **before** every recover-spawn so the registration
+loop cannot read a pre-restart token; registration always follows a successful
+authenticated probe (never mere cookie-file presence). This is the single source
+of truth used by fresh deploy, idempotent re-deploy, and startup reconcile.
+
 ### Quiesce ordering
 
 `LatticeNode.stop()` calls `supervisor.quiesce()` **before** it tears down its own
