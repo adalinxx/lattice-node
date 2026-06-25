@@ -248,6 +248,34 @@ extension LatticeNode {
         return entries.map { (key: $0.key, amountDeposited: $0.value) }
     }
 
+    /// Discover the child chains announced by `chainPath`: a bounded page of the chain's
+    /// on-chain `GenesisState` (`directory -> genesisBlockCID`, written by each genesisAction).
+    /// Any node that synced `chainPath` can enumerate its immediate children with no knowledge
+    /// of who deployed or runs them. Uses cashew 3.4.0 `boundedKeysAndValues` — the same
+    /// O(limit+depth) bounded read as `listDeposits`, so it never walks the whole genesisState
+    /// trie. Deeper descendants become enumerable once their parent is followed and synced.
+    public func listChildChains(chainPath: [String], limit: Int = 100, after: String? = nil) async throws -> [(directory: String, genesisHash: String)] {
+        guard let tip = try await resolveTipFrontier(chainPath: chainPath) else { return [] }
+        guard let genesisDict = try await tip.state.genesisState.resolve(fetcher: tip.fetcher).node else { return [] }
+        let entries = try await genesisDict.boundedKeysAndValues(after: after, limit: limit, fetcher: tip.fetcher)
+        return entries.map { (directory: $0.key, genesisHash: $0.value) }
+    }
+
+    /// Resolve a single announced child's genesis block CID from the PARENT chain's on-chain
+    /// `GenesisState`. Permissionless: a node that synced the parent holds this with no
+    /// knowledge of who deployed or runs the child. Scoped `.existence` proof (same primitive
+    /// as `getReceipt`) — reads one key, never walks the whole genesisState trie. Returns nil
+    /// when the child isn't announced on the parent (or the parent isn't synced here).
+    public func announcedChildGenesisCID(chainPath: [String]) async -> String? {
+        guard chainPath.count >= 2, let directory = chainPath.last else { return nil }
+        let parentPath = Array(chainPath.dropLast())
+        guard let tip = try? await resolveTipFrontier(chainPath: parentPath) else { return nil }
+        guard let proven = try? await tip.state.genesisState.proof(paths: [[directory]: .existence], fetcher: tip.fetcher),
+              let dict = proven.node,
+              let genesisCID = try? dict.get(key: directory) else { return nil }
+        return genesisCID
+    }
+
     public func getBalanceProof(address: String, directory: String? = nil) async throws -> Data? {
         let dir = directory ?? genesisConfig.directory
         return try await getBalanceProof(address: address, chainPath: chainPath(forDirectory: dir))

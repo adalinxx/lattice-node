@@ -401,10 +401,15 @@ public actor LatticeNode: ChainNetworkDelegate {
         // this child via unregister-rpc. A detached child is never auto-respawned on
         // restart or by idempotent deploy; re-deploying the same path clears it.
         public var detached: Bool
+        // Subscription provenance: a FOLLOWED child is one this node did NOT deploy but chose
+        // to follow (`chain follow`). Its genesisHash/genesisHex start empty and are resolved
+        // from the parent's on-chain GenesisState + CAS on the first reconcile pass. A deployed
+        // child has them at record time, so followed=false and resolution is skipped.
+        public var followed: Bool
 
         public init(chainPath: [String], directory: String, parentDirectory: String,
                     genesisHash: String, genesisHex: String, timestamp: Int64,
-                    detached: Bool = false) {
+                    detached: Bool = false, followed: Bool = false) {
             self.chainPath = chainPath
             self.directory = directory
             self.parentDirectory = parentDirectory
@@ -412,6 +417,7 @@ public actor LatticeNode: ChainNetworkDelegate {
             self.genesisHex = genesisHex
             self.timestamp = timestamp
             self.detached = detached
+            self.followed = followed
         }
 
         // Persisted files are protocol formats, not internal structs: decode tolerantly.
@@ -420,7 +426,7 @@ public actor LatticeNode: ChainNetworkDelegate {
         // stored-property defaults to missing non-optional keys (it throws keyNotFound),
         // which would otherwise silently wipe a parent's deployed-child set on upgrade.
         enum CodingKeys: String, CodingKey {
-            case chainPath, directory, parentDirectory, genesisHash, genesisHex, timestamp, detached
+            case chainPath, directory, parentDirectory, genesisHash, genesisHex, timestamp, detached, followed
         }
         public init(from decoder: Decoder) throws {
             let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -431,6 +437,7 @@ public actor LatticeNode: ChainNetworkDelegate {
             genesisHex = try c.decode(String.self, forKey: .genesisHex)
             timestamp = try c.decode(Int64.self, forKey: .timestamp)
             detached = try c.decodeIfPresent(Bool.self, forKey: .detached) ?? false
+            followed = try c.decodeIfPresent(Bool.self, forKey: .followed) ?? false
         }
     }
     var deployedChildChains: [String: DeployedChainMetadata]

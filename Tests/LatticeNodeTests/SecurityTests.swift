@@ -2026,6 +2026,7 @@ final class SecurityTests: XCTestCase {
         "GET chain/candidate",
         "GET chain/auth-check",
         "POST chain/deploy",
+        "POST chain/follow",
     ]
 
     /// State-changing POST routes that are intentionally public (unauthenticated).

@@ -1,4 +1,7 @@
 import Foundation
+import Lattice
+import cashew
+import LatticeNodeRPCFuzzSupport  // GenesisHexCodec/GenesisHexEntry (shared genesis-hex codec)
 #if canImport(FoundationNetworking)
 import FoundationNetworking  // URLSession/URLRequest live here on Linux
 #endif
@@ -34,6 +37,7 @@ extension LatticeNode {
         case booting        // tracked/launched, RPC not yet answering (within grace)
         case degraded       // alive but no cookie authenticates — manual recovery
         case recovering     // (re)spawned this pass; will register on a later pass
+        case resolving      // followed child whose genesis isn't resolved/available yet; retry next sweep
     }
 
     /// Result of probing a child's authenticated `/chain/auth-check`.
@@ -160,6 +164,19 @@ extension LatticeNode {
         // Re-check immediately before the destructive delete-cookie + spawn: a detach may
         // have landed since the caller's last check.
         guard stillManaged() else { return .detached }
+        // A FOLLOWED child has no locally-built genesis — resolve it from the parent's on-chain
+        // GenesisState + CAS before spawning (the spawn requires genesisHex). If the genesis
+        // isn't available from pinners yet, stay in `resolving` and let the next sweep retry;
+        // never spawn a child without its genesis. Deployed children already have genesisHex,
+        // so this is skipped for them.
+        var metadata = metadata
+        if metadata.followed && metadata.genesisHex.isEmpty {
+            guard let resolved = await resolveFollowedGenesis(metadata) else { return .resolving }
+            guard stillManaged() else { return .detached }
+            deployedChildChains[key] = resolved
+            await persistDeployedChildChains()
+            metadata = resolved
+        }
         let cookiePath = URL(fileURLWithPath: childDataDir).appendingPathComponent(".cookie")
         try? FileManager.default.removeItem(at: cookiePath)
         let spec = ChildSpec(
@@ -238,5 +255,51 @@ extension LatticeNode {
             await supervisor.stop(label: dir)
         }
         unregisterRPCEndpoint(chainPath: chainPath)
+    }
+
+    /// Declare that this node FOLLOWS (subscribes to) an existing, announced child chain.
+    /// Records a followed-child stub (genesis empty); the reconcile loop resolves its genesis
+    /// from the parent's on-chain GenesisState + CAS and spawns/syncs it. Idempotent, and
+    /// clears a prior detach so re-following resumes management. No-op if not supervising.
+    public func followChild(chainPath: [String]) async {
+        guard childSupervisor != nil, chainPath.count >= 2, let directory = chainPath.last else { return }
+        let key = chainKey(forPath: chainPath)
+        let parentDir = chainPath[chainPath.count - 2]
+        let existing = deployedChildChains[key]
+        deployedChildChains[key] = DeployedChainMetadata(
+            chainPath: chainPath, directory: directory, parentDirectory: parentDir,
+            genesisHash: existing?.genesisHash ?? "", genesisHex: existing?.genesisHex ?? "",
+            timestamp: existing?.timestamp ?? 0, detached: false, followed: true)
+        await persistDeployedChildChains()
+    }
+
+    /// Resolve a followed child's genesis into a self-contained genesis-hex payload: read its
+    /// genesis CID from the parent's on-chain GenesisState, fetch the genesis block + spec +
+    /// WASM policy modules from CAS by CID (ivyFetcher does pinner discovery on a local miss),
+    /// and encode with the shared `GenesisHexCodec`. Returns an updated metadata with
+    /// genesisHash/genesisHex filled, or nil if the genesis isn't resolvable/available yet.
+    private func resolveFollowedGenesis(_ metadata: DeployedChainMetadata) async -> DeployedChainMetadata? {
+        guard let parentNetwork = network(forPath: Array(metadata.chainPath.dropLast())) else { return nil }
+        guard let genesisCID = await announcedChildGenesisCID(chainPath: metadata.chainPath) else { return nil }
+        guard let genesisData = try? await parentNetwork.ivyFetcher.fetch(rawCid: genesisCID),
+              let genesisBlock = Block(data: genesisData) else { return nil }
+        var entries: [GenesisHexEntry] = [GenesisHexEntry(cid: genesisCID, data: genesisData)]
+        let specCID = genesisBlock.spec.rawCID
+        var spec = genesisBlock.spec.node
+        if spec == nil { spec = try? await genesisBlock.spec.resolve(fetcher: parentNetwork.ivyFetcher).node }
+        if let specData = spec?.toData() { entries.append(GenesisHexEntry(cid: specCID, data: specData)) }
+        if let spec {
+            for policy in spec.wasmPolicies {
+                let moduleHeader = WasmPolicyModuleHeader(rawCID: policy.moduleCID)
+                guard let module = try? await moduleHeader.resolve(fetcher: parentNetwork.ivyFetcher).node,
+                      let moduleData = module.toData() else { continue }
+                entries.append(GenesisHexEntry(cid: policy.moduleCID, data: moduleData))
+            }
+        }
+        let genesisHex = GenesisHexCodec.encodeEntries(entries).map { String(format: "%02x", $0) }.joined()
+        return DeployedChainMetadata(
+            chainPath: metadata.chainPath, directory: metadata.directory,
+            parentDirectory: metadata.parentDirectory, genesisHash: genesisCID,
+            genesisHex: genesisHex, timestamp: metadata.timestamp, detached: metadata.detached, followed: true)
     }
 }
