@@ -10,12 +10,14 @@ import FoundationNetworking
 struct ChainCommand: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "chain",
-        abstract: "Child-chain lifecycle management (deploy, attach, detach, genesis)",
+        abstract: "Child-chain lifecycle management (deploy, attach, detach, genesis, children, follow)",
         subcommands: [
             ChainDeployCommand.self,
             ChainAttachCommand.self,
             ChainDetachCommand.self,
             ChainGenesisCommand.self,
+            ChainChildrenCommand.self,
+            ChainFollowCommand.self,
         ]
     )
 }
@@ -574,5 +576,139 @@ struct ChainGenesisCommand: AsyncParsableCommand {
     private func fetchJSON(_ urlString: String, authToken: String? = nil) async throws -> [String: Any] {
         let data = try await httpGet(urlString, authToken: authToken)
         return (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
+    }
+}
+
+// MARK: - chain children
+
+struct ChainChildrenCommand: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "children",
+        abstract: "Discover the child chains announced by a chain (from its on-chain GenesisState)"
+    )
+
+    @Option(help: "Node base URL (without /api suffix)")
+    var rpc: String = "http://127.0.0.1:8080"
+
+    @Option(help: "Chain whose children to list, e.g. Nexus or Nexus/toy (default: the node's root)")
+    var chainPath: String?
+
+    @Option(help: "Maximum children to return (default 100)")
+    var limit: Int = 100
+
+    @Option(help: "Pagination cursor: return children whose directory sorts after this")
+    var after: String?
+
+    func run() async throws {
+        var url = "\(rpc)/api/chain/children?limit=\(limit)"
+        var allowed = CharacterSet.urlQueryAllowed
+        allowed.remove(charactersIn: "&=+")
+        if let chainPath {
+            url += "&chainPath=\(chainPath.addingPercentEncoding(withAllowedCharacters: allowed) ?? chainPath)"
+        }
+        if let after {
+            url += "&after=\(after.addingPercentEncoding(withAllowedCharacters: allowed) ?? after)"
+        }
+        let resp = try await fetchJSON(url)
+        if let errMsg = resp["error"] as? String {
+            printError("Failed to list child chains: \(errMsg)")
+            throw ExitCode.failure
+        }
+        let chainName = resp["chain"] as? String ?? (chainPath ?? "Nexus")
+        let children = resp["children"] as? [[String: Any]] ?? []
+        printHeader("Child chains of '\(chainName)' (\(children.count))")
+        if children.isEmpty {
+            print("  (none announced yet)")
+            return
+        }
+        for c in children {
+            let dir = c["directory"] as? String ?? "?"
+            let hash = c["genesisHash"] as? String ?? "?"
+            let path = (c["chainPath"] as? [String])?.joined(separator: "/") ?? dir
+            printKeyValue(path, hash.count > 24 ? String(hash.prefix(24)) + "…" : hash)
+        }
+        print("")
+        print("  Follow one with: \(Style.dim)lattice-node chain follow <chainPath>\(Style.reset)")
+    }
+
+    private func httpGet(_ urlString: String) async throws -> Data {
+        guard let url = URL(string: urlString) else { return Data() }
+        let req = URLRequest(url: url)
+        #if canImport(FoundationNetworking)
+        return try await withCheckedThrowingContinuation { continuation in
+            URLSession.shared.dataTask(with: req) { data, _, error in
+                if let error { continuation.resume(throwing: error) }
+                else { continuation.resume(returning: data ?? Data()) }
+            }.resume()
+        }
+        #else
+        let (data, _) = try await URLSession.shared.data(for: req)
+        return data
+        #endif
+    }
+
+    private func fetchJSON(_ urlString: String) async throws -> [String: Any] {
+        let data = try await httpGet(urlString)
+        return (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
+    }
+}
+
+// MARK: - chain follow
+
+struct ChainFollowCommand: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "follow",
+        abstract: "Subscribe to an existing announced child chain (genesis resolved from chain state; no genesis-hex/peer needed)"
+    )
+
+    @Option(help: "Node base URL (without /api suffix)")
+    var rpc: String = "http://127.0.0.1:8080"
+
+    @Option(help: "Path to node cookie file for admin auth")
+    var cookieFile: String?
+
+    @Argument(help: "Full chain path to follow, e.g. Nexus/toy")
+    var chainPath: String
+
+    func run() async throws {
+        let authToken = loadToken(cookieFile: cookieFile)
+        let path = chainPath.split(separator: "/").map(String.init)
+        printHeader("Following chain '\(chainPath)'")
+        printKeyValue("Node RPC", rpc)
+        let body = try JSONSerialization.data(withJSONObject: ["chainPath": path])
+        let resp = try await postJSON("\(rpc)/api/chain/follow", body: body, authToken: authToken)
+        if let errMsg = resp["error"] as? String {
+            printError("Follow failed: \(errMsg)")
+            throw ExitCode.failure
+        }
+        printSuccess("Now following '\(chainPath)'. The node resolves its genesis from the parent's on-chain state and syncs it as a supervised child; check progress with the node logs or 'lattice-node chain children'.")
+    }
+
+    private func loadToken(cookieFile: String?) -> String? {
+        guard let path = cookieFile else { return nil }
+        return try? String(contentsOf: URL(fileURLWithPath: path), encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func postJSON(_ urlString: String, body: Data, authToken: String? = nil) async throws -> [String: Any] {
+        guard let url = URL(string: urlString) else { return [:] }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.httpBody = body
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if let token = authToken { request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
+        let responseData: Data
+        #if canImport(FoundationNetworking)
+        responseData = try await withCheckedThrowingContinuation { continuation in
+            URLSession.shared.dataTask(with: request) { data, _, error in
+                if let error { continuation.resume(throwing: error) }
+                else { continuation.resume(returning: data ?? Data()) }
+            }.resume()
+        }
+        #else
+        let (data, _) = try await URLSession.shared.data(for: request)
+        responseData = data
+        #endif
+        return (try? JSONSerialization.jsonObject(with: responseData) as? [String: Any]) ?? [:]
     }
 }

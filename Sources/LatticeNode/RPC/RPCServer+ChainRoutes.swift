@@ -96,6 +96,32 @@ extension RPCRoutes {
         return json(result)
     }
 
+    // GET /api/chain/children?chainPath=<path>&limit=&after= — discover the child chains
+    // announced by a chain, read from its on-chain GenesisState (directory -> genesisCID).
+    // Any node that synced the chain can enumerate its immediate children with no knowledge
+    // of who deployed or runs them. Bounded page (cashew boundedKeysAndValues) — never walks
+    // the whole genesisState trie. Deeper descendants become enumerable once a child is
+    // followed and synced (the discover -> follow -> discover-deeper loop).
+    static func chainChildren(node: LatticeNode, request: Request) async throws -> Response {
+        let chain: ResolvedChain
+        switch await resolveChainResult(node: node, request: request) {
+        case .success(let resolved): chain = resolved
+        case .failure(let response): return response
+        }
+        let limitStr = request.uri.queryParameters["limit"].map(String.init)
+        let limit = min(limitStr.flatMap(Int.init) ?? 100, 1000)
+        let after = request.uri.queryParameters["after"].map(String.init)
+        do {
+            let entries = try await node.listChildChains(chainPath: chain.path, limit: limit, after: after)
+            struct ChildEntry: Encodable { let directory: String; let chainPath: [String]; let genesisHash: String }
+            let children = entries.map { ChildEntry(directory: $0.directory, chainPath: chain.path + [$0.directory], genesisHash: $0.genesisHash) }
+            struct R: Encodable { let children: [ChildEntry]; let count: Int; let chain: String }
+            return json(R(children: children, count: children.count, chain: chain.key))
+        } catch {
+            return jsonError("Failed to list child chains", status: .internalServerError)
+        }
+    }
+
     // GET /api/chain/parent-height?chainPath=<path>
     // Contract 2 (parent-visibility): a child block carried by parent block H commits
     // `parentState = postState(H-1)` (BlockBuilder uses the carrier's prevState). So:
@@ -179,6 +205,27 @@ extension RPCRoutes {
         // swaps waiting for a withdrawal block on that child will be unable to mine.
         struct R: Encodable { let ok: Bool; let warning: String }
         return json(R(ok: true, warning: "Block delivery to this child may stall if this node was its only merged-mined relay. Ensure the child has an alternative peer before detaching."))
+    }
+
+    // POST /api/chain/follow { chainPath: [...] } — subscribe to an existing, announced child.
+    // Records the follow intent durably; the supervised reconciler then resolves the child's
+    // genesis from THIS node's synced parent GenesisState + CAS and spawns/syncs it — no
+    // genesis-hex or peer address from the operator. Reuses the {chainPath} body codec.
+    static func followChain(node: LatticeNode, request: Request) async throws -> Response {
+        guard let buffer = try? await request.body.collect(upTo: 4_096),
+              let body = RPCRequestBodyCodecs.decodeUnregisterChainRPC(Data(buffer: buffer)) else {
+            return jsonError("Expected {chainPath}", status: .badRequest)
+        }
+        let basePath = await currentChainPath(node: node)
+        guard let resolved = resolveChainSelector(body.chainPath, from: basePath), resolved.count >= 2 else {
+            return jsonError("Invalid chainPath (must be a child path, e.g. Nexus/toy)", status: .badRequest)
+        }
+        await node.followChild(chainPath: resolved)
+        // Kick a reconcile so resolution+spawn starts now rather than on the next 30s tick;
+        // if the genesis isn't yet fetchable the child stays `resolving` and the loop retries.
+        await node.reconcileSupervisedChildren()
+        struct R: Encodable { let ok: Bool; let chainPath: [String] }
+        return json(R(ok: true, chainPath: resolved))
     }
 
     // GET /api/chain/genesis?chainPath=<path> — returns genesis hex for a chain.

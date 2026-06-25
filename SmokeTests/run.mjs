@@ -77,6 +77,7 @@ const TESTS = [
     { name: 'sync-under-load',       file: 'scenarios/network/sync-under-load.mjs',       timeoutMs: 360_000 },
     { name: 'multi-child-miner-revenue', file: 'scenarios/network/multi-child-miner-revenue.mjs', timeoutMs: 600_000 },
     { name: 'multichain-late-joiner', file: 'scenarios/network/multichain-late-joiner.mjs', timeoutMs: 8 * 60_000 },
+    { name: 'permissionless-child-join', file: 'scenarios/network/permissionless-child-join.mjs', timeoutMs: 8 * 60_000 },
   ]),
   ...group('network-core', [
     { name: 'multinode-convergence', file: 'scenarios/network/multinode-convergence.mjs', timeoutMs: 90_000 },

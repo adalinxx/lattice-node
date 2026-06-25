@@ -152,6 +152,7 @@ enum RPCRoutes {
 
         api.get("chain/info") { _, _ in try await chainInfo(node: node) }
         api.get("chain/map") { _, _ in try await chainMap(node: node) }
+        api.get("chain/children") { req, _ in try await chainChildren(node: node, request: req) }
         api.post("chain/register-rpc") { req, _ in
             if let denied = requireAdminAccess(request: req, auth: auth, endpoint: "chain/register-rpc") {
                 return denied
@@ -163,6 +164,12 @@ enum RPCRoutes {
                 return denied
             }
             return try await unregisterChainRPC(node: node, request: req)
+        }
+        api.post("chain/follow") { req, _ in
+            if let denied = requireAdminAccess(request: req, auth: auth, endpoint: "chain/follow") {
+                return denied
+            }
+            return try await followChain(node: node, request: req)
         }
         api.get("chain/genesis") { req, _ in try await chainGenesis(node: node, request: req) }
         // Contract 3 (RPC liveness): an authenticated GET that returns 200 iff the
