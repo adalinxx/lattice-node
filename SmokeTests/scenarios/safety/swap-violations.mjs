@@ -61,19 +61,16 @@ const childNode = await nexusNode.spawnChild({
 })
 net.add(childNode)
 
-// Internal miner earns Nexus coinbase; LatticeMiner advances child chain.
-await nexusNode.startMining(nexusDir)
-await waitFor(async () => (await nexusNode.height(nexusDir)) >= 5,
-  'nexus height 5', { timeoutMs: WARMUP_WAIT_MS, intervalMs: 500 })
-await nexusNode.stopMining(nexusDir)
-await nexusNode.awaitQuiesced(nexusDir)
-
+// One merged-mining coordinator advances BOTH Nexus and the child — including
+// parent state-access txs (receipts, transfers). The node builds each template with
+// full state access; the coordinator only does PoW. No Nexus-only miner needed.
 const miner = new LatticeMiner(nexusNode, [childNode])
 net.addMiner(miner)
 await miner.start()
 
+// 6 blocks from genesis under one miner needs more than a single WARMUP window.
 await waitFor(async () => (await nexusNode.height(nexusDir)) >= 6,
-  'nexus height 6', { timeoutMs: WARMUP_WAIT_MS, intervalMs: 500 })
+  'nexus height 6', { timeoutMs: 2 * WARMUP_WAIT_MS, intervalMs: 500 })
 
 let _nonceSeq = 0
 function swapNonce() {
@@ -161,13 +158,8 @@ async function fundUser(user, amount) {
     await miner.stop()
     await awaitStableChains('before funding')
     await fundOnChain(user, amount, nexusDir)
-    await nexusNode.startMining(nexusDir)
-    await waitFor(async () => (await nexusNode.balance(user.address, nexusDir)) >= amount,
-      'nexus funding confirmed', { timeoutMs: FUND_WAIT_MS, intervalMs: 1000 })
-    await nexusNode.stopMining(nexusDir)
-    await nexusNode.awaitQuiesced(nexusDir)
     await fundOnChain(user, amount, CHILD)
-    await miner.start()
+    await miner.start()  // merged miner confirms BOTH the Nexus and child funding txs
     await waitFor(async () => {
       const nb = await nexusNode.balance(user.address, nexusDir)
       const cb = await childNode.balance(user.address, CHILD)
@@ -189,15 +181,14 @@ async function fundUser(user, amount) {
   console.log(`  ✓ funded`)
 }
 
+// Confirm a Nexus state tx under the merged miner (the node builds the template with
+// full state access). Stop-for-stable-tip keeps the pre-submit state deterministic.
 async function mineNexusTx(submitFn, confirmFn, desc) {
   await miner.stop()
   await awaitStableChains(`before ${desc}`)
-  await nexusNode.startMining(nexusDir)
   await submitFn()
-  await waitFor(confirmFn, desc, { timeoutMs: MINING_WAIT_MS, intervalMs: 1000 })
-  await nexusNode.stopMining(nexusDir)
-  await nexusNode.awaitQuiesced(nexusDir)
   await miner.start()
+  await waitFor(confirmFn, desc, { timeoutMs: MINING_WAIT_MS, intervalMs: 1000 })
 }
 
 // ── Violation 1: Withdraw with receipt but no deposit ───────────────────

@@ -558,20 +558,32 @@ extension LatticeNode {
         childNodeAuth: [String: String]
     ) async -> [String: ChildRPCForwarder] {
         guard !childNodes.isEmpty else { return [:] }
-        let validChildNodes = childNodes.filter(RPCRoutes.validLoopbackHTTPBaseURL)
+        // Normalize to API-base: block delivery and candidate calls append /chain/...,
+        // so the stored endpoint must always include /api.
+        let validChildNodes = childNodes
+            .filter(RPCRoutes.validLoopbackHTTPBaseURL)
+            .map { $0.hasSuffix("/api") ? $0 : $0 + "/api" }
         guard !validChildNodes.isEmpty else { return [:] }
+        // Normalize auth-map keys to match normalized endpoints (bearerToken uses exact/path-aware
+        // lookup). Use a loop instead of uniqueKeysWithValues to avoid crashing when a caller sends
+        // both the bare origin and the /api form (last writer wins, deterministic).
+        var normalizedAuth: [String: String] = [:]
+        for (k, v) in childNodeAuth {
+            let bare = k.hasSuffix("/") ? String(k.dropLast()) : k
+            let normalized = bare.hasSuffix("/api") ? bare : bare + "/api"
+            normalizedAuth[normalized] = v
+        }
 
         struct ChainInfo: Decodable {
             struct Chain: Decodable {
                 let directory: String
-                let parentDirectory: String?
+                let chainPath: [String]?
             }
             let chains: [Chain]
         }
         struct NodeInfo: Sendable {
             let endpoint: String
-            let directory: String
-            let parentDirectory: String?
+            let chainPath: [String]
         }
 
         let session = RPCRoutes.childFanoutSession()
@@ -584,11 +596,10 @@ extension LatticeNode {
                           (response as? HTTPURLResponse)?.statusCode == 200,
                           let info = try? JSONDecoder().decode(ChainInfo.self, from: data),
                           let chain = info.chains.first else { return nil }
-                    return NodeInfo(
-                        endpoint: endpoint,
-                        directory: chain.directory,
-                        parentDirectory: chain.parentDirectory
-                    )
+                    // Use the canonical chainPath served by the child; fall back to
+                    // appending the leaf directory to our root path when the field is absent.
+                    let path = chain.chainPath ?? (rootPath + [chain.directory])
+                    return NodeInfo(endpoint: endpoint, chainPath: path)
                 }
             }
             var results: [NodeInfo] = []
@@ -601,30 +612,11 @@ extension LatticeNode {
         }
         guard !infos.isEmpty else { return [:] }
 
-        let infoByDirectory = Dictionary(grouping: infos, by: \.directory).compactMapValues(\.first)
-        func path(for info: NodeInfo, seen: Set<String> = []) -> [String]? {
-            guard !seen.contains(info.directory) else { return nil }
-            var nextSeen = seen
-            nextSeen.insert(info.directory)
-            guard let parent = info.parentDirectory, !parent.isEmpty else {
-                return rootPath + [info.directory]
-            }
-            if parent == rootPath.last {
-                return rootPath + [info.directory]
-            }
-            guard let parentInfo = infoByDirectory[parent],
-                  let parentPath = path(for: parentInfo, seen: nextSeen) else {
-                return rootPath + [info.directory]
-            }
-            return parentPath + [info.directory]
-        }
-
         var forwarders: [String: ChildRPCForwarder] = [:]
         for info in infos {
-            guard let path = path(for: info) else { continue }
-            forwarders[chainKey(forPath: path)] = ChildRPCForwarder(
+            forwarders[chainKey(forPath: info.chainPath)] = ChildRPCForwarder(
                 endpoint: info.endpoint,
-                authToken: RPCRoutes.bearerToken(for: info.endpoint, in: childNodeAuth)
+                authToken: RPCRoutes.bearerToken(for: info.endpoint, in: normalizedAuth)
             )
         }
         return forwarders

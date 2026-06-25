@@ -10,6 +10,8 @@ struct LatticeCLI: AsyncParsableCommand {
             NodeCommand.self,
             SendCommand.self,
             TxCommand.self,
+            ChainCommand.self,
+            SwapCommand.self,
             DevnetCommand.self,
             ClusterCommand.self,
             KeysCommand.self,

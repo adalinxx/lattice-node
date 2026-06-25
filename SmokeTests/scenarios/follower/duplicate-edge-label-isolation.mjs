@@ -270,10 +270,12 @@ for (const [label, node, expectedPath] of [
 }
 const alphaMap = await alpha.rpc('GET', '/api/chain/map')
 const betaMap = await beta.rpc('GET', '/api/chain/map')
-if (alphaMap.json?.[alphaPath.join('/')] !== alphaPayments.base) {
+// Registered endpoints are stored in API-base form (trailing "/api"); normalize.
+const normEndpoint = (u) => (u ?? '').replace(/\/api\/?$/, '')
+if (normEndpoint(alphaMap.json?.[alphaPath.join('/')]) !== normEndpoint(alphaPayments.base)) {
   throw new Error(`Alpha map missing ${alphaPath.join('/')}: ${JSON.stringify(alphaMap.json)}`)
 }
-if (betaMap.json?.[betaPath.join('/')] !== betaPayments.base) {
+if (normEndpoint(betaMap.json?.[betaPath.join('/')]) !== normEndpoint(betaPayments.base)) {
   throw new Error(`Beta map missing ${betaPath.join('/')}: ${JSON.stringify(betaMap.json)}`)
 }
 if (alphaMap.json?.[betaPath.join('/')] || betaMap.json?.[alphaPath.join('/')]) {

@@ -71,16 +71,14 @@ if (!childSpec.ok) throw new Error(`child spec failed: ${JSON.stringify(childSpe
 const CHILD_REWARD = childSpec.json.initialReward
 const CHILD_PREMINE = childSpec.json.premineAmount ?? childSpec.json.premine ?? 100
 
-// Internal miner earns Nexus coinbase; LatticeMiner advances child chain.
-await nexusNode.startMining(nexusDir)
-await nexusNode.waitForHeight(5, nexusDir, { timeoutMs: WARMUP_WAIT_MS })
-await nexusNode.stopMining(nexusDir)
-
+// One merged-mining coordinator advances BOTH Nexus and the child — including parent
+// state-access txs (funding transfers, receipts). The node builds each template with
+// full state access; the coordinator only does PoW. No Nexus-only miner needed.
 const miner = new LatticeMiner(nexusNode, [childNode])
 await miner.start()
 net.addMiner(miner)
 
-await nexusNode.waitForHeight(8, nexusDir, { timeoutMs: WARMUP_WAIT_MS })
+await nexusNode.waitForHeight(8, nexusDir, { timeoutMs: 2 * WARMUP_WAIT_MS })
 await childNode.waitForHeight(3, CHILD, { timeoutMs: FUND_WAIT_MS })
 
 console.log(`\n[1] Snapshot pre-swap balances...`)
@@ -135,11 +133,6 @@ const fundNexus = await nexusNode.submitTx({
 }, nexusDir, funder)
 if (!fundNexus.ok) throw new Error(`fund nexus failed: ${JSON.stringify(fundNexus)}`)
 
-await nexusNode.startMining(nexusDir)
-await waitFor(async () => (await nexusNode.balance(user.address, nexusDir)) >= FUND,
-  'nexus funded', { timeoutMs: FUND_WAIT_MS })
-await nexusNode.stopMining(nexusDir)
-
 const mc = await childNode.nonce(funder.address, CHILD)
 const fundChild = await childNode.submitTx({
   chainPath: [nexusDir, CHILD], nonce: mc, signers: [funder.address], fee: FEE,
@@ -154,6 +147,9 @@ const miner2 = new LatticeMiner(nexusNode, [childNode])
 await miner2.start()
 net.addMiner(miner2)
 
+// The merged miner confirms BOTH the Nexus and the child funding txs.
+await waitFor(async () => (await nexusNode.balance(user.address, nexusDir)) >= FUND,
+  'nexus funded', { timeoutMs: FUND_WAIT_MS })
 await waitFor(async () => (await childNode.balance(user.address, CHILD)) >= FUND,
   'child funded', { timeoutMs: FUND_WAIT_MS })
 

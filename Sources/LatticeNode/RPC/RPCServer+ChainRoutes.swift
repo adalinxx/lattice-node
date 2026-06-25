@@ -51,6 +51,7 @@ extension RPCRoutes {
             let health: String
             let healthReason: String?
             let chainP2PAddress: String?  // per-chain P2P address for --subscribe-p2p in Phase 3
+            let minFeeRate: UInt64        // Contract 6: per-byte fee floor this node admits at
         }
         var chains: [C] = []
         for s in statuses {
@@ -70,7 +71,8 @@ extension RPCRoutes {
                             unhealthy: s.unhealthy,
                             health: s.health,
                             healthReason: s.healthReason,
-                            chainP2PAddress: chainP2P))
+                            chainP2PAddress: chainP2P,
+                            minFeeRate: s.minFeeRate))
         }
         return json(R(chains: chains, genesisHash: node.genesisResult.blockHash,
                       genesisTimestamp: node.genesisConfig.timestamp,
@@ -94,6 +96,43 @@ extension RPCRoutes {
         return json(result)
     }
 
+    // GET /api/chain/parent-height?chainPath=<path>
+    // Contract 2 (parent-visibility): a child block carried by parent block H commits
+    // `parentState = postState(H-1)` (BlockBuilder uses the carrier's prevState). So:
+    //   parentHeight       = H        (the carrier block this child's tip is anchored to)
+    //   visibleStateHeight = H - 1    (highest parent block whose post-state is visible
+    //                                  through parentState — i.e. the receiptState a
+    //                                  withdrawal validates against)
+    // A receipt mined in parent block R is visible once visibleStateHeight >= R, i.e.
+    // parentHeight >= R + 1. Both null for the root chain (no parent).
+
+    static func parentChainHeight(node: LatticeNode, request: Request) async throws -> Response {
+        let basePath = await currentChainPath(node: node)
+        let rawPath = request.uri.queryParameters["chainPath"].map(String.init)
+        let chainPath: [String]
+        if let raw = rawPath {
+            guard let resolved = resolveChainSelector(raw.split(separator: "/").map(String.init), from: basePath) else {
+                return jsonError("Invalid chainPath", status: .badRequest)
+            }
+            chainPath = resolved
+        } else {
+            chainPath = basePath
+        }
+        // Proxy to the registered remote child for per-process topologies where the
+        // parent has only an RPC pointer, not a local fork-choice view of the child.
+        if await node.network(forPath: chainPath) == nil,
+           let endpoint = await node.registeredRPCEndpoint(chainPath: chainPath) {
+            let authToken = await node.registeredRPCAuthToken(chainPath: chainPath)
+            return await proxyRegisteredRPC(endpoint: endpoint, request: request, authToken: authToken)
+        }
+        let height = await node.getParentChainHeight(chainPath: chainPath)
+        // visibleStateHeight = carrier - 1; nil when carrier is nil or 0 (genesis carrier
+        // commits no prior parent post-state).
+        let visibleStateHeight: UInt64? = height.flatMap { $0 > 0 ? $0 - 1 : nil }
+        struct R: Encodable { let parentHeight: UInt64?; let visibleStateHeight: UInt64? }
+        return json(R(parentHeight: height, visibleStateHeight: visibleStateHeight))
+    }
+
     // POST /api/chain/register-rpc { chainPath: [...], endpoint: "http://..." }
     // Called by a per-process child node on startup to announce its RPC endpoint.
     // The parent stores it and propagates up to any registered ancestor.
@@ -106,13 +145,40 @@ extension RPCRoutes {
         guard validLoopbackHTTPBaseURL(body.endpoint) else {
             return jsonError("Invalid endpoint: expected loopback http(s) base URL", status: .badRequest)
         }
+        // Normalize to API-base at ingress: callers may omit /api but all internal
+        // paths (block delivery, proxy) expect the stored form to include it.
+        let normalizedEndpoint = body.endpoint.hasSuffix("/api") ? body.endpoint : body.endpoint + "/api"
         let pathKey = body.chainPath.joined(separator: "/")
-        await node.registerRPCEndpoint(chainPath: body.chainPath, endpoint: body.endpoint, authToken: body.authToken)
+        await node.registerRPCEndpoint(chainPath: body.chainPath, endpoint: normalizedEndpoint, authToken: body.authToken)
         if let network = await node.networks[pathKey] {
-            await network.setRPCEndpoint(body.endpoint)
+            await network.setRPCEndpoint(normalizedEndpoint)
         }
         struct R: Encodable { let ok: Bool }
         return json(R(ok: true))
+    }
+
+    // POST /api/chain/unregister-rpc { chainPath: [...] }
+    // Removes a previously-registered child RPC endpoint from the parent.
+
+    static func unregisterChainRPC(node: LatticeNode, request: Request) async throws -> Response {
+        guard let buffer = try? await request.body.collect(upTo: 4_096),
+              let body = RPCRequestBodyCodecs.decodeUnregisterChainRPC(Data(buffer: buffer)) else {
+            return jsonError("Expected {chainPath}", status: .badRequest)
+        }
+        let basePath = await currentChainPath(node: node)
+        guard let resolved = resolveChainSelector(body.chainPath, from: basePath) else {
+            return jsonError("Invalid chainPath", status: .badRequest)
+        }
+        // Contract 4: detach is durable. For a supervised child this marks the deployed
+        // metadata detached (so restart/idempotent-deploy will NOT auto-respawn it),
+        // stops the process, and drops the registration. For a non-supervised child it
+        // is just an endpoint removal. detachSupervisedChild handles both.
+        await node.detachSupervisedChild(chainPath: resolved)
+        // If this node was the sole merged-mined block-delivery path for the child
+        // (no other Ivy peer), the child will stall after this call. Any in-flight
+        // swaps waiting for a withdrawal block on that child will be unable to mine.
+        struct R: Encodable { let ok: Bool; let warning: String }
+        return json(R(ok: true, warning: "Block delivery to this child may stall if this node was its only merged-mined relay. Ensure the child has an alternative peer before detaching."))
     }
 
     // GET /api/chain/genesis?chainPath=<path> — returns genesis hex for a chain.
@@ -297,12 +363,6 @@ extension RPCRoutes {
         if dir.hasPrefix(".") {
             return jsonError("Directory cannot start with '.' (path traversal or hidden file)")
         }
-        if dir == node.genesisConfig.directory {
-            return jsonError("Directory '\(dir)' conflicts with nexus")
-        }
-        if await node.network(for: dir) != nil {
-            return jsonError("Chain '\(dir)' already exists")
-        }
         let storageDir = await node.config.storagePath.appendingPathComponent(dir)
         if FileManager.default.fileExists(atPath: storageDir.path) {
             return jsonError("Chain directory '\(dir)' already has data on disk from a prior deploy. Remove \(storageDir.path) before redeploying.", status: .conflict)
@@ -333,14 +393,52 @@ extension RPCRoutes {
         guard parentDir == body.parentDirectory else {
             return jsonError("parentDirectory must match chainPath parent", status: .badRequest)
         }
-        guard await node.deployedChildChains[requestedChildPath.joined(separator: "/")] == nil,
-              await node.network(forPath: requestedChildPath) == nil else {
-            return jsonError("Chain '\(requestedChildPath.joined(separator: "/"))' already exists", status: .conflict)
+        // Idempotent: if this chain is already staged return the existing genesis so the
+        // caller can retry submitting the GenesisAction tx without re-deploying.
+        let existingPathKey = requestedChildPath.joined(separator: "/")
+        if let existing = await node.deployedChildChains[existingPathKey] {
+            let pubKey2 = await node.config.publicKey
+            let parentPort2: UInt16
+            if let p = await node.network(for: body.parentDirectory)?.ivy.config.listenPort {
+                parentPort2 = p
+            } else {
+                parentPort2 = await node.config.listenPort
+            }
+            // Contract 4: re-deploying a DETACHED child is the explicit reattach gesture —
+            // clear the flag so reconcile/ensure will manage it again.
+            var reattached = existing
+            if existing.detached {
+                reattached.detached = false
+                await node.recordDeployedChildChain(reattached)
+                log.info("deployChain (idempotent): reattaching previously-detached '\(dir)'")
+            }
+            // Single source of truth: probe → adopt-live-or-recover-dead, never spawn a
+            // duplicate into a live child's ports, register only after auth succeeds.
+            // Detached so the deploy HTTP response returns without waiting on the cookie.
+            if await node.childSupervisor != nil {
+                Task { await node.ensureSupervisedChild(reattached) }
+            }
+            let chainP2P2 = "\(pubKey2)@127.0.0.1:\(parentPort2)"
+            struct R: Encodable {
+                let directory: String; let parentDirectory: String
+                let genesisHash: String; let genesisHex: String; let chainP2PAddress: String?
+            }
+            return json(R(directory: dir, parentDirectory: body.parentDirectory,
+                          genesisHash: existing.genesisHash, genesisHex: existing.genesisHex,
+                          chainP2PAddress: chainP2P2))
         }
-        if await node.network(forPath: parentChainPath) == nil,
-           let endpoint = await node.registeredRPCEndpoint(chainPath: parentChainPath) {
-            let authToken = await node.registeredRPCAuthToken(chainPath: parentChainPath)
-            return await proxyRegisteredRPC(endpoint: endpoint, request: request, authToken: authToken, body: requestData)
+        guard await node.network(forPath: requestedChildPath) == nil else {
+            return jsonError("Chain '\(existingPathKey)' already exists", status: .conflict)
+        }
+        // Require the parent to be exactly local or have a registered proxy.
+        // Falling through to a nearest-ancestor network would deploy the child under
+        // a different parent than declared, producing an invalid parent-proof path.
+        if await node.network(forPath: parentChainPath) == nil {
+            if let endpoint = await node.registeredRPCEndpoint(chainPath: parentChainPath) {
+                let authToken = await node.registeredRPCAuthToken(chainPath: parentChainPath)
+                return await proxyRegisteredRPC(endpoint: endpoint, request: request, authToken: authToken, body: requestData)
+            }
+            return jsonError("Parent chain '\(parentChainPath.joined(separator: "/"))' is not local; run deploy on its owning node", status: .badRequest)
         }
         guard let parentNetwork = await node.nearestLocalNetwork(forPath: parentChainPath) else {
             return jsonError("No local storage network for parent chain: \(parentChainPath.joined(separator: "/"))", status: .notFound)
@@ -515,58 +613,13 @@ extension RPCRoutes {
         }
         let chainP2P = "\(pubKey)@127.0.0.1:\(parentPort)"
 
-        // when this parent supervises children, spawn the freshly-deployed
-        // child as a managed OS process — process-per-chain, no manual wiring. The
-        // child's P2P/RPC ports are derived deterministically; its genesis, parent
-        // subscription, and bootstrap peer are exactly what an external orchestrator
-        // would have passed. Default off (--supervise-children).
-        if let supervisor = node.childSupervisor, let rpcBase = node.childRPCBasePort {
-            let childPort = deterministicPort(basePort: parentPort, directory: dir)
-            let childRPCPort = deterministicPort(basePort: rpcBase, directory: dir)
-            let childDataDir = await node.config.storagePath
-                .appendingPathComponent("children").appendingPathComponent(dir).path
-            let spec = ChildSpec(
-                directory: dir,
-                chainPath: childChainPath,
-                genesisHex: genesisHex,
-                subscribeP2P: chainP2P,
-                bootstrapPeer: chainP2P,
-                port: childPort,
-                rpcPort: childRPCPort,
-                dataDir: childDataDir,
-                inheritedArguments: node.childInheritedArguments
-            )
-            do {
-                _ = try await supervisor.spawn(spec.launch(nodeExecutable: ChildProcessSupervisor.selfExecutableURL()))
-                log.info("deployChain: supervised spawn of '\(dir)' (p2p \(childPort), rpc \(childRPCPort))")
-                // Register the child's RPC with this parent so merged-mined child
-                // blocks get forwarded to it (forwardMinedChildBlockIfRegistered).
-                // Without registration the child's store never receives its own
-                // blocks, so nothing holds the chain and its headers-first sync
-                // fails ("child sync requires a source peer"). The child writes its
-                // admin cookie when its RPC comes up, so read it (briefly polling)
-                // then register endpoint + token. Endpoint includes "/api" because
-                // the mined-block forwarder appends "/chain/..." to it.
-                let regChainPath = childChainPath
-                let regEndpoint = "http://127.0.0.1:\(childRPCPort)/api"
-                let regCookiePath = URL(fileURLWithPath: childDataDir).appendingPathComponent(".cookie")
-                let regDir = dir
-                Task {
-                    let regLog = NodeLogger("supervisor")
-                    for _ in 0..<120 {  // up to ~30s for the child RPC to come up + write its cookie
-                        if let token = try? String(contentsOf: regCookiePath, encoding: .utf8)
-                            .trimmingCharacters(in: .whitespacesAndNewlines), !token.isEmpty {
-                            await node.registerRPCEndpoint(chainPath: regChainPath, endpoint: regEndpoint, authToken: token)
-                            regLog.info("registered supervised child '\(regDir)' RPC \(regEndpoint) for mined-block delivery")
-                            return
-                        }
-                        try? await Task.sleep(nanoseconds: 250_000_000)
-                    }
-                    regLog.error("could not register supervised child '\(regDir)' RPC — cookie never appeared; its mined blocks won't be forwarded")
-                }
-            } catch {
-                log.error("deployChain: supervised spawn of '\(dir)' failed: \(error)")
-            }
+        // Contract 4: bring the freshly-staged child to RUNNING+REGISTERED via the same
+        // probe→adopt-or-recover path used on restart and idempotent re-deploy. Detached
+        // so the deploy HTTP response returns without waiting on the child's cookie. The
+        // metadata was just recorded by deployChildChain above.
+        if node.childSupervisor != nil,
+           let metadata = await node.deployedChildChains[childChainPath.joined(separator: "/")] {
+            Task { await node.ensureSupervisedChild(metadata) }
         }
 
         struct R: Encodable {

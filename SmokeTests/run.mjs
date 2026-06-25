@@ -45,7 +45,7 @@ const HEAVY_TESTS = new Set([
   'multichain-late-joiner', 'multidepth-swap', 'stateless-follower',
   'restart-resilience', 'swap-violations', 'late-joiner', 'deep-sync',
   'sync-finality-refusal', 'per-process-deep-reorg', 'cross-chain-reorg',
-  'swap', 'retention-pruning', 'grandchild-swap', 'sync-under-load',
+  'swap', 'swap-cli', 'retention-pruning', 'grandchild-swap', 'sync-under-load',
   'mempool-propagation', 'partition', 'pin-lifecycle', 'reorg-state-rollback',
   'orphaned-withdrawal-pending', 'deep-reorg', 'concurrent-mining',
     'parent-dependency', 'supply-conservation', 'tx-throughput',
@@ -111,6 +111,7 @@ const TESTS = [
   ]),
   ...group('swap', [
     { name: 'swap',                  file: 'scenarios/swap/swap.mjs',                     timeoutMs: 10 * 60_000 },
+    { name: 'swap-cli',              file: 'scenarios/swap/swap-cli.mjs',                 timeoutMs: 10 * 60_000 },
     { name: 'variable-rate-swap',    file: 'scenarios/swap/variable-rate-swap.mjs',       timeoutMs: 480_000 },
     { name: 'receipt-derived-transfer', file: 'scenarios/swap/receipt-derived-transfer.mjs', timeoutMs: 10 * 60_000 },
     { name: 'grandchild-swap',       file: 'scenarios/swap/grandchild-swap.mjs',          timeoutMs: 480_000 },

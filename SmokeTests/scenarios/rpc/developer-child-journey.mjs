@@ -80,7 +80,10 @@ const chainMap = await waitFor(async () => {
   const r = await node.rpc('GET', '/api/chain/map')
   return r.ok && r.json?.[childPathText] ? r.json : null
 }, `${CHILD} in chain/map`, { timeoutMs: 30_000, intervalMs: 500 })
-if (chainMap[childPathText] !== child.base) fail('chain/map endpoint mismatch', `${chainMap[childPathText]} != ${child.base}`)
+// Registered endpoints are stored in API-base form (a trailing "/api" is appended at
+// register time); normalize both sides so the check holds regardless of that suffix.
+const normEndpoint = (u) => u.replace(/\/api\/?$/, '')
+if (normEndpoint(chainMap[childPathText]) !== normEndpoint(child.base)) fail('chain/map endpoint mismatch', `${chainMap[childPathText]} != ${child.base}`)
 console.log(`  ✓ chain/map: ${childPathText} -> ${chainMap[childPathText]}`)
 
 const specR = await node.rpc('GET', `/api/chain/spec?chainPath=${encodeURIComponent(childPathText)}`)
@@ -101,12 +104,12 @@ if (premineBal !== expectedPremine) fail('child premine balance != spec premineA
 console.log(`  ✓ ${CHILD} premine balance=${premineBal} (matches spec premineAmount)`)
 
 console.log(`\n[4] Spend the premine via documented prepare/sign/submit, merge-mine to confirm...`)
-await node.startMining(nexusDir)
-await node.waitForHeight(3, nexusDir, { timeoutMs: 60_000 })
-await node.stopMining(nexusDir)
+// One merged miner advances both chains from genesis (the node builds templates with
+// full state access — no separate Nexus-only warm-up needed).
 const miner = new LatticeMiner(node, [child])
 await miner.start()
 net.addMiner(miner)
+await node.waitForHeight(3, nexusDir, { timeoutMs: 2 * 60_000 })
 await child.waitForHeight(2, CHILD, { timeoutMs: 120_000 })
 
 const recipient = genKeypair()

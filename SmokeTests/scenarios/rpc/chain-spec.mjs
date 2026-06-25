@@ -107,7 +107,9 @@ if (leakedChildEntry) {
   await fail(`parent node leaked child chain view: ${JSON.stringify(leakedChildEntry)}`)
 }
 const chainMap = await node.rpc('GET', '/api/chain/map')
-if (!chainMap.ok || chainMap.json?.[childPathText] !== childNode.base) {
+// Registered endpoints are stored in API-base form (trailing /api); normalize before compare.
+const normEndpoint = (u) => (u ?? '').replace(/\/api\/?$/, '')
+if (!chainMap.ok || normEndpoint(chainMap.json?.[childPathText]) !== normEndpoint(childNode.base)) {
   await fail(`parent chain/map did not route ${childPathText} to child: ${JSON.stringify(chainMap.json)}`)
 }
 const childInfo = await childNode.chainInfo()

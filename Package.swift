@@ -23,7 +23,9 @@ let package = Package(
         // adapters (Module 2: generic adapters co-located with the protocol).
         // cashew 3.3.0 = 3.2.0 + Header.walkOwnedSubtree (Module 11: generic
         // owned-subtree edge enumeration; node keeps state-retention policy).
-        .package(url: "https://github.com/adalinxx/cashew.git", from: "3.3.0"),
+        // cashew 3.4.0 = 3.3.0 + MerkleDictionary.boundedKeysAndValues (fetcher-backed
+        // bounded paginated page — used by listDeposits to avoid an O(all-deposits) walk).
+        .package(url: "https://github.com/adalinxx/cashew.git", from: "3.4.0"),
         .package(url: "https://github.com/adalinxx/Tally.git", from: "2.0.0"),
         // Ivy 6.4.0: spawn-cert chain transport in the identify handshake
         // (setSpawnCertChain/spawnCertChain(for:)); ⊃ 6.3.0 spawn-cert

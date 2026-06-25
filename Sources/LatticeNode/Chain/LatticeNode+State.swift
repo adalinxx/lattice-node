@@ -19,6 +19,10 @@ extension LatticeNode {
         public let unhealthy: Bool
         public let health: String
         public let healthReason: String?
+        // Contract 6 (fee-policy): this node's effective per-byte fee-rate floor for
+        // admission on this chain. A cross-chain swap buyer must size the child
+        // withdrawal fee against this value before the irreversible parent payment.
+        public let minFeeRate: UInt64
     }
 
     public func chainStatus() async -> [ChainInfo] {
@@ -47,7 +51,8 @@ extension LatticeNode {
             syncing: isSyncing,
             unhealthy: rootCommitted.unhealthy,
             health: rootCommitted.health,
-            healthReason: rootCommitted.healthReason
+            healthReason: rootCommitted.healthReason,
+            minFeeRate: config.minFeeRate
         ))
         return result
     }
@@ -208,17 +213,38 @@ extension LatticeNode {
         let parentPath = destinationPath.count > 1 ? Array(destinationPath.dropLast()) : destinationPath
         guard let tip = try await resolveTipFrontier(chainPath: parentPath) else { return nil }
         let key = ReceiptKey(receiptAction: ReceiptAction(withdrawer: "", nonce: nonce, demander: demander, amountDemanded: amountDemanded, directory: directory)).description
-        let receiptResolved = try await tip.state.receiptState.resolve(paths: [[""]: .list], fetcher: tip.fetcher)
-        guard let receiptDict = receiptResolved.node else { return nil }
+        // Resolve via a SCOPED sparse-merkle proof for this one key — the same primitive
+        // consensus uses to read a receipt's withdrawer in withdrawal validation
+        // (Lattice ReceiptState.proveExistenceAndVerifyWithdrawers). This is correct on
+        // all three axes that the resolve-based strategies are not:
+        //   - SCOPED: `proof(paths:)` only recurses the queried key's path and returns
+        //     off-path children as-is (cashew MerkleDictionary+proofs.swift:8-37), so it
+        //     does NOT walk the whole receiptState trie — avoiding the unauthenticated
+        //     O(all-receipts) DoS that `[[""]: .list]` would incur on mainnet.
+        //   - NO VALUE HYDRATION: it yields the leaf's CID (`stored.rawCID` == the
+        //     withdrawer) without fetching the value node, so a just-mined / merged-mined
+        //     receipt whose value isn't locally materialized doesn't throw `notFound`
+        //     (the bug that `.targeted` and a keyed `.list` both hit).
+        //   - GRACEFUL ABSENCE: `.existence` (unlike `.mutation`/`.deletion`, which throw
+        //     on a non-existent child, ibid. :17) returns an absence proof, so polling a
+        //     not-yet-mined receipt yields `get(key:) == nil` → not found, not an error.
+        let proven = try await tip.state.receiptState.proof(paths: [[key]: .existence], fetcher: tip.fetcher)
+        guard let receiptDict = proven.node else { return nil }
         guard let stored: HeaderImpl<PublicKey> = try? receiptDict.get(key: key) else { return nil }
         return stored.rawCID
     }
 
     public func listDeposits(chainPath: [String], limit: Int = 100, after: String? = nil) async throws -> [(key: String, amountDeposited: UInt64)] {
         guard let tip = try await resolveTipFrontier(chainPath: chainPath) else { return [] }
-        let depositResolved = try await tip.state.depositState.resolveRecursive(fetcher: tip.fetcher)
-        guard let depositDict = depositResolved.node else { return [] }
-        let entries = try depositDict.sortedKeysAndValues(limit: limit, after: after)
+        // Bounded, fetcher-backed page (cashew 3.4.0): boundedKeysAndValues resolves only
+        // the radix nodes on the page's path — pruning pre-cursor branches without fetching
+        // them and stopping at `limit` — so cost is O(limit + depth), not O(all deposits).
+        // This replaces `resolveRecursive` (which hydrated the ENTIRE depositState on every
+        // call) AND the interim `.range` resolve (whose resolver ignores `limit`, and whose
+        // sortedKeysAndValues throws nodeNotAvailable on unresolved pre-cursor branches) —
+        // both of which left GET /api/deposits an unauthenticated O(all-deposits) walk.
+        guard let depositDict = try await tip.state.depositState.resolve(fetcher: tip.fetcher).node else { return [] }
+        let entries = try await depositDict.boundedKeysAndValues(after: after, limit: limit, fetcher: tip.fetcher)
         return entries.map { (key: $0.key, amountDeposited: $0.value) }
     }
 
@@ -245,6 +271,24 @@ extension LatticeNode {
             fetcher: fetcher,
             header: lightClientHeader(block: block, blockHash: blockHash, cumulativeWork: cumulativeWork)
         )
+    }
+
+    /// Height of the parent-chain block that this chain's current tip references via
+    /// `parentState`. Returns `nil` for the root chain (no parent) or when the tip
+    /// has not yet referenced any parent block.
+    public func getParentChainHeight(chainPath: [String]) async -> UInt64? {
+        guard let chain = await self.chain(forPath: chainPath) else { return nil }
+        // Read from the persisted child-parent anchor: the normal block-submission path
+        // does not populate the Lattice parentIndex field, so a block accepted via
+        // processBlockHeader can have parentIndex == nil even when its parent anchor is
+        // durably stored in the StateStore.
+        if let tipHash = await chain.getHighestBlock()?.blockHash,
+           let store = stateStore(forPath: chainPath),
+           let parentHash = store.getChildParentAnchor(childHash: tipHash),
+           let header = store.getParentHeader(parentHash: parentHash) {
+            return header.height
+        }
+        return await chain.getHighestBlock()?.parentIndex
     }
 
     private func resolvePostStateForProof(

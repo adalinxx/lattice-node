@@ -158,7 +158,24 @@ enum RPCRoutes {
             }
             return try await registerChainRPC(node: node, request: req)
         }
+        api.post("chain/unregister-rpc") { req, _ in
+            if let denied = requireAdminAccess(request: req, auth: auth, endpoint: "chain/unregister-rpc") {
+                return denied
+            }
+            return try await unregisterChainRPC(node: node, request: req)
+        }
         api.get("chain/genesis") { req, _ in try await chainGenesis(node: node, request: req) }
+        // Contract 3 (RPC liveness): an authenticated GET that returns 200 iff the
+        // presented cookie is the one this process accepts. A supervising parent probes
+        // this on restart to tell "child alive, auth valid" (adopt) from "child alive,
+        // stale auth" (re-read cookie) from "child dead" (connection error → recover).
+        api.get("chain/auth-check") { req, _ in
+            if let denied = requireAdminAccess(request: req, auth: auth, endpoint: "chain/auth-check") {
+                return denied
+            }
+            return json(["ok": true])
+        }
+        api.get("chain/parent-height") { req, _ in try await parentChainHeight(node: node, request: req) }
         api.get("chain/spec") { req, _ in try await chainSpec(node: node, request: req) }
         api.post("chain/template") { req, _ in
             if let denied = requireAdminAccess(request: req, auth: auth, endpoint: "chain/template") {
@@ -322,7 +339,11 @@ enum RPCRoutes {
         authToken: String? = nil,
         body: Data? = nil
     ) async -> Response {
-        guard let url = URL(string: endpoint + String(describing: request.uri)) else {
+        // endpoint is an API-base URL (e.g. http://child/api); request.uri begins /api/...
+        // Strip the leading /api so concatenation yields http://child/api/chain/... not /api/api/chain/...
+        let rawURI = String(describing: request.uri)
+        let proxiedPath = rawURI.hasPrefix("/api") ? String(rawURI.dropFirst(4)) : rawURI
+        guard let url = URL(string: endpoint + proxiedPath) else {
             return jsonError("Invalid registered RPC endpoint", status: .serviceUnavailable)
         }
         var out = URLRequest(url: url)
@@ -430,10 +451,13 @@ enum RPCRoutes {
 
     static func authMap(for baseURLs: [String], in authMap: [String: String]?) -> [String: String] {
         guard let authMap else { return [:] }
-        return Dictionary(uniqueKeysWithValues: baseURLs.compactMap { baseURL in
-            guard let token = bearerToken(for: baseURL, in: authMap) else { return nil }
-            return (baseURL, token)
-        })
+        var result: [String: String] = [:]
+        for baseURL in baseURLs {
+            if let token = bearerToken(for: baseURL, in: authMap) {
+                result[baseURL] = token
+            }
+        }
+        return result
     }
 
     private static func normalizedHTTPBaseURL(_ raw: String) -> String? {

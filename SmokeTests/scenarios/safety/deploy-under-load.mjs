@@ -59,9 +59,11 @@ if (leakedChildEntry) {
   await fail(`parent node leaked ${CHILD} chain view after deploy: ${JSON.stringify(leakedChildEntry)}`)
 }
 const childPathText = `${nexusDir}/${CHILD}`
+// Registered endpoints are stored in API-base form (trailing /api); normalize before compare.
+const normEndpoint = (u) => (u ?? '').replace(/\/api\/?$/, '')
 const chainMap = await waitFor(async () => {
   const r = await node.rpc('GET', '/api/chain/map')
-  return r.ok && r.json?.[childPathText] === childNode.base ? r.json : null
+  return r.ok && normEndpoint(r.json?.[childPathText]) === normEndpoint(childNode.base) ? r.json : null
 }, `${CHILD} registered in chain/map`, { timeoutMs: 30_000, intervalMs: 500 })
 console.log(`  ✓ parent mined during deploy (${preDeployHeight}→${await node.height(nexusDir)}), chain/info unchanged (${initialChains.join(', ')}), chain/map routes ${childPathText} -> ${chainMap[childPathText]}`)
 
@@ -117,7 +119,7 @@ if (JSON.stringify(postSecondChains) !== JSON.stringify(initialChains)) {
 }
 const secondMap = await waitFor(async () => {
   const r = await node.rpc('GET', '/api/chain/map')
-  return r.ok && r.json?.[childPathText] === childNode.base && r.json?.[child2PathText] === childNode2.base ? r.json : null
+  return r.ok && normEndpoint(r.json?.[childPathText]) === normEndpoint(childNode.base) && normEndpoint(r.json?.[child2PathText]) === normEndpoint(childNode2.base) ? r.json : null
 }, `${CHILD2} registered in chain/map`, { timeoutMs: 30_000, intervalMs: 500 })
 console.log(`  ✓ parent mined during second deploy (${preSecondDeployHeight}→${await node.height(nexusDir)}); chain/map routes ${child2PathText} -> ${secondMap[child2PathText]}`)
 await miner.stop()

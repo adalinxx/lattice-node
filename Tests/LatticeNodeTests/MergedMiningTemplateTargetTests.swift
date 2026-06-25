@@ -42,7 +42,7 @@ final class MergedMiningTemplateTargetTests: XCTestCase {
         childPort: UInt16,
         childToken: String
     ) async throws -> TemplateResponse {
-        let childURL = "http://127.0.0.1:\(childPort)"
+        let childURL = "http://127.0.0.1:\(childPort)/api"
         var request = URLRequest(url: URL(string: "http://127.0.0.1:\(parentPort)/api/chain/template")!)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -98,7 +98,7 @@ final class MergedMiningTemplateTargetTests: XCTestCase {
         let childPort = nextTestPort()
         let router = Router()
         let candidateCounter = CandidateCounter()
-        router.get("chain/info") { _, _ in
+        router.get("api/chain/info") { _, _ in
             struct ChainInfo: Encodable {
                 struct Chain: Encodable {
                     let directory: String
@@ -109,7 +109,7 @@ final class MergedMiningTemplateTargetTests: XCTestCase {
             return try Self.jsonResponse(ChainInfo(chains: [.init(directory: "Child", parentDirectory: "Nexus")]))
         }
         let childToken = UUID().uuidString.replacingOccurrences(of: "-", with: "")
-        router.post("chain/candidate") { request, _ in
+        router.post("api/chain/candidate") { request, _ in
             struct CandidateVolume: Decodable { let root: String; let entries: [String: String] }
             struct CandidateBody: Decodable {
                 let parentBlockHex: String?

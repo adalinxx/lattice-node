@@ -51,24 +51,25 @@ const childNode = await nexusNode.spawnChild({
   directory: CHILD,
   parentDirectory: nexusDir,
   ports: childPorts,
-  // Premine both miner and user on child so no fund TXs needed there.
-  // LatticeMiner can't confirm mempool TXs (needs full trie access for post-state).
+  // Premine the user on the child so no child fund tx is needed.
   premine: fundAmount * 10 + 1000,
   premineRecipient: user.address,
 })
 net.add(childNode)
 
-// Earn Nexus coinbase into a dedicated funder account, then fund user on Nexus.
-// The coinbase is still signed by the node identity, so using a separate payout
-// key prevents reward-only blocks from consuming the funder's nonce if a funding
-// block lands on a side fork.
-// The internal miner can confirm TXs because it has full state trie access.
-await nexusNode.startMining(nexusDir)
-await waitFor(async () => (await nexusNode.height(nexusDir)) >= 5,
-  'nexus height 5', { timeoutMs: 120_000, intervalMs: 500 })
+// One merged-mining coordinator advances BOTH Nexus and the child — including the
+// parent funding transfer and the swap receipt (the node builds each template with
+// full state access; the coordinator only does PoW). A separate payout key keeps
+// reward-only blocks from consuming the funder's nonce if a block lands on a fork.
+const miner = new LatticeMiner(nexusNode, [childNode])
+net.addMiner(miner)
+await miner.start()
 
-// Pause mining to get stable nonce, then submit and resume.
-await nexusNode.stopMining(nexusDir)
+// Let the funder earn Nexus coinbase, then fund the user on Nexus. Stop-for-stable-tip
+// to read a stable nonce; the merged miner then confirms the funding tx.
+await waitFor(async () => (await nexusNode.balance(funder.address, nexusDir)) >= fundAmount + 1,
+  'funder nexus coinbase', { timeoutMs: 2 * 120_000, intervalMs: 500 })
+await miner.stop()
 await nexusNode.awaitQuiesced(nexusDir)
 const nexusFundNonce = await nexusNode.nonce(funder.address, nexusDir)
 const nexusFundR = await nexusNode.submitTx({
@@ -76,16 +77,9 @@ const nexusFundR = await nexusNode.submitTx({
   accountActions: [{ owner: funder.address, delta: -(fundAmount + 1) }, { owner: user.address, delta: fundAmount }],
 }, nexusDir, funder)
 if (!nexusFundR.ok) throw new Error(`nexus fund failed: ${JSON.stringify(nexusFundR)}`)
-await nexusNode.startMining(nexusDir)
-await waitFor(async () => (await nexusNode.balance(user.address, nexusDir)) >= fundAmount,
-  'user nexus funded', { timeoutMs: 90_000 })
-await nexusNode.stopMining(nexusDir)
-
-// Start LatticeMiner for merged mining (Nexus + child).
-// Mempool is now clear so LatticeMiner builds empty-transaction blocks (no trie issues).
-const miner = new LatticeMiner(nexusNode, [childNode])
-net.addMiner(miner)
 await miner.start()
+await waitFor(async () => (await nexusNode.balance(user.address, nexusDir)) >= fundAmount,
+  'user nexus funded', { timeoutMs: 2 * 90_000 })
 
 await waitFor(async () => (await childNode.height(CHILD)) >= 10,
   `${CHILD} height 10`, { timeoutMs: 210_000, intervalMs: 500 })

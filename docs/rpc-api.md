@@ -34,12 +34,14 @@ return `401 Unauthorized`:
 
 - `POST /api/chain/deploy`
 - `POST /api/chain/register-rpc`
+- `POST /api/chain/unregister-rpc`
 - `POST /api/chain/template`
 - `POST /api/chain/submit-work`
 - `POST /api/chain/submit-child-block`
 - `POST /api/chain/parent-continuity`
 - `GET /api/chain/candidate`
 - `POST /api/chain/candidate`
+- `GET /api/chain/auth-check`
 
 ## Chain
 
@@ -57,6 +59,7 @@ Status of all chains hosted by this node, plus genesis and P2P metadata.
       "mining": true,
       "mempoolCount": 5,
       "syncing": false,
+      "minFeeRate": 1,
       "chainP2PAddress": "<pubkey>@127.0.0.1:4001"
     }
   ],
@@ -66,6 +69,11 @@ Status of all chains hosted by this node, plus genesis and P2P metadata.
   "p2pAddress": "<pubkey>@127.0.0.1:4001"
 }
 ```
+
+`minFeeRate` is the per-byte fee-rate floor this node enforces at admission for the
+chain. A cross-chain swap buyer must size the child withdrawal fee at or above
+`minFeeRate` before paying the irreversible parent receipt; otherwise the withdrawal
+is rejected and the seller has already been credited with no refund path.
 
 ### GET /api/chain/spec
 Chain specification parameters. `targetBlockTime` is in milliseconds (Nexus
@@ -90,22 +98,55 @@ targets `3600000`, i.e. 1 hour).
 
 These endpoints coordinate a tree of per-process chain nodes.
 
+#### GET /api/chain/auth-check *(privileged)*
+Returns `{"ok": true}` (200) iff the presented bearer cookie is the one this
+process accepts; otherwise `401`. A supervising parent probes this on restart to
+classify a child as alive-and-authenticated (adopt), alive-but-stale-cookie
+(re-read cookie), or dead (recover). It mutates nothing.
+
 #### GET /api/chain/map
 Map of full chain path → RPC endpoint for every registered chain whose endpoint
 has been announced. Lets clients discover the direct HTTP endpoint of any chain
 in the subtree.
 
 ```json
-{"Nexus": "http://127.0.0.1:8080", "Nexus/Payments": "http://127.0.0.1:8081"}
+{"Nexus": "http://127.0.0.1:8080/api", "Nexus/Payments": "http://127.0.0.1:8081/api"}
 ```
 
-#### POST /api/chain/register-rpc
+#### POST /api/chain/register-rpc *(privileged)*
 Called by a child node on startup to announce its RPC endpoint to its parent.
-Privileged endpoint; `endpoint` must be a loopback HTTP(S) base URL.
+`endpoint` must be a loopback HTTP(S) URL; `/api` is appended automatically if
+omitted. `authToken` is the child node's RPC cookie and is forwarded to the child
+when the parent delivers a mined block.
 
-**Request:** `{"chainPath": ["Nexus", "Payments"], "endpoint": "http://127.0.0.1:8081"}`
+**Request:** `{"chainPath": ["Nexus", "Payments"], "endpoint": "http://127.0.0.1:8081/api", "authToken"?: "<child-cookie>"}`
 
 **Response:** `{"ok": true}`
+
+#### POST /api/chain/unregister-rpc *(privileged)*
+Removes a previously-registered child RPC endpoint from the parent. Called by
+`chain detach`. After this call, the parent will no longer deliver mined child
+blocks to the child's process.
+
+**Request:** `{"chainPath": ["Nexus", "Payments"]}`
+
+**Response:** `{"ok": true, "warning": "Block delivery to this child may stall if this node was its only merged-mined relay. Ensure the child has an alternative peer before detaching."}`
+
+#### GET /api/chain/parent-height?chainPath=<path>
+Reports how far up the parent chain the specified child's current tip can see.
+A child block carried by parent block `H` commits `parentState = postState(H-1)`,
+so two heights are returned:
+
+- `parentHeight` (`H`) — the carrier block the child's tip is anchored to.
+- `visibleStateHeight` (`H-1`) — the highest parent block whose **post-state**
+  (including `receiptState`) is visible through `parentState`. This is the state a
+  child withdrawal validates against.
+
+A receipt mined in parent block `R` becomes claimable once `visibleStateHeight >= R`
+(equivalently `parentHeight >= R + 1`). Both are `null` for the root chain.
+
+**Response:** `{"parentHeight": 1234, "visibleStateHeight": 1233}` or
+`{"parentHeight": null, "visibleStateHeight": null}` for root chains.
 
 #### GET /api/chain/genesis?chainPath=<path>
 Returns the genesis block (hex-encoded payload) for a child chain so a new
@@ -259,7 +300,11 @@ Submit a signed transaction.
 }
 ```
 
-**Response:** `{"accepted": true, "txCID": "baguqeera...", "error": null}`
+**Response:** `{"accepted": true, "txCID": "baguqeera...", "bodyCID": "baguqeerb...", "error": null}`
+
+`txCID` is the canonical transaction CID — the key under which the mined receipt is
+indexed, so `GET /api/receipt/{txCID}` resolves once the tx is in a block. `bodyCID`
+is the transaction-body CID used for mempool dedup; do not use it for receipt lookups.
 
 ### POST /api/transaction/prepare
 Build and serialize an unsigned transaction body from structured action inputs.

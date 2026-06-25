@@ -731,9 +731,32 @@ extension LatticeNode {
         config.storagePath.appendingPathComponent("registered_rpc_auth_tokens.json")
     }
 
+    // Versioned on-disk envelope for deployed-child metadata. Treating the file as a
+    // protocol format (not a bare struct dump) means schema changes are explicit and
+    // migratable: load tries the current envelope, then falls back to the legacy bare
+    // map, and a present-but-corrupt file is logged loudly rather than silently dropped
+    // (silent [:] on upgrade would erase a parent's whole deployed-child set).
+    struct DeployedChildChainsFile: Codable {
+        static let currentVersion = 2
+        var schemaVersion: Int
+        var chains: [String: DeployedChainMetadata]
+
+        init(chains: [String: DeployedChainMetadata], schemaVersion: Int = currentVersion) {
+            self.schemaVersion = schemaVersion
+            self.chains = chains
+        }
+        enum CodingKeys: String, CodingKey { case schemaVersion, chains }
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            schemaVersion = try c.decodeIfPresent(Int.self, forKey: .schemaVersion) ?? Self.currentVersion
+            chains = try c.decode([String: DeployedChainMetadata].self, forKey: .chains)
+        }
+    }
+
     func persistDeployedChildChains() async {
         do {
-            let data = try JSONEncoder().encode(deployedChildChains)
+            let file = DeployedChildChainsFile(chains: deployedChildChains)
+            let data = try JSONEncoder().encode(file)
             try data.write(to: deployedChildChainsURL, options: .atomic)
         } catch {
             NodeLogger("persistence").error("Failed to persist deployed child chain metadata: \(error)")
@@ -741,11 +764,32 @@ extension LatticeNode {
     }
 
     func loadDeployedChildChains() -> [String: DeployedChainMetadata] {
-        guard let data = try? Data(contentsOf: deployedChildChainsURL),
-              let map = try? JSONDecoder().decode([String: DeployedChainMetadata].self, from: data) else {
+        guard FileManager.default.fileExists(atPath: deployedChildChainsURL.path) else {
+            return [:]  // fresh node — no file yet
+        }
+        guard let data = try? Data(contentsOf: deployedChildChainsURL) else {
+            NodeLogger("persistence").error("deployed_child_chains.json unreadable; keeping file, starting with empty deployed-child set")
             return [:]
         }
-        return map
+        return Self.decodeDeployedChildChains(data)
+    }
+
+    /// Pure decode with legacy migration — extracted so migration tests can exercise it
+    /// against fixture bytes without standing up a node. v2 = versioned envelope; v1 =
+    /// legacy bare `[chainKey: DeployedChainMetadata]` map.
+    static func decodeDeployedChildChains(_ data: Data) -> [String: DeployedChainMetadata] {
+        let decoder = JSONDecoder()
+        if let file = try? decoder.decode(DeployedChildChainsFile.self, from: data) {
+            return file.chains
+        }
+        do {
+            let legacy = try decoder.decode([String: DeployedChainMetadata].self, from: data)
+            NodeLogger("persistence").info("migrated deployed_child_chains.json from legacy (v1) to versioned (v\(DeployedChildChainsFile.currentVersion)) schema")
+            return legacy
+        } catch {
+            NodeLogger("persistence").error("deployed_child_chains.json present but undecodable (\(error)); keeping file for recovery, starting with empty deployed-child set")
+            return [:]
+        }
     }
 
     func persistRegisteredRPCRegistrations() {
@@ -764,12 +808,17 @@ extension LatticeNode {
     }
 
     private func loadRegisteredRPCEndpoints() -> [String: String] {
-        guard let data = try? Data(contentsOf: registeredRPCRegistrationsURL) else { return [:] }
-        let decoder = JSONDecoder()
-        if let payload = try? decoder.decode(PersistedRPCEndpoints.self, from: data) {
-            return payload.endpoints
+        guard FileManager.default.fileExists(atPath: registeredRPCRegistrationsURL.path) else { return [:] }
+        guard let data = try? Data(contentsOf: registeredRPCRegistrationsURL) else {
+            NodeLogger("persistence").error("registered_rpc_endpoints.json unreadable; starting with no registrations")
+            return [:]
         }
-        return [:]
+        do {
+            return try JSONDecoder().decode(PersistedRPCEndpoints.self, from: data).endpoints
+        } catch {
+            NodeLogger("persistence").error("registered_rpc_endpoints.json present but undecodable (\(error)); keeping file for recovery, starting with no registrations")
+            return [:]
+        }
     }
 
     private func loadRegisteredRPCAuthTokens() -> [String: String] {
@@ -780,11 +829,16 @@ extension LatticeNode {
                 NodeLogger("persistence").error("Ignoring registered RPC auth token sidecar with non-0600 permissions: \(registeredRPCAuthTokensURL.path)")
                 return [:]
             }
-            guard let data = try? Data(contentsOf: registeredRPCAuthTokensURL),
-                  let payload = try? decoder.decode(PersistedRPCAuthTokens.self, from: data) else {
+            guard let data = try? Data(contentsOf: registeredRPCAuthTokensURL) else {
+                NodeLogger("persistence").error("registered_rpc_auth_tokens.json unreadable; starting with no auth tokens")
                 return [:]
             }
-            return payload.authTokens
+            do {
+                return try decoder.decode(PersistedRPCAuthTokens.self, from: data).authTokens
+            } catch {
+                NodeLogger("persistence").error("registered_rpc_auth_tokens.json present but undecodable (\(error)); keeping file for recovery, starting with no auth tokens")
+                return [:]
+            }
         }
         return [:]
     }
@@ -836,5 +890,9 @@ extension LatticeNode {
         deployedChildChains = loadDeployedChildChains()
         registeredRPCEndpoints = loadRegisteredRPCEndpoints()
         registeredRPCAuthTokens = loadRegisteredRPCAuthTokens()
+        // Persisted loopback registrations are KEPT: reconcileSupervisedChildren()
+        // probes each child and adopts a live one (using the persisted token) or
+        // recovers a dead one. Clearing here would discard the token needed to adopt
+        // a child that survived a parent crash (Contract 4).
     }
 }

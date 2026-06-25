@@ -2007,24 +2007,64 @@ final class SecurityTests: XCTestCase {
         XCTAssertEqual(devnetContent, devnetJSON, "DevnetCommand identity must be in storagePath (SEC-029)")
     }
 
-    // MARK: - RPC endpoint admin/public classification coverage
+    // MARK: - RPC route authority manifest (method-aware)
 
-    private static let tre50AdminRoutes: Set<String> = [
-        "chain/register-rpc",
-        "chain/template",
-        "chain/submit-work",
-        "chain/submit-child-block",
-        "chain/candidate",
-        "chain/deploy",
-        // Per-process parent-continuity relay endpoint — admin-guarded
-        // (requireAdminAccess in RPCServer.swift); an operator-internal channel.
-        "chain/parent-continuity",
+    /// Single source of truth for privileged (admin-gated) routes, keyed "METHOD path".
+    /// A route is privileged iff its handler calls requireAdminAccess. The
+    /// `testPrivilegedManifestMatchesSourceGating` test proves this declared set equals
+    /// the set actually gated in source (GET *and* POST), and
+    /// `testPrivilegedRoutesGatedAtRuntimeMethodAware` proves each is gated at runtime —
+    /// so neither a new admin route nor a dropped gate can drift past the regression net.
+    static let privilegedRouteManifest: Set<String> = [
+        "POST chain/register-rpc",
+        "POST chain/unregister-rpc",
+        "POST chain/template",
+        "POST chain/submit-work",
+        "POST chain/submit-child-block",
+        "POST chain/parent-continuity",
+        "POST chain/candidate",
+        "GET chain/candidate",
+        "GET chain/auth-check",
+        "POST chain/deploy",
     ]
 
-    private static let tre50KnownPublicPostRoutes: Set<String> = [
+    /// State-changing POST routes that are intentionally public (unauthenticated).
+    static let knownPublicPostRoutes: Set<String> = [
         "transaction",
         "transaction/prepare",
     ]
+
+    // Path-only views derived from the manifest, for the existing POST-oriented tests.
+    private static var tre50AdminRoutes: Set<String> {
+        Set(privilegedRouteManifest.filter { $0.hasPrefix("POST ") }.map { String($0.dropFirst(5)) })
+    }
+    private static var tre50KnownPublicPostRoutes: Set<String> { knownPublicPostRoutes }
+
+    /// All `(method, path)` route registrations in the RPC sources, keyed "METHOD path".
+    static func registeredRoutes(in source: String) -> Set<String> {
+        let pattern = #"\bapi\.(get|post|put|delete|patch)\(\s*"([^"]+)""#
+        let regex = try! NSRegularExpression(pattern: pattern)
+        let ns = source as NSString
+        var routes: Set<String> = []
+        for m in regex.matches(in: source, range: NSRange(location: 0, length: ns.length)) {
+            let method = ns.substring(with: m.range(at: 1)).uppercased()
+            let path = ns.substring(with: m.range(at: 2))
+            routes.insert("\(method) \(path)")
+        }
+        return routes
+    }
+
+    /// Paths passed to `requireAdminAccess(endpoint:)` — the runtime gate's own authority.
+    static func adminGatedPaths(in source: String) -> Set<String> {
+        let pattern = #"requireAdminAccess\([^)]*endpoint:\s*"([^"]+)""#
+        let regex = try! NSRegularExpression(pattern: pattern)
+        let ns = source as NSString
+        var paths: Set<String> = []
+        for m in regex.matches(in: source, range: NSRange(location: 0, length: ns.length)) {
+            paths.insert(ns.substring(with: m.range(at: 1)))
+        }
+        return paths
+    }
 
     static func tre50UnclassifiedStateChangingRoutes(in source: String) -> [String] {
         let pattern = #"api\.(?:post|on)\(\s*"([^"]+)""#
@@ -2111,6 +2151,67 @@ final class SecurityTests: XCTestCase {
             unclassified.contains(unclassifiedRoute),
             "classification scan must cover sibling RPCServer*.swift extensions; a route registered there must be flagged. Got: \(unclassified)"
         )
+    }
+
+    /// Method-aware drift gate: the declared privileged manifest must equal the set of
+    /// routes actually gated by requireAdminAccess in source — for GET *and* POST. A new
+    /// admin GET (e.g. chain/auth-check) registered+gated but not declared fails here, as
+    /// does a manifest entry whose gate was removed.
+    func testPrivilegedManifestMatchesSourceGating() throws {
+        let source = try Self.tre50RPCServerSources()
+        let registered = Self.registeredRoutes(in: source)
+        let adminPaths = Self.adminGatedPaths(in: source)
+        // Every registered route whose path is admin-gated, formatted "METHOD path".
+        let actualPrivileged = Set(registered.filter { route in
+            guard let path = route.split(separator: " ", maxSplits: 1).last else { return false }
+            return adminPaths.contains(String(path))
+        })
+        XCTAssertEqual(
+            actualPrivileged, Self.privilegedRouteManifest,
+            "privileged route manifest drifted from requireAdminAccess gating (method-aware). "
+            + "Only-in-source: \(actualPrivileged.subtracting(Self.privilegedRouteManifest)); "
+            + "only-in-manifest: \(Self.privilegedRouteManifest.subtracting(actualPrivileged))"
+        )
+        // The new privileged GET must be present specifically.
+        XCTAssertTrue(Self.privilegedRouteManifest.contains("GET chain/auth-check"),
+                      "chain/auth-check must be classified as a privileged GET")
+    }
+
+    /// Runtime method-aware gate: every privileged route — GET and POST — must fail closed
+    /// (401) when hit unauthenticated on a public bind. None of these carry path params.
+    func testPrivilegedRoutesGatedAtRuntimeMethodAware() async throws {
+        let kp = CryptoUtils.generateKeyPair()
+        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        let config = LatticeNodeConfig(
+            publicKey: kp.publicKey, privateKey: kp.privateKey,
+            listenPort: nextTestPort(), storagePath: tmp,
+            enableLocalDiscovery: false, minPeerKeyBits: 0
+        )
+        let node = try await LatticeNode(config: config, genesisConfig: testGenesis())
+        try await node.start()
+        defer { Task { await node.stop() } }
+
+        let rpcPort = nextTestPort()
+        let server = RPCServer(node: node, port: rpcPort, bindAddress: "0.0.0.0", allowedOrigin: "*")
+        let serverTask = Task { try await server.run() }
+        defer { serverTask.cancel() }
+        try await waitForRPCServer(port: rpcPort)
+
+        for route in Self.privilegedRouteManifest {
+            let parts = route.split(separator: " ", maxSplits: 1)
+            let method = String(parts[0]); let path = String(parts[1])
+            var req = URLRequest(url: URL(string: "http://127.0.0.1:\(rpcPort)/api/\(path)")!)
+            req.httpMethod = method
+            req.addValue("external-host.example.com", forHTTPHeaderField: "Host")
+            if method == "POST" {
+                req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                req.httpBody = Data("{}".utf8)
+            }
+            let (_, response) = try await URLSession.shared.data(for: req)
+            let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+            XCTAssertEqual(code, 401, "privileged \(method) /api/\(path) must fail closed on public bind: got \(code)")
+        }
     }
 
     func testParityScanFlagsUnclassifiedStateChangingRoute() {
