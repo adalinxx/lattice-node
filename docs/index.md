@@ -13,8 +13,8 @@ Start here, then follow the path that matches what you're doing.
 | Understand what Lattice is and why it exists | [Whitepaper](whitepaper.md) · [README](../README.md) |
 | Run a node for the first time | [Getting started](getting-started.md) |
 | Call the HTTP API | [RPC API reference](rpc-api.md) |
-| Operate a node in production | [Operations runbook](operations.md) · [Deployment](../deploy/README.md) |
-| Deploy or manage child chains | [Deployment runbook](../deploy/README.md) |
+| Operate a node in production | [Operations runbook](operations.md) · [Deployment](../README.md#deployment) |
+| Deploy or manage child chains | [Deploy & Announce a Child Chain](getting-started.md#deploy--announce-a-child-chain) |
 | Understand the protocol in depth | [Protocol specification](protocol.md) |
 | Understand the node's internals | [Architecture](architecture.md) |
 | Understand the core design philosophy | [Fractal structure](design/fractal-structure.md) |

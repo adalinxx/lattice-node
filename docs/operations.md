@@ -261,7 +261,7 @@ LatticeNode node --data-dir /data/lattice --peer pubkey@host:port
 ```
 
 The node creates a fresh genesis, syncs from the peer, and rebuilds all state.
-For child chains in the production per-process model, re-spawn each child process per [`../deploy/README.md`](../deploy/README.md) ("Per-process child chains").
+For child chains in the production per-process model, re-spawn each child process per [Join & Merge-Mine an Existing Child Chain](getting-started.md#join--merge-mine-an-existing-child-chain).
 
 ### Partial State Rebuild (Preserve CAS)
 

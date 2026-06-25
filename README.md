@@ -102,7 +102,7 @@ Full docs live in [`docs/`](docs/index.md). Quick links:
 - [Protocol specification](docs/protocol.md) — the canonical spec
 - [Architecture](docs/architecture.md) — node internals and the per-process topology
 - [RPC API reference](docs/rpc-api.md) — the HTTP API
-- [Operations](docs/operations.md) and [Deployment](deploy/README.md) — running in production
+- [Operations](docs/operations.md) and [Deployment](#deployment) — running in production (incl. cloud/NAT)
 - [Development](docs/development.md) — building, testing, and reproducing the Linux CI build
 - [Whitepaper](docs/whitepaper.md) — vision and design rationale
 
@@ -204,6 +204,39 @@ is privileged: it requires the generated RPC cookie bearer credential.
 | `--genesis-hex <hex>` | — | Genesis bytes for a per-process child, from the parent's deploy response |
 | `--chain-directory <name>` | — | Which chain this process owns (per-process child) |
 | `--subscribe-p2p <pubKey@host:port>` | — | Parent P2P address to subscribe to for block extraction (per-process child) |
+| `--chain-path <Nexus/.../self>` | — | Full slash-separated chain path this node validates against (per-process child) |
+| `--rpc-bind <addr>` | `127.0.0.1` | RPC bind address (set `0.0.0.0` to expose the API — firewall it) |
+| `--external-address <host:port>` | — | Public P2P address to advertise. **Required on cloud/NAT hosts** whose locally-observed address isn't dialable (e.g. fly `172.x`); without it peers learn an unreachable address |
+| `--relay` | off (on if `--external-address`) | Serve as a circuit relay for peers that can't connect directly (NAT) |
+| `--use-relay <pubKey@host:port>` | — | Relay to route through when a direct dial fails (repeatable) |
+| `--min-peer-key-bits <N>` | 16 | Min PoW bits a peer identity key must carry to be admitted (0 disables); must match the network |
+| `--coinbase-address <addr>` | — | Payout address credited in block templates (templates carry no reward when unset) |
+| `--supervise-children` | off | Spawn and supervise one OS process per deployed child chain |
+| `--state-mode <mode>` | `stateful` | State storage: `stateless` \| `stateful` \| `historical` |
+| `--block-retention <mode>` | `retention` | Block retention: `tip` \| `retention` \| `historical` |
+| `--max-peers <N>` | 128 | Maximum peer connections |
+| `--min-fee-rate <N>` | 1 | Mempool admission min fee per serialized byte (relay policy, not consensus) |
+
+### Subcommands
+
+Run `lattice-node <command> --help` for the full flag list of any command.
+
+| Command | Description |
+|---------|-------------|
+| `lattice-node` (no subcommand) | Run a node daemon (joins the Nexus; serves RPC when `--rpc-port` is set) |
+| `keys generate` / `show` / `address` | Create a keypair (optionally `--output <file>`), inspect a key file, or derive an address from a public key |
+| `send <to> <amount>` | Submit a transfer via a node's RPC (`--key`, `--rpc`, `--fee`, `--chain-path`) |
+| `tx` | Build/sign/submit a general transaction — transfer (`--to`/`--amount`), KV write (`--set k=v`), child create, or swap legs |
+| `chain deploy` | Deploy a child chain (privileged): seed its genesis and announce it (`--directory`, `--key`, `--cookie-file`, spec flags) |
+| `chain genesis` / `attach` / `detach` | Fetch a child's staged genesis; register / unregister a child node's RPC endpoint with the parent |
+| `swap sell` / `buy` / `status` | Cross-chain atomic swap: escrow on the child, pay+receipt on the parent, withdraw on the child |
+| `query <height\|tip\|blocks\|balance>` | Read persisted chain state directly from `--storage-path` (offline; no running node) |
+| `status` | Chain tip, height, and block counts read directly from `--storage-path` (offline) |
+| `identity` | Print the node's persisted identity public key from `--data-dir` |
+| `devnet` / `cluster` | Run a local single-node devnet (`--mining`) or a multi-node cluster |
+| `faucet` | Run a testnet faucet that drips funds to requesting addresses |
+| `init <name>` | Scaffold a new chain project (`--template basic\|token\|multi-chain`) |
+| `diag` | Print the genesis-serialization diagnostic (mainnet Nexus, or `--testnet`) |
 
 ### Interactive commands
 
@@ -261,6 +294,36 @@ lattice-node \
   --peer <node1-pubkey>@<node1-ip>:4001 \
   --peer <node2-pubkey>@<node2-ip>:4001
 ```
+
+### Cloud and NAT nodes
+
+A node advertises the address peers should dial it on. On a cloud VM or behind NAT the
+**locally-observed address is not externally dialable** (e.g. a fly host sees `172.x`), so
+peers learn an unreachable address and can't connect. Set `--external-address` to the
+node's real public `host:port`:
+
+```bash
+# Public/cloud node: advertise the reachable address. Expose the P2P port (4001) and,
+# if you serve the API publicly, bind + firewall the RPC port. --external-address also
+# turns this node into a circuit relay by default, so NATed peers can route through it.
+lattice-node --rpc-port 8080 --rpc-bind 0.0.0.0 \
+  --external-address <public-ip-or-dns>:4001 \
+  --min-peer-key-bits 16
+```
+
+A node with **no public address** (home/NAT, can't or won't port-forward) instead routes
+through a relay — it still syncs and mines, just over a relayed connection:
+
+```bash
+lattice-node --rpc-port 8080 \
+  --use-relay <relay-pubkey>@<relay-host>:4001 \
+  --peer <seed-pubkey>@<seed-host>:4001
+```
+
+`--min-peer-key-bits` must match the network (the Nexus seeds use 16); a mismatch makes
+peers reject each other on admission. Open/forward the P2P port (`--port`, default 4001)
+for direct inbound connections; keep the RPC port (`--rpc-port`) private or firewalled —
+privileged endpoints are cookie-authed, but the API should not be openly exposed.
 
 Nodes don't run nonce-search loops. During the E15 migration, run the current
 external miner against whichever node(s) should produce blocks:
