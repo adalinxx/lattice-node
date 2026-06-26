@@ -4,7 +4,7 @@
 
 import { rmSync, mkdirSync } from 'node:fs'
 import { allocPorts, smokeRoot } from 'lattice-node-sdk/env'
-import { LatticeNode, LatticeNetwork, sleep, waitFor, genKeypair, computeAddress } from 'lattice-node-sdk'
+import { LatticeNode, LatticeNetwork, sleep, waitFor, waitForProgress, genKeypair, computeAddress } from 'lattice-node-sdk'
 
 const ROOT = smokeRoot('mining-key-boundary')
 rmSync(ROOT, { recursive: true, force: true })
@@ -58,10 +58,8 @@ const submit = await node.rpc('POST', '/api/chain/submit-work', {
 if (!submit.ok || submit.json?.accepted !== true) {
   throw new Error(`submit-work failed: ${submit.status} ${JSON.stringify(submit.json)}`)
 }
-await waitFor(async () => {
-  const h = await node.height(nexus)
-  return h >= 1 ? h : null
-}, 'submitted work accepted', { timeoutMs: 30_000, intervalMs: 300 })
+await waitForProgress(async () => node.height(nexus), (h) => h >= 1,
+  'submitted work accepted', { stallMs: 30_000, intervalMs: 300 })
 console.log('  ✓ node accepted its own sealed work')
 
 console.log('\n[3] Verify rewards went to node-owned identity, not request key...')

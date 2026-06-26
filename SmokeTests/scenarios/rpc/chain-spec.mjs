@@ -5,7 +5,7 @@
 //   4. Child process owns child chain/info; parent exposes only route metadata
 
 import { allocPorts, smokeRoot } from 'lattice-node-sdk/env'
-import { LatticeNode, LatticeNetwork, LatticeMiner, sleep, waitFor } from 'lattice-node-sdk'
+import { LatticeNode, LatticeNetwork, LatticeMiner, sleep, waitFor, waitForProgress } from 'lattice-node-sdk'
 
 const ROOT = smokeRoot('chain-spec')
 const [{ port, rpcPort }, childPorts] = await allocPorts(2, { seed: 55 })
@@ -65,10 +65,8 @@ console.log(`  child process up`)
 // Use LatticeMiner to mine the child chain.
 const miner = net.addMiner(new LatticeMiner(node, [childNode], { workers: 2 }))
 await miner.start()
-await waitFor(async () => {
-  const h = await childNode.height(CHILD)
-  return h >= 3 ? h : null
-}, `${CHILD} height ≥ 3`, { timeoutMs: 120_000, intervalMs: 500 })
+await waitForProgress(async () => childNode.height(CHILD), (h) => h >= 3,
+  `${CHILD} height ≥ 3`, { stallMs: 120_000, intervalMs: 500 })
 await miner.stop()
 console.log(`  ✓ child chain deployed and mining`)
 

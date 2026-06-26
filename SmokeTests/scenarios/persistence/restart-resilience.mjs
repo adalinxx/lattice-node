@@ -7,7 +7,7 @@ import { rmSync, mkdirSync } from 'node:fs'
 import { allocPorts, smokeRoot } from 'lattice-node-sdk/env'
 import {
   LatticeNode, LatticeNetwork, LatticeMiner,
-  sleep, waitFor, genKeypair, computeAddress,
+  sleep, waitFor, waitForProgress, genKeypair, computeAddress,
 } from 'lattice-node-sdk'
 
 const ROOT = smokeRoot('restart-resilience')
@@ -519,10 +519,12 @@ console.log(`  swap A receipt still present`)
 
 console.log(`\n[phase 5] swap B (post-restart, inverse rate)...`)
 const initialHeight = await nexusNode.height(nexusDir)
-await waitFor(async () => {
-  const h = await nexusNode.height(nexusDir)
-  return h > initialHeight ? h : null
-}, 'nexus mining advance after restart', { timeoutMs: MINING_WAIT_MS, intervalMs: 1_000 })
+await waitForProgress(
+  async () => nexusNode.height(nexusDir),
+  (h) => h > initialHeight,
+  'nexus mining advance after restart',
+  { stallMs: MINING_WAIT_MS, intervalMs: 1_000 },
+)
 
 console.log(`  user B: ${userB.address} (child genesis-premine account)`)
 const userBChildBeforeSwap = childPremineAmount - 5001

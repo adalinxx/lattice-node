@@ -6,7 +6,7 @@ import { rmSync, mkdirSync } from 'node:fs'
 import { allocPorts, smokeRoot } from 'lattice-node-sdk/env'
 import {
   LatticeNode, LatticeNetwork, LatticeMiner,
-  sleep, waitFor, genKeypair, computeAddress,
+  sleep, waitFor, waitForProgress, genKeypair, computeAddress,
 } from 'lattice-node-sdk'
 
 const ROOT = smokeRoot('vrs')
@@ -81,8 +81,8 @@ await miner.start()
 await waitFor(async () => (await nexusNode.balance(user.address, nexusDir)) >= fundAmount,
   'user nexus funded', { timeoutMs: 2 * 90_000 })
 
-await waitFor(async () => (await childNode.height(CHILD)) >= 10,
-  `${CHILD} height 10`, { timeoutMs: 210_000, intervalMs: 500 })
+await waitForProgress(async () => childNode.height(CHILD), (h) => h >= 10,
+  `${CHILD} height 10`, { stallMs: 210_000, intervalMs: 500 })
 // Keep miner running through the swap cycle to confirm swap TXs.
 
 await waitFor(async () => (await nexusNode.balance(user.address, nexusDir)) >= fundAmount,
