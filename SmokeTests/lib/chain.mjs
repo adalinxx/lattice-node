@@ -1,7 +1,7 @@
 // Chain introspection + RPC wrappers. All take a Node so multi-node scenarios
 // can probe each independently.
 
-import { sleep, waitFor } from './waitFor.mjs'
+import { sleep, waitFor, waitForProgress, scaledMs } from './waitFor.mjs'
 
 export async function chainInfo(node) {
   const r = await node.rpc('GET', '/api/chain/info')
@@ -97,19 +97,39 @@ export async function awaitChainsQuiesced(node, dirs, { timeoutMs = 15_000, inte
   throw new Error(`chains never stabilized within ${timeoutMs}ms: ${last}`)
 }
 
-export async function waitForHeight(node, chain, minHeight, timeoutMs = 30_000) {
-  return waitFor(async () => {
-    const t = await tipInfo(node, chain)
-    return t && t.height >= minHeight ? t.height : null
-  }, `${node.name}/${chain} height ≥ ${minHeight}`, { timeoutMs, intervalMs: 1_000 })
+// Progress-based: the height target is a CORRECTNESS invariant (the chain advances to
+// `minHeight`), not a latency bound. Fails only if production STALLS (no new block for
+// the stall window), so a slow-but-advancing chain under CI contention still passes.
+// The legacy 4th arg (a number = old hard timeoutMs) is reinterpreted as the stall
+// window — "no progress for that long" — which is a strict robustness upgrade.
+export async function waitForHeight(node, chain, minHeight, opts = {}) {
+  const o = typeof opts === 'number' ? { stallMs: opts } : opts
+  return waitForProgress(
+    async () => { const t = await tipInfo(node, chain); return t ? t.height : null },
+    (h) => h >= minHeight,
+    `${node.name}/${chain} height ≥ ${minHeight}`,
+    { stallMs: o.stallMs ?? 30_000, safetyMs: o.safetyMs ?? 600_000, intervalMs: o.intervalMs ?? 1_000 },
+  )
 }
 
-export async function mineBurst(node, chain, { targetHeight = 5, maxMs = 8000 } = {}) {
+// Best-effort burst: mine until `targetHeight`, or until production stalls (no new block
+// for `stallMs`), or an absolute backstop — progress-based rather than a fixed wall-clock
+// window, so a loaded host that mines slowly-but-steadily still reaches the target instead
+// of being cut off mid-burst. Never throws; returns the tip reached (or null).
+export async function mineBurst(node, chain, { targetHeight = 5, stallMs = 8000, maxMs = 120_000 } = {}) {
   await startMining(node, chain)
   const start = Date.now()
-  while (Date.now() - start < maxMs) {
+  const stallDeadline = scaledMs(stallMs)
+  const maxDeadline = scaledMs(maxMs)
+  let best = -1
+  let lastProgress = Date.now()
+  while (true) {
     const t = await tipInfo(node, chain)
     if (t && t.height >= targetHeight) break
+    if (t && t.height > best) { best = t.height; lastProgress = Date.now() }
+    const now = Date.now()
+    if (now - lastProgress > stallDeadline) break
+    if (now - start > maxDeadline) break
     await sleep(200)
   }
   await stopMining(node, chain)

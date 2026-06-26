@@ -11,7 +11,7 @@
 import { rmSync, mkdirSync } from 'node:fs'
 import { createConnection } from 'node:net'
 import { allocPorts, smokeRoot } from 'lattice-node-sdk/env'
-import { LatticeNode, LatticeNetwork, LatticeMiner, sleep, waitFor } from 'lattice-node-sdk'
+import { LatticeNode, LatticeNetwork, LatticeMiner, sleep, waitFor, waitForProgress } from 'lattice-node-sdk'
 
 const ROOT = smokeRoot('redeploy-from-genesis')
 rmSync(ROOT, { recursive: true, force: true })
@@ -43,10 +43,12 @@ const firstGenesisHex = childNode._deployInfo.genesisHex
 
 let miner = net.addMiner(new LatticeMiner(node, [childNode], { workers: 2 }))
 await miner.start()
-await waitFor(async () => {
-  const h = await childNode.height(CHILD)
-  return h >= 5 ? h : null
-}, `${CHILD} height ≥ 5`, { timeoutMs: 60_000, intervalMs: 500 })
+await waitForProgress(
+  async () => childNode.height(CHILD),
+  (h) => h >= 5,
+  `${CHILD} height ≥ 5`,
+  { stallMs: 60_000, intervalMs: 500 },
+)
 await miner.stop()
 
 const heightAfterFirst = await childNode.height(CHILD)
@@ -151,10 +153,12 @@ childNode = net.add(await node.spawnChild({
 
 miner = net.addMiner(new LatticeMiner(node, [childNode], { workers: 2 }))
 await miner.start()
-await waitFor(async () => {
-  const h = await childNode.height(CHILD)
-  return h >= 2 ? h : null
-}, `${CHILD} height ≥ 2`, { timeoutMs: 60_000, intervalMs: 500 })
+await waitForProgress(
+  async () => childNode.height(CHILD),
+  (h) => h >= 2,
+  `${CHILD} height ≥ 2`,
+  { stallMs: 60_000, intervalMs: 500 },
+)
 await miner.stop()
 
 const heightAfterRedeploy = await childNode.height(CHILD)

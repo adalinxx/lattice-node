@@ -404,10 +404,18 @@ extension LatticeNode {
         block: Block,
         directory: String,
         network: ChainNetwork,
-        source: any ContentSource
+        source: any ContentSource,
+        skipNetworkPrefetch: Bool = false
     ) async -> Block? {
         let log = NodeLogger("blocks")
-        var bundleRoots = await prefetchBlockContentClosure(blockHash: header.rawCID, network: network)
+        // `skipNetworkPrefetch` is set when the block's content is already durably stored
+        // locally (the mined path): the carrier's own content resolves from storage, and a
+        // merged carrier's embedded-child closure must NOT be fetched over the network (it is
+        // the child's, not ours, and blocks ~15s per call). The retry refetch below still
+        // fires if local resolution genuinely misses, so correctness is preserved.
+        var bundleRoots = skipNetworkPrefetch
+            ? []
+            : await prefetchBlockContentClosure(blockHash: header.rawCID, network: network)
 
         var resolvedBlock: Block?
         for attempt in 0..<3 {
