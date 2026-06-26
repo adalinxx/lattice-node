@@ -1,16 +1,18 @@
-// Two-node sync: A (miner) deploys child chain "Payments" and mines both Nexus
-// and Payments; B (follower) bootstraps from A and must converge on both tips.
-// Exercises validated block-receive plus child-chain extraction from
-// merged-mined Nexus blocks.
+// Two-node sync: A (miner) deploys + ANNOUNCES child chain "Payments" and mines
+// both Nexus and Payments; B is an UNTRUSTED joiner — peered to A for Nexus only,
+// it DISCOVERS Payments from its own synced GenesisState, follows it (no genesis
+// hex / peer / subscribe hand-off), self-resolves the genesis, finds A's Payments
+// via getChildPeers, and must converge on BOTH tips + the child account state.
+// Exercises validated block-receive + child extraction + permissionless join.
 
 import { allocPorts, smokeRoot } from 'lattice-node-sdk/env'
 import { LatticeNode, LatticeNetwork, LatticeMiner, sleep, waitFor, peerCount, computeAddress } from 'lattice-node-sdk'
 
 const ROOT = smokeRoot('sync')
-const [a, b, childA, childB] = await allocPorts(4, { seed: 91 })
+const [a, b, childA] = await allocPorts(3, { seed: 91 })
 const CHILD = 'Payments'
 
-console.log('=== two-node sync smoke test (Nexus + child) ===')
+console.log('=== two-node sync smoke test (Nexus + permissionlessly-joined child) ===')
 const net = new LatticeNetwork()
 net.installSignalHandlers()
 
@@ -25,89 +27,53 @@ const aIdent = await A.readIdentity()
 console.log(`  A pubkey: ${aIdent.publicKey.slice(0, 32)}...`)
 console.log(`  nexus directory: ${nexusDir}`)
 
-console.log(`\n[2] Deploy child chain "${CHILD}" on A as a separate process...`)
-// spawnChild deploys on A and starts the child as a per-process node.
+console.log(`\n[2] A: deploy child "${CHILD}" (operator) as a separate process + mine both...`)
 const aPayments = net.add(await A.spawnChild({
   directory: CHILD,
   parentDirectory: nexusDir,
   ports: childA,
   premine: 0,
 }))
-const { genesisHex: paymentsGenesisHex, chainP2PAddress: paymentsP2POnA } = aPayments._deployInfo
-const aNexusInfo = await A.chainInfo()
-const aNexusP2P = aNexusInfo.p2pAddress
-// Read A-Payments identity so B-Payments can peer with A-Payments directly for block sync.
-const aPaymentsIdent = await aPayments.readIdentity()
-const aPaymentsPeerArg = aPayments.peerArg()
-console.log(`  A/${CHILD} process up, chainP2P=${paymentsP2POnA}`)
-
-console.log(`\n[3] Boot node B with --peer <A>...`)
-B.start([
-  '--peer', A.peerArg(),
-])
-await B.waitForRPC()
-
-// B's Payments child uses A's genesis hex so it shares the same chain.
-// It subscribes to A's nexus P2P to extract new Payments blocks via gossip,
-// and peers directly with A-Payments for historical block sync.
-const bPayments = net.add(new LatticeNode({
-  name: `B-${CHILD}`,
-  dir: `${ROOT}/B-${CHILD}`,
-  port: childB.port,
-  rpcPort: childB.rpcPort,
-  chainPath: [nexusDir, CHILD],
-}))
-bPayments.start([
-  '--genesis-hex', paymentsGenesisHex,
-  '--chain-directory', CHILD,
-  '--chain-path', `${nexusDir}/${CHILD}`,
-  '--subscribe-p2p', aNexusP2P,
-  '--peer', aPaymentsPeerArg,
-])
-await bPayments.waitForRPC()
-console.log(`  B/${CHILD} process up`)
-
-console.log('  letting peers connect...')
-await waitFor(async () => (await peerCount(A)) >= 1 && (await peerCount(B)) >= 1,
-  'peers connected', { timeoutMs: 15_000 })
-await waitFor(async () => (await peerCount(aPayments)) >= 1 && (await peerCount(bPayments)) >= 1,
-  `${CHILD} peers connected`, { timeoutMs: 15_000 })
-console.log(`  peer counts: A=${await peerCount(A)} B=${await peerCount(B)} A/${CHILD}=${await peerCount(aPayments)} B/${CHILD}=${await peerCount(bPayments)}`)
+const paymentsGenesisHash = aPayments._deployInfo.genesisHash
+console.log(`  A/${CHILD} process up, genesis=${paymentsGenesisHash.slice(0, 20)}...`)
 
 const NEXUS_TARGET = 18
 const CHILD_TARGET = 3
-console.log(`\n[4] Mining on A using LatticeMiner until Nexus reaches height ${NEXUS_TARGET} and ${CHILD} reaches height ${CHILD_TARGET}...`)
 const miner = net.addMiner(new LatticeMiner(A, [aPayments], { workers: 2 }))
 await miner.start()
 
+console.log(`\n[3] A: announce ${CHILD} on-chain so untrusted peers can discover it...`)
+await A.announceChild({ nexusDir, child: CHILD, genesisHash: paymentsGenesisHash })
+
+console.log(`\n[4] Boot B: peer A for Nexus ONLY (+ supervise children) — no child genesis/peer...`)
+B.start(['--peer', A.peerArg(), '--supervise-children'])
+await B.waitForRPC()
+await waitFor(async () => (await peerCount(A)) >= 1 && (await peerCount(B)) >= 1,
+  'Nexus peers connected', { timeoutMs: 15_000 })
+
+console.log(`\n[5] B: DISCOVER + FOLLOW ${CHILD} (no genesis-hex / peer / subscribe supplied)...`)
+const bPayments = await B.followChild({ nexusDir, child: CHILD, expectGenesis: paymentsGenesisHash })
+console.log(`  B/${CHILD} joined permissionlessly, endpoint=${bPayments.endpoint}`)
+
+console.log(`\n[6] Mine A until Nexus ≥ ${NEXUS_TARGET}, ${CHILD} ≥ ${CHILD_TARGET}, then freeze...`)
 await waitFor(async () => {
   const [nxH, chH] = await Promise.all([A.height(nexusDir), aPayments.height(CHILD)])
   return nxH >= NEXUS_TARGET && chH >= CHILD_TARGET ? [nxH, chH] : null
-}, `A heights Nexus ≥ ${NEXUS_TARGET}, ${CHILD} ≥ ${CHILD_TARGET}`, { timeoutMs: 90_000 })
-
-console.log(`\n[5] Stopping miner to freeze the tip...`)
+}, `A heights Nexus ≥ ${NEXUS_TARGET}, ${CHILD} ≥ ${CHILD_TARGET}`, { timeoutMs: 120_000 })
 await miner.stop()
 await A.awaitQuiesced(nexusDir)
 await aPayments.awaitQuiesced(CHILD)
 await sleep(2000)
 
+const minerAddr = computeAddress(aIdent.publicKey)
 const aNxH = await A.height(nexusDir)
 const aChH = await aPayments.height(CHILD)
-const aNxTip = await A.tip(nexusDir)
-const aChTip = await aPayments.tip(CHILD)
-const minerAddr = computeAddress(aIdent.publicKey)
-const aChildBalance = await aPayments.balance(minerAddr, CHILD)
-console.log(`  A frozen: ${nexusDir}@${aNxH} tip=${aNxTip.slice(0, 20)}...`)
-console.log(`  A frozen: ${CHILD}@${aChH} tip=${aChTip.slice(0, 20)}...`)
+console.log(`  A frozen: ${nexusDir}@${aNxH}, ${CHILD}@${aChH}`)
 
-// Compare B against A's CURRENT (now-frozen) state each poll, not the values
-// captured above: the external miner can land an in-flight block or two after
-// awaitQuiesced returns, nudging A's real tip past the snapshot. B correctly
-// converges on A's actual final tip, so chasing the live value (stable once the
-// miner is truly stopped) is what we must assert — a stale snapshot would never
-// match. Require A itself to be stable across the poll so we never compare
-// against a mid-flight A tip.
-console.log(`\n[6] Waiting for B to converge on both chains...`)
+// Compare B against A's CURRENT (now-frozen) state each poll: the external miner can
+// land an in-flight block or two after awaitQuiesced, so we chase A's actual final
+// tip and require A itself stable across the poll (never compare a mid-flight A tip).
+console.log(`\n[7] Wait for B to converge on Nexus tip AND the joined child's state...`)
 let lastANxTip = null
 let lastAChTip = null
 await waitFor(async () => {
@@ -123,17 +89,17 @@ await waitFor(async () => {
   if (!aStable) return null
   const [bNxTip, bChH, bChTip, bChildBalance] = await Promise.all([
     B.tip(nexusDir),
-    bPayments.height(CHILD),
-    bPayments.tip(CHILD),
-    bPayments.balance(minerAddr, CHILD),
+    bPayments.height(),
+    bPayments.tip(),
+    bPayments.balance(minerAddr),
   ])
   return bNxTip === aNxTipNow &&
     bChH === aChHNow &&
     bChTip === aChTipNow &&
     bChildBalance === aChildBalNow ? true : null
-}, 'B converged on Nexus tip and child state', { timeoutMs: 240_000 })
+}, 'B converged on Nexus tip and joined child state', { timeoutMs: 240_000 })
 
-console.log(`✓ B converged: ${nexusDir}@${aNxH}, ${CHILD}@${aChH}`)
+console.log(`✓ B converged: ${nexusDir}@${aNxH}, ${CHILD}@${aChH} (child joined permissionlessly)`)
 console.log('✓ two-node sync smoke test passed.')
 net.teardown()
 await sleep(500)

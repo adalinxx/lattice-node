@@ -562,6 +562,15 @@ struct NodeCommand: AsyncParsableCommand {
         // and derived at spawn time.
         var childInheritedArgs = ["--min-peer-key-bits", String(effectiveMinPeerKeyBits), "--min-fee-rate", String(effectiveMinFeeRate)]
         if effectiveNoDnsSeeds { childInheritedArgs.append("--no-dns-seeds") }
+        // A stateless operator holds no local CAS; the children it supervises/follows
+        // must be stateless too, otherwise a followed child silently accrues full
+        // on-disk state the parent's stateless posture promised not to keep.
+        if effectiveStateless { childInheritedArgs.append("--stateless") }
+        // Self-similar recursion: a supervised/followed child is itself a full node that
+        // supervises + auto-follows ITS OWN announced children. Inheriting the flag is
+        // what lets a deep subtree (Nexus -> Mid -> Stable -> …) self-assemble one level
+        // per process — no chain is special. (See autoFollowAnnouncedChildren.)
+        if superviseChildren { childInheritedArgs.append("--supervise-children") }
         // Decode this node's spawn-cert chain (base64 JSON), if delivered. A
         // malformed value fails closed (federated) — it never trusts on a parse error.
         var decodedSpawnCertChain: [SpawnCertificate] = []

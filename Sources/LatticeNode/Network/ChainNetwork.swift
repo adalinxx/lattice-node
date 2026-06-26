@@ -54,6 +54,17 @@ public protocol ChainNetworkDelegate: AnyObject, Sendable {
     /// `peer` is the responder — the client only accepts it if it matches the peer
     /// the request was sent to (anti-forgery).
     func chainNetwork(_ network: ChainNetwork, handleConsensusResponse payload: Data, from peer: PeerID) async
+    /// A connected child advertised its chain-gossip `(pubkey, port)` over this
+    /// (parent) chain's link. The node stores it against the peer and pairs it with
+    /// the observed host when serving `getChildPeers`.
+    func chainNetwork(_ network: ChainNetwork, handleChildPeerAdvertise payload: Data, from peer: PeerID) async
+    /// (serve): a followed child asked for the chain endpoints of this chain's
+    /// `directory` children. Returns the response payload to send back on THIS
+    /// network, or nil to stay silent (undecodable).
+    func chainNetwork(_ network: ChainNetwork, handleChildPeerRequest payload: Data, from peer: PeerID) async -> Data?
+    /// (client): a response to one of our own getChildPeers requests. `peer` is the
+    /// responder — accepted only if it matches the peer we asked (anti-forgery).
+    func chainNetwork(_ network: ChainNetwork, handleChildPeerResponse payload: Data, from peer: PeerID) async
     /// Penalize a peer that has repeatedly flooded an already-full mempool by
     /// adding it to the durable, cross-restart ban store. The node disconnects
     /// the peer and refuses future connections until the ban expires.
@@ -81,6 +92,9 @@ public extension ChainNetworkDelegate {
     func chainNetwork(_ network: ChainNetwork, didReceiveSpawnCertChain peer: PeerID) async {}
     func chainNetwork(_ network: ChainNetwork, handleConsensusRequest payload: Data, from peer: PeerID) async -> Data? { nil }
     func chainNetwork(_ network: ChainNetwork, handleConsensusResponse payload: Data, from peer: PeerID) async {}
+    func chainNetwork(_ network: ChainNetwork, handleChildPeerAdvertise payload: Data, from peer: PeerID) async {}
+    func chainNetwork(_ network: ChainNetwork, handleChildPeerRequest payload: Data, from peer: PeerID) async -> Data? { nil }
+    func chainNetwork(_ network: ChainNetwork, handleChildPeerResponse payload: Data, from peer: PeerID) async {}
     // Default: no proof available. Keeps non-node conformers (test mocks) source-compatible.
     func chainNetwork(_ network: ChainNetwork, blockProofData cid: String) async -> Data? { nil }
     // Default: permit. Non-node conformers (test mocks) impose no size policy.
@@ -189,6 +203,10 @@ public actor ChainNetwork: IvyDelegate, IvyDataSource {
     /// a cheap request that triggers a chain-path resolution + weight lookup +
     /// response, the same amplification class as getHeaders; gate it the same way.
     var consensusRequestBuckets: PeerRateBuckets
+    /// Per-peer token bucket for same-chain-peer requests (childpeers-request and
+    /// childpeers-advertise) — cheap requests that trigger a subscriber scan +
+    /// reply, the same amplification class as cw-request; gate them the same way.
+    var childPeerRequestBuckets: PeerRateBuckets
     nonisolated var mempoolGossipCapacity: Double { rateLimitTuning.mempoolGossipCapacity }
     nonisolated var mempoolGossipRefillPerSec: Double { rateLimitTuning.mempoolGossipRefillPerSec }
     nonisolated var getHeadersCapacity: Double { rateLimitTuning.getHeadersCapacity }
@@ -280,6 +298,11 @@ public actor ChainNetwork: IvyDelegate, IvyDataSource {
             maxEntries: Self.maxBucketEntries
         )
         self.consensusRequestBuckets = PeerRateBuckets(
+            capacity: rateLimitTuning.getHeadersCapacity,
+            refillPerSec: rateLimitTuning.getHeadersRefillPerSec,
+            maxEntries: Self.maxBucketEntries
+        )
+        self.childPeerRequestBuckets = PeerRateBuckets(
             capacity: rateLimitTuning.getHeadersCapacity,
             refillPerSec: rateLimitTuning.getHeadersRefillPerSec,
             maxEntries: Self.maxBucketEntries

@@ -1,258 +1,110 @@
-// Per-process parent-dependency smoke test.
+// Deep self-similar permissionless join: Nexus → Mid → Stable (depth 3).
 //
-// Each chain runs as a separate process. Each child process receives:
-//   - genesis hex  (from deploy response — includes block + spec bytes)
-//   - peer address (the chain's P2P address on the parent node, seeded from deploy)
-//   - subscribe-p2p (parent's main P2P for block extraction via ParentChainBlockExtractor)
-//
-// Topology: Nexus → Mid → Stable (three separate processes per side).
-// A side mines all three; B side follows each chain independently.
+// A deploys + ANNOUNCES a 3-deep chain and merge-mines all three. B boots a SINGLE
+// node with --supervise-children and NOTHING ELSE — no genesis hex, no peer beyond
+// A's Nexus, no per-level wiring. The whole subtree then SELF-ASSEMBLES:
+//   B (own chain Nexus) auto-follows Mid → spawns a supervised Mid →
+//   that Mid (own chain Mid) auto-follows Stable → spawns a supervised Stable.
+// No chain is special: every node runs the identical discover→follow→sync→discover
+// loop for its own children. B must converge on all three tips.
 
-import { allocPorts, smokeRoot, BIN, requireBinary, devGenesisArgs } from 'lattice-node-sdk/env'
-import { spawn } from 'node:child_process'
-import { mkdirSync, rmSync, readFileSync, createWriteStream } from 'node:fs'
-import { sleep, waitFor } from 'lattice-node-sdk/waitFor'
-import { rpcAuthHeaders } from 'lattice-node-sdk/rpcAuth'
+import { allocPorts, smokeRoot } from 'lattice-node-sdk/env'
+import { LatticeNode, LatticeNetwork, LatticeMiner, sleep, waitFor } from 'lattice-node-sdk'
 
-requireBinary()
-const MINER_BIN = BIN.replace('LatticeNode', 'LatticeMiningCoordinatorTool')
 const ROOT = smokeRoot('parent-dependency')
-const TARGET_HEIGHT = 5
+const [a, mid, stable, b] = await allocPorts(4)
+const TARGET = 5
 
-rmSync(ROOT, { recursive: true, force: true })
-mkdirSync(ROOT, { recursive: true })
+console.log('=== parent-dependency: deep self-assembling permissionless join (Nexus→Mid→Stable) ===')
+const net = new LatticeNetwork()
+net.installSignalHandlers()
 
-const [nexusA, midA, stableA, nexusB, midB, stableB] = await allocPorts(6)
+const A = net.add(new LatticeNode({ name: 'A', dir: `${ROOT}/A`, port: a.port, rpcPort: a.rpcPort }))
 
-function startNode(name, { port, rpcPort }, extraArgs = []) {
-  const dir = `${ROOT}/${name}`
-  mkdirSync(dir, { recursive: true })
-  const args = ['node', '--port', String(port), '--rpc-port', String(rpcPort),
-    '--data-dir', dir, '--no-dns-seeds',
-    ...devGenesisArgs(),
-    '--min-peer-key-bits', '0',
-    ...extraArgs]
-  const proc = spawn(BIN, args, { stdio: ['ignore', 'pipe', 'pipe'] })
-  const log = createWriteStream(`${ROOT}/${name}.log`, { flags: 'a' })
-  proc.stdout.pipe(log); proc.stderr.pipe(log)
-  proc.on('exit', code => console.log(`[${name}] exited code=${code}`))
-  return { proc, port, rpcPort, dir }
-}
+console.log('\n[1] A: boot Nexus, deep-deploy Mid (on Nexus) + Stable (on Mid)...')
+A.start()
+await A.waitForRPC()
+await A.readIdentity()
+const nexusDir = (await A.chainInfo()).nexus
 
-async function chainInfo(rpcPort) {
-  try {
-    const r = await fetch(`http://127.0.0.1:${rpcPort}/api/chain/info`)
-    return r.ok ? await r.json() : null
-  } catch { return null }
-}
+const aMid = net.add(await A.spawnChild({ directory: 'Mid', parentDirectory: nexusDir, ports: mid, premine: 0 }))
+await aMid.waitForRPC()
+await aMid.readIdentity()
+const aStable = net.add(await aMid.spawnChild({ directory: 'Stable', parentDirectory: 'Mid', ports: stable, premine: 0 }))
+await aStable.waitForRPC()
+const midGenesis = aMid._deployInfo.genesisHash
+const stableGenesis = aStable._deployInfo.genesisHash
+console.log(`  A/Mid + A/Stable up`)
 
-async function waitRPC(rpcPort, name, timeoutMs = 20_000) {
-  return waitFor(() => chainInfo(rpcPort), `${name} RPC up`, { timeoutMs })
-}
+const miner = net.addMiner(new LatticeMiner(A, [aMid, aStable], { workers: 2 }))
+await miner.start()
 
-async function getHeight(rpcPort) {
-  const info = await chainInfo(rpcPort)
-  return info?.chains?.[0]?.height ?? 0
-}
-
-async function getTip(rpcPort) {
-  const info = await chainInfo(rpcPort)
-  return info?.chains?.[0]?.tip
-}
-
-async function waitStableTip(rpcPort, name, { timeoutMs = 30_000, idleMs = 2_000, intervalMs = 500 } = {}) {
-  let lastTip = null
-  let stableSince = 0
-  return waitFor(async () => {
-    const tip = await getTip(rpcPort)
-    if (!tip) return null
-    const now = Date.now()
-    if (tip !== lastTip) {
-      lastTip = tip
-      stableSince = now
-      return null
-    }
-    return now - stableSince >= idleMs ? tip : null
-  }, `${name} stable tip`, { timeoutMs, intervalMs })
-}
-
-async function stopProcAndWait(proc, name, { timeoutMs = 5_000, killTimeoutMs = 2_000 } = {}) {
-  if (!proc) return
-  const waitForExit = async (ms) => {
-    if (proc.exitCode !== null || proc.signalCode !== null) return true
-    return Promise.race([
-      new Promise(resolve => proc.once('exit', () => resolve(true))),
-      sleep(ms).then(() => false),
-    ])
-  }
-  try { proc.kill('SIGTERM') } catch {}
-  if (!(await waitForExit(timeoutMs))) {
-    try { proc.kill('SIGKILL') } catch {}
-    if (!(await waitForExit(killTimeoutMs))) {
-      throw new Error(`${name} did not exit after SIGKILL`)
-    }
-  }
-}
-
-async function deploy(rpcPort, nodeDir, directory, parentDirectory) {
-  const r = await fetch(`http://127.0.0.1:${rpcPort}/api/chain/deploy`, {
-    method: 'POST', headers: { 'content-type': 'application/json', ...rpcAuthHeaders(nodeDir) },
-    body: JSON.stringify({
-      directory, parentDirectory,
-      initialReward: 100, halvingInterval: 1000000, targetBlockTime: 100,
-      maxStateGrowth: 1048576, maxBlockSize: 1048576,
-      maxTransactionsPerBlock: 1000, retargetWindow: 100,
-      premine: 0, wasmPolicies: [],
-    }),
-  })
-  if (!r.ok) throw new Error(`deploy ${directory} failed: ${await r.text()}`)
-  return r.json()
-}
-
-console.log('=== parent-dependency: per-process chains ===')
-
-// ── A side ────────────────────────────────────────────────────────────────
-
-console.log('\n[1] Start A/Nexus...')
-const aNexus = startNode('A-Nexus', nexusA)
-await waitRPC(nexusA.rpcPort, 'A-Nexus')
-const aNexusInfo = await chainInfo(nexusA.rpcPort)
-const nexusDir = aNexusInfo.nexus
-const aNexusP2P = aNexusInfo.p2pAddress
-console.log(`  ✓ A/Nexus  p2p=${aNexusP2P}`)
-
-console.log('\n[2] Deploy Mid on A/Nexus, start A/Mid...')
-const midDeploy = await deploy(nexusA.rpcPort, aNexus.dir, 'Mid', nexusDir)
-if (!midDeploy.genesisHex) throw new Error('Mid deploy missing genesisHex')
-// chainP2PAddress = Mid chain's P2P port on A/Nexus — seeded from deploy response
-const midPeerOnNexus = midDeploy.chainP2PAddress
-console.log(`  Mid deployed  chainP2P=${midPeerOnNexus}`)
-
-const aMid = startNode('A-Mid', midA, [
-  '--genesis-hex', midDeploy.genesisHex,  // genesis + spec, no DHT needed
-  '--chain-directory', 'Mid',
-  '--chain-path', `${nexusDir}/Mid`,
-  '--subscribe-p2p', aNexusP2P,           // receive Mid blocks from Nexus gossip
-  '--peer', midPeerOnNexus || aNexusP2P,  // sync Mid history from this chain's P2P on A
-])
-await waitRPC(midA.rpcPort, 'A-Mid')
-const aMidP2P = (await chainInfo(midA.rpcPort))?.p2pAddress
-console.log(`  ✓ A/Mid  p2p=${aMidP2P}`)
-
-console.log('\n[3] Deploy Stable on A/Mid, start A/Stable...')
-const stableDeploy = await deploy(midA.rpcPort, aMid.dir, 'Stable', 'Mid')
-if (!stableDeploy.genesisHex) throw new Error('Stable deploy missing genesisHex')
-const stablePeerOnMid = stableDeploy.chainP2PAddress
-console.log(`  Stable deployed  chainP2P=${stablePeerOnMid}`)
-
-const aStable = startNode('A-Stable', stableA, [
-  '--genesis-hex', stableDeploy.genesisHex,
-  '--chain-directory', 'Stable',
-  '--chain-path', `${nexusDir}/Mid/Stable`,
-  '--subscribe-p2p', aMidP2P,              // receive Stable blocks from Mid gossip
-  '--peer', stablePeerOnMid || aMidP2P,    // sync Stable history from this chain's P2P on A/Mid
-])
-await waitRPC(stableA.rpcPort, 'A-Stable')
-const aStableP2P = (await chainInfo(stableA.rpcPort))?.p2pAddress
-console.log(`  ✓ A/Stable  p2p=${aStableP2P}`)
-
-console.log('\n[4] Mine all three A chains to height ≥ ' + TARGET_HEIGHT + '...')
-const minerProc = spawn(MINER_BIN, [
-  '--node',       `http://127.0.0.1:${nexusA.rpcPort}/api`,
-  '--rpc-cookie-file', `${aNexus.dir}/.cookie`,
-  '--child-node', `http://127.0.0.1:${midA.rpcPort}/api`,
-  '--child-rpc-cookie-file', `${aMid.dir}/.cookie`,
-  '--child-node', `http://127.0.0.1:${stableA.rpcPort}/api`,
-  '--child-rpc-cookie-file', `${aStable.dir}/.cookie`,
-  '--workers', '2', '--batch-size', '2000',
-], { stdio: ['ignore', 'pipe', 'pipe'] })
-const minerLog = createWriteStream(`${ROOT}/miner.log`)
-minerProc.stdout.pipe(minerLog); minerProc.stderr.pipe(minerLog)
+console.log('\n[2] A: announce each level in its PARENT\'s GenesisState (Mid on Nexus, Stable on Mid)...')
+await A.announceChild({ nexusDir, child: 'Mid', genesisHash: midGenesis })
+await aMid.announceChild({ nexusDir: 'Mid', child: 'Stable', genesisHash: stableGenesis })
 
 await waitFor(async () => {
-  const [nh, mh, sh] = await Promise.all([
-    getHeight(nexusA.rpcPort), getHeight(midA.rpcPort), getHeight(stableA.rpcPort)])
+  const [nh, mh, sh] = await Promise.all([A.height(nexusDir), aMid.height('Mid'), aStable.height('Stable')])
   process.stdout.write(`\r  A: Nexus@${nh} Mid@${mh} Stable@${sh}   `)
-  return nh >= TARGET_HEIGHT && mh >= TARGET_HEIGHT && sh >= TARGET_HEIGHT ? true : null
-}, `A height ≥ ${TARGET_HEIGHT}`, { timeoutMs: 120_000, intervalMs: 1000 })
-
-await stopProcAndWait(minerProc, 'parent-dependency miner')
-// Child chains can still be applying blocks extracted from a just-settled parent.
-// Freeze expectations in parent-before-child order so Stable is captured after
-// Mid has stopped moving, not while Mid's final block is still propagating.
-await waitStableTip(nexusA.rpcPort, 'A/Nexus')
-await waitStableTip(midA.rpcPort, 'A/Mid')
-await waitStableTip(stableA.rpcPort, 'A/Stable')
-const [aNH, aMH, aSH] = await Promise.all([
-  getHeight(nexusA.rpcPort), getHeight(midA.rpcPort), getHeight(stableA.rpcPort)])
-const [aNT, aMT, aST] = await Promise.all([
-  getTip(nexusA.rpcPort), getTip(midA.rpcPort), getTip(stableA.rpcPort)])
-console.log(`\n  A frozen: Nexus@${aNH} Mid@${aMH} Stable@${aSH}`)
-
-// ── B side ────────────────────────────────────────────────────────────────
-
-console.log('\n[5] Start B/Nexus and sync parent first...')
-const bNexus = startNode('B-Nexus', nexusB, ['--peer', aNexusP2P])
-await waitRPC(nexusB.rpcPort, 'B-Nexus')
-const bNexusP2P = (await chainInfo(nexusB.rpcPort))?.p2pAddress
-// Compare against A's LIVE tip, re-read each iteration — not the snapshot
-// captured above. A's merged miner produces Nexus blocks continuously while the
-// deeper child chains catch up to TARGET_HEIGHT, so a final in-flight Nexus
-// block can land just after waitStableTip's short idle window, making the
-// snapshot one block stale. A is stable once its miner is stopped, so B
-// converges on A's live tip.
-await waitFor(async () => {
-  const [bNH, bNT, aLiveNT] = await Promise.all([
-    getHeight(nexusB.rpcPort), getTip(nexusB.rpcPort), getTip(nexusA.rpcPort)])
-  process.stdout.write(`\r  B/Nexus: ${bNH}   `)
-  return bNT && bNT === aLiveNT ? true : null
-}, 'B/Nexus synced parent tip', { timeoutMs: 90_000, intervalMs: 2000 })
-console.log(`\n  ✓ B/Nexus synced  p2p=${bNexusP2P}`)
-
-console.log('\n[6] Start B/Mid after parent sync...')
-const bMid = startNode('B-Mid', midB, [
-  '--genesis-hex', midDeploy.genesisHex,
-  '--chain-directory', 'Mid',
-  '--chain-path', `${nexusDir}/Mid`,
-  '--subscribe-p2p', bNexusP2P || aNexusP2P,
-  '--peer', aMidP2P || midPeerOnNexus || aNexusP2P,
+  return nh >= TARGET && mh >= TARGET && sh >= TARGET ? true : null
+}, `A all three ≥ ${TARGET}`, { timeoutMs: 360_000, intervalMs: 1000 })
+await miner.stop()
+await Promise.all([
+  A.awaitQuiesced(nexusDir, { timeoutMs: 20_000, idleMs: 2_000 }),
+  aMid.awaitQuiesced('Mid', { timeoutMs: 30_000, idleMs: 6_000 }),
+  aStable.awaitQuiesced('Stable', { timeoutMs: 30_000, idleMs: 6_000 }),
 ])
-await waitRPC(midB.rpcPort, 'B-Mid')
-const bMidP2P = (await chainInfo(midB.rpcPort))?.p2pAddress
+console.log(`\n  A frozen: Nexus@${await A.height(nexusDir)} Mid@${await aMid.height('Mid')} Stable@${await aStable.height('Stable')}`)
+
+console.log('\n[3] B: boot ONE node — peer A for Nexus + supervise children. Nothing else.')
+const B = net.add(new LatticeNode({ name: 'B', dir: `${ROOT}/B`, port: b.port, rpcPort: b.rpcPort }))
+// Fast reconcile sweep so the 3-level cascade (each level follows its children one
+// sweep after syncing) converges quickly; inherited by every spawned descendant.
+B.start(['--peer', A.peerArg(), '--supervise-children'], { env: { LATTICE_SUPERVISE_RECONCILE_SECONDS: '3' } })
+await B.waitForRPC()
+
+// Walk B's self-assembled tree level by level: each node registers its DIRECT children
+// in its OWN chain/map (B has Nexus/Mid; that Mid has Nexus/Mid/Stable). Self-similar.
+async function resolveLeaf(rootBase, fullPath) {
+  let base = `${rootBase}/api`
+  for (let depth = 2; depth <= fullPath.length; depth++) {
+    const key = fullPath.slice(0, depth).join('/')
+    const ep = await waitFor(async () => {
+      const m = await fetch(`${base}/chain/map`).then((x) => x.json()).catch(() => null)
+      return m?.[key] ?? null
+    }, `endpoint registered for ${key}`, { timeoutMs: 180_000, intervalMs: 3000 })
+    base = ep  // descend into the just-registered child to find the next level
+  }
+  return base
+}
+
+console.log('\n[4] Wait for B to self-assemble Nexus→Mid→Stable + converge on all tips...')
+const stablePath = [nexusDir, 'Mid', 'Stable']
+const midPath = [nexusDir, 'Mid']
+const bMidEp = await resolveLeaf(B.base, midPath)
+console.log(`  ✓ B auto-followed Mid → ${bMidEp}`)
+const bStableEp = await resolveLeaf(B.base, stablePath)
+console.log(`  ✓ B's Mid auto-followed Stable → ${bStableEp}`)
+
+const heightTipAt = async (endpoint, directory) => {
+  const i = await fetch(`${endpoint}/chain/info`).then((x) => x.json()).catch(() => null)
+  const c = i?.chains?.find((x) => x.directory === directory)
+  return { height: c?.height ?? 0, tip: c?.tip ?? '' }
+}
+
 await waitFor(async () => {
-  const [bMH, bMT, aLiveMT] = await Promise.all([
-    getHeight(midB.rpcPort), getTip(midB.rpcPort), getTip(midA.rpcPort)])
-  process.stdout.write(`\r  B/Mid: ${bMH}   `)
-  return bMT && bMT === aLiveMT ? true : null
-}, 'B/Mid synced child tip', { timeoutMs: 90_000, intervalMs: 2000 })
-console.log(`\n  ✓ B/Mid synced  p2p=${bMidP2P}`)
+  const [aN, aM, aS] = await Promise.all([A.tip(nexusDir), aMid.tip('Mid'), aStable.tip('Stable')])
+  const [bN, bM, bS] = await Promise.all([
+    B.tip(nexusDir),
+    heightTipAt(bMidEp, 'Mid').then((x) => x.tip),
+    heightTipAt(bStableEp, 'Stable').then((x) => x.tip),
+  ])
+  return bN === aN && bM && bM === aM && bS && bS === aS ? true : null
+}, 'B converged on all 3 tips', { timeoutMs: 360_000, intervalMs: 2000 })
 
-console.log('\n[7] Start B/Stable after Mid sync...')
-const bStable = startNode('B-Stable', stableB, [
-  '--genesis-hex', stableDeploy.genesisHex,
-  '--chain-directory', 'Stable',
-  '--chain-path', `${nexusDir}/Mid/Stable`,
-  '--subscribe-p2p', bMidP2P || aMidP2P,
-  '--peer', aStableP2P || stablePeerOnMid || aMidP2P,
-])
-await waitRPC(stableB.rpcPort, 'B-Stable')
-console.log('  ✓ B side up, parent-before-child')
-
-console.log('\n[8] Wait for B to converge on A tips (up to 90s)...')
-await waitFor(async () => {
-  const [bNT, bMT, bST] = await Promise.all([
-    getTip(nexusB.rpcPort), getTip(midB.rpcPort), getTip(stableB.rpcPort)])
-  const [bNH, bMH, bSH] = await Promise.all([
-    getHeight(nexusB.rpcPort), getHeight(midB.rpcPort), getHeight(stableB.rpcPort)])
-  // Live A tips (A is stable post-miner-stop) — see note above.
-  const [aLiveNT, aLiveMT, aLiveST] = await Promise.all([
-    getTip(nexusA.rpcPort), getTip(midA.rpcPort), getTip(stableA.rpcPort)])
-  process.stdout.write(`\r  B: Nexus@${bNH} Mid@${bMH} Stable@${bSH}   `)
-  return bNT === aLiveNT && bMT === aLiveMT && bST === aLiveST ? true : null
-}, 'B converged on all tips', { timeoutMs: 90_000, intervalMs: 2000 })
-
-console.log(`\n  ✓ B converged: Nexus Mid Stable all match A`)
-console.log('✓ parent-dependency per-process test passed.')
-;[aNexus, aMid, aStable, bNexus, bMid, bStable].forEach(n => { try { n.proc?.kill?.('SIGTERM') } catch {} })
+const bSH = (await heightTipAt(bStableEp, 'Stable')).height
+console.log(`\n  ✓ B self-assembled + converged: Nexus + Mid + Stable all match A (Stable@${bSH})`)
+console.log('✓ parent-dependency deep self-assembly test passed.')
+net.teardown()
 await sleep(500)
 process.exit(0)

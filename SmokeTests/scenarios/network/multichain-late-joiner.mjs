@@ -1,18 +1,20 @@
-// Multi-chain late joiner: A mines Nexus + 2 child chains beyond the
-// headers-first catch-up threshold.
-// B joins fresh, subscribes to both children, and must discover + sync
-// all 3 chains. Follows the same frozen-tip pattern as late-joiner.mjs.
+// Multi-chain late joiner: A mines Nexus + 2 child chains beyond the headers-first
+// catch-up threshold, then freezes. B joins LATE as an untrusted node — peered to A
+// for Nexus only — DISCOVERS both children from its own synced GenesisState, follows
+// each (no genesis-hex / peer / subscribe hand-off), self-resolves their genesis,
+// finds A's child processes via getChildPeers, and must backfill + converge on all 3
+// chains. Proves permissionless multi-child discovery + deep backfill.
 
 import { allocPorts, smokeRoot } from 'lattice-node-sdk/env'
 import { LatticeNode, LatticeNetwork, LatticeMiner, sleep, waitFor } from 'lattice-node-sdk'
 
 const ROOT = smokeRoot('multichain-late-joiner')
-const [a, b, alphaA, betaA, alphaB, betaB] = await allocPorts(6, { seed: 93 })
+const [a, b, alphaA, betaA] = await allocPorts(4, { seed: 93 })
 const CHILD1 = 'Alpha'
 const CHILD2 = 'Beta'
 const TARGET = 6
 
-console.log('=== multichain-late-joiner smoke test ===')
+console.log('=== multichain-late-joiner smoke test (permissionless multi-child join) ===')
 const net = new LatticeNetwork()
 net.installSignalHandlers()
 
@@ -26,29 +28,20 @@ await A.readIdentity()
 
 const infoA = await A.chainInfo()
 const nexusDir = infoA.nexus
-const aNexusP2P = infoA.p2pAddress
 
-// Deploy both child chains as separate processes.
-const aAlpha = net.add(await A.spawnChild({
-  directory: CHILD1,
-  parentDirectory: nexusDir,
-  ports: alphaA,
-  premine: 0,
-}))
-const alphaDeploy = aAlpha._deployInfo
-
-const aBeta = net.add(await A.spawnChild({
-  directory: CHILD2,
-  parentDirectory: nexusDir,
-  ports: betaA,
-  premine: 0,
-}))
-const betaDeploy = aBeta._deployInfo
-
+// Deploy both child chains as separate processes (operator deploy).
+const aAlpha = net.add(await A.spawnChild({ directory: CHILD1, parentDirectory: nexusDir, ports: alphaA, premine: 0 }))
+const aBeta = net.add(await A.spawnChild({ directory: CHILD2, parentDirectory: nexusDir, ports: betaA, premine: 0 }))
+const alphaGenesis = aAlpha._deployInfo.genesisHash
+const betaGenesis = aBeta._deployInfo.genesisHash
 console.log(`  A/${CHILD1} up  A/${CHILD2} up`)
 
 const miner = net.addMiner(new LatticeMiner(A, [aAlpha, aBeta], { workers: 2 }))
 await miner.start()
+
+console.log('\n[2] A: announce BOTH children on-chain so untrusted peers can discover them...')
+await A.announceChild({ nexusDir, child: CHILD1, genesisHash: alphaGenesis })
+await A.announceChild({ nexusDir, child: CHILD2, genesisHash: betaGenesis })
 
 await waitFor(async () => {
   const [nxH, a1H, a2H] = await Promise.all([
@@ -57,7 +50,7 @@ await waitFor(async () => {
   return nxH >= TARGET && a1H >= TARGET && a2H >= TARGET ? true : null
 }, `A heights ≥ ${TARGET}`, { timeoutMs: 240_000, intervalMs: 1000 })
 
-console.log('\n[2] Freeze A\'s tip...')
+console.log('\n[3] Freeze A\'s tip...')
 await miner.stop()
 await Promise.all([
   A.awaitQuiesced(nexusDir, { timeoutMs: 20_000, idleMs: 2_000 }),
@@ -70,51 +63,22 @@ const aA1H = await aAlpha.height(CHILD1)
 const aA2H = await aBeta.height(CHILD2)
 console.log(`  A frozen: ${nexusDir}@${aNxH}, ${CHILD1}@${aA1H}, ${CHILD2}@${aA2H}`)
 
-console.log('\n[3] Boot B\'s nexus + 2 child processes (late joiner)...')
-B.start([
-  '--peer', A.peerArg(),
-])
+console.log('\n[4] Boot B (late joiner): peer A for Nexus ONLY + supervise children...')
+B.start(['--peer', A.peerArg(), '--supervise-children'])
 await B.waitForRPC()
 
-// B's child processes use A's genesis hexes to share the same chains.
-const bAlpha = net.add(new LatticeNode({
-  name: `B-${CHILD1}`,
-  dir: `${ROOT}/B-${CHILD1}`,
-  port: alphaB.port,
-  rpcPort: alphaB.rpcPort,
-}))
-bAlpha.start([
-  '--genesis-hex', alphaDeploy.genesisHex,
-  '--chain-directory', CHILD1,
-  '--chain-path', `${nexusDir}/${CHILD1}`,
-  '--subscribe-p2p', aNexusP2P,
-  '--peer', aAlpha.peerArg(),   // peer with A-Alpha process directly for history
-])
-await bAlpha.waitForRPC()
+console.log('\n[5] B: DISCOVER + FOLLOW both children (no genesis-hex / peer / subscribe)...')
+const bAlpha = await B.followChild({ nexusDir, child: CHILD1, expectGenesis: alphaGenesis })
+const bBeta = await B.followChild({ nexusDir, child: CHILD2, expectGenesis: betaGenesis })
+console.log(`  B joined ${CHILD1} + ${CHILD2} permissionlessly`)
 
-const bBeta = net.add(new LatticeNode({
-  name: `B-${CHILD2}`,
-  dir: `${ROOT}/B-${CHILD2}`,
-  port: betaB.port,
-  rpcPort: betaB.rpcPort,
-}))
-bBeta.start([
-  '--genesis-hex', betaDeploy.genesisHex,
-  '--chain-directory', CHILD2,
-  '--chain-path', `${nexusDir}/${CHILD2}`,
-  '--subscribe-p2p', aNexusP2P,
-  '--peer', aBeta.peerArg(),   // peer with A-Beta process directly for history
-])
-await bBeta.waitForRPC()
-console.log(`  B nexus + B/${CHILD1} + B/${CHILD2} up`)
-
-console.log('\n[4] Wait for B to sync all chains...')
+console.log('\n[6] Wait for B to backfill + converge on all 3 chains...')
 const synced = await waitFor(async () => {
   const [aNxTip, bNxTip, aA1Tip, bA1Tip, aA2Tip, bA2Tip, bNxH, bA1H, bA2H] = await Promise.all([
     A.tip(nexusDir), B.tip(nexusDir),
-    aAlpha.tip(CHILD1), bAlpha.tip(CHILD1),
-    aBeta.tip(CHILD2), bBeta.tip(CHILD2),
-    B.height(nexusDir), bAlpha.height(CHILD1), bBeta.height(CHILD2),
+    aAlpha.tip(CHILD1), bAlpha.tip(),
+    aBeta.tip(CHILD2), bBeta.tip(),
+    B.height(nexusDir), bAlpha.height(), bBeta.height(),
   ])
   if (!bNxTip || bNxTip !== aNxTip) return null
   if (!bA1Tip || bA1Tip !== aA1Tip) return null
@@ -123,7 +87,7 @@ const synced = await waitFor(async () => {
 }, 'B converged on all tips', { timeoutMs: 240_000, intervalMs: 2000 })
 
 console.log(`  B synced: ${nexusDir}@${synced.nexus}, ${CHILD1}@${synced.alpha}, ${CHILD2}@${synced.beta}`)
-console.log(`  ✓ B discovered and synced both child chains`)
+console.log(`  ✓ B permissionlessly discovered + backfilled both child chains`)
 
 console.log('\n✓ multichain-late-joiner smoke test passed.')
 net.teardown()
