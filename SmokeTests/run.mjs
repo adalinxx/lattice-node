@@ -91,7 +91,7 @@ const TESTS = [
     { name: 'external-miner-quickstart', file: 'scenarios/network/external-miner-quickstart.mjs', timeoutMs: 180_000 },
   ]),
   ...group('follower', [
-    { name: 'parent-dependency',          file: 'scenarios/follower/parent-dependency.mjs',          timeoutMs: 420_000 },
+    { name: 'parent-dependency',          file: 'scenarios/follower/parent-dependency.mjs',          timeoutMs: 12 * 60_000 },
     { name: 'stateless-cli',              file: 'scenarios/follower/stateless-cli.mjs',              timeoutMs: 60_000 },
     { name: 'stateless-follower',         file: 'scenarios/follower/stateless-follower.mjs',         timeoutMs: 12 * 60_000 },
     { name: 'chain-path-required',        file: 'scenarios/follower/chain-path-required.mjs',        timeoutMs: 10 * 60_000 },

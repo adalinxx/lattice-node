@@ -335,17 +335,19 @@ extension LatticeNode {
             )
             attemptedTip = activeTip
 
-            // Stateful nodes: fetch the tip state trie in parallel with headers.
-            // resolveRecursive pulls every sub-volume into the local CAS by CID,
-            // so the state is available immediately for gossip block validation
-            // after sync completes.
+            // Stateful nodes: warm the tip BLOCK content (header + spec + tx bodies)
+            // in parallel with headers, so the recompute that materializes state
+            // during sync finds it locally. The state trie itself is NEVER fetched —
+            // it is re-executed from these transactions (see
+            // materializeSyncedCanonicalContent), so the tip state is available for
+            // gossip validation after sync without depending on the source serving
+            // the whole historical trie.
             if config.storageMode == .stateful {
                 let prefetchSource = IvyContentSource(network.ivyFetcher)
                 let tipCIDForPrefetch = activeTip
                 statePrefetchTask = Task {
-                    guard let tipBlock = try? await VolumeImpl<Block>(rawCID: tipCIDForPrefetch)
-                        .resolve(source: prefetchSource).node else { return }
-                    _ = try? await tipBlock.postState.resolveRecursive(source: prefetchSource)
+                    _ = try? await VolumeImpl<Block>(rawCID: tipCIDForPrefetch)
+                        .resolve(source: prefetchSource).node
                 }
             }
 
@@ -1326,48 +1328,26 @@ extension LatticeNode {
                     _ = await network.ivyFetcher.takeVolumeTrace()
                     break
                 } catch {
-                    // JIT verification failed: the bundles we fetched did not
-                    // resolve into a complete block. Accumulate every root fetched
-                    // this attempt — INCLUDING deep boundaries the hand-enumerated
-                    // prefetch can't see, discovered by the resolution trace — and
-                    // punish their servers, which also suppresses them per-root in
-                    // Ivy so the forced refetch routes around them. Punishing the
-                    // whole accumulated set (not just the traced subset) is the
-                    // safe direction: a deficient bundle that was PREFETCHED (not
-                    // re-fetched during resolve) won't be in `traced`, so narrowing
-                    // would let that liar escape suppression and be re-served by the
-                    // same peer. Over-punishing an honest peer on a benign eviction
-                    // is self-healing (30s suppression + advisory fallback).
+                    // A bundle did not resolve into a complete block. This is an
+                    // AVAILABILITY miss, NOT fraud — the peer doesn't (yet) have the
+                    // data. A connected peer can transiently answer notHave for content
+                    // it is about to hold (a freshly-accepted block whose sub-volumes
+                    // are still writing through on the source; see IvyFetcher.fetch).
+                    // So do NOT punish or suppress the server: suppressing our only
+                    // same-chain peer would strand the sync permanently (it has nobody
+                    // else to fetch from). Just force-refetch the full accumulated
+                    // closure — the hand-enumerated set plus every trace-discovered deep
+                    // boundary — and retry. Resolution IS the verification, so a
+                    // genuinely-bad bundle still fails closed (it is never accepted); it
+                    // only ever costs a refetch, never a peer penalty.
                     let traced = await network.ivyFetcher.takeVolumeTrace()
                     var seen = Set(bundleRoots)
                     for root in traced where seen.insert(root).inserted { bundleRoots.append(root) }
-                    let punished = await network.ivyFetcher.reportDeficientVolumes(roots: bundleRoots)
-                    if punished.isEmpty {
-                        if attempt == 2 {
-                            log.warn("\(network.directory): synced block content \(String(meta.blockHash.prefix(16)))… unresolved with no attributable deficient server; retrying on next sync")
-                            return nil
-                        }
-                        log.warn("\(network.directory): synced block content \(String(meta.blockHash.prefix(16)))… unresolved with no attributable deficient server; refetching before retry")
-                        let refetched = await prefetchBlockContentClosure(
-                            blockHash: meta.blockHash, network: network, force: true)
-                        var refetchedSet = Set(refetched)
-                        for root in bundleRoots where refetchedSet.insert(root).inserted {
-                            await network.ivyFetcher.fetchVolumeBundle(rootCID: root, force: true)
-                        }
-                        continue
-                    }
                     if attempt == 2 {
-                        log.error("\(network.directory): failed to resolve synced block content \(String(meta.blockHash.prefix(16)))…: \(error)")
+                        log.warn("\(network.directory): synced block content \(String(meta.blockHash.prefix(16)))…@\(meta.blockHeight) still unresolved after retries; error=\(error); roots=\(bundleRoots.count); retrying on next sync")
                         return nil
                     }
-                    log.warn("\(network.directory): synced block content \(String(meta.blockHash.prefix(16)))… did not resolve from served bundles; punished \(punished.count) peer(s), refetching")
-                    // Force-refetch the FULL accumulated set — the hand-enumerated
-                    // closure AND every trace-discovered deep boundary — so a
-                    // deficient/evicted DEEP bundle is re-sourced (routed around the
-                    // punished peer) instead of re-trusted from the local cache,
-                    // which the non-force short-circuit in fetchVolumeBundle would
-                    // otherwise return. Without this, an adversary lying only on a
-                    // deep boundary stalls the victim's sync indefinitely.
+                    log.warn("\(network.directory): synced block content \(String(meta.blockHash.prefix(16)))…@\(meta.blockHeight) not yet resolvable (attempt \(attempt)); error=\(error); refetching (availability miss, no peer penalty)")
                     let refetched = await prefetchBlockContentClosure(
                         blockHash: meta.blockHash, network: network, force: true)
                     var refetchedSet = Set(refetched)
@@ -1387,8 +1367,41 @@ extension LatticeNode {
 
             var blockToStore = block
             if config.storageMode != .stateless {
+                // Forward state recompute — NEVER resolveRecursive-fetch the state
+                // trie. A block's content bundle carries only the trie nodes it
+                // CREATED (its diff); the unchanged majority lives in ancestor
+                // blocks' bundles, so fetching the whole postState needs the source
+                // to serve the entire historical trie — which it cannot at depth
+                // (object-grain availability), the root cause of cold-sync stalls.
+                // Instead re-execute this block's transactions against its prev
+                // post-state. Blocks are applied height-ascending and each is stored
+                // below before the next, so prevState resolves from LOCAL CAS — the
+                // same transition `verifySyncedStateTransition` checks, but here we
+                // KEEP the materialized frontier to store. Fails closed: a recompute
+                // that does not reproduce the declared postState root is rejected.
+                let source = FetcherContentSource(fetcher)
+                guard let transactions = await resolveCompleteSyncedBlockTransactions(
+                    block: block, blockHash: meta.blockHash, blockHeight: meta.blockHeight,
+                    directory: network.directory, source: source
+                ) else { return nil }
                 do {
-                    let postState = try await block.postState.resolveRecursive(fetcher: fetcher)
+                    let prevState = try await block.prevState.resolve(fetcher: fetcher)
+                    let bodies = transactions.orderedBodies
+                    let (postState, _) = try await prevState.proveAndUpdateState(
+                        allAccountActions: bodies.flatMap(\.accountActions),
+                        allActions: bodies.flatMap(\.actions),
+                        allDepositActions: bodies.flatMap(\.depositActions),
+                        allGenesisActions: bodies.flatMap(\.genesisActions),
+                        allReceiptActions: bodies.flatMap(\.receiptActions),
+                        allWithdrawalActions: bodies.flatMap(\.withdrawalActions),
+                        transactionBodies: bodies,
+                        fetcher: fetcher
+                    )
+                    let postStateHeader = try LatticeStateHeader(node: postState)
+                    guard postStateHeader.rawCID == block.postState.rawCID else {
+                        log.error("\(network.directory): synced block \(String(meta.blockHash.prefix(16)))… recomputed postState \(String(postStateHeader.rawCID.prefix(16)))… does not match declared \(String(block.postState.rawCID.prefix(16)))…")
+                        return nil
+                    }
                     blockToStore = Block(
                         version: block.version,
                         parent: block.parent,
@@ -1398,14 +1411,14 @@ extension LatticeNode {
                         spec: block.spec,
                         parentState: block.parentState,
                         prevState: block.prevState,
-                        postState: postState,
+                        postState: postStateHeader,
                         children: block.children,
                         height: block.height,
                         timestamp: block.timestamp,
                         nonce: block.nonce
                     )
                 } catch {
-                    log.error("\(network.directory): failed to resolve synced state \(String(meta.blockHash.prefix(16)))…: \(error)")
+                    log.error("\(network.directory): failed to recompute synced state \(String(meta.blockHash.prefix(16)))…: \(error)")
                     return nil
                 }
             }

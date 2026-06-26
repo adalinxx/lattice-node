@@ -59,6 +59,9 @@ struct LatticeMiningCoordinatorTool: AsyncParsableCommand {
     @Flag(name: .long, help: "Disable the best-effort freshness probe for this run.")
     var noStaleProbe = false
 
+    @Option(name: .long, help: "Minimum milliseconds between accepted blocks (paces production for realistic block time; 0 = unthrottled).")
+    var minBlockIntervalMs: UInt64 = 0
+
     func run() async throws {
         guard let apiBaseURL = URL(string: node) else {
             throw ValidationError("Invalid --node URL: \(node)")
@@ -129,6 +132,12 @@ struct LatticeMiningCoordinatorTool: AsyncParsableCommand {
                 )
                 if !submission.accepted {
                     try? await Task.sleep(for: .milliseconds(250))
+                } else if minBlockIntervalMs > 0 {
+                    // Pace accepted block production for a realistic block time
+                    // (both merge-mined chains advance together per accepted PoW),
+                    // so a joining node can ride the live tip incrementally instead
+                    // of racing a debug-speed source it can never catch.
+                    try? await Task.sleep(for: .milliseconds(Int(minBlockIntervalMs)))
                 }
             }
         }

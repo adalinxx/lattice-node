@@ -274,6 +274,90 @@ export class LatticeNode {
   }
 
   /**
+   * Announce a child this node deployed into the parent's on-chain GenesisState so
+   * OTHER nodes can permissionlessly discover it (deploy only pins/serves the
+   * genesis — it does NOT write it to GenesisState; this genesisAction does).
+   * Uses this node's coinbase keypair as the funder, so mining must be running to
+   * accrue the fee. Pair with followChild() on the joiner.
+   */
+  async announceChild({ nexusDir, child, genesisHash, fee = 1000, minFunds = 5000, timeoutMs = 400_000 }) {
+    const funder = this._keypair
+    if (!funder) throw new Error(`${this.name}: start() the node before announceChild`)
+    await waitFor(async () => (await this.balance(funder.address, nexusDir)) >= minFunds ? true : null,
+      `${this.name} coinbase funded for ${child} announce`, { timeoutMs, intervalMs: 1000 })
+    await waitFor(async () => {
+      const base = await this.nonce(funder.address, nexusDir)
+      const r = await this.submitTx({
+        nonce: base, signers: [funder.address], fee,
+        accountActions: [{ owner: funder.address, delta: -fee }],
+        genesisActions: [{ directory: child, blockCID: genesisHash }],
+      }, nexusDir, funder)
+      return r.ok ? true : null
+    }, `${this.name} submit ${child} genesisAction (announce)`, { timeoutMs: 60_000, intervalMs: 1000 })
+    await waitFor(async () => {
+      const r = await this.rpc('GET', `/api/chain/children?chainPath=${encodeURIComponent(nexusDir)}`).catch(() => null)
+      const dirs = (r?.json?.children ?? []).map((c) => c.directory)
+      return dirs.includes(child) ? true : null
+    }, `${this.name} announced ${child} in GenesisState`, { timeoutMs: 300_000, intervalMs: 2000 })
+  }
+
+  /**
+   * Permissionlessly JOIN a child chain this node did NOT deploy — the realistic
+   * untrusted-joiner path (vs spawnChild, which hand-feeds genesis-hex + a peer).
+   *
+   * Discovers the child from THIS node's OWN synced GenesisState (no genesis-hex,
+   * no peer, no subscribe-p2p hand-off), follows it (the reconciler self-resolves
+   * the genesis from on-chain GenesisState + CAS by CID and boots a supervised
+   * child), and the child finds a same-chain peer via getChildPeers over the parent
+   * link. Requires this node to have been started with `--supervise-children`.
+   *
+   * Returns a lightweight handle over the supervised child's RPC endpoint with the
+   * same height()/tip()/balance() shape as a LatticeNode, so convergence assertions
+   * read identically whether the peer is a deployer or a permissionless joiner.
+   */
+  async followChild({ nexusDir, child, expectGenesis = null, timeoutMs = 240_000 } = {}) {
+    const childPathStr = `${nexusDir}/${child}`
+    // 1. Discover from OUR OWN synced GenesisState — not a query to the source node.
+    await waitFor(async () => {
+      const r = await this.rpc('GET', `/api/chain/children?chainPath=${encodeURIComponent(nexusDir)}`).catch(() => null)
+      const dirs = (r?.json?.children ?? []).map((c) => c.directory)
+      return dirs.includes(child) ? dirs : null
+    }, `${this.name} discovered ${child} from synced GenesisState`, { timeoutMs, intervalMs: 2000 })
+    // 2. Follow — NO genesis-hex / subscribe-p2p / peer supplied.
+    const fol = await this.rpc('POST', '/api/chain/follow', { chainPath: [nexusDir, child] })
+    if (!fol.ok) throw new Error(`${this.name} follow ${childPathStr} failed: ${JSON.stringify(fol.json)}`)
+    // 3. The reconciler self-resolves genesis + spawns a supervised child, then
+    //    registers its RPC endpoint in chain/map once up.
+    let endpoint = null
+    await waitFor(async () => {
+      const m = await this.rpc('GET', '/api/chain/map').catch(() => null)
+      const ep = m?.json?.[childPathStr]
+      if (ep) { endpoint = ep; return true }
+      return null
+    }, `${this.name} spawned + registered followed ${child}`, { timeoutMs, intervalMs: 3000 })
+    // 4. Verify the booted genesis (resolved from GenesisState) is the expected one.
+    const info = async () => fetch(`${endpoint}/chain/info`).then((x) => x.json()).catch(() => null)
+    const chainOf = (i) => i?.chains?.find((c) => c.directory === child) ?? null
+    const genesis = (await info())?.genesisHash
+    if (!genesis) throw new Error(`${this.name} followed ${child} reported no genesis (spawn/boot failed)`)
+    if (expectGenesis && genesis !== expectGenesis) {
+      throw new Error(`${this.name} ${child} booted genesis ${genesis} != expected ${expectGenesis} (wrong genesis resolution)`)
+    }
+    return {
+      endpoint,
+      genesis,
+      directory: child,
+      async height() { return chainOf(await info())?.height ?? 0 },
+      async tip() { return chainOf(await info())?.tip ?? '' },
+      async balance(addr) {
+        const r = await fetch(`${endpoint}/balance/${addr}?chainPath=${encodeURIComponent(childPathStr)}`)
+          .then((x) => x.json()).catch(() => null)
+        return r?.balance ?? 0
+      },
+    }
+  }
+
+  /**
    * Fetch genesis hex for a child chain deployed on this node.
    * Alternative to getting it from the deploy response — useful when
    * bootstrapping from an existing deployment.
@@ -615,6 +699,9 @@ export class LatticeMiner {
       '--workers', String(this.opts.workers ?? 2),
       '--batch-size', String(this.opts.batchSize ?? 2000),
     ]
+    if (this.opts.minBlockIntervalMs) {
+      args.push('--min-block-interval-ms', String(this.opts.minBlockIntervalMs))
+    }
     for (const child of this.childNodes) {
       args.push('--child-node', `${child.base}/api`)
       args.push('--child-rpc-cookie-file', `${child.dir}/.cookie`)

@@ -33,60 +33,68 @@ The journey matters, because each "obvious" approach hit a wall:
    routing-table keys, every message carrying an identity, PoW admission, spawn-cert/eclipse
    machinery). Deferred as the eventual foundation; out of scope here.
 
-## Chosen design: direct-parent-query child-peer tracker
+## Chosen design: live-subscriber `getChildPeers` (no registry, no forward)
 
-Keep the pinning/DHT model **exactly as-is**. Add a small, node-level tracker: the parent
-chain a child subscribes to is the natural rendezvous for that child's peers, because every
-child subscribes to its parent anyway.
+Keep the pinning/DHT model **exactly as-is**. The parent chain a child subscribes to is the
+natural rendezvous for that child's peers, because every child subscribes to its parent
+anyway — and the parent **already tracks its connected subscribers**. So there is no separate
+registry to build; the parent serves straight from its live connection set.
 
-1. **Register** — on subscribe, a child sends `registerChildPeer(directory, chainEndpoint)`
-   to its parent over the parent-subscription link (`chainEndpoint` = its chain-gossip
-   `pubkey@host:port`). Re-sent periodically (TTL).
-2. **Parent registry** — the parent keeps `{directChildDirectory → {chainEndpoint}}`, evicted
-   on subscriber disconnect / TTL. **Direct children only** — a parent knows only its own
-   immediate subscribers; it has no business answering for a grandchild's peers (those
-   subscribe to the child, not to it). So the query takes a single child directory, not an
-   arbitrary chainPath.
-3. **Query** — `getChildPeers(directory)` request/response, modeled on `ConsensusProvider`
-   (`pending`-correlated, response accepted only from the queried peer, manual bounded wire
-   format). Answered from the registry **plus a bounded 1-hop forward** to the parent's own
-   connected parent-network peers (so a follower asking *its* parent still reaches peers that
-   registered with a *sibling* parent — "ask the parent, and the parent asks its immediate
-   peers," not a recursive DHT walk).
-4. **Follower** — on follow/spawn, the child sends `getChildPeers(itsDirectory)` to its
-   parent, connects its chain-gossip Ivy to the returned endpoints, and headers-first syncs.
-   Connections are verify-not-trust: the handshake authenticates the dialed identity and
-   consensus validates the chain, so a bogus endpoint costs only a wasted dial.
+1. **Advertise** — while its parent link is up, a child periodically sends
+   `childpeers-advertise(directory, chainEndpoint)` to its parent(s) (`chainEndpoint` = its
+   chain-gossip `pubkey@host:port`, from `externalAddress` or loopback for local/test). The
+   parent stores it against the connected peer, evicted on disconnect. The only thing carried
+   is the chain-gossip endpoint — a deliberately *separate* identity from the parent-sub link
+   (reusing one identity flaps with duplicate-identity eviction), so it cannot be inferred and
+   must be stated.
+2. **Query** — a follower sends `getChildPeers(directory)` (request/response, modeled on
+   `ConsensusProvider`: `pending`-correlated, response accepted only from the queried peer,
+   manual bounded wire format) to **each** parent it is connected to. The fan-out is on the
+   *asker*, so no parent-side 1-hop forward is needed — in a seed-based topology every child's
+   parent link converges on common seeds that accumulate the subscriber set.
+3. **Serve** — the parent answers from its **live connected subscribers** that advertised that
+   directory, excluding the asker. The directory is *self-declared*, not proven (no spawn cert
+   is required, so this works in federated deployments too); that is safe by verify-not-trust —
+   the follower's dial authenticates the identity and consensus validates the chain, so a bogus
+   directory/endpoint costs only a wasted dial (rate-limited at the parent).
+4. **Follower** — until it has a same-chain peer (no chain-gossip peer, or height still 0), the
+   reconciler-spawned child queries its parents and dials the returned endpoints on its
+   chain-gossip Ivy. The existing `didConnectPeer` → tip-exchange → headers-first-sync machinery
+   takes over. A *followed* child spawns with no operator `--peer` (an empty `bootstrapPeer`),
+   so its only same-chain peer comes from `getChildPeers`.
 
 ### Transport
-- Topic-based `peerMessage` (`ivy.broadcastMessage`/`sendMessage`) over the existing
-  parent-subscription link — the same path `chainAnnounce`/`childBlock` already use.
-- Request/response: copy the `ConsensusProvider` shape (`requestTopic`/`responseTopic`,
-  `pending[id]`, `handleRequest`/`handleResponse`, `encode/decodeRequest/Response`).
-- Dispatch the three topics (`registerChildPeer`, `getChildPeers` request, response) in
-  `ChainNetwork+IvyDelegate` where `peerMessage` topics are routed.
-- Hook register + query in `startParentChainSubscription` (`BackgroundLoops.swift`), after the
-  parent link is up and on each reconnect/periodic tick.
+- Topic-based `peerMessage` over the existing parent-subscription link — same path
+  `chainAnnounce`/`childBlock`/`cw-request` use. Three topics: `childpeers-advertise`,
+  `childpeers-request`, `childpeers-response`.
+- Request/response copies the `ConsensusProvider` shape (`pending[id]`, anti-spoof responder
+  gate, bounded `ByteCursor` wire codec). Serve uses the node's per-network context (live
+  subscribers), so the node owns it via the provider's static codec.
+- Dispatch in `ChainNetwork+IvyDelegate` (parent: advertise + request) and
+  `ParentChainBlockExtractor` (follower: response over the parent-sub link).
+- Advertise + query/dial are driven by a periodic task in `startParentChainSubscription`
+  (`BackgroundLoops.swift`): tight cadence while still hunting a peer, relaxed once synced.
 
 ## Properties / trade-offs
-- **Pinning model untouched** — pure identity-only provider records, two-step resolve.
-- **No Ivy/protocol change** — entirely node-level (new peerMessage topics + a registry).
+- **Pinning model untouched; no Ivy/protocol change** — entirely node-level (new peerMessage
+  topics + an advertised-endpoint table read from the live connection set).
 - **Separate per-chain DHTs preserved** — the parent is only a bootstrap rendezvous; the
   child's own DHT stays isolated (Sybil resistance).
-- **Reach** — a direct parent only knows its direct subscribers; the bounded 1-hop forward
-  extends reach to sibling parents without a DHT walk. Realistic seed-based topologies (many
-  children + followers touching common seed/parent nodes) converge quickly. Document the
-  bound; it is *not* full network-wide discovery.
-- **Sybil** — the parent serves endpoints only for chains it actually has subscribers for;
+- **Reach** — bounded by the parents a follower is connected to; with no forward, a follower
+  finds a peer iff one of *its* parents currently has that child subscribed. Realistic
+  seed-based topologies (children + followers converging on common seeds) satisfy this; it is
+  *not* full network-wide discovery.
+- **Sybil** — the parent serves only endpoints currently-connected subscribers advertised,
   there is no on-chain authority claim, and the follower verifies every dialed peer.
 
 ## Validation
-Upgrade the `permissionless-child-join` smoke from asserting *spawn/registration* to asserting
-**full headers-first sync**: B follows `Nexus/toy`, its reconciler-spawned Toy finds A's Toy
-via `getChildPeers` over the parent link, connects, and converges to A's Toy height — with no
-operator-supplied `--peer`/`--subscribe-p2p`/`--genesis-hex`. Plus a unit test for the
-registry (record/evict/direct-children-only) and the `getChildPeers` request/response.
+The `permissionless-child-join` smoke asserts **full headers-first sync**: B follows
+`Nexus/toy` (no `--peer`/`--subscribe-p2p`/`--genesis-hex`), its reconciler-spawned Toy finds
+A's Toy via `getChildPeers` over the parent link, connects, and converges to A's (frozen) Toy
+height — B runs no Toy miner, so reaching A's pre-join height proves a real same-chain
+backfill. Plus `ChildPeerProviderTests` for the wire codec, the responder-bound anti-spoof
+gate, the directory-filtered/asker-excluded serve, and timeout-to-empty.
 
 ## Status
-Discovery + follow + genesis self-resolution shipped (this PR). The tracker above is the
-focused next build; the design is locked and requires no Ivy or pinning changes.
+Implemented. Discovery + follow + genesis self-resolution shipped earlier; this build adds the
+same-chain peer bootstrap with no Ivy or pinning changes.

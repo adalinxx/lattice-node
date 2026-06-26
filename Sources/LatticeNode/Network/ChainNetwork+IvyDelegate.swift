@@ -407,6 +407,24 @@ extension ChainNetwork {
             // (client): a response to one of our own weight requests.
             // Pass the responder so the client only accepts it from the peer it asked.
             await delegate?.chainNetwork(self, handleConsensusResponse: payload, from: peer)
+
+        case ChildPeerProvider.advertiseTopic:
+            // A connected child advertised its chain-gossip endpoint over this
+            // (parent) chain's link. Rate-gate (same amplification class as cw) and
+            // hand to the node, which stores it against the peer for getChildPeers.
+            guard childPeerRequestBuckets.tryConsume(peer) else { break }
+            await delegate?.chainNetwork(self, handleChildPeerAdvertise: payload, from: peer)
+        case ChildPeerProvider.requestTopic:
+            // (serve): answer a followed child's same-chain-peer query from the live
+            // spawn-trusted subscriber set and reply on THIS network. Rate gate FIRST
+            // so a flood does not cost an unthrottled decode + subscriber scan each.
+            guard childPeerRequestBuckets.tryConsume(peer) else { break }
+            if let reply = await delegate?.chainNetwork(self, handleChildPeerRequest: payload, from: peer) {
+                await ivy.sendMessage(to: peer, topic: ChildPeerProvider.responseTopic, payload: reply)
+            }
+        case ChildPeerProvider.responseTopic:
+            // (client): a response to one of our own getChildPeers requests.
+            await delegate?.chainNetwork(self, handleChildPeerResponse: payload, from: peer)
         case "chainAnnounce":
             // Per-peer rate gate: a chainAnnounce flood from one peer triggers a
             // recordProvider + delegate announcement-handling per message; cap it

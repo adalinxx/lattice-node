@@ -17,10 +17,28 @@ extension LatticeNode {
     /// Volume boundary CIDs that must stay resolvable to answer queries at `block`.
     /// Pinned in the per-chain protection policy to survive LRU eviction.
     static func stateRoots(of block: Block) -> [String] {
+        // Only the block's OWNED postState frontier. prevState/parentState are
+        // References (docs/design/block-content-storage.md): "Do not pin or require
+        // references … under the block's owner — they are independently retained by
+        // their producers" and are resolved by CID on demand ONLY as deeply as
+        // validation touches. Requiring the WHOLE parentState durable demands the
+        // parent chain's full state trie a child never owns — a followed child holds
+        // only sparse parent state — which fails the durability gate on every
+        // gossip-accept past the initial sync and wrongly announces it as servable.
+        //
+        // RECOVERY INVARIANT (why dropping prevState is safe, not just spec-aligned):
+        // the only paths that must RECONSTRUCT a block by re-executing from its
+        // prevState — materializeSyncedCanonicalContent (the sync segment) and
+        // gossip-accept — only ever target IN-WINDOW blocks. A block's prevState is the
+        // immediately-prior block's OWNED postState, which is itself in-window and
+        // required-durable here, and retention's structural sharing keeps the shared
+        // trie nodes reachable from any in-window height. So a prevState a node may need
+        // to recompute is always still durably reachable; recompute never targets a
+        // block whose prevState was pruned out-of-window. (If a future fast-path ever
+        // accepts a block WITHOUT the full prevState→postState recompute check, this
+        // invariant must be revisited — that path would lose prevState reconstructability.)
         [
             block.postState.rawCID,
-            block.prevState.rawCID,
-            block.parentState.rawCID,
         ].filter { !$0.isEmpty }
     }
     static func blockContentRoots(of block: Block, blockHash: String) -> [String] {

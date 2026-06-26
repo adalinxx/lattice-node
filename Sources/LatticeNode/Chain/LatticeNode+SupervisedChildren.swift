@@ -24,7 +24,86 @@ import FoundationNetworking  // URLSession/URLRequest live here on Linux
 // duplicate into occupied ports.
 extension LatticeNode {
 
-    static let supervisedReconcileIntervalSeconds: UInt64 = 30
+    /// Reconcile/auto-follow sweep cadence. Default 30s; overridable via env so a deep
+    /// self-assembling tree (each level discovers its children one sweep after syncing)
+    /// can converge faster in tests without waiting 30s per level. Inherited by spawned
+    /// children (they share the supervisor's environment), so one override speeds the
+    /// whole subtree.
+    static var supervisedReconcileIntervalSeconds: UInt64 {
+        if let s = ProcessInfo.processInfo.environment["LATTICE_SUPERVISE_RECONCILE_SECONDS"],
+           let v = UInt64(s), v > 0 { return v }
+        return 30
+    }
+
+    /// Hard bounds on RECURSIVE AUTO-FOLLOW. Child announcement is permissionless
+    /// on-chain data (anyone who can land a GenesisAction can announce a child), and
+    /// auto-follow turns each announcement into an OS process — recursively. Without
+    /// caps, a single cheap stream of garbage announcements fork-bombs every
+    /// supervising node (process/fd/disk/port exhaustion). These bound THIS node's
+    /// resource use (not consensus), so they are applied identically at every level —
+    /// still self-similar. Operator-overridable via env; explicit `chain follow` is
+    /// NOT subject to these caps (it is an operator decision, not attacker-driven).
+    static var maxAutoFollowedChildren: Int {
+        if let s = ProcessInfo.processInfo.environment["LATTICE_MAX_SUPERVISED_CHILDREN"],
+           let v = Int(s), v >= 0 { return v }
+        return 64
+    }
+    static var maxAutoFollowDepth: Int {
+        if let s = ProcessInfo.processInfo.environment["LATTICE_MAX_SUPERVISE_DEPTH"],
+           let v = Int(s), v >= 1 { return v }
+        return 8
+    }
+    /// Stop actively re-resolving an unresolvable announced genesis (garbage/withheld
+    /// CID) after this many failed sweeps, so one bad announcement can't keep a hot
+    /// fetch/pinner-discovery loop running forever. It drops to a slow re-probe.
+    static let maxFollowedGenesisResolveAttempts = 10
+
+    /// A child port for `basePort + slot`, kept in a valid non-privileged range even when
+    /// `basePort` is high: `basePort &+ 1 &+ slot` can otherwise WRAP (e.g. base ~49k +
+    /// slot ~16k > 65535) into a tiny/privileged port. Fold the slot into the headroom
+    /// below 65535 so the result is always a usable port.
+    func safeChildPort(basePort: UInt16, slot: UInt16) -> UInt16 {
+        let headroom = basePort < 65534 ? UInt32(65534 - basePort) : 1
+        let safeSlot = UInt16(UInt32(slot) % Swift.max(1, Swift.min(headroom, 0x4000)))
+        return basePort &+ 1 &+ safeSlot
+    }
+
+    /// The base 14-bit port slot for a directory (mirrors `deterministicPort`'s FNV-1a).
+    private func childPortSlot(_ directory: String) -> UInt16 {
+        var h: UInt32 = 2166136261
+        for byte in directory.utf8 { h = (h ^ UInt32(byte)) &* 16777619 }
+        return UInt16(h & 0x3FFF)
+    }
+
+    /// The STABLE 14-bit port slot a managed child uses for both its RPC and P2P ports.
+    /// FNV-1a over a 14-bit slot is not collision-resistant, so an attacker can grind an
+    /// announced directory name to a victim's slot. The fix is NOT a cleverer hash (any
+    /// 14-bit slot is grindable) but binding each child's slot to its OWN identity and
+    /// PERSISTING it on first assignment: the slot is the deterministic base if free, else
+    /// the next free slot, probed against EVERY already-assigned slot (so it never collides
+    /// with another child — fixing both the original slot-denial and secondary collisions).
+    /// Once assigned it is persisted and reused verbatim, so a later colliding announcement
+    /// can never shift a running child's port — it just probes to a different free slot for
+    /// the newcomer. No rank, no dependence on the mutable/attacker-grown sibling set.
+    func assignChildPortSlot(key: String, metadata: DeployedChainMetadata) async -> UInt16 {
+        if let s = metadata.portSlot { return s }
+        // Reserve EVERY assigned slot (including detached children, so a re-follow reuses
+        // its own slot and a freed slot isn't handed to a different child mid-life).
+        let used = Set(deployedChildChains.values.compactMap { $0.portSlot })
+        var slot = childPortSlot(metadata.directory)
+        var probes = 0
+        while used.contains(slot) && probes < 0x4000 {
+            slot = (slot &+ 1) & 0x3FFF
+            probes += 1
+        }
+        // Persist against the LIVE entry (a detach may have landed); skip if detached.
+        if var live = deployedChildChains[key], !live.detached {
+            live.portSlot = slot
+            deployedChildChains[key] = live
+            await persistDeployedChildChains()
+        }
+        return slot
+    }
     /// How long a supervisor-tracked child may answer no RPC before we treat it as
     /// wedged (hung / never bound its RPC) and force a restart, rather than waiting
     /// forever on the supervisor — which only restarts on process *exit*.
@@ -88,8 +167,12 @@ extension LatticeNode {
         let key = chainKey(forPath: metadata.chainPath)
         let dir = metadata.directory
         let parentPort = config.listenPort
-        let childRPCPort = deterministicPort(basePort: rpcBase, directory: dir)
-        let childPort = deterministicPort(basePort: parentPort, directory: dir)
+        // Stable, persisted slot (see assignChildPortSlot): a child's RPC and P2P ports
+        // derive from one slot it owns for life, so a colliding announcement can never
+        // move a running child's port.
+        let slot = await assignChildPortSlot(key: key, metadata: metadata)
+        let childRPCPort = safeChildPort(basePort: rpcBase, slot: slot)
+        let childPort = safeChildPort(basePort: parentPort, slot: slot)
         let endpoint = "http://127.0.0.1:\(childRPCPort)/api"
         let childDataDir = config.storagePath
             .appendingPathComponent("children").appendingPathComponent(dir).path
@@ -171,7 +254,23 @@ extension LatticeNode {
         // so this is skipped for them.
         var metadata = metadata
         if metadata.followed && metadata.genesisHex.isEmpty {
-            guard let resolved = await resolveFollowedGenesis(metadata) else { return .resolving }
+            // Bound resolve retries (#3): a garbage/withheld announced CID would otherwise
+            // keep a hot fetch + pinner-discovery loop running every sweep forever. After
+            // the attempt threshold, only re-probe every 10th sweep.
+            let failures = followedGenesisResolveFailures[key] ?? 0
+            let shouldAttempt = failures < Self.maxFollowedGenesisResolveAttempts || failures % 10 == 0
+            guard shouldAttempt else {
+                followedGenesisResolveFailures[key] = failures + 1
+                return .resolving
+            }
+            guard let resolved = await resolveFollowedGenesis(metadata) else {
+                followedGenesisResolveFailures[key] = failures + 1
+                if failures + 1 == Self.maxFollowedGenesisResolveAttempts {
+                    log.warn("supervised child '\(dir)' genesis unresolvable after \(failures + 1) attempts; slowing re-probe (announced CID may be garbage/withheld)")
+                }
+                return .resolving
+            }
+            followedGenesisResolveFailures.removeValue(forKey: key)  // resolved — reset
             guard stillManaged() else { return .detached }
             deployedChildChains[key] = resolved
             await persistDeployedChildChains()
@@ -179,11 +278,18 @@ extension LatticeNode {
         }
         let cookiePath = URL(fileURLWithPath: childDataDir).appendingPathComponent(".cookie")
         try? FileManager.default.removeItem(at: cookiePath)
+        // A followed child has no operator-supplied same-chain peer; it discovers
+        // one via getChildPeers over the parent link. Passing the PARENT's endpoint
+        // as the child's chain-gossip `--peer` would be a bogus cross-chain peer (a
+        // Nexus node is not a Toy peer) that pollutes the Toy peer count and would
+        // mask "I still need a same-chain peer". So leave it empty for followed
+        // children; deployed children keep the existing parent bootstrap.
+        let childBootstrapPeer = metadata.followed ? nil : "\(config.publicKey)@127.0.0.1:\(config.listenPort)"
         let spec = ChildSpec(
             directory: dir, chainPath: metadata.chainPath,
             genesisHex: metadata.genesisHex,
             subscribeP2P: "\(config.publicKey)@127.0.0.1:\(config.listenPort)",
-            bootstrapPeer: "\(config.publicKey)@127.0.0.1:\(config.listenPort)",
+            bootstrapPeer: childBootstrapPeer,
             port: childPort, rpcPort: childRPCPort,
             dataDir: childDataDir, inheritedArguments: childInheritedArguments
         )
@@ -219,9 +325,72 @@ extension LatticeNode {
         return .recovering
     }
 
+    /// Self-similar recursive follow. A supervising node follows the children announced
+    /// in ITS OWN chain's GenesisState — exactly as the root follows Nexus's children —
+    /// so a whole subtree self-assembles with no chain treated specially. Each followed
+    /// child is spawned with `--supervise-children` inherited (see NodeCommand), so it
+    /// runs this same sweep for ITS children: one level per node, recursing process by
+    /// process down `discover -> follow -> sync -> discover-deeper` until the leaves.
+    ///
+    /// Only brand-new announcements are followed: a child already managed (deployed,
+    /// followed, or operator-detached) is left exactly as-is, so this never re-resolves
+    /// a running child or un-detaches one an operator stopped.
+    func autoFollowAnnouncedChildren() async {
+        guard childSupervisor != nil else { return }
+        let ownChainPath = config.fullChainPath ?? [genesisConfig.directory]
+        let log = NodeLogger("supervise")
+        // DEPTH CAP: stop the recursion from descending without bound. A node at/below
+        // the cap still runs (and serves), it just doesn't AUTO-follow deeper — bounding
+        // an adversarial deep announced chain. (Explicit `chain follow` is unaffected.)
+        guard ownChainPath.count < Self.maxAutoFollowDepth else {
+            log.warn("\(ownChainPath.joined(separator: "/")): at auto-follow depth cap (\(Self.maxAutoFollowDepth)); not following deeper")
+            return
+        }
+        // SYNC GATE (the root fix): do NOT subscribe to (auto-follow + spawn) children until
+        // THIS chain has established same-chain connectivity — a connected same-chain peer and
+        // a tip past genesis. Spawning a child before the parent is connected hands the child a
+        // parent-subscription to a not-yet-ready node that cannot route it to its own same-chain
+        // peers, starving the deepest level. A connected parent is a stable rendezvous, so its
+        // children discover reliably. (Live-safe: requires connectivity, not "caught up to an
+        // exact tip" — which a perpetually-mining chain never durably is.)
+        let ownDir = ownChainPath.last ?? genesisConfig.directory
+        if await needsSameChainPeer(directory: ownDir) {
+            log.info("\(ownChainPath.joined(separator: "/")): no same-chain connectivity yet; deferring child auto-follow until synced")
+            return
+        }
+        let announced: [(directory: String, genesisHash: String)]
+        do {
+            announced = try await listChildChains(chainPath: ownChainPath)
+        } catch {
+            // Own tip / GenesisState not resolvable yet (e.g. this level hasn't synced).
+            // Surface it so a silently-stalled middle level — which would strand its
+            // whole subtree — is observable, not invisible. Retry next sweep.
+            log.info("\(ownChainPath.joined(separator: "/")): children not enumerable yet (level not synced?); will retry")
+            return
+        }
+        for child in announced {
+            let childPath = ownChainPath + [child.directory]
+            guard deployedChildChains[chainKey(forPath: childPath)] == nil else { continue }
+            // TOTAL CAP: bound processes/disk regardless of how many children are
+            // announced. Count live (non-detached) managed children. The excess is
+            // logged and refused, never spawned — so a flood of announcements can't
+            // exhaust the node.
+            let managed = deployedChildChains.values.lazy.filter { !$0.detached }.count
+            guard managed < Self.maxAutoFollowedChildren else {
+                log.warn("\(ownChainPath.joined(separator: "/")): auto-follow cap reached (\(managed)/\(Self.maxAutoFollowedChildren)); refusing \(child.directory) and any further announcements this sweep")
+                break
+            }
+            log.info("\(childPath.joined(separator: "/")): auto-following newly-announced child")
+            await followChild(chainPath: childPath)
+        }
+    }
+
     /// One reconcile sweep over every non-detached deployed child.
     func reconcileSupervisedChildren() async {
         guard childSupervisor != nil else { return }
+        // First discover newly-announced children of our own chain and follow them
+        // (recursive self-assembly); then reconcile every managed child below.
+        await autoFollowAnnouncedChildren()
         // Snapshot before the loop: ensureSupervisedChild suspends on network probes,
         // and a concurrent detach/deploy could mutate deployedChildChains mid-iteration.
         let snapshot = Array(deployedChildChains.values)
@@ -251,6 +420,7 @@ extension LatticeNode {
             await persistDeployedChildChains()
         }
         supervisedRPCDownSince.removeValue(forKey: key)
+        followedGenesisResolveFailures.removeValue(forKey: key)
         if let supervisor = childSupervisor, let dir = chainPath.last {
             await supervisor.stop(label: dir)
         }
@@ -269,7 +439,8 @@ extension LatticeNode {
         deployedChildChains[key] = DeployedChainMetadata(
             chainPath: chainPath, directory: directory, parentDirectory: parentDir,
             genesisHash: existing?.genesisHash ?? "", genesisHex: existing?.genesisHex ?? "",
-            timestamp: existing?.timestamp ?? 0, detached: false, followed: true)
+            timestamp: existing?.timestamp ?? 0, detached: false, followed: true,
+            portSlot: existing?.portSlot)  // preserve the assigned port across re-follow
         await persistDeployedChildChains()
     }
 
@@ -300,6 +471,7 @@ extension LatticeNode {
         return DeployedChainMetadata(
             chainPath: metadata.chainPath, directory: metadata.directory,
             parentDirectory: metadata.parentDirectory, genesisHash: genesisCID,
-            genesisHex: genesisHex, timestamp: metadata.timestamp, detached: metadata.detached, followed: true)
+            genesisHex: genesisHex, timestamp: metadata.timestamp, detached: metadata.detached,
+            followed: true, portSlot: metadata.portSlot)  // preserve the assigned port
     }
 }

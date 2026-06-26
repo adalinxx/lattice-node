@@ -412,6 +412,20 @@ extension LatticeNode {
                    let network = keyedNetwork ?? network(for: directory) {
                     await unpinBlockStorageForRejectedCandidate(block, storedRoots: durablyStoredCIDs, network: network)
                 }
+                // Defer-don't-fault during sync (Bitcoin IBD / Geth fetcher–downloader
+                // pattern): while this chain is actively backfilling, a gossip/extracted
+                // block can fail durable commit ONLY because its ancestor state isn't
+                // materialized yet — a transient "not caught up", not storage corruption.
+                // The beforeCommit hook already aborted (the tip did not advance), so
+                // treat it as a soft rejection (`.rejected` = "missing state, not fraud",
+                // no peer penalty) and let sync re-deliver it once contiguous. Degrading
+                // here would STOP the very sync that heals the gap. Steady state (not
+                // syncing) still fails closed: a genuine durability fault degrades.
+                let chainIsSyncing = blockChainPath.map { isChainSyncing(chainPath: $0) } ?? isSyncing
+                if chainIsSyncing {
+                    NodeLogger("blocks").info("\(directory): deferring premature block \(String(header.rawCID.prefix(16)))… while syncing (\(failureReason)); sync will re-deliver")
+                    return .rejected
+                }
                 return await failStorageDegraded(failureReason, directory: directory, chainPath: blockChainPath)
             }
             if await chain.contains(blockHash: header.rawCID) {

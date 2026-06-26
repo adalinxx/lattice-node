@@ -378,6 +378,11 @@ public actor ParentChainBlockExtractor: IvyDelegate {
         await node.deliverConsensusResponse(payload, from: peer)
     }
 
+    private func handleParentChildPeerResponse(_ payload: Data, from peer: PeerID) async {
+        guard let node else { return }
+        await node.deliverChildPeerResponse(payload, from: peer)
+    }
+
     public nonisolated func ivy(_ ivy: Ivy, didReceiveBlock cid: String, data: Data, from peer: PeerID) {
         spawnExtractionTask { [weak self] in await self?.handle(cid: cid, data: data, ivy: ivy, from: peer) }
     }
@@ -392,6 +397,9 @@ public actor ParentChainBlockExtractor: IvyDelegate {
         case ConsensusProvider.responseTopic:
             // the parent answered one of our inherited-weight queries.
             Task { [weak self] in await self?.handleParentConsensusResponse(payload, from: peer) }
+        case ChildPeerProvider.responseTopic:
+            // the parent answered our same-chain-peer query over this link.
+            Task { [weak self] in await self?.handleParentChildPeerResponse(payload, from: peer) }
         case "newBlock":
             guard let decoded = NetworkWireCodecs.parseNewBlockPayload(payload),
                   let blockData = decoded.blockData else { return }

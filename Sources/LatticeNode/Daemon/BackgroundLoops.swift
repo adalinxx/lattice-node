@@ -257,6 +257,30 @@ func startParentChainSubscription(
 
         log.info("\(directory): subscribed to parent chain at \(parentP2PAddress)")
 
+        // Same-chain peer bootstrap: while the parent link is up, advertise our
+        // chain-gossip endpoint to parents (so a follower can find us) and — until
+        // we have same-chain peers — ask parents for peers to dial. Adaptive
+        // cadence: tight while still peerless (snappy first sync), relaxed once
+        // connected (periodic re-advertise). Tied to this subscription's lifetime.
+        let bootstrapTask = Task {
+            while !Task.isCancelled {
+                var needsPeer = false
+                if await parentIvy.directPeerCount > 0 {
+                    await node.advertiseChainEndpointToParents(directory: directory)
+                    needsPeer = await node.needsSameChainPeer(directory: directory)
+                    if needsPeer {
+                        await node.discoverAndDialSameChainPeers(directory: directory)
+                    }
+                }
+                // Tight cadence while still hunting a same-chain peer (snappy first
+                // sync); relaxed once synced (periodic re-advertise so new followers
+                // can still find us).
+                do { try await Task.sleep(for: needsPeer ? .seconds(3) : .seconds(30)) }
+                catch { return }
+            }
+        }
+        defer { bootstrapTask.cancel() }
+
         var reconnectBackoff = ReconnectBackoff()
         while true {
             let action = ParentSubscriptionReconnectLoop.nextAction(

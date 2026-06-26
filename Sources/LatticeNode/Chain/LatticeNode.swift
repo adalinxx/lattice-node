@@ -155,6 +155,15 @@ public actor LatticeNode: ChainNetworkDelegate {
     /// verified descendants (and, in 2c-c, requests an ancestor's weight to feed
     /// the inherited-weight provider). See ConsensusProvider.
     public private(set) var consensusProvider: ConsensusProvider!
+    /// Same-chain peer bootstrap: a followed child queries a parent for its
+    /// connected children's chain endpoints; a parent serves them from the live
+    /// spawn-trusted subscriber set. See ChildPeerProvider.
+    public private(set) var childPeerProvider: ChildPeerProvider!
+    /// The `(directory, pubkey@host:port)` a connected child advertised over a
+    /// parent chain's link, keyed by the (parent-subscription) peer that
+    /// advertised. Served to a follower asking for `directory`; the directory is
+    /// self-declared and verified on dial. Evicted when the peer disconnects.
+    var advertisedChildEndpoints: [PeerID: (directory: String, endpoint: String)] = [:]
     /// the parent-subscription link(s) as node-managed trusted
     /// consensus channels, keyed by child directory. The `ivy` lets us send
     /// cw-requests to the parent; `peer` is captured when the parent identifies.
@@ -227,6 +236,9 @@ public actor LatticeNode: ChainNetworkDelegate {
         // Drop any recorded spawn-tree trust so it never outlives the connection
         // (a reconnect re-classifies on its next identify).
         Task { [spawnTrust] in await spawnTrust.forget(PeerID(publicKey: publicKey)) }
+        // Drop any chain endpoint this peer advertised — eviction is by disconnect,
+        // so a stale endpoint is never served after the subscriber is gone.
+        advertisedChildEndpoints.removeValue(forKey: PeerID(publicKey: publicKey))
         for key in Array(knownPeerTips.keys) {
             knownPeerTips[key]?.removeValue(forKey: publicKey)
             if knownPeerTips[key]?.isEmpty == true {
@@ -360,6 +372,9 @@ public actor LatticeNode: ChainNetworkDelegate {
     // health-grace tracking (first time a tracked-but-RPC-dead child was seen wedged).
     var supervisedReconcileTask: Task<Void, Never>?
     var supervisedRPCDownSince: [String: Date] = [:]
+    /// Per-followed-child count of consecutive failed genesis-resolve attempts, so a
+    /// garbage/withheld announced CID drops to a slow re-probe instead of a hot loop.
+    var followedGenesisResolveFailures: [String: Int] = [:]
     public var feeEstimators: [String: FeeEstimator]
     public let subscriptions: SubscriptionManager
     public let anchorPeers: AnchorPeers
@@ -406,10 +421,17 @@ public actor LatticeNode: ChainNetworkDelegate {
         // from the parent's on-chain GenesisState + CAS on the first reconcile pass. A deployed
         // child has them at record time, so followed=false and resolution is skipped.
         public var followed: Bool
+        // The 14-bit port slot this child was assigned on its FIRST successful spawn,
+        // persisted so the child's ports are a stable function of its OWN identity — not
+        // of the (attacker-influenceable, permissionlessly-grown) set of sibling
+        // announcements. Without this, recomputing the slot from the live collision set
+        // each sweep lets a colliding announcement shift a healthy victim's port and
+        // force-restart it. nil until first assignment; assigned by probing a free slot.
+        public var portSlot: UInt16?
 
         public init(chainPath: [String], directory: String, parentDirectory: String,
                     genesisHash: String, genesisHex: String, timestamp: Int64,
-                    detached: Bool = false, followed: Bool = false) {
+                    detached: Bool = false, followed: Bool = false, portSlot: UInt16? = nil) {
             self.chainPath = chainPath
             self.directory = directory
             self.parentDirectory = parentDirectory
@@ -418,6 +440,7 @@ public actor LatticeNode: ChainNetworkDelegate {
             self.timestamp = timestamp
             self.detached = detached
             self.followed = followed
+            self.portSlot = portSlot
         }
 
         // Persisted files are protocol formats, not internal structs: decode tolerantly.
@@ -426,7 +449,7 @@ public actor LatticeNode: ChainNetworkDelegate {
         // stored-property defaults to missing non-optional keys (it throws keyNotFound),
         // which would otherwise silently wipe a parent's deployed-child set on upgrade.
         enum CodingKeys: String, CodingKey {
-            case chainPath, directory, parentDirectory, genesisHash, genesisHex, timestamp, detached, followed
+            case chainPath, directory, parentDirectory, genesisHash, genesisHex, timestamp, detached, followed, portSlot
         }
         public init(from decoder: Decoder) throws {
             let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -438,6 +461,7 @@ public actor LatticeNode: ChainNetworkDelegate {
             timestamp = try c.decode(Int64.self, forKey: .timestamp)
             detached = try c.decodeIfPresent(Bool.self, forKey: .detached) ?? false
             followed = try c.decodeIfPresent(Bool.self, forKey: .followed) ?? false
+            portSlot = try c.decodeIfPresent(UInt16.self, forKey: .portSlot)
         }
     }
     var deployedChildChains: [String: DeployedChainMetadata]
@@ -984,6 +1008,18 @@ public actor LatticeNode: ChainNetworkDelegate {
                 // Reach the peer wherever it is connected: chain-gossip links AND
                 // the parent-subscription link (the trusted ancestor we query lives
                 // on the latter). sendMessage is a no-op where `peer` isn't connected.
+                for network in await self.networks.values {
+                    await network.ivy.sendMessage(to: peer, topic: topic, payload: payload)
+                }
+                for link in await self.parentConsensusLinks.values {
+                    await link.ivy.sendMessage(to: peer, topic: topic, payload: payload)
+                }
+            })
+        childPeerProvider = ChildPeerProvider(
+            send: { [weak self] peer, topic, payload in
+                guard let self else { return }
+                // Reach the queried parent wherever it is connected — the parent we
+                // ask for same-chain peers lives on the parent-subscription link.
                 for network in await self.networks.values {
                     await network.ivy.sendMessage(to: peer, topic: topic, payload: payload)
                 }
