@@ -59,19 +59,27 @@ public actor ChildPeerProvider {
     /// what makes discovery work at depth, where the immediate parent is a fresh node
     /// that hasn't propagated its peers yet); a forwarded query carries ttl=0 so it is
     /// never re-forwarded (no loops, fan-out bounded to one hop).
-    public func requestChildPeers(from peer: PeerID, directory: String, ttl: UInt8 = 1) async -> [String] {
+    public func requestChildPeers(from peer: PeerID, directory: String, ttl: UInt8 = 1, timeout: Duration? = nil) async -> [String] {
         let id = nextId
         nextId &+= 1
         let payload = Self.encodeRequest(requestId: id, directory: directory, ttl: ttl)
+        let waitFor = timeout ?? requestTimeout
         return await withCheckedContinuation { (cont: CheckedContinuation<[String], Never>) in
             pending[id] = (peer, cont)
             Task {
                 await send(peer, Self.requestTopic, payload)
-                try? await Task.sleep(for: requestTimeout)
+                try? await Task.sleep(for: waitFor)
                 self.timeout(id)
             }
         }
     }
+
+    /// Forwarded sub-requests use a SHORT timeout so a parent that runs the one-hop
+    /// transitive forward inside its request handler cannot be made to hold a scarce
+    /// gossip-task slot for the full client timeout when its peers don't answer (H1).
+    /// The source's parent answers from its direct subscriber set fast; legitimate
+    /// answers arrive well within this.
+    public static let forwardTimeout: Duration = .milliseconds(400)
 
     private func timeout(_ id: UInt64) {
         if let entry = pending.removeValue(forKey: id) { entry.cont.resume(returning: []) }

@@ -25,11 +25,14 @@ extension LatticeNode {
         var endpoints = await collectChildPeerEndpoints(network: network, directory: req.directory, asker: peer)
         // Transitive forward (one hop): if we serve no DIRECT same-chain child for this
         // directory but were asked with ttl>0, ask OUR OWN same-chain peers — one of them
-        // may be the source's parent, which DOES have it advertised. This is what makes
-        // discovery converge at depth, where a follower's immediate parent is a fresh node
-        // that hasn't yet propagated its same-chain peers. ttl=0 on the forward → no
-        // re-forward (single hop, no loops); fan-out is capped.
-        if endpoints.isEmpty && req.ttl > 0 {
+        // may be the source's parent, which DOES have it advertised. ttl=0 on the forward →
+        // no re-forward (single hop, no loops); fan-out is capped; forwarded sub-requests
+        // use a short timeout so the handler never holds a gossip-task slot long (H1).
+        // GATE (H2): only forward for a directory that is genuinely OUR OWN managed child —
+        // so an attacker cannot make us reflect an 8-way fan-out at our peers for arbitrary
+        // (garbage) directory strings. A legitimate follower only ever asks its parent for
+        // its parent's child chains, so this never blocks real discovery.
+        if endpoints.isEmpty, req.ttl > 0, await isManagedChildDirectory(req.directory) {
             endpoints = await forwardChildPeerQuery(network: network, directory: req.directory, asker: peer)
         }
         return ChildPeerProvider.encodeResponse(requestId: req.requestId, endpoints: endpoints)
@@ -39,6 +42,15 @@ extension LatticeNode {
     /// (peers on `network`, excluding the asker), bounded by `maxForwardFanout` and sent
     /// with ttl=0 so they never re-forward. Parallel, so the responder stays fast (it
     /// returns as soon as the source's parent answers from its direct subscriber set).
+    /// Is `directory` one of THIS node's own managed (non-detached) children? Cheap
+    /// in-memory check used to gate the transitive forward, so we only ever reflect a
+    /// fan-out for chains we genuinely parent — never for an attacker-supplied directory.
+    func isManagedChildDirectory(_ directory: String) -> Bool {
+        let ownChainPath = config.fullChainPath ?? [genesisConfig.directory]
+        let key = chainKey(forPath: ownChainPath + [directory])
+        return (deployedChildChains[key].map { !$0.detached }) ?? false
+    }
+
     func forwardChildPeerQuery(network: ChainNetwork, directory: String, asker: PeerID) async -> [String] {
         guard let provider = childPeerProvider else { return [] }
         let targets = await network.ivy.connectedPeers.filter { $0 != asker }.prefix(ChildPeerProvider.maxForwardFanout)
@@ -46,7 +58,7 @@ extension LatticeNode {
         var aggregated: [String] = []
         await withTaskGroup(of: [String].self) { group in
             for p in targets {
-                group.addTask { await provider.requestChildPeers(from: p, directory: directory, ttl: 0) }
+                group.addTask { await provider.requestChildPeers(from: p, directory: directory, ttl: 0, timeout: ChildPeerProvider.forwardTimeout) }
             }
             for await eps in group {
                 aggregated.append(contentsOf: eps)
