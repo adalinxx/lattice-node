@@ -19,7 +19,7 @@
 
 import { rmSync, mkdirSync } from 'node:fs'
 import { allocPorts, smokeRoot } from 'lattice-node-sdk/env'
-import { LatticeNode, LatticeNetwork, LatticeMiner, sleep, waitFor } from 'lattice-node-sdk'
+import { LatticeNode, LatticeNetwork, LatticeMiner, sleep, waitFor, waitForProgress } from 'lattice-node-sdk'
 
 const ROOT = smokeRoot('permissionless-child-join')
 rmSync(ROOT, { recursive: true, force: true })
@@ -78,8 +78,8 @@ await waitFor(async () => {
 // the production property a debug-FAST source can't satisfy (it makes B fall unboundedly
 // behind). The throttle makes blocks arrive slower than B applies them, so B keeps up.
 const TARGET = 6
-await waitFor(async () => (await aToy.height(CHILD)) >= TARGET ? true : null,
-  `A Toy ≥ ${TARGET} (live backlog)`, { timeoutMs: 300_000, intervalMs: 1000 })
+await waitForProgress(async () => aToy.height(CHILD), (h) => h >= TARGET,
+  `A Toy ≥ ${TARGET} (live backlog)`, { stallMs: 300_000, intervalMs: 1000 })
 console.log(`  A live (throttled ~3s/block): ${nexusDir}@${await A.height(nexusDir)} ${CHILD}@${await aToy.height(CHILD)}`)
 
 console.log('\n[3] B: fresh node, peer A for Nexus, supervise children')

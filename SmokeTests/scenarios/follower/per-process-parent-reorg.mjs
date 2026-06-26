@@ -12,7 +12,7 @@ import { rmSync, mkdirSync, readFileSync, createWriteStream } from 'node:fs'
 import { spawn, execSync } from 'node:child_process'
 import { allocPorts, smokeRoot, BIN, requireBinary, devGenesisArgs } from 'lattice-node-sdk/env'
 const MINER_BIN = BIN.replace('LatticeNode', 'LatticeMiningCoordinatorTool')
-import { sleep, waitFor } from 'lattice-node-sdk/waitFor'
+import { sleep, waitFor, waitForProgress } from 'lattice-node-sdk/waitFor'
 import { rpcAuthHeaders } from 'lattice-node-sdk/rpcAuth'
 
 requireBinary()
@@ -185,10 +185,10 @@ await waitRPC(cPorts.rpcPort, 'Ciso', 20_000)
 
 // Mine C to a much longer chain (> preNH + 5 blocks).
 const cMiner = startMiner(Ciso)
-await waitFor(async () => {
-  const ch = await height(cPorts.rpcPort)
-  return ch > preNH + 5 ? ch : null
-}, `C height > ${preNH + 5}`, { timeoutMs: 60_000, intervalMs: 500 })
+await waitForProgress(
+  async () => height(cPorts.rpcPort),
+  (ch) => ch > preNH + 5,
+  `C height > ${preNH + 5}`, { stallMs: 60_000, intervalMs: 500 })
 cMiner.kill('SIGTERM')
 const cTip = await getTip(cPorts.rpcPort)
 const cH = await height(cPorts.rpcPort)
@@ -212,10 +212,10 @@ await waitRPC(cPorts.rpcPort, 'C2', 20_000)
 // established), adding the tip to A's failedSyncTips. A new block gives A
 // a fresh tip that bypasses the failed-tip cache and triggers a clean sync.
 const c2Miner = startMiner(C2)
-await waitFor(async () => {
-  const ch = await height(cPorts.rpcPort)
-  return ch > cH ? ch : null
-}, 'C2 mined new block', { timeoutMs: 20_000, intervalMs: 300 })
+await waitForProgress(
+  async () => height(cPorts.rpcPort),
+  (ch) => ch > cH,
+  'C2 mined new block', { stallMs: 20_000, intervalMs: 300 })
 c2Miner.kill('SIGTERM')
 console.log(`  C2 at height ${await height(cPorts.rpcPort)}, gossipping to A...`)
 
@@ -244,10 +244,10 @@ console.log(`  ✓ SwapTest did not roll back across parent reorg`)
 
 console.log('\n[5] Mine on the post-reorg parent and require SwapTest progress...')
 const postReorgMiner = startMergedMiner(A, swapNode, 'miner-post-reorg')
-const advancedSH = await waitFor(async () => {
-  const sh = await height(swapPorts.rpcPort)
-  return sh > preSH ? sh : null
-}, `SwapTest height > ${preSH} after parent reorg`, { timeoutMs: 90_000, intervalMs: 500 })
+const advancedSH = await waitForProgress(
+  async () => height(swapPorts.rpcPort),
+  (sh) => sh > preSH,
+  `SwapTest height > ${preSH} after parent reorg`, { stallMs: 90_000, intervalMs: 500 })
 postReorgMiner.kill('SIGTERM')
 await sleep(500)
 

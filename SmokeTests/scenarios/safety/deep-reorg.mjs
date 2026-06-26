@@ -18,7 +18,7 @@ import { rmSync, mkdirSync } from 'node:fs'
 import { allocPorts, smokeRoot } from 'lattice-node-sdk/env'
 import {
   LatticeNode, LatticeNetwork, LatticeMiner,
-  sleep, waitFor, genKeypair, computeAddress,
+  sleep, waitFor, waitForProgress, genKeypair, computeAddress,
 } from 'lattice-node-sdk'
 import { startMining, stopMining } from 'lattice-node-sdk/chain'
 
@@ -61,8 +61,8 @@ const miner = new LatticeMiner(A, [swapTestNode], { workers: 2, batchSize: 2000 
 net.addMiner(miner)
 await miner.start()
 
-await waitFor(async () => (await A.height(nexusDir)) >= 5, 'nexus height 5', { timeoutMs: SHORT_WAIT_MS, intervalMs: 300 })
-await waitFor(async () => (await swapTestNode.height(CHILD)) >= 3, 'SwapTest height 3', { timeoutMs: SHORT_WAIT_MS, intervalMs: 300 })
+await waitForProgress(async () => A.height(nexusDir), (h) => h >= 5, 'nexus height 5', { stallMs: SHORT_WAIT_MS, intervalMs: 300 })
+await waitForProgress(async () => swapTestNode.height(CHILD), (h) => h >= 3, 'SwapTest height 3', { stallMs: SHORT_WAIT_MS, intervalMs: 300 })
 await miner.stop()
 await A.awaitQuiesced(nexusDir)
 await swapTestNode.awaitQuiesced(CHILD)
@@ -129,8 +129,8 @@ console.log('\n[3] Boot C standalone, mine a longer fork (no SwapTest)...')
 C.start(['--finality-confirmations', '999999'])
 await C.waitForRPC()
 await startMining(C, nexusDir)
-await waitFor(async () => (await C.height(nexusDir)) > forkANexusAfterDeposit + 2,
-  'C fork longer', { timeoutMs: MEDIUM_WAIT_MS, intervalMs: 500 })
+await waitForProgress(async () => C.height(nexusDir), (h) => h > forkANexusAfterDeposit + 2,
+  'C fork longer', { stallMs: MEDIUM_WAIT_MS, intervalMs: 500 })
 await stopMining(C, nexusDir)
 await C.awaitQuiesced(nexusDir)
 const forkCHeight = await C.height(nexusDir)
@@ -161,10 +161,8 @@ console.log('  Mining parent blocks after heal as a child-stability control...')
 const prePostHealChildHeight = await swapTestNode.height(CHILD)
 const prePostHealChildTip = await swapTestNode.tip(CHILD)
 await miner.start()
-await waitFor(async () => {
-  const h = await A.height(nexusDir)
-  return h > aFinalNexusH ? h : null
-}, 'Nexus advanced after parent heal', { timeoutMs: MEDIUM_WAIT_MS, intervalMs: 500 })
+await waitForProgress(async () => A.height(nexusDir), (h) => h > aFinalNexusH,
+  'Nexus advanced after parent heal', { stallMs: MEDIUM_WAIT_MS, intervalMs: 500 })
 await miner.stop()
 await A.awaitQuiesced(nexusDir)
 await swapTestNode.awaitQuiesced(CHILD)

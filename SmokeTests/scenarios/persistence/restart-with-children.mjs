@@ -5,7 +5,7 @@
 import { allocPorts, smokeRoot } from 'lattice-node-sdk/env'
 import {
   LatticeNode, LatticeNetwork, LatticeMiner,
-  sleep, waitFor, genKeypair, computeAddress,
+  sleep, waitFor, waitForProgress, genKeypair, computeAddress,
 } from 'lattice-node-sdk'
 
 const ROOT = smokeRoot('restart-with-children')
@@ -204,10 +204,12 @@ console.log(`  userA=${balA} userB=${balB}`)
 console.log('\n[6] Mine + new tx after restart...')
 const checker = genKeypair()
 await restartMiner()
-await waitFor(async () => {
-  const h = await node.height(nexusDir)
-  return h > postNx ? h : null
-}, 'Nexus advances after restart', { timeoutMs: 90_000, intervalMs: 1_000 })
+await waitForProgress(
+  async () => node.height(nexusDir),
+  (h) => h > postNx,
+  'Nexus advances after restart',
+  { stallMs: 90_000, intervalMs: 1_000 },
+)
 await miner.stop()
 await node.awaitQuiesced(nexusDir)
 await alpha.awaitQuiesced(CHILD1)

@@ -13,7 +13,7 @@
 
 import { rmSync, mkdirSync } from 'node:fs'
 import { allocPorts, smokeRoot } from 'lattice-node-sdk/env'
-import { LatticeNode, LatticeNetwork, LatticeMiner, sleep, waitFor } from 'lattice-node-sdk'
+import { LatticeNode, LatticeNetwork, LatticeMiner, sleep, waitFor, waitForProgress } from 'lattice-node-sdk'
 
 const ROOT = smokeRoot('child-epoch-difficulty')
 rmSync(ROOT, { recursive: true, force: true })
@@ -55,10 +55,8 @@ console.log(`  Child spec before mining: window=${specBefore?.retargetWindow}`)
 console.log(`\n[2] Mine past epoch boundary (${EPOCH_WINDOW + 2} blocks)...`)
 const miner1 = net.addMiner(new LatticeMiner(node, [childNode], { workers: 2 }))
 await miner1.start()
-await waitFor(async () => {
-  const h = await childNode.height('EpochTest')
-  return h >= EPOCH_WINDOW + 2 ? h : null
-}, `EpochTest height ≥ ${EPOCH_WINDOW + 2}`, { timeoutMs: 60_000, intervalMs: 300 })
+await waitForProgress(async () => childNode.height('EpochTest'), (h) => h >= EPOCH_WINDOW + 2,
+  `EpochTest height ≥ ${EPOCH_WINDOW + 2}`, { stallMs: 60_000, intervalMs: 300 })
 await miner1.stop()
 await node.awaitQuiesced(nexusDir)
 
@@ -76,10 +74,8 @@ console.log('\n[3] Mine 3 more blocks post-epoch to verify chain still advances.
 const preResumeHeight = childHeight
 const miner2 = net.addMiner(new LatticeMiner(node, [childNode], { workers: 2 }))
 await miner2.start()
-await waitFor(async () => {
-  const h = await childNode.height('EpochTest')
-  return h >= preResumeHeight + 3 ? h : null
-}, `EpochTest height ≥ ${preResumeHeight + 3}`, { timeoutMs: 60_000, intervalMs: 300 })
+await waitForProgress(async () => childNode.height('EpochTest'), (h) => h >= preResumeHeight + 3,
+  `EpochTest height ≥ ${preResumeHeight + 3}`, { stallMs: 60_000, intervalMs: 300 })
 await miner2.stop()
 const finalHeight = await childNode.height('EpochTest')
 console.log(`  EpochTest final height: ${finalHeight}`)

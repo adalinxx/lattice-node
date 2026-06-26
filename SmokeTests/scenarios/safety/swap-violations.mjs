@@ -10,7 +10,7 @@ import { rmSync, mkdirSync } from 'node:fs'
 import { allocPorts, smokeRoot } from 'lattice-node-sdk/env'
 import {
   LatticeNode, LatticeNetwork, LatticeMiner,
-  sleep, waitFor, genKeypair, computeAddress,
+  sleep, waitFor, waitForProgress, genKeypair, computeAddress,
 } from 'lattice-node-sdk'
 
 const ROOT = smokeRoot('swap-violations')
@@ -69,8 +69,8 @@ net.addMiner(miner)
 await miner.start()
 
 // 6 blocks from genesis under one miner needs more than a single WARMUP window.
-await waitFor(async () => (await nexusNode.height(nexusDir)) >= 6,
-  'nexus height 6', { timeoutMs: 2 * WARMUP_WAIT_MS, intervalMs: 500 })
+await waitForProgress(async () => nexusNode.height(nexusDir), (h) => h >= 6,
+  'nexus height 6', { stallMs: 2 * WARMUP_WAIT_MS, intervalMs: 500 })
 
 let _nonceSeq = 0
 function swapNonce() {
@@ -362,8 +362,8 @@ if (!dep3b.ok) {
 } else {
   console.log(`  duplicate deposit accepted at submit; verifying block-level rejection`)
   await miner.start()
-  await waitFor(async () => (await childNode.height(CHILD)) > childHeight3Before,
-    'duplicate deposit attempt processed', { timeoutMs: MINING_WAIT_MS, intervalMs: 1000 })
+  await waitForProgress(async () => childNode.height(CHILD), (h) => h > childHeight3Before,
+    'duplicate deposit attempt processed', { stallMs: MINING_WAIT_MS, intervalMs: 1000 })
   await miner.stop()
   await awaitStableChains('after duplicate deposit attempt')
 

@@ -8,7 +8,7 @@ import { rmSync, mkdirSync } from 'node:fs'
 import { allocPorts, smokeRoot } from 'lattice-node-sdk/env'
 import {
   LatticeNode, LatticeNetwork, LatticeMiner,
-  sleep, waitFor, genKeypair, computeAddress,
+  sleep, waitFor, waitForProgress, genKeypair, computeAddress,
 } from 'lattice-node-sdk'
 
 const ROOT = smokeRoot('swap')
@@ -71,8 +71,8 @@ await miner.start()
 
 // 10 blocks from genesis under one miner (~30s/block) needs more than a single
 // WARMUP window; the original split this across two miners. Give it room.
-await waitFor(async () => (await nexusNode.height(nexusDir)) >= 10,
-  'nexus height 10 (merged miner advancing both chains)', { timeoutMs: 2 * WARMUP_WAIT_MS, intervalMs: 500 })
+await waitForProgress(async () => nexusNode.height(nexusDir), (h) => h >= 10,
+  'nexus height 10 (merged miner advancing both chains)', { stallMs: 2 * WARMUP_WAIT_MS, intervalMs: 500 })
 console.log(`${CHILD} deployed and mining`)
 
 const funderNexusBal = await nexusNode.balance(funder.address, nexusDir)
