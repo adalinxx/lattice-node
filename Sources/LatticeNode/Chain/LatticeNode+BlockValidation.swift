@@ -356,10 +356,10 @@ extension LatticeNode {
         }
 
         // Expand sub-state tries only for postState (owned by this block).
-        // prevState/parentState root CIDs remain required-durable elsewhere (via
-        // `stateRoots(of:)`); they are References whose sub-tries are owned by
-        // their producers and resolved by CID on demand, and their `.node` is nil
-        // for synced blocks anyway — so there is nothing to expand here.
+        // prevState/parentState are References — NOT required-durable (stateRoots(of:)
+        // requires only the owned postState now): their sub-tries are owned by their
+        // producers and resolved by CID on demand during validation/recompute, and their
+        // `.node` is nil for synced blocks anyway — so there is nothing to expand here.
         appendMaterializedRoot(block.postState)
         if let stateNode = block.postState.node {
             appendMaterializedRoot(stateNode.accountState)
