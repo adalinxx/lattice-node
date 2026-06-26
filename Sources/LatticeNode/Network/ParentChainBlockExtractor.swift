@@ -267,9 +267,14 @@ public actor ParentChainBlockExtractor: IvyDelegate {
                 return
             }
 
-            let rootHash = block.proofOfWorkHash()
-            guard block.validateProofOfWork(nexusHash: rootHash) else {
-                log.warn("\(childDirectory): rejected backfilled parent ancestor \(String(cursor.prefix(16)))…: invalid PoW")
+            // A merge-mined ancestor (itself a child) carries nonce=0 and fails standalone
+            // PoW; trust one already verified when first relayed (its header edge was
+            // recorded only after securing-work verification), else require standalone PoW
+            // (valid for a root carrier). A not-yet-verified merge-mined ancestor is
+            // deferred rather than falsely rejected on standalone PoW (the depth-3 stall).
+            guard await node.hasVerifiedParentHeaderEdge(directory: childDirectory, blockHash: cursor)
+                  || block.validateProofOfWork(nexusHash: block.proofOfWorkHash()) else {
+                log.warn("\(childDirectory): rejected backfilled parent ancestor \(String(cursor.prefix(16)))…: unverified work; deferring")
                 return
             }
 
@@ -648,40 +653,65 @@ public actor ParentChainBlockExtractor: IvyDelegate {
         node: LatticeNode,
         inboundProofs: [ChildBlockProof]
     ) async -> ParentAnchor? {
-        if !inboundProofs.isEmpty {
-            guard !inboundProofs.isEmpty,
-                  let expectedParentPath = await parentProofChainPath(node: node) else { return nil }
-            for inboundProof in inboundProofs {
-                guard let proofForParent = MinedChildBlockSelection.projectedProof(
-                    inboundProof,
-                    targeting: expectedParentPath
-                ),
-                let root = await proofForParent.anchorRoot() else { return nil }
-                // Validity is per-chain PoW via `accepts`; a parent/carrier mined at
-                // its own difficulty under a harder-target ancestor legitimately has
-                // zero inherited work. The union-weight zero-exclusion is applied
-                // downstream (recordVerifiedWorkContributions), not here; gating
-                // admission/continuity/extraction on it wrongly dropped valid deep
-                // merged-mined parent relays — same fix as verifiedCommittingParentAnchor.
-                guard await MinedChildBlockSelection.accepts(
-                    chainPath: expectedParentPath,
-                    block: parentBlock,
-                    childCID: cid,
-                    rootHash: root.hash,
-                    proof: proofForParent
-                ) else { return nil }
-            }
-        } else {
-            let rootHash = parentBlock.proofOfWorkHash()
-            guard parentBlock.validateProofOfWork(nexusHash: rootHash) else { return nil }
-        }
-
+        guard await parentBlockWorkVerified(cid: cid, parentBlock: parentBlock, node: node, inboundProofs: inboundProofs) else { return nil }
         return ParentAnchor(
             blockHash: cid,
             parentHash: parentBlock.parent?.rawCID,
             height: parentBlock.height,
             prevStateCID: parentBlock.prevState.rawCID
         )
+    }
+
+    /// THE single choke point for "is this parent block's WORK verified?" — used before
+    /// any fact (continuity edge, inherited work) is derived from a parent block.
+    ///
+    /// A MERGE-MINED parent (one that is itself a child, i.e. depth ≥ 3 relative to the
+    /// PoW root) is built with nonce=0: it does NOT satisfy STANDALONE proof-of-work —
+    /// its work is its CARRIER's, proven by a `ChildBlockProof`. So verify work the SAME
+    /// way acceptance does: securing-work via the projected proof
+    /// (`MinedChildBlockSelection.accepts` against the proof's anchor root), and
+    /// standalone PoW ONLY when there is no securing proof (the parent IS the PoW root,
+    /// which cleared its own target by construction). Validating a nonce-0 child parent
+    /// with `validateProofOfWork(nexusHash: block.proofOfWorkHash())` is a coin-flip
+    /// (`target ≥ hash(preimage, nonce=0)`) that falsely rejects legitimate deep
+    /// merged-mined parent relays after the target retargets — wedging the grandchild
+    /// at height 1 (the depth-3 "deep-child stall"). Identical to the predicate the miner
+    /// submission and proof-based extraction already use to ACCEPT these very blocks, so
+    /// this is the correct check, not a PoW weakening.
+    func parentBlockWorkVerified(cid: String, parentBlock: Block, node: LatticeNode, inboundProofs: [ChildBlockProof]) async -> Bool {
+        // STANDALONE first: true iff the parent cleared its OWN target — always the case
+        // for the PoW ROOT (Nexus/Bitcoin), and the long-standing admission rule. This must
+        // be tried first because a relayed parent block can arrive with CHILD proofs attached
+        // (the carrier's children) that don't project to the parent's own path — branching on
+        // "has proofs" alone then wrongly sends a ROOT block down the proof branch and rejects
+        // it (the depth-2 regression).
+        let expectedParentPath = await parentProofChainPath(node: node)
+        // ROOT carrier ONLY (the parent chain IS the absolute PoW root, e.g. Nexus — path
+        // count 1): validate its OWN standalone PoW; it cleared its own target by construction.
+        // Restricting standalone to the root (defense-in-depth) keeps a forged-target DEEP
+        // parent off the continuity index entirely, and still covers a ROOT block relayed with
+        // its CHILDREN's proofs attached (which don't project to the root's own path — routing
+        // it down the proof branch would wrongly reject it, the depth-2 regression).
+        if (expectedParentPath?.count ?? 1) == 1 {
+            return parentBlock.validateProofOfWork(nexusHash: parentBlock.proofOfWorkHash())
+        }
+        // The parent is itself a MERGE-MINED child (built nonce=0, no standalone work): REQUIRE
+        // securing work via a carrier proof. One valid projected proof bound to THIS block
+        // (childCID == cid) on THIS chain (expectedParentPath) suffices — identical to the
+        // predicate that ACCEPTS these blocks. Without this, a nonce-0 child parent is falsely
+        // rejected after the target retargets (the depth-3 deep-child stall).
+        guard let expectedParentPath, !inboundProofs.isEmpty else { return false }
+        for inboundProof in inboundProofs {
+            if let proofForParent = MinedChildBlockSelection.projectedProof(inboundProof, targeting: expectedParentPath),
+               let root = await proofForParent.anchorRoot(),
+               await MinedChildBlockSelection.accepts(
+                 chainPath: expectedParentPath, block: parentBlock,
+                 childCID: cid, rootHash: root.hash, proof: proofForParent
+               ) {
+                return true
+            }
+        }
+        return false
     }
 
     private func verifiedInboundParentProofs(
@@ -740,9 +770,9 @@ public actor ParentChainBlockExtractor: IvyDelegate {
         // downstream fact (continuity edges, inherited work) to be derived from
         // unverified work. The hash computed here is reused by the proof/no-proof
         // branches below, so this adds no extra cost on the valid path.
-        let rootHash = parentBlock.proofOfWorkHash()
-        guard parentBlock.validateProofOfWork(nexusHash: rootHash) else {
-            log.warn("\(childDirectory): rejected parent block \(String(cid.prefix(16)))… before processing: invalid PoW")
+        let preGateProofs: [ChildBlockProof] = inboundProofData.flatMap { ChildBlockProofEnvelope.deserialize($0) } ?? []
+        guard await parentBlockWorkVerified(cid: cid, parentBlock: parentBlock, node: node, inboundProofs: preGateProofs) else {
+            log.warn("\(childDirectory): rejected parent block \(String(cid.prefix(16)))… before processing: invalid work")
             return
         }
 

@@ -15,7 +15,7 @@
 import { spawn, execSync } from 'node:child_process'
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:net'
-import { tmpdir } from 'node:os'
+import { tmpdir, cpus } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -25,7 +25,13 @@ const TAG_FILTER = process.env.SMOKE_TAGS
   ? new Set(process.env.SMOKE_TAGS.split(/[,\s]+/).filter(Boolean))
   : null
 const FAIL_FAST = process.env.SMOKE_FAIL_FAST === '1'
-const WORKERS = parseInt(process.env.SMOKE_WORKERS ?? '4', 10)
+// Each scenario spawns several full-node processes + a miner, so parallel scenarios
+// multiply process count. Cap workers at the core count: never schedule more concurrent
+// multi-process scenarios than cores, so CPU contention can't starve block production
+// (the verified flake cause) on a small/loaded box. CI runners with enough cores keep
+// their configured SMOKE_WORKERS unchanged; set SMOKE_WORKERS to override downward.
+const CORES = Math.max(1, cpus().length)
+const WORKERS = Math.max(1, Math.min(parseInt(process.env.SMOKE_WORKERS ?? '4', 10), CORES))
 const STREAM = process.env.SMOKE_STREAM === '1'
 const DETACHED_CHILDREN = process.env.SMOKE_DETACHED_CHILDREN !== '0'
 // Load-aware timeout scale: under N concurrent workers each scenario gets ~1/N of

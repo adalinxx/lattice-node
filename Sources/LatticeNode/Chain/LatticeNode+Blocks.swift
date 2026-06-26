@@ -305,7 +305,16 @@ extension LatticeNode {
             // same way headers-first sync would. This is a no-op once the closure is
             // local (mined/already-fetched blocks), so it only costs the gossip
             // followers a one-shot whole-closure fetch.
-            await prefetchBlockContentClosure(blockHash: header.rawCID, network: network)
+            // Skip the whole-closure network warm-up when this block's content is ALREADY
+            // durably stored locally (the mined path supplies `preStoredCIDs`). The carrier's
+            // own content is local, and a MERGED carrier embeds a CHILD block whose content it
+            // does NOT own — warming the closure over the network then blocks ~15s per call on
+            // the child's unreachable content, serializing merged block production to ~31s/block.
+            // Gossip followers (no preStoredCIDs) still warm their closure exactly as before.
+            let contentAlreadyLocal = durablyStoredCIDs != nil
+            if !contentAlreadyLocal {
+                await prefetchBlockContentClosure(blockHash: header.rawCID, network: network)
+            }
             let localHeightAfterPrefetch = await chain.getHighestBlockHeight()
             if block.height < localHeightAfterPrefetch {
                 return .rejected
@@ -315,7 +324,8 @@ extension LatticeNode {
                 block: block,
                 directory: directory,
                 network: network,
-                source: validationSource
+                source: validationSource,
+                skipNetworkPrefetch: contentAlreadyLocal
             ) else {
                 return .rejected
             }

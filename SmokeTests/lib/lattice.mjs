@@ -14,7 +14,7 @@
 import { spawn } from 'node:child_process'
 import { mkdirSync, createWriteStream, readFileSync, writeFileSync } from 'node:fs'
 import { BIN, allocPorts, devGenesisArgs } from './env.mjs'
-import { waitFor, sleep, scaledMs } from './waitFor.mjs'
+import { waitFor, waitForProgress, sleep, scaledMs } from './waitFor.mjs'
 import { sign as signMsg, genKeypair } from './wallet.mjs'
 import { jsonRpcHeaders } from './rpcAuth.mjs'
 
@@ -578,7 +578,7 @@ export class LatticeNode {
   }
 
   /** Mine until the chain reaches `targetHeight`, then stop. */
-  async mineToHeight(targetHeight, dir, { timeoutMs = 120_000 } = {}) {
+  async mineToHeight(targetHeight, dir, { timeoutMs = 300_000 } = {}) {
     const info = await this.chainInfo()
     const d = dir ?? info?.nexus
     await this.mineUntil(async () => {
@@ -609,13 +609,19 @@ export class LatticeNode {
     return last
   }
 
-  async waitForHeight(targetHeight, dir, { timeoutMs = 60_000 } = {}) {
+  // Progress-based (height is a correctness invariant, not a latency bound): fails only
+  // if production stalls (no new block for the stall window), so a slow-but-advancing
+  // chain still passes. Legacy numeric 3rd/4th arg (old hard timeoutMs) → stall window.
+  async waitForHeight(targetHeight, dir, opts = {}) {
     const info = await this.chainInfo()
     const d = dir ?? info?.nexus
-    return waitFor(async () => {
-      const h = await this.height(d)
-      return h >= targetHeight ? h : null
-    }, `${this.name}/${d} height ≥ ${targetHeight}`, { timeoutMs, intervalMs: 500 })
+    const o = typeof opts === 'number' ? { stallMs: opts } : opts
+    return waitForProgress(
+      async () => this.height(d),
+      (h) => h >= targetHeight,
+      `${this.name}/${d} height ≥ ${targetHeight}`,
+      { stallMs: o.stallMs ?? 30_000, safetyMs: o.safetyMs ?? 600_000, intervalMs: o.intervalMs ?? 500 },
+    )
   }
 
   async waitForTip(expectedTip, dir, { timeoutMs = 60_000 } = {}) {
@@ -696,7 +702,11 @@ export class LatticeMiner {
     await this.rootNode.readIdentity()
     const args = [
       '--node', `${this.rootNode.base}/api`,
-      '--workers', String(this.opts.workers ?? 2),
+      // Default 1: the test genesis is max-target, so worker 0 satisfies PoW on its first
+      // hash (nonce=0) — additional workers only burn CPU that contends with parallel
+      // scenarios' nodes, slowing block production. Scenarios needing real parallel search
+      // can still pass `{ workers: N }` explicitly.
+      '--workers', String(this.opts.workers ?? 1),
       '--batch-size', String(this.opts.batchSize ?? 2000),
     ]
     if (this.opts.minBlockIntervalMs) {
@@ -761,42 +771,58 @@ export class LatticeMiner {
     return this.start()
   }
 
+  // Progress-based: when a `progress` metric is supplied, the chain advancing resets the
+  // stall window, so a slow-but-advancing run under CPU contention NEVER times out — only
+  // a genuine stall (no forward progress for `stallMs`, even after `maxStallRestarts`
+  // miner kicks) fails. `timeoutMs` is now only an absolute safety-net backstop against a
+  // livelock that progresses forever without satisfying `check` (was a hard wall-clock cap
+  // that false-failed correct-but-slow runs — the #1 integration-test flake cause).
   async mineUntil(check, {
     desc = 'mining condition',
-    timeoutMs = 120_000,
+    timeoutMs = 600_000,
     intervalMs = 500,
     stallMs = defaultMinerStallMs(this.childNodes.length),
+    maxStallRestarts = 3,
     progress = null,
   } = {}) {
     await this.start()
     const start = Date.now()
-    const deadline = scaledMs(timeoutMs)
+    const safetyDeadline = scaledMs(timeoutMs)
     const stallDeadline = scaledMs(stallMs)
     let lastProgress = progress ? await progress() : null
     let lastAdvance = Date.now()
-    while (Date.now() - start < deadline) {
+    let restarts = 0
+    while (true) {
       const value = await check()
       // Zero can be a successful observed value (for example, a drained mempool).
       // Reserve null/undefined/false for "keep waiting".
       if (value !== null && value !== undefined && value !== false) return value
+      const now = Date.now()
       if (!this.running) {
         await this.start()
-        lastAdvance = Date.now()
+        lastAdvance = now
       } else if (progress) {
         const current = await progress()
         if (current !== lastProgress) {
           lastProgress = current
-          lastAdvance = Date.now()
-        } else if (Date.now() - lastAdvance > stallDeadline) {
-          console.log(`[miner] stalled while waiting for ${desc}; restarting`)
-          await this.restart()
-          lastAdvance = Date.now()
+          lastAdvance = now
+          restarts = 0
+        } else if (now - lastAdvance > stallDeadline) {
+          if (restarts < maxStallRestarts) {
+            console.log(`[miner] stalled while waiting for ${desc}; restarting (${restarts + 1}/${maxStallRestarts})`)
+            await this.restart()
+            lastAdvance = now
+            restarts++
+          } else {
+            throw new Error(`stalled: ${desc} — no forward progress for ${stallDeadline}ms across ${restarts} miner restarts`)
+          }
         }
+      }
+      if (now - start > safetyDeadline) {
+        throw new Error(`safety-net timeout: ${desc} after ${safetyDeadline}ms`)
       }
       await sleep(intervalMs)
     }
-    const scaleNote = deadline !== timeoutMs ? ` (base ${timeoutMs}ms × scale ${deadline / timeoutMs})` : ''
-    throw new Error(`timed out after ${deadline}ms${scaleNote}: ${desc}`)
   }
 }
 
@@ -877,7 +903,7 @@ export async function latticeTest(testName, { nodes = [] } = {}) {
 }
 
 // ─── Re-export lower-level helpers for tests that need them ──────────────────
-export { sleep, waitFor } from './waitFor.mjs'
+export { sleep, waitFor, waitForProgress } from './waitFor.mjs'
 export { genKeypair, computeAddress, sign } from './wallet.mjs'
 export { submitTx } from './tx.mjs'
 export { dirSizeBytes, rssBytes, peerCount, peers } from './probe.mjs'

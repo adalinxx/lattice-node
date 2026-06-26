@@ -674,9 +674,14 @@ extension LatticeNode {
             // recorded as a continuity fact — a state edge attests "this transition
             // happened", which only PoW-backed work may assert.
             if requireProofOfWork {
-                let rootHash = block.proofOfWorkHash()
-                guard block.validateProofOfWork(nexusHash: rootHash) else {
-                    NodeLogger("sync").warn("\(directory): parent-state backfill rejected parent block \(String(hash.prefix(16)))… with invalid PoW")
+                // A merge-mined parent (itself a child) carries nonce=0 and fails standalone
+                // PoW; trust one already verified when first relayed (header edge recorded
+                // only after securing-work verification), else require standalone PoW (valid
+                // for a root carrier). Standalone PoW on a nonce-0 child parent is a coin-flip
+                // that falsely rejects legitimate deep merged-mined parents (the depth-3 stall).
+                guard hasVerifiedParentHeaderEdge(directory: directory, blockHash: hash)
+                      || block.validateProofOfWork(nexusHash: block.proofOfWorkHash()) else {
+                    NodeLogger("sync").warn("\(directory): parent-state backfill rejected parent block \(String(hash.prefix(16)))… with unverified work")
                     return false
                 }
             }
