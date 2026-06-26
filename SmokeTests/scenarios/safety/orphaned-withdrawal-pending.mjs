@@ -21,7 +21,7 @@
 
 import { rmSync, mkdirSync } from 'node:fs'
 import { allocPorts, smokeRoot } from 'lattice-node-sdk/env'
-import { LatticeNode, LatticeNetwork, LatticeMiner, sleep, waitFor, genKeypair, computeAddress, peers } from 'lattice-node-sdk'
+import { LatticeNode, LatticeNetwork, LatticeMiner, sleep, waitFor, waitForProgress, genKeypair, computeAddress, peers } from 'lattice-node-sdk'
 
 const ROOT = smokeRoot('orphaned-withdrawal-pending')
 rmSync(ROOT, { recursive: true, force: true })
@@ -194,12 +194,17 @@ B.rpcPort = bHealPorts.rpcPort
 
 B.start(['--finality-confirmations', '999999', '--peer', A.peerArg()])
 await B.waitForRPC(60_000)
-const restoredBTip = await waitFor(async () => {
-  const bh = await B.height(nexusDir)
-  if (bh < bForkHeight) return null
-  const bt = await B.tip(nexusDir)
-  return bt ? bt : null
-}, "B restored fork provider", { timeoutMs: 60_000, intervalMs: 500 })
+// Progress-based: B re-syncing to its fork height is monotonic progress, not a latency
+// bound — fail only if the resync STALLS, so a slow-but-advancing restore under CI load
+// still passes (this fixed-deadline wait was an intermittent flake). B is a stable fork
+// provider (no mining), so its tip at ≥ bForkHeight is the restored fork tip.
+await waitForProgress(
+  async () => B.height(nexusDir),
+  (bh) => bh >= bForkHeight,
+  "B restored fork provider",
+  { stallMs: 60_000, intervalMs: 500 },
+)
+const restoredBTip = await B.tip(nexusDir)
 
 // Reconnect gate: require a genuinely ADMITTED peer on A (the node that must
 // pull B's longer fork), not merely a peerCount. Per the SDK, a peer still

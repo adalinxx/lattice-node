@@ -13,6 +13,19 @@ import Lattice
 public enum ChildBlockProofEnvelope {
     private static let magic = Data([0x4C, 0x4E, 0x50, 0x46, 0x53, 0x45, 0x54, 0x31]) // LNPFSET1
 
+    // Explicit fail-closed DoS bounds on the ingress codec. Without these the only
+    // ceiling is Ivy's frame-size cap (~4 MB) — i.e. an attacker can pack one frame with
+    // thousands of tiny proofs/entries and force a full deserialize + per-proof
+    // `canonicalProofID` (base64 over every entry) + dedup BEFORE any semantic check. These
+    // make the bound an EXPLICIT, stated invariant rather than an implicit consequence of
+    // the transport frame size. Chosen GENEROUSLY so they never reject a legitimate proof:
+    // a child block carries only a handful of distinct securing carriers; a proof's entries
+    // grow ~O(depth) (a few content nodes per hop); real chain trees are nowhere near 64
+    // levels deep. Verification is O(depth)·O(proofs), so bounding both bounds the work.
+    static let maxProofsPerEnvelope = 64
+    static let maxEntriesPerProof = 1024
+    static let maxDirectoryPathDepth = 64
+
     public static func serialize(_ proofs: [ChildBlockProof]) -> Data {
         var deduped: [ChildBlockProof] = []
         var seen = Set<String>()
@@ -39,6 +52,8 @@ public enum ChildBlockProofEnvelope {
               data.prefix(magic.count) == magic else { return nil }
         var pos = data.index(data.startIndex, offsetBy: magic.count)
         guard let count = readU16(data, &pos) else { return nil }
+        // Bound the proof count BEFORE parsing any (fail closed, no work done on overflow).
+        guard Int(count) <= maxProofsPerEnvelope else { return nil }
         var proofs: [ChildBlockProof] = []
         var seen = Set<String>()
         for _ in 0..<Int(count) {
@@ -46,6 +61,10 @@ public enum ChildBlockProofEnvelope {
                   data.distance(from: pos, to: data.endIndex) >= Int(len) else { return nil }
             let proofData = Data(data[pos..<data.index(pos, offsetBy: Int(len))])
             guard let proof = ChildBlockProof.deserialize(proofData) else { return nil }
+            // Bound per-proof entry count + path depth BEFORE the expensive `canonicalized`
+            // (which base64-encodes every entry) and the dedup set insert.
+            guard proof.entries.count <= maxEntriesPerProof,
+                  proof.directoryPath.count <= maxDirectoryPathDepth else { return nil }
             let canonical = proof.canonicalized
             if seen.insert(canonical.canonicalProofID).inserted {
                 proofs.append(canonical)
