@@ -48,6 +48,7 @@ const TIMEOUT_SCALE = Math.max(1, Number(process.env.SMOKE_TIMEOUT_SCALE) || Mat
 // the other workers keep draining the ~65 light tests while peak load drops.
 // Overridable via SMOKE_HEAVY_CONCURRENCY (set to WORKERS to disable the cap).
 const HEAVY_TESTS = new Set([
+  'reorg-restart-durability', 'sigkill-mid-reorg',
   'multichain-late-joiner', 'multidepth-swap', 'stateless-follower',
   'restart-resilience', 'swap-violations', 'late-joiner', 'deep-sync',
   'sync-finality-refusal', 'per-process-deep-reorg', 'cross-chain-reorg',
@@ -138,6 +139,8 @@ const TESTS = [
     { name: 'supply-conservation',   file: 'scenarios/safety/supply-conservation.mjs',    timeoutMs: 600_000 },
     { name: 'mempool-propagation',   file: 'scenarios/safety/mempool-propagation.mjs',    timeoutMs: 300_000 },
     { name: 'cross-chain-conservation', file: 'scenarios/safety/cross-chain-conservation.mjs', timeoutMs: 10 * 60_000 },
+    { name: 'reorg-restart-durability', file: 'scenarios/safety/reorg-restart-durability.mjs', timeoutMs: 360_000 },
+    { name: 'sigkill-mid-reorg',     file: 'scenarios/safety/sigkill-mid-reorg.mjs',      timeoutMs: 360_000 },
   ]),
   ...group('safety-b', [
     { name: 'mempool-eviction',      file: 'scenarios/safety/mempool-eviction.mjs',       timeoutMs: 180_000 },
