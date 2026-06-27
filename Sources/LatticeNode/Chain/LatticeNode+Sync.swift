@@ -363,6 +363,10 @@ extension LatticeNode {
                 localWork: localWork,
                 network: network,
                 sourcePeer: activeSourcePeer,
+                // Source-agnostic redundancy: every connected same-chain peer is a
+                // valid fallback for the proof-carrying child walk (authority is the
+                // proof, not the peer), so a single flaky/empty peer can't stall sync.
+                candidatePeers: await network.ivy.connectedPeers,
                 expectedChildPath: expectedChildPath,
                 progress: { current, total in
                     if current % 100 == 0 {
@@ -1496,7 +1500,13 @@ extension LatticeNode {
             connectedPeers.first(where: { $0.publicKey == p.publicKey })
         }
         guard let tips = knownPeerTips[chainKey(forPath: network.chainPath)], !tips.isEmpty else {
-            return (defaultTipCID, connectedPreferred)
+            // Source-agnostic: a peer is only a fetch hint — authority is PoW +
+            // ChildBlockProof, never peer identity (consensus-fork-choice.md: "the
+            // source does not make the data authoritative"; SOTA: Bitcoin IBD
+            // PR#2964 removed single-source dependence). With no preferred peer and
+            // no recorded tip, fall back to ANY connected same-chain peer rather
+            // than returning nil — which fails child sync closed while peers exist.
+            return (defaultTipCID, connectedPreferred ?? connectedPeers.first)
         }
         let tally = await network.ivy.tally
         var best: (key: String, height: UInt64, tipCID: String, peer: PeerID)? = nil
@@ -1519,7 +1529,7 @@ extension LatticeNode {
         if let defaultTipHeight,
            !failedSyncTips.contains(defaultTipCID),
            best == nil || defaultTipHeight > best!.height {
-            return (defaultTipCID, connectedPreferred)
+            return (defaultTipCID, connectedPreferred ?? connectedPeers.first)
         }
         if let preferredPeer,
            let connectedPreferred = connectedPeers.first(where: { $0.publicKey == preferredPeer.publicKey }),
@@ -1531,7 +1541,7 @@ extension LatticeNode {
             // choice. Header validation and cumulative work still decide adoption.
             return (preferredEntry.tipCID, connectedPreferred)
         }
-        return (best?.tipCID ?? defaultTipCID, best?.peer)
+        return (best?.tipCID ?? defaultTipCID, best?.peer ?? connectedPreferred ?? connectedPeers.first)
     }
 
     func verifySyncWithPeers(tipCID: String, tipHeight: UInt64, network: ChainNetwork) async {

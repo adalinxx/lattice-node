@@ -38,10 +38,14 @@ private struct ChildProofBatchSource: HeaderBatchSource {
     let parentByCID: [String: String?]
     let genesisCID: String
     let batchSize: Int
+    // Peers (by public key) that serve NOTHING — models a peer that is behind, has
+    // pruned the range, or whose link is flaky. Used to exercise multi-peer fallthrough.
+    var emptyPeers: Set<String> = []
 
     func requestHeaderBatch(fromCID: String, count: Int, peer: PeerID) async -> [(cid: String, data: Data)] { [] }
 
     func requestHeaderBatchWithProofs(fromCID: String, count: Int, peer: PeerID) async -> [(cid: String, data: Data, proof: Data?)] {
+        if emptyPeers.contains(peer.publicKey) { return [] }
         var out: [(cid: String, data: Data, proof: Data?)] = []
         var cid: String? = fromCID
         while let c = cid, c != genesisCID, out.count < batchSize {
@@ -242,5 +246,79 @@ final class HeaderChainMemoryCapTests: XCTestCase {
         XCTAssertEqual(headers.last?.cid, chain.tip)
         let proofs = await headerChain.acceptedProofs
         XCTAssertEqual(proofs.count, 5, "each accepted child header retains its verified proof")
+    }
+
+    // Source-agnostic child sync (foundational): a child block's authority is its
+    // own PoW-anchored `ChildBlockProof`, never the peer that served it
+    // (consensus-fork-choice.md "the source does not make the data authoritative";
+    // SOTA: Bitcoin IBD PR#2964 removed single-source dependence). So with NO
+    // designated source peer but a connected same-chain candidate available, child
+    // sync must use the candidate and complete — NOT fail closed with
+    // "child sync requires a source peer" (the pre-fix bug that stalled a follower
+    // whenever the trigger didn't name a peer, e.g. periodic re-sync).
+    func testChildSyncSelectsCandidatePeerWhenNoSourcePeer() async throws {
+        let chain = try await buildChildChainWithProofs(length: 6, batchSize: 1_000)
+        let headerChain = HeaderChain(maxAccumulatedHeaders: 1_000)
+        let candidate = PeerID(publicKey: "candidate-peer")
+
+        let headers = try await headerChain.downloadHeaders(
+            peerTipCID: chain.tip,
+            fetcher: HeaderDataFetcher(dataByCID: [:]),
+            genesisBlockHash: chain.genesis,
+            localWork: .zero,
+            network: chain.source,
+            sourcePeer: nil,                 // no designated source peer
+            candidatePeers: [candidate],     // but a connected same-chain peer exists
+            expectedChildPath: ["Mid"]
+        )
+        XCTAssertEqual(headers.count, 5, "child sync uses a candidate peer when no source peer is named")
+        XCTAssertEqual(headers.last?.cid, chain.tip)
+    }
+
+    // Redundant availability: the first (hinted) peer returns empty — behind, pruned,
+    // or a flaky link — so the proof-carrying walk must fall through to the next
+    // candidate and complete, instead of giving up after one empty batch (the pre-fix
+    // `break`-on-empty that produced `Downloaded 0 headers → emptyChain`).
+    func testChildSyncFallsThroughEmptyPeerToNextCandidate() async throws {
+        let chain = try await buildChildChainWithProofs(length: 6, batchSize: 1_000)
+        var source = chain.source
+        source.emptyPeers = ["empty-peer"]   // the hinted peer serves nothing
+        let headerChain = HeaderChain(maxAccumulatedHeaders: 1_000)
+
+        let headers = try await headerChain.downloadHeaders(
+            peerTipCID: chain.tip,
+            fetcher: HeaderDataFetcher(dataByCID: [:]),
+            genesisBlockHash: chain.genesis,
+            localWork: .zero,
+            network: source,
+            sourcePeer: PeerID(publicKey: "empty-peer"),  // hint serves nothing
+            candidatePeers: [PeerID(publicKey: "good-peer")], // fallback serves the chain
+            expectedChildPath: ["Mid"]
+        )
+        XCTAssertEqual(headers.count, 5, "child sync falls through an empty peer to a serving candidate")
+        XCTAssertEqual(headers.last?.cid, chain.tip)
+    }
+
+    // Safety line preserved: source agnosticism changes WHO we ask, never WHAT we
+    // accept. With NO source peer and NO candidate peers, child sync still fails
+    // closed — it never adopts unanchored child blocks from thin air.
+    func testChildSyncFailsClosedWithNoPeers() async throws {
+        let chain = try await buildChildChainWithProofs(length: 3, batchSize: 1_000)
+        let headerChain = HeaderChain(maxAccumulatedHeaders: 1_000)
+        do {
+            _ = try await headerChain.downloadHeaders(
+                peerTipCID: chain.tip,
+                fetcher: HeaderDataFetcher(dataByCID: [:]),
+                genesisBlockHash: chain.genesis,
+                localWork: .zero,
+                network: chain.source,
+                sourcePeer: nil,
+                candidatePeers: [],          // no peers at all
+                expectedChildPath: ["Mid"]
+            )
+            XCTFail("child sync must fail closed when no peer can serve a proof")
+        } catch HeaderChain.HeaderChainError.invalidPoW {
+            // expected — no source, no candidates ⇒ nothing to verify against
+        }
     }
 }
