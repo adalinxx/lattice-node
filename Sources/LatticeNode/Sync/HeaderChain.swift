@@ -210,6 +210,7 @@ public actor HeaderChain {
         knownBlockCIDs: Set<String> = [],
         network: (any HeaderBatchSource)? = nil,
         sourcePeer: PeerID? = nil,
+        candidatePeers: [PeerID] = [],
         expectedChildPath: [String]? = nil,
         isAcceptedRoot _: (@Sendable (String, UInt64) async -> Bool)? = nil,
         progress: (@Sendable (UInt64, UInt64) async -> Void)? = nil
@@ -218,11 +219,23 @@ public actor HeaderChain {
         // fallback. If we can't run it (no source peer), fail closed rather than
         // risk adopting unanchored child blocks.
         if let expectedChildPath {
-            guard let network, let peer = sourcePeer else {
-                throw HeaderChainError.invalidPoW("child sync requires a source peer")
+            // Source-agnostic candidate set: the hinted source peer first (locality),
+            // then every other connected same-chain peer as a redundant fallback.
+            // Authority is the per-block `ChildBlockProof` (PoW-anchored), so peers
+            // are interchangeable byte providers — fail closed only when NO peer can
+            // serve a valid proof, never because one designated peer was absent or
+            // returned empty. (consensus-fork-choice.md: "the source does not make the
+            // data authoritative"; SOTA: Bitcoin IBD PR#2964 dropped single-source.)
+            var peerOrder: [PeerID] = []
+            if let sourcePeer { peerOrder.append(sourcePeer) }
+            for p in candidatePeers where !peerOrder.contains(where: { $0.publicKey == p.publicKey }) {
+                peerOrder.append(p)
+            }
+            guard let network, !peerOrder.isEmpty else {
+                throw HeaderChainError.invalidPoW("child sync requires at least one connected peer")
             }
             return try await downloadChildHeadersWithProofs(
-                peerTipCID: peerTipCID, network: network, peer: peer,
+                peerTipCID: peerTipCID, network: network, peers: peerOrder,
                 genesisBlockHash: genesisBlockHash, knownBlockCIDs: knownBlockCIDs,
                 expectedChildPath: expectedChildPath, progress: progress
             )
@@ -325,7 +338,7 @@ public actor HeaderChain {
     private func downloadChildHeadersWithProofs(
         peerTipCID: String,
         network: any HeaderBatchSource,
-        peer: PeerID,
+        peers: [PeerID],
         genesisBlockHash: String,
         knownBlockCIDs: Set<String>,
         expectedChildPath: [String],
@@ -338,9 +351,19 @@ public actor HeaderChain {
         var totalHeight: UInt64 = 0
 
         while !Task.isCancelled {
-            let bulk = await network.requestHeaderBatchWithProofs(
-                fromCID: nextCID, count: ChainNetwork.maxHeaderBatchSize, peer: peer
-            )
+            // Source-agnostic: request this batch from any candidate peer; the first
+            // non-empty response wins. A peer that is behind, has pruned the range, or
+            // whose link is flaky returns empty — try the next rather than ending the
+            // walk. Only an empty result from EVERY peer stops it. Mixing peers across
+            // batches is safe — each block is verified against its own ChildBlockProof.
+            var bulk: [(cid: String, data: Data, proof: Data?)] = []
+            for p in peers {
+                if Task.isCancelled { throw HeaderChainError.cancelled }
+                bulk = await network.requestHeaderBatchWithProofs(
+                    fromCID: nextCID, count: ChainNetwork.maxHeaderBatchSize, peer: p
+                )
+                if !bulk.isEmpty { break }
+            }
             guard !bulk.isEmpty else { break }
 
             if totalHeight == 0 {
