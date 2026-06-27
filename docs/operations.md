@@ -265,17 +265,19 @@ Two wiring steps beyond running the chains ([Child Chains](#child-chains)):
 > **hangs** waiting on it, and the coordinator silently makes no progress. This is
 > the single most common "merged mining does nothing" symptom.
 
-> **A child advances only as fast as the parent can anchor it.** Each child block is
-> anchored to the parent's state. While the parent is producing blocks, the child
-> rides along. But if the parent **stalls** (no new parent blocks — e.g. the Nexus
-> is at full difficulty and you haven't found one yet), the child keeps advancing on
-> its own work only until it out-runs the last parent state it can anchor to, then
-> **stalls too** — the merged template build can no longer produce a continuous
-> child candidate. This is expected, not a bug: advance the parent (more hashrate on
-> it) and the child resumes. A child with a too-easy genesis target compounds this —
-> it retargets hard within a few blocks and out-runs a slow parent almost
-> immediately, so calibrate the child's genesis target to the hashrate you'll point
-> at it.
+> **A child advances on its own difficulty, independent of the parent's cadence.**
+> A child block anchors to the parent's *current* state, and consecutive child blocks
+> minted against an unchanged parent state are valid — so a child keeps advancing
+> normally **even while the parent produces no blocks** (e.g. the Nexus is at full
+> difficulty and hasn't been solved). A child's block rate is governed by **its own
+> target and the hashrate you point at it**, not by the parent. Before suspecting a
+> child is "stuck," compute its expected block time — `(2^256 / target)` hashes per
+> block ÷ your hashrate — over a window long enough to see a block at that rate.
+> A child with a too-easy genesis target mines its first blocks almost instantly,
+> then the windowed retarget tightens hard and can briefly overshoot to many minutes
+> per block before settling back toward `targetBlockTime`; during the overshoot it
+> looks frozen but isn't. Calibrate the child's genesis target to the hashrate you'll
+> point at it to avoid the swing.
 
 > **URL forms differ between the two CLIs.** The coordinator's `--node` /
 > `--child-node` take the API base **with** `/api` (`http://host:8080/api`); the
