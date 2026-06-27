@@ -19,17 +19,33 @@ network (see *Run a Node*).
 
 ### From source
 
-Requires **Swift 6.1** — the toolchain the network is built and run on.
-
 ```bash
 git clone https://github.com/adalinxx/lattice-node.git
 cd lattice-node
 swift build -c release   # binary at .build/release/LatticeNode
 ```
 
-> **macOS 26 caveat:** macOS 26's only SDK is paired with Swift 6.3.2, which has a
-> concurrency bug that aborts the node during chain sync. Until it's fixed upstream,
-> run via **Docker** on macOS; build natively only on Linux with Swift 6.1.
+CI and tagged releases build on **Swift 6.1** with full `-O`. On a **Swift 6.3**
+toolchain (e.g. macOS 26, whose only SDK ships 6.3.x) you must build a different
+way — `swift build -c release` produces a binary that **crash-loops ~28s after
+startup** with `freed pointer was not the last allocation`. That is the Swift 6.3
+`-O` optimizer miscompiling the node's `Task { … Task.sleep … }` background loops
+(peer refresh, reconnect, health monitor) into an out-of-order `swift_task_dealloc`
+that corrupts the task allocator. It hits every node (root and child) and is *not*
+a node bug. Two reliable options:
+
+```bash
+# A) Build native + unoptimized (sidesteps the optimizer bug). Use `xcrun` so the
+#    compiler matches the installed SDK.
+xcrun swift build -c release -Xswiftc -Onone     # or: xcrun swift build   (debug)
+
+# B) Use Docker (below) — the published image is built on an unaffected toolchain.
+```
+
+> **Toolchain must match the SDK.** Don't "fix" the 6.3 crash by pinning an older
+> compiler: a 6.1 `.xctoolchain` on `PATH` can't build against a 6.3 SDK and fails
+> with `failed to build module 'Darwin' … select a toolchain which matches the SDK`.
+> `xcrun swift build` uses Xcode's default toolchain, which always matches the SDK.
 
 ## Quick Start
 
@@ -250,9 +266,19 @@ lattice-node \
   --peer <anotherToyNode@host:port> \
   --port 4002 --rpc-port 8081 --data-dir ./toy-data
 
-# 3. Merge-mine Nexus + toy with ONE coordinator. The Nexus node builds the merged block
+# 3. Register toy's RPC with your Nexus so the parent can deliver a mined toy block back
+#    to the toy process. (Skip and the parent mines valid toy blocks with nowhere to put
+#    them.) See operations.md "Merge-Mining Child Chains".
+curl -s -X POST http://localhost:8080/api/chain/register-rpc \
+  -H "Authorization: Bearer $(cat ~/.lattice/.cookie)" -H 'Content-Type: application/json' \
+  -d '{"chainPath":["Nexus","toy"],"endpoint":"http://localhost:8081/api","authToken":"'"$(cat ./toy-data/.cookie)"'"}'
+
+# 4. Merge-mine Nexus + toy with ONE coordinator. The Nexus node builds the merged block
 #    template (Nexus block + toy candidate, via state access); the coordinator only does
 #    PoW + submit-work. One solution advances BOTH chains. Repeat --child-node per child.
+#    WAIT first: both nodes must answer `POST /api/chain/template` with 200 (warmup gate) —
+#    starting the coordinator against a still-warming node hangs it. See operations.md
+#    "Wait for ready, not just up".
 LatticeMiningCoordinatorTool \
   --node       http://localhost:8080/api --rpc-cookie-file       ~/.lattice/.cookie \
   --child-node http://localhost:8081/api --child-rpc-cookie-file ./toy-data/.cookie \

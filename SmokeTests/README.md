@@ -5,15 +5,12 @@ assert observable chain state. Each scenario is hermetic: it owns its
 `SMOKE_ROOT`, allocates a non-overlapping port range, and tears down its own
 processes on exit, SIGINT, or uncaughtException.
 
-> **Local toolchain note (Swift 6.3.x).** Swift 6.3's optimizer (`-O`)
-> miscompiles the `Task { … try? await Task.sleep(…) … }` background-loop
-> pattern used across the node and Ivy (PEX, health monitor, peer refresh,
-> reconnect): on resume it emits an out-of-order `swift_task_dealloc` that
-> corrupts the task allocator and crashes the node ~28s after startup. Build
-> the smoke binaries unoptimized on that toolchain:
-> `swift build -c release -Xswiftc -Onone` (or plain `swift build`). CI and
-> release builds use Swift 6.1 and are unaffected (keep full `-O`). Remove this
-> note once the Swift 6.3 optimizer regression is fixed.
+> **Local toolchain note (Swift 6.3.x).** The smoke binaries are subject to the
+> same Swift 6.3 `-O` crash as any node build — build them unoptimized
+> (`xcrun swift build`, or `xcrun swift build -c release -Xswiftc -Onone`). CI and
+> tagged releases use Swift 6.1 and keep full `-O`. See
+> [getting-started.md → From source](../docs/getting-started.md#from-source) for the
+> full explanation and the `xcrun`/SDK-match caveat (single source of truth).
 
 ## Architecture
 

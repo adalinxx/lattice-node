@@ -57,6 +57,39 @@ external (see [Local Mining Coordinator Gate](#local-mining-coordinator-gate)), 
 no specialized hardware is required to run or mine the Nexus. Throughput-heavy
 workloads belong on child chains with their own `ChainSpec`, not on the Nexus.
 
+#### Wait for *ready*, not just *up*
+
+Driving a freshly launched node — pointing a mining coordinator at it, starting a
+child process, wiring a health check — is the most common cause of **transient
+hangs and timeouts**. The process being alive, or even the RPC answering, does not
+mean the node can serve work yet. A node passes through three stages, each with its
+own gate; wait for the gate, don't sleep-and-hope:
+
+| Stage | What happens | Gate to wait on |
+|---|---|---|
+| 1. Identity grind → RPC bind | First boot grinds an anti-Sybil identity key *before* the RPC port opens (minutes at the 24-bit default). | `GET /api/chain/info` returns `200`. |
+| 2. Migrations + state warmup | After the RPC binds, the node runs schema migrations and warms its state stores. **`POST /api/chain/template` can hang or time out here even though `chain/info` already answers** — a coordinator started now blocks. | `POST /api/chain/template` returns `200`. |
+| 3. Peer discovery + sync | `"syncing": false` is **edge-triggered**: a just-booted node reads `false` *before* it discovers peers, then flips to `true` once it starts catching up. | `/api/peers` count ≥ 1 **and** `chain/info` `"syncing": false` **stable across two polls** a few seconds apart. |
+
+Rules of thumb:
+
+- **Start a mining coordinator only after gate 2** (and gate 3 if you need a synced
+  tip). Gate 2 is the one most people miss — `chain/info` answering is *not* enough.
+- **Before pointing a merged coordinator at a child**, wait for the *child's* own
+  `POST /api/chain/template` to answer (gate 2 on the child).
+- A node that just restarted under a keepalive loop re-enters stage 2 every time —
+  so the readiness probe belongs in the keepalive/orchestrator, not just at first
+  boot.
+
+```bash
+# Minimal readiness probe before starting dependents
+CK=$(cat <data-dir>/.cookie)
+until curl -fsS -X POST http://127.0.0.1:8080/api/chain/template \
+  -H "Authorization: Bearer $CK" -H 'content-type: application/json' -d '{}' \
+  >/dev/null 2>&1; do sleep 2; done
+# node is now warm enough to build templates → safe to start the coordinator
+```
+
 ### Child Chains
 
 In production, child chains run as **separate processes** that subscribe to their parent (Nexus) for blocks. Nexus stays the control plane (`/api/chain/deploy`, `/api/chain/register-rpc`); an orchestrator deploys the child's genesis on the parent, then spawns the child process from it:
@@ -223,6 +256,26 @@ Two wiring steps beyond running the chains ([Child Chains](#child-chains)):
    ```
    (`--child-rpc-cookie-file <path>` reads the token from a file, re-read each
    round, instead of a fixed `--child-rpc-token`.)
+
+> **Readiness applies to *both* nodes.** Start the coordinator only after the parent
+> **and** every child have passed gate 2 ([Wait for *ready*](#wait-for-ready-not-just-up)) —
+> a `POST /api/chain/template` that returns `200`. The merged template build fans
+> out to each child's `/chain/candidate`; if a child is still warming up (or was
+> crash-looping — see the Swift 6.3 build note), the parent's `/api/chain/template`
+> **hangs** waiting on it, and the coordinator silently makes no progress. This is
+> the single most common "merged mining does nothing" symptom.
+
+> **A child advances only as fast as the parent can anchor it.** Each child block is
+> anchored to the parent's state. While the parent is producing blocks, the child
+> rides along. But if the parent **stalls** (no new parent blocks — e.g. the Nexus
+> is at full difficulty and you haven't found one yet), the child keeps advancing on
+> its own work only until it out-runs the last parent state it can anchor to, then
+> **stalls too** — the merged template build can no longer produce a continuous
+> child candidate. This is expected, not a bug: advance the parent (more hashrate on
+> it) and the child resumes. A child with a too-easy genesis target compounds this —
+> it retargets hard within a few blocks and out-runs a slow parent almost
+> immediately, so calibrate the child's genesis target to the hashrate you'll point
+> at it.
 
 > **URL forms differ between the two CLIs.** The coordinator's `--node` /
 > `--child-node` take the API base **with** `/api` (`http://host:8080/api`); the
