@@ -49,7 +49,7 @@ const TIMEOUT_SCALE = Math.max(1, Number(process.env.SMOKE_TIMEOUT_SCALE) || Mat
 // Overridable via SMOKE_HEAVY_CONCURRENCY (set to WORKERS to disable the cap).
 const HEAVY_TESTS = new Set([
   'reorg-restart-durability', 'sigkill-mid-reorg',
-  'reorg-mempool-readmit', 'reorg-mempool-nonce-evict',
+  'reorg-mempool-readmit', 'reorg-mempool-nonce-evict', 'child-genesis-orphaned', 'heterogeneous-child-targets',
   'multichain-late-joiner', 'multidepth-swap', 'depth4-merged-mining', 'stateless-follower',
   'sync-during-reorg',
   'restart-resilience', 'swap-violations', 'late-joiner', 'deep-sync',
@@ -167,6 +167,8 @@ const TESTS = [
     { name: 'orphaned-withdrawal-pending', file: 'scenarios/safety/orphaned-withdrawal-pending.mjs', timeoutMs: 360_000 },
     { name: 'websocket-disconnect',  file: 'scenarios/safety/websocket-disconnect.mjs',   timeoutMs: 120_000 },
     { name: 'redeploy-from-genesis', file: 'scenarios/safety/redeploy-from-genesis.mjs',  timeoutMs: 180_000 },
+    { name: 'child-genesis-orphaned', file: 'scenarios/safety/child-genesis-orphaned.mjs', timeoutMs: 360_000 },
+    { name: 'heterogeneous-child-targets', file: 'scenarios/safety/heterogeneous-child-targets.mjs', timeoutMs: 360_000 },
   ]),
   ...group('rpc', [
     { name: 'finality',              file: 'scenarios/rpc/finality.mjs',                  timeoutMs: 180_000 },
