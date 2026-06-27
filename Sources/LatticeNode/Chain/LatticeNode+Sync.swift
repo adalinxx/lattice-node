@@ -356,12 +356,20 @@ extension LatticeNode {
             // never self-hashed. expectedChildPath is the proof's root-exclusive path.
             let chainPath = network.chainPath
             let expectedChildPath: [String]? = chainPath.count >= 2 ? Array(chainPath.dropFirst()) : nil
-            // Reputation-gated candidate set for the source-agnostic child walk:
-            // only Tally-allowed connected peers (a misbehaving peer must still be
-            // skipped — audit H1); downloadHeaders bounds how many are tried so an
-            // empty/slow-peer flood can't burn the sync window (audit M2).
+            // Reputation-gated, SHUFFLED, bounded candidate set for the source-agnostic
+            // child walk:
+            //  - Tally-allowed only — a misbehaving peer is still skipped (audit H1).
+            //  - shuffled so the bounded window ROTATES across sync retries: an empty
+            //    response/timeout draws no Tally penalty, so without rotation an attacker
+            //    holding a fixed front-N of empty-serving peers could stall sync forever
+            //    (audit M3). A fresh shuffle each attempt means the honest tail is reached.
+            //  - admission-gate only a bounded slice (not every connected peer), so
+            //    building the set doesn't spend a Tally request token network-wide and
+            //    can't spuriously shrink under load (audit Low). downloadHeaders applies
+            //    the final per-batch cap.
             let syncTally = await network.ivy.tally
-            let allowedCandidates = (await network.ivy.connectedPeers)
+            let allowedCandidates = (await network.ivy.connectedPeers).shuffled()
+                .prefix(HeaderChain.maxSyncCandidatePeers * 2)
                 .filter { syncTally.shouldAllow(peer: $0) }
             let headers = try await headerChain.downloadHeaders(
                 peerTipCID: activeTip,
