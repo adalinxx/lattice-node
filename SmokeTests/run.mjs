@@ -49,7 +49,9 @@ const TIMEOUT_SCALE = Math.max(1, Number(process.env.SMOKE_TIMEOUT_SCALE) || Mat
 // Overridable via SMOKE_HEAVY_CONCURRENCY (set to WORKERS to disable the cap).
 const HEAVY_TESTS = new Set([
   'reorg-restart-durability', 'sigkill-mid-reorg',
-  'multichain-late-joiner', 'multidepth-swap', 'stateless-follower',
+  'reorg-mempool-readmit', 'reorg-mempool-nonce-evict',
+  'multichain-late-joiner', 'multidepth-swap', 'depth4-merged-mining', 'stateless-follower',
+  'sync-during-reorg',
   'restart-resilience', 'swap-violations', 'late-joiner', 'deep-sync',
   'sync-finality-refusal', 'per-process-deep-reorg', 'cross-chain-reorg',
   'swap', 'swap-cli', 'retention-pruning', 'grandchild-swap', 'sync-under-load',
@@ -91,6 +93,7 @@ const TESTS = [
     { name: 'sync',                  file: 'scenarios/network/sync.mjs',                  timeoutMs: 300_000 },
     { name: 'late-joiner',           file: 'scenarios/network/late-joiner.mjs',           timeoutMs: 8 * 60_000 },
     { name: 'partition',             file: 'scenarios/network/partition.mjs',             timeoutMs: 360_000 },
+    { name: 'sync-during-reorg',     file: 'scenarios/network/sync-during-reorg.mjs',     timeoutMs: 360_000 },
     { name: 'concurrent-mining',     file: 'scenarios/network/concurrent-mining.mjs',     timeoutMs: 420_000 },
     { name: 'mesh-convergence',      file: 'scenarios/network/mesh-convergence.mjs',      timeoutMs: 300_000 },
     { name: 'peer-churn',            file: 'scenarios/network/peer-churn.mjs',            timeoutMs: 300_000 },
@@ -123,6 +126,7 @@ const TESTS = [
     { name: 'variable-rate-swap',    file: 'scenarios/swap/variable-rate-swap.mjs',       timeoutMs: 480_000 },
     { name: 'receipt-derived-transfer', file: 'scenarios/swap/receipt-derived-transfer.mjs', timeoutMs: 10 * 60_000 },
     { name: 'grandchild-swap',       file: 'scenarios/swap/grandchild-swap.mjs',          timeoutMs: 480_000 },
+    { name: 'depth4-merged-mining',  file: 'scenarios/swap/depth4-merged-mining.mjs',     timeoutMs: 480_000 },
   ]),
   ...group('cli', [
     { name: 'operator-journey',      file: 'scenarios/cli/operator-journey.mjs',          timeoutMs: 10 * 60_000 },
@@ -141,6 +145,8 @@ const TESTS = [
     { name: 'cross-chain-conservation', file: 'scenarios/safety/cross-chain-conservation.mjs', timeoutMs: 10 * 60_000 },
     { name: 'reorg-restart-durability', file: 'scenarios/safety/reorg-restart-durability.mjs', timeoutMs: 360_000 },
     { name: 'sigkill-mid-reorg',     file: 'scenarios/safety/sigkill-mid-reorg.mjs',      timeoutMs: 360_000 },
+    { name: 'reorg-mempool-readmit', file: 'scenarios/safety/reorg-mempool-readmit.mjs',  timeoutMs: 360_000 },
+    { name: 'reorg-mempool-nonce-evict', file: 'scenarios/safety/reorg-mempool-nonce-evict.mjs', timeoutMs: 360_000 },
   ]),
   ...group('safety-b', [
     { name: 'mempool-eviction',      file: 'scenarios/safety/mempool-eviction.mjs',       timeoutMs: 180_000 },
