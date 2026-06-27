@@ -1508,7 +1508,10 @@ extension LatticeNode {
         // (authority is PoW + ChildBlockProof), yet a peer that has misbehaved below
         // Tally's allow-threshold must still be skipped — exactly as the recorded-tip
         // loop skips it. Source agnosticism must not become a Tally bypass (audit H1).
-        let anyAllowedPeer = connectedPreferred ?? connectedPeers.first(where: { tally.shouldAllow(peer: $0) })
+        // The preferred (announcing) peer is Tally-gated too: the original preferred
+        // path checked it, so the fallback must not silently re-admit a disallowed one.
+        let allowedPreferred = connectedPreferred.flatMap { tally.shouldAllow(peer: $0) ? $0 : nil }
+        let anyAllowedPeer = allowedPreferred ?? connectedPeers.first(where: { tally.shouldAllow(peer: $0) })
         guard let tips = knownPeerTips[chainKey(forPath: network.chainPath)], !tips.isEmpty else {
             // Source-agnostic: a peer is only a fetch hint — authority is PoW +
             // ChildBlockProof, never peer identity (consensus-fork-choice.md: "the
