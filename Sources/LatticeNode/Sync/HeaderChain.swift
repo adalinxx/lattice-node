@@ -42,6 +42,10 @@ public actor HeaderChain {
     /// (`headerWalkTooLarge`) rather than OOM. Single choke point for all three
     /// download paths.
     public static let defaultMaxAccumulatedHeaders = ChainNetwork.maxHeaderBatchSize * 1_000
+    /// Max candidate peers tried per batch on the source-agnostic child walk. Bounds
+    /// the per-batch timeout cost so a Sybil-filled peer set can't burn the sync
+    /// window (audit M2) while keeping enough redundancy that one flaky peer is fine.
+    static let maxSyncCandidatePeers = 5
     let maxAccumulatedHeaders: Int
 
     public init(
@@ -231,11 +235,17 @@ public actor HeaderChain {
             for p in candidatePeers where !peerOrder.contains(where: { $0.publicKey == p.publicKey }) {
                 peerOrder.append(p)
             }
-            guard let network, !peerOrder.isEmpty else {
+            // Bound the set actually tried per batch: an empty/slow peer costs a full
+            // request timeout, so an unbounded candidate list (e.g. a Sybil-filled
+            // peer set) would let an attacker burn the whole sync window. Cap to a
+            // small constant of (already Tally-allowed) peers — enough redundancy
+            // without an amplification surface (audit M2). The source hint stays first.
+            let triedPeers = Array(peerOrder.prefix(Self.maxSyncCandidatePeers))
+            guard let network, !triedPeers.isEmpty else {
                 throw HeaderChainError.invalidPoW("child sync requires at least one connected peer")
             }
             return try await downloadChildHeadersWithProofs(
-                peerTipCID: peerTipCID, network: network, peers: peerOrder,
+                peerTipCID: peerTipCID, network: network, peers: triedPeers,
                 genesisBlockHash: genesisBlockHash, knownBlockCIDs: knownBlockCIDs,
                 expectedChildPath: expectedChildPath, progress: progress
             )
@@ -350,19 +360,26 @@ public actor HeaderChain {
         var nextCID = peerTipCID
         var totalHeight: UInt64 = 0
 
+        // Index of the peer that served the previous batch — each batch starts with
+        // it (locality: a healthy server keeps serving without re-paying other peers'
+        // timeouts) and rotates only when it goes empty (audit M2: don't re-iterate the
+        // whole set every batch). Bounded to `peers.count` tries per batch.
+        var serveIdx = 0
         while !Task.isCancelled {
-            // Source-agnostic: request this batch from any candidate peer; the first
+            // Source-agnostic: a batch may come from ANY candidate peer — the first
             // non-empty response wins. A peer that is behind, has pruned the range, or
-            // whose link is flaky returns empty — try the next rather than ending the
-            // walk. Only an empty result from EVERY peer stops it. Mixing peers across
-            // batches is safe — each block is verified against its own ChildBlockProof.
+            // whose link is flaky returns empty; rotate to the next rather than ending
+            // the walk. Only an empty result from EVERY peer stops it. Mixing peers
+            // across batches is safe — each block is verified against its own
+            // ChildBlockProof and bound to the carried-over `nextCID` (no fork splice).
             var bulk: [(cid: String, data: Data, proof: Data?)] = []
-            for p in peers {
+            for offset in 0..<peers.count {
                 if Task.isCancelled { throw HeaderChainError.cancelled }
+                let idx = (serveIdx + offset) % peers.count
                 bulk = await network.requestHeaderBatchWithProofs(
-                    fromCID: nextCID, count: ChainNetwork.maxHeaderBatchSize, peer: p
+                    fromCID: nextCID, count: ChainNetwork.maxHeaderBatchSize, peer: peers[idx]
                 )
-                if !bulk.isEmpty { break }
+                if !bulk.isEmpty { serveIdx = idx; break }
             }
             guard !bulk.isEmpty else { break }
 
