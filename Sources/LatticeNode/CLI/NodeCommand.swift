@@ -742,6 +742,15 @@ struct NodeCommand: AsyncParsableCommand {
         peerRefreshTask.cancel()
         await rpcServer?.shutdown()
         rpcTask?.cancel()
+        // Drain in-flight RPC handlers to COMPLETION before node.stop(). triggerGracefulShutdown
+        // (above) stops accepting new connections but returns immediately; without awaiting the
+        // task, an already-executing submit-work handler (no cancellation checks on that actor
+        // path) can still enter withChainMutation AFTER node.stop()'s gate-drain runs, advancing
+        // the in-memory tip past the durable commit and re-introducing the persisted-phantom-tip
+        // divergence the drain is meant to prevent. Awaiting here makes "no new mutation starts
+        // after shutdown" actually true for the RPC mutation source (bounded: only in-flight
+        // handlers remain once new connections are refused).
+        try? await rpcTask?.value
         for task in backgroundTasks { task.cancel() }
         for task in backgroundTasks { await task.value }
 

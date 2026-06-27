@@ -548,9 +548,20 @@ extension LatticeNode {
             if canonicalTipAfterValidation == header.rawCID {
                 let txSource = await buildMempoolAwareSource(directory: directory, baseFetcher: fetcher)
                 let txEntries = await resolveBlockTransactions(block: block, source: txSource)
+                // This block IS the canonical main-chain tip (fork choice just promoted it).
+                // The durable tip MUST advance to it even when its height is <= the previous
+                // durable height — a heaviest-work reorg to a HEAVIER-BUT-SHORTER branch
+                // legitimately lowers the tip height. Without `allowLowerHeightReplay`, the
+                // `prepareAcceptedBlockEffects` height-skip guard (meant to drop a STALE
+                // non-canonical lower block) silently skips the durable commit, leaving
+                // meta:chain-tip behind the in-memory tip; on restart recovery then projects
+                // the in-memory tip DOWN to that stale pointer, losing accepted blocks. The
+                // guard still protects the side-fork branch below (which is NOT the tip and is
+                // never committed), so only the genuine canonical tip is allowed to lower.
                 guard await applyAcceptedBlock(
                     block: block, blockHash: header.rawCID,
-                    txEntries: txEntries, directory: directory
+                    txEntries: txEntries, directory: directory,
+                    allowLowerHeightReplay: true
                 ) else {
                     return await failDurable("failed to durably publish accepted block", directory: directory)
                 }
