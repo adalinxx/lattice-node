@@ -356,6 +356,13 @@ extension LatticeNode {
             // never self-hashed. expectedChildPath is the proof's root-exclusive path.
             let chainPath = network.chainPath
             let expectedChildPath: [String]? = chainPath.count >= 2 ? Array(chainPath.dropFirst()) : nil
+            // Reputation-gated candidate set for the source-agnostic child walk:
+            // only Tally-allowed connected peers (a misbehaving peer must still be
+            // skipped — audit H1); downloadHeaders bounds how many are tried so an
+            // empty/slow-peer flood can't burn the sync window (audit M2).
+            let syncTally = await network.ivy.tally
+            let allowedCandidates = (await network.ivy.connectedPeers)
+                .filter { syncTally.shouldAllow(peer: $0) }
             let headers = try await headerChain.downloadHeaders(
                 peerTipCID: activeTip,
                 fetcher: fetcher,
@@ -363,10 +370,7 @@ extension LatticeNode {
                 localWork: localWork,
                 network: network,
                 sourcePeer: activeSourcePeer,
-                // Source-agnostic redundancy: every connected same-chain peer is a
-                // valid fallback for the proof-carrying child walk (authority is the
-                // proof, not the peer), so a single flaky/empty peer can't stall sync.
-                candidatePeers: await network.ivy.connectedPeers,
+                candidatePeers: allowedCandidates,
                 expectedChildPath: expectedChildPath,
                 progress: { current, total in
                     if current % 100 == 0 {
@@ -1496,9 +1500,15 @@ extension LatticeNode {
         preferredPeer: PeerID? = nil
     ) async -> (String, PeerID?) {
         let connectedPeers = await network.ivy.connectedPeers
+        let tally = await network.ivy.tally
         let connectedPreferred = preferredPeer.flatMap { p in
             connectedPeers.first(where: { $0.publicKey == p.publicKey })
         }
+        // Source-agnostic but still reputation-gated: a peer is only a fetch hint
+        // (authority is PoW + ChildBlockProof), yet a peer that has misbehaved below
+        // Tally's allow-threshold must still be skipped — exactly as the recorded-tip
+        // loop skips it. Source agnosticism must not become a Tally bypass (audit H1).
+        let anyAllowedPeer = connectedPreferred ?? connectedPeers.first(where: { tally.shouldAllow(peer: $0) })
         guard let tips = knownPeerTips[chainKey(forPath: network.chainPath)], !tips.isEmpty else {
             // Source-agnostic: a peer is only a fetch hint — authority is PoW +
             // ChildBlockProof, never peer identity (consensus-fork-choice.md: "the
@@ -1506,9 +1516,8 @@ extension LatticeNode {
             // PR#2964 removed single-source dependence). With no preferred peer and
             // no recorded tip, fall back to ANY connected same-chain peer rather
             // than returning nil — which fails child sync closed while peers exist.
-            return (defaultTipCID, connectedPreferred ?? connectedPeers.first)
+            return (defaultTipCID, anyAllowedPeer)
         }
-        let tally = await network.ivy.tally
         var best: (key: String, height: UInt64, tipCID: String, peer: PeerID)? = nil
         for peer in connectedPeers {
             guard let entry = tips[peer.publicKey] else { continue }
@@ -1529,7 +1538,7 @@ extension LatticeNode {
         if let defaultTipHeight,
            !failedSyncTips.contains(defaultTipCID),
            best == nil || defaultTipHeight > best!.height {
-            return (defaultTipCID, connectedPreferred ?? connectedPeers.first)
+            return (defaultTipCID, anyAllowedPeer)
         }
         if let preferredPeer,
            let connectedPreferred = connectedPeers.first(where: { $0.publicKey == preferredPeer.publicKey }),
@@ -1541,7 +1550,7 @@ extension LatticeNode {
             // choice. Header validation and cumulative work still decide adoption.
             return (preferredEntry.tipCID, connectedPreferred)
         }
-        return (best?.tipCID ?? defaultTipCID, best?.peer ?? connectedPreferred ?? connectedPeers.first)
+        return (best?.tipCID ?? defaultTipCID, best?.peer ?? anyAllowedPeer)
     }
 
     func verifySyncWithPeers(tipCID: String, tipHeight: UInt64, network: ChainNetwork) async {
