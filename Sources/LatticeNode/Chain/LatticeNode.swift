@@ -1168,6 +1168,20 @@ public actor LatticeNode: ChainNetworkDelegate {
         for task in cancellableNetworkTasks {
             await task.value
         }
+        // Drain any in-flight per-chain block processing before snapshotting state.
+        // A block's in-memory tip advances (processBlockHeader) before its durable
+        // applyBlock commit, both under `withChainMutation`; if SIGTERM arrives between
+        // them, `persistChainState` (which snapshots the IN-MEMORY tip into chain_state.json
+        // + the DiskBroker chain_tip meta) would record a tip the StateStore never committed.
+        // On restart, recovery then projects the in-memory tip DOWN to the lower committed
+        // tip — and the RPC can briefly serve that never-committed phantom tip. Awaiting the
+        // gate lets the last in-flight applyBlock commit first (maintenance/sync/mining tasks
+        // are already cancelled above, so no new mutation starts), keeping the persisted tip
+        // == the durable StateStore tip. (Geth posture: never persist a head ahead of its
+        // committed state.)
+        for (_, network) in networks {
+            await chainMutationGate[chainKey(forPath: network.chainPath)]?.value
+        }
         // One last WAL checkpoint + incremental vacuum on a graceful stop so
         // the file on disk is consistent-and-compact before the process exits.
         // Keep shutdown flush-only: cleanup/reconcile passes are periodic

@@ -64,7 +64,13 @@ const postInfo = await chainInfo(node)
 const postHeight = postInfo.chains.find(c => c.directory === nexusDir).height
 console.log(`  post-restart height: ${postHeight}`)
 
-if (postHeight < preHeight - 1) {
+// Strict: a graceful restart must NOT regress the height at all. The durable
+// canonical-tip pointer is advanced atomically with every accepted tip (even a
+// heavier-but-shorter reorg tip), so recovery — a pure pointer read — always lands
+// on the exact accepted tip. The former `preHeight - 1` tolerance papered over a real
+// bug where the single-block apply path skipped the durable-tip commit for a lower
+// canonical tip; this now asserts that invariant.
+if (postHeight < preHeight) {
   console.error(`  ✗ height regressed from ${preHeight} to ${postHeight}`)
   node.stop(); await sleep(500); process.exit(1)
 }
