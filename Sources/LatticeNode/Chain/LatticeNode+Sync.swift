@@ -368,9 +368,13 @@ extension LatticeNode {
             //    can't spuriously shrink under load (audit Low). downloadHeaders applies
             //    the final per-batch cap.
             let syncTally = await network.ivy.tally
-            let allowedCandidates = (await network.ivy.connectedPeers).shuffled()
-                .prefix(HeaderChain.maxSyncCandidatePeers * 2)
+            // Tally-filter BEFORE slicing so the candidate window is filled with allowed
+            // peers, not silently shrunk when disallowed peers land in the shuffled prefix
+            // (audit Low). `shouldAllow` is a local in-memory check, so filtering the full
+            // set first costs nothing. downloadHeaders applies the final per-batch cap.
+            let allowedCandidates = Array((await network.ivy.connectedPeers).shuffled()
                 .filter { syncTally.shouldAllow(peer: $0) }
+                .prefix(HeaderChain.maxSyncCandidatePeers * 2))
             let headers = try await headerChain.downloadHeaders(
                 peerTipCID: activeTip,
                 fetcher: fetcher,
@@ -458,7 +462,15 @@ extension LatticeNode {
 
         } catch {
             let peerCount2 = await network.ivy.directPeerCount
-            if peerCount2 > 0 {
+            // Don't blacklist the (honest) tip CID when the failure was lying peers —
+            // they were already Tally-penalized; a reshuffled retry should re-reach the
+            // tip via other peers. Blacklisting the content would lock honest peers out
+            // of serving it too (audit M1).
+            var lyingPeers = false
+            if let hce = error as? HeaderChain.HeaderChainError, case .allCandidatesServedInvalid = hce {
+                lyingPeers = true
+            }
+            if peerCount2 > 0, !lyingPeers {
                 recordFailedSyncTip(attemptedTip)
             }
             if let prefetch = statePrefetchTask {

@@ -41,11 +41,24 @@ private struct ChildProofBatchSource: HeaderBatchSource {
     // Peers (by public key) that serve NOTHING — models a peer that is behind, has
     // pruned the range, or whose link is flaky. Used to exercise multi-peer fallthrough.
     var emptyPeers: Set<String> = []
+    // Peers (by public key) that serve a NON-EMPTY but consensus-INVALID batch — models
+    // a lying peer. Returns a NON-genesis (height ≥ 1) block's bytes mislabelled as the
+    // requested CID: the accept's CID re-derivation mismatches and throws, AND its
+    // non-zero height seeds `totalHeight` so the accept's totalHeight ROLLBACK (not just
+    // the progress clamp) is exercised before rotating to the next candidate — a liar's
+    // small height must not bleed into an honest peer's larger-height accept.
+    var lyingPeers: Set<String> = []
 
     func requestHeaderBatch(fromCID: String, count: Int, peer: PeerID) async -> [(cid: String, data: Data)] { [] }
 
     func requestHeaderBatchWithProofs(fromCID: String, count: Int, peer: PeerID) async -> [(cid: String, data: Data, proof: Data?)] {
         if emptyPeers.contains(peer.publicKey) { return [] }
+        if lyingPeers.contains(peer.publicKey) {
+            // The height-1 block is the one whose parent is genesis.
+            let h1 = parentByCID.first(where: { $0.value == genesisCID })?.key
+            let lie = h1.flatMap { blockByCID[$0] } ?? blockByCID[genesisCID] ?? Data([0xFF])
+            return [(fromCID, lie, nil)]
+        }
         var out: [(cid: String, data: Data, proof: Data?)] = []
         var cid: String? = fromCID
         while let c = cid, c != genesisCID, out.count < batchSize {
@@ -296,6 +309,32 @@ final class HeaderChainMemoryCapTests: XCTestCase {
             expectedChildPath: ["Mid"]
         )
         XCTAssertEqual(headers.count, 5, "child sync falls through an empty peer to a serving candidate")
+        XCTAssertEqual(headers.last?.cid, chain.tip)
+    }
+
+    // A peer that returns a NON-EMPTY but INVALID batch (data whose real CID ≠ the
+    // requested CID) must NOT wedge sync the way an empty peer mustn't: the walk rolls
+    // back its partial state (headers, work, proofs, AND totalHeight — a liar's small
+    // height must not bleed into the honest accept and underflow the progress delta),
+    // rotates to an honest candidate, and adopts its chain. Regression for the
+    // lying-peer stall + the cross-peer totalHeight crash.
+    func testChildSyncRotatesPastLyingPeerToNextCandidate() async throws {
+        let chain = try await buildChildChainWithProofs(length: 6, batchSize: 1_000)
+        var source = chain.source
+        source.lyingPeers = ["liar"]                 // hinted peer serves garbage
+        let headerChain = HeaderChain(maxAccumulatedHeaders: 1_000)
+
+        let headers = try await headerChain.downloadHeaders(
+            peerTipCID: chain.tip,
+            fetcher: HeaderDataFetcher(dataByCID: [:]),
+            genesisBlockHash: chain.genesis,
+            localWork: .zero,
+            network: source,
+            sourcePeer: PeerID(publicKey: "liar"),           // hint lies
+            candidatePeers: [PeerID(publicKey: "good-peer")], // fallback serves the real chain
+            expectedChildPath: ["Mid"]
+        )
+        XCTAssertEqual(headers.count, 5, "child sync rotates past a lying peer to an honest one")
         XCTAssertEqual(headers.last?.cid, chain.tip)
     }
 
