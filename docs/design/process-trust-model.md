@@ -122,16 +122,6 @@ relies on its parent as the authorized consensus provider for the ancestor view;
 **outside** it (an unrelated chain, an unverified peer), everything is federated —
 full verification, no inherited authority.
 
-## Status
-
-Wired today: the per-process topology (Nexus root + `--subscribe-p2p`
-children), `ChildBlockProof`-gated extraction, the single-`trueCumWork` fork
-choice, and the inherited-weight provider
-([consensus-fork-choice.md](consensus-fork-choice.md)). The spawn certificate
-primitive exists in Ivy but is not yet load-bearing in the node, so the legacy
-in-process child registration remains as a compatibility/test harness
-([architecture.md](../architecture.md#per-process-topology)).
-
 ## References
 
 - [fractal-structure.md](fractal-structure.md) — the securing relationship this
