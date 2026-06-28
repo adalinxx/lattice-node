@@ -45,30 +45,29 @@ candidate set:
   accept, **penalize the peer**, and rotate to the next candidate.
 
 The walk **fails closed only when no candidate produced an accepted batch** — never
-because one peer was absent or malicious. A single peer, silent or lying, must
-never wedge sync. (Earlier code aborted the whole sync on the first invalid batch;
-one Tally-allowed liar could then stall every retry — the documented anti-pattern.)
+because one peer was absent or malicious. A single peer, silent or lying, must never
+wedge sync: aborting on one peer's misbehavior would reintroduce the trusted-source
+coupling this design exists to remove.
 
 **Rollback must be complete.** A rejected batch's partial state is fully rolled
 back before rotating — accumulated headers, cumulative work, retained proofs, *and*
 the derived tip height. A liar's (small) tip height must not bleed into an honest
-peer's accept; the progress delta is unsigned and would otherwise underflow-trap.
-Blocks a liar already stored are content-addressed and harmless: an honest batch
-for the same cursor re-derives identical CIDs.
+peer's accept; the progress delta is unsigned and must not underflow. Blocks a liar
+already stored are content-addressed and harmless: an honest batch for the same
+cursor re-derives identical CIDs.
 
 ## Penalize the peer, not the content
 
 A failed or invalid download is the **peer's** fault, not the tip's:
 
-- The lying peer is penalized in reputation (`recordInvalidHeaderBatch` →
-  `Tally.recordFailure`), so it is deprioritized — and filtered out — on subsequent
-  attempts.
+- The lying peer is penalized in reputation (Tally), so it is deprioritized — and
+  filtered out of the candidate set — on subsequent attempts.
 - The (honest) tip CID is **not** blacklisted. Blacklisting content because a peer
   lied about it locks honest peers out of serving it too. When a first batch's
-  candidates all fail and at least one lied, sync signals
-  `allCandidatesServedInvalid` so the caller skips the tip blacklist and a
-  reshuffled retry re-reaches the same tip through other peers. A genuinely
-  unreachable tip (every candidate empty, none lying) is still treated as such.
+  candidates all fail and at least one lied, sync distinguishes that from an
+  unreachable tip and skips the tip blacklist, so a reshuffled retry re-reaches the
+  same tip through other peers. A genuinely unreachable tip (every candidate empty,
+  none lying) is still treated as such.
 
 ## Invariants (load-bearing)
 
@@ -82,10 +81,10 @@ A failed or invalid download is the **peer's** fault, not the tip's:
 4. **Fail closed only when no peer serves a valid proof.** With no candidate able
    to provide a verifiable batch, sync stops rather than adopt unanchored blocks.
 
-## State of the art
+## Prior art
 
-This is the established design for trustless multi-peer sync, corroborated across
-PoW chains, merge-mined chains, and content-addressed storage:
+This follows established practice for trustless multi-peer sync across proof-of-work
+chains, merge-mined chains, and content-addressed storage:
 
 - **Bitcoin** headers-first IBD downloads from multiple peers in parallel and no
   longer depends on selecting one good sync peer (Bitcoin Core PR #2964); a
