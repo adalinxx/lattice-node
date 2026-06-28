@@ -82,6 +82,19 @@ async function resolveLeaf(rootBase, fullPath) {
 const heightAt = async (ep, dir) => (await fetch(`${ep}/chain/info`).then((x) => x.json()).catch(() => null))?.chains?.find((c) => c.directory === dir)?.height ?? 0
 const balAt = async (ep, addr) => (await fetch(`${ep}/balance/${addr}`).then((x) => x.json()).catch(() => null))?.balance ?? 0
 
+// A withdrawal only becomes valid once the child's parentState advances past the
+// receipt; on a LIVE tip the receipt may not be visible at first-submit time, so
+// resubmit (re-reading the nonce) until the withdrawn balance lands. Mirrors the
+// bounded-resubmit loop in grandchild-swap.mjs.
+const landWithdraw = async (submit, check, desc) => {
+  for (let i = 0; i < 40; i++) {
+    if (await check()) return
+    try { await submit() } catch { /* not yet valid — retry */ }
+    await sleep(3000)
+  }
+  if (!(await check())) throw new Error(`${desc} never landed`)
+}
+
 const bToyEp = await resolveLeaf(B.base, Ptoy)
 console.log('  B auto-followed toy →', bToyEp)
 await waitFor(async () => (await heightAt(bToyEp, 'toy')) >= (await aToy.height('toy')) - 2 ? true : null, 'B toy caught up', { timeoutMs: 180_000, intervalMs: 2000 })
@@ -100,15 +113,19 @@ Object.defineProperty(bTt, 'base', { value: bTtEp.replace(/\/api$/, ''), configu
 console.log('[B] LEG 1 (nexus->toy): pay 100 nexus, withdraw 1000 toy')
 await B.submitTx({ chainPath: [NEXUS], nonce: await B.nonce(buyer.address, [NEXUS]), signers: [buyer.address], fee: 1, accountActions: [{ owner: buyer.address, delta: -101 }, { owner: toySeller.address, delta: 100 }], receiptActions: [{ withdrawer: buyer.address, nonce: N1, demander: toySeller.address, amountDemanded: 100, directory: 'toy' }] }, NEXUS, buyer)
 await waitFor(async () => (await B.balance(buyer.address, [NEXUS])) <= 900 ? true : null, 'B sees leg1 receipt (paid nexus)', { timeoutMs: 120_000, intervalMs: 2000 })
-await B.submitTx({ chainPath: Ptoy, nonce: await B.nonce(buyer.address, Ptoy), signers: [buyer.address], fee: 1, accountActions: [{ owner: buyer.address, delta: 999 }], withdrawalActions: [{ withdrawer: buyer.address, nonce: N1, demander: toySeller.address, amountDemanded: 100, amountWithdrawn: 1000 }] }, undefined, buyer)
-await waitFor(async () => (await balAt(bToyEp, buyer.address)) >= 999 ? true : null, 'B received toy', { timeoutMs: 120_000, intervalMs: 2000 })
+await landWithdraw(
+  async () => B.submitTx({ chainPath: Ptoy, nonce: await B.nonce(buyer.address, Ptoy), signers: [buyer.address], fee: 1, accountActions: [{ owner: buyer.address, delta: 999 }], withdrawalActions: [{ withdrawer: buyer.address, nonce: N1, demander: toySeller.address, amountDemanded: 100, amountWithdrawn: 1000 }] }, undefined, buyer),
+  async () => (await balAt(bToyEp, buyer.address)) >= 999,
+  'B received toy (leg1 withdrawal)')
 console.log('[B] leg 1 done — buyer toy =', await balAt(bToyEp, buyer.address))
 
 console.log('[B] LEG 2 (toy->toytoy): pay 100 toy, withdraw 1000 toytoy')
 await B.submitTx({ chainPath: Ptoy, nonce: await B.nonce(buyer.address, Ptoy), signers: [buyer.address], fee: 1, accountActions: [{ owner: buyer.address, delta: -101 }, { owner: ttSeller.address, delta: 100 }], receiptActions: [{ withdrawer: buyer.address, nonce: N2, demander: ttSeller.address, amountDemanded: 100, directory: 'toytoy' }] }, undefined, buyer)
 await waitFor(async () => (await balAt(bToyEp, buyer.address)) <= 900 ? true : null, 'B sees leg2 receipt (paid toy)', { timeoutMs: 120_000, intervalMs: 2000 })
-await bTt.submitTx({ chainPath: Ptt, nonce: await bTt.nonce(buyer.address, Ptt), signers: [buyer.address], fee: 1, accountActions: [{ owner: buyer.address, delta: 999 }], withdrawalActions: [{ withdrawer: buyer.address, nonce: N2, demander: ttSeller.address, amountDemanded: 100, amountWithdrawn: 1000 }] }, undefined, buyer)
-await waitFor(async () => (await balAt(bTtEp, buyer.address)) >= 999 ? true : null, 'B received toytoy', { timeoutMs: 120_000, intervalMs: 2000 })
+await landWithdraw(
+  async () => bTt.submitTx({ chainPath: Ptt, nonce: await bTt.nonce(buyer.address, Ptt), signers: [buyer.address], fee: 1, accountActions: [{ owner: buyer.address, delta: 999 }], withdrawalActions: [{ withdrawer: buyer.address, nonce: N2, demander: ttSeller.address, amountDemanded: 100, amountWithdrawn: 1000 }] }, undefined, buyer),
+  async () => (await balAt(bTtEp, buyer.address)) >= 999,
+  'B received toytoy (leg2 withdrawal)')
 
 const finalTt = await balAt(bTtEp, buyer.address)
 console.log('    buyer toytoy (FINAL, read from B) =', finalTt)
