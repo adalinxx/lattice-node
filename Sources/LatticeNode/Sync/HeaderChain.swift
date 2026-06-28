@@ -16,12 +16,16 @@ public protocol HeaderBatchSource: Sendable {
     func requestHeaderBatchWithProofs(fromCID: String, count: Int, peer: PeerID) async -> [(cid: String, data: Data, proof: Data?)]
     func storeBlock(cid: String, data: Data) async
     func storeSyncedBlock(cid: String, data: Data) async
+    /// Penalize a peer that served a non-empty but consensus-invalid header batch, so
+    /// a lying peer is deprioritized rather than re-tried first on the next sync.
+    func recordInvalidHeaderBatch(peer: PeerID) async
 }
 
 public extension HeaderBatchSource {
     func storeSyncedBlock(cid: String, data: Data) async {
         await storeBlock(cid: cid, data: data)
     }
+    func recordInvalidHeaderBatch(peer: PeerID) async {}
 }
 
 public actor HeaderChain {
@@ -98,6 +102,11 @@ public actor HeaderChain {
         /// fed more headers than any plausible chain delta. Fail closed instead
         /// of growing memory without bound.
         case headerWalkTooLarge(Int)
+        /// No candidate peer served a valid first batch and at least one served an
+        /// INVALID one (a liar) — distinct from "the tip is genuinely unreachable".
+        /// The lying peers were already Tally-penalized, so the caller must NOT
+        /// blacklist the (honest) tip CID: a reshuffled retry should re-reach it.
+        case allCandidatesServedInvalid
     }
 
     static func acceptedHeader(expectedCID: String, receivedCID: String, data: Data) throws -> (block: Block, header: SyncBlockHeader) {
@@ -323,7 +332,7 @@ public actor HeaderChain {
             cumulativeWork = saturatingWorkSum(cumulativeWork, workForTarget(block.target))
             headers.append(accepted.header)
             lastParent = accepted.header.previousBlockCID
-            await progress?(totalHeight - block.height, totalHeight)
+            await progress?(totalHeight >= block.height ? totalHeight - block.height : 0, max(totalHeight, block.height))
             await store(accepted.header.cid, data)
 
             if let parentCID = block.parent?.rawCID, knownBlockCIDs.contains(parentCID) {
@@ -365,38 +374,59 @@ public actor HeaderChain {
         // timeouts) and rotates only when it goes empty (audit M2: don't re-iterate the
         // whole set every batch). Bounded to `peers.count` tries per batch.
         var serveIdx = 0
+        var penalizedAny = false
         while !Task.isCancelled {
-            // Source-agnostic: a batch may come from ANY candidate peer — the first
-            // non-empty response wins. A peer that is behind, has pruned the range, or
-            // whose link is flaky returns empty; rotate to the next rather than ending
-            // the walk. Only an empty result from EVERY peer stops it. Mixing peers
-            // across batches is safe — each block is verified against its own
-            // ChildBlockProof and bound to the carried-over `nextCID` (no fork splice).
-            var bulk: [(cid: String, data: Data, proof: Data?)] = []
+            // Source-agnostic: a batch may come from ANY candidate peer. Rotate past
+            // BOTH a peer that returns empty (behind/pruned/flaky) AND a peer that
+            // returns a non-empty but INVALID batch (a liar). The walk ends (fail
+            // closed) only when NO candidate produces an *accepted* batch — a single
+            // peer serving garbage must not wedge the whole sync. Mixing peers across
+            // batches is safe: each block is verified against its own ChildBlockProof
+            // and bound to the carried-over `nextCID` (no fork splice).
+            var accepted: (reachedStop: Bool, nextCID: String?)? = nil
             for offset in 0..<peers.count {
                 if Task.isCancelled { throw HeaderChainError.cancelled }
                 let idx = (serveIdx + offset) % peers.count
-                bulk = await network.requestHeaderBatchWithProofs(
+                let bulk = await network.requestHeaderBatchWithProofs(
                     fromCID: nextCID, count: ChainNetwork.maxHeaderBatchSize, peer: peers[idx]
                 )
-                if !bulk.isEmpty { serveIdx = idx; break }
+                if bulk.isEmpty { continue }
+                // Checkpoint ALL accumulators — including `totalHeight`, which is derived
+                // from the batch's tip block BEFORE validation — so a lying peer's batch
+                // can be fully rolled back before rotating. Critically, the liar's tip
+                // height must not bleed into an honest peer's accept: progress reports
+                // `totalHeight - block.height` over UInt64, so a liar's small totalHeight
+                // against an honest block's larger height would underflow-trap (crash).
+                let savedHeaders = headers
+                let savedWork = cumulativeWork
+                let savedProofs = proofs
+                let savedTotalHeight = totalHeight
+                if totalHeight == 0 {
+                    totalHeight = Block(data: bulk.first?.data ?? Data())?.height ?? 0
+                }
+                do {
+                    accepted = try await acceptChildHeaderBatch(
+                        bulk,
+                        startingAt: nextCID,
+                        totalHeight: totalHeight,
+                        genesisBlockHash: genesisBlockHash,
+                        knownBlockCIDs: knownBlockCIDs,
+                        expectedChildPath: expectedChildPath,
+                        progress: progress,
+                        store: { cid, data in await network.storeSyncedBlock(cid: cid, data: data) }
+                    )
+                    serveIdx = idx
+                    break
+                } catch {
+                    headers = savedHeaders
+                    cumulativeWork = savedWork
+                    proofs = savedProofs
+                    totalHeight = savedTotalHeight
+                    penalizedAny = true
+                    await network.recordInvalidHeaderBatch(peer: peers[idx])
+                }
             }
-            guard !bulk.isEmpty else { break }
-
-            if totalHeight == 0 {
-                totalHeight = Block(data: bulk.first?.data ?? Data())?.height ?? 0
-            }
-
-            let accepted = try await acceptChildHeaderBatch(
-                bulk,
-                startingAt: nextCID,
-                totalHeight: totalHeight,
-                genesisBlockHash: genesisBlockHash,
-                knownBlockCIDs: knownBlockCIDs,
-                expectedChildPath: expectedChildPath,
-                progress: progress,
-                store: { cid, data in await network.storeSyncedBlock(cid: cid, data: data) }
-            )
+            guard let accepted else { break }
 
             if accepted.reachedStop { break }
             guard headers.count <= self.maxAccumulatedHeaders else {
@@ -409,6 +439,14 @@ public actor HeaderChain {
         }
 
         if Task.isCancelled { throw HeaderChainError.cancelled }
+
+        // No candidate served a valid first batch but at least one lied: the tip is
+        // honest, the peers were already Tally-penalized — signal that distinctly so the
+        // caller doesn't blacklist the (honest) tip CID. Genuine all-empty (no liar)
+        // still returns [] and is treated as an unreachable tip by the caller.
+        if headers.isEmpty && penalizedAny {
+            throw HeaderChainError.allCandidatesServedInvalid
+        }
 
         headers.reverse()
         return headers
@@ -445,7 +483,7 @@ public actor HeaderChain {
                     timestamp: block.timestamp,
                     specCID: block.spec.rawCID.isEmpty ? nil : block.spec.rawCID,
                     spec: block.spec.node))
-                await progress?(totalHeight - block.height, totalHeight)
+                await progress?(totalHeight >= block.height ? totalHeight - block.height : 0, max(totalHeight, block.height))
                 await store(cid, data)
                 return (true, block.parent?.rawCID)
             }
@@ -458,7 +496,7 @@ public actor HeaderChain {
             headers.append(accepted.header)
             proofs[accepted.header.cid] = accepted.proofEnvelope
             lastParent = accepted.header.previousBlockCID
-            await progress?(totalHeight - block.height, totalHeight)
+            await progress?(totalHeight >= block.height ? totalHeight - block.height : 0, max(totalHeight, block.height))
             await store(accepted.header.cid, data)
 
             if let parentCID = block.parent?.rawCID, knownBlockCIDs.contains(parentCID) {
@@ -518,7 +556,7 @@ public actor HeaderChain {
             }
 
             if let th = targetHeight {
-                await progress?(th - block.height, th)
+                await progress?(th >= block.height ? th - block.height : 0, max(th, block.height))
             }
 
             guard let prevCID = block.parent?.rawCID else {
