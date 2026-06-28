@@ -60,3 +60,55 @@ SMOKE_FILTER=stability-multichain SMOKE_DURATION_MIN=5 npm run all
 | `SMOKE_FAIL_FAST` | `1` to stop on first failure |
 | `SMOKE_DURATION_MIN` | duration for stability test (default 30) |
 | `SMOKE_MINER_STALL_MS` | override the miner restart stall window; by default merged-mining scenarios use a longer window than flat-chain scenarios |
+
+## Writing realistic multi-node / cross-chain scenarios
+
+Two-node and deep (Nexus → child → grandchild) scenarios have non-obvious traps.
+Each rule below cost real debugging. Canonical examples:
+`scenarios/follower/parent-dependency.mjs` (deep self-assembly),
+`scenarios/network/multichain-late-joiner.mjs` (multi-child join),
+`scenarios/swap/toytoy-compound-swap.mjs` (two-node compound grandchild swap).
+
+1. **Genesis params change the genesis CID — set them deliberately.** `targetBlockTime`
+   and `premine` passed to `spawnChild` are baked into the child's `ChainSpec` (the
+   genesis), so they change its CID. For cross-node tests use **`premine: 0`**: a
+   premined genesis is not reproducible across nodes (the follower computes a different
+   CID and rejects the genesis). Fund participants by **mining** instead.
+
+2. **Each chain's coinbase is the natural seller of its coin.** With `premine: 0`, a
+   child chain's block rewards accrue to *that child node's* coinbase, NOT the root
+   node's. So the toy seller is `aToy._keypair`, the toytoy seller is `aTt._keypair`,
+   etc. Don't assume the root identity holds child coins.
+
+3. **A follower can only sync a chain it can keep pace with — throttle, don't freeze.**
+   A node applies blocks at a finite rate (much slower in debug builds). If the chain
+   mines faster than the joiner applies, the joiner *never catches up* and its child
+   follower defers forever ("no same-chain connectivity / until synced"). Pace the
+   live chain with `new LatticeMiner(root, [..], { minBlockIntervalMs: 3000 })` so it
+   mines slower than the joiner syncs. **Freezing the miner to let a reader catch up is
+   not realistic** — a real node syncs a live tip. (Late-joiner *snapshot* tests may
+   freeze once before the join; transactional flows must not.)
+
+4. **Don't run two miners.** `node.mineUntil(...)` spawns its *own* `LatticeMiner`
+   internally. If you also created an explicit miner, you now have two (the second is
+   un-throttled and races the chain). Pick one: keep a single continuous throttled
+   miner and use plain `waitFor(check)` for "mine until X".
+
+5. **Permissionless cross-node follow is a top-down cascade, not a call.** Boot the
+   joiner with `['--peer', root.peerArg(), '--supervise-children']` (+
+   `{ env: { LATTICE_SUPERVISE_RECONCILE_SECONDS: '3' } }` to speed convergence) and let
+   the subtree **self-assemble**. An explicitly `followChild`-ed node does **not**
+   supervise its own children, so it will never auto-follow a *grandchild*. Use pure
+   auto-follow all the way down and resolve each level's endpoint from its parent's
+   `GET /api/chain/map` (walk `Nexus`, then `Nexus/child`, then `Nexus/child/grandchild`).
+
+6. **Order is load-bearing: parent before child.** A grandchild's registration lives in
+   its **parent's** state, so the parent must sync before the grandchild even appears in
+   the parent's map. The cascade enforces this; assert the parent has caught up
+   (`heightAt(parentEp) >= rootHeight - 2`) before resolving/awaiting the grandchild.
+
+7. **Submit each tx to the node that actually hosts that chain.** A node hosts only its
+   own chain and its **direct** children. The top-level joiner does not know
+   `Nexus/child/grandchild` (that lives under the child follower) — submitting there
+   fails with `Unknown chain path`. Target the follower endpoint that hosts the chain
+   (resolve it from `chain/map`, then point an RPC client at it).
