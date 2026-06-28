@@ -1,9 +1,7 @@
 # Content-Addressed Ingress
 
-## Status
-
-Design invariant. This document describes the rule every implementation path
-must preserve when accepting externally supplied content-addressed data.
+A design invariant: the rule every implementation path must preserve when
+accepting externally supplied content-addressed data.
 
 ## Principle
 
