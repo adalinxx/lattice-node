@@ -132,14 +132,27 @@ export class LatticeNode {
       '--min-peer-key-bits', '0',
       ...extraArgs,
     ]
+    // Stash for waitForRPC's respawn-on-startup-crash path.
+    this._startArgs = extraArgs
+    this._startOptions = options
+    this._exitInfo = null
+    this._rpcCameUp = false
+    this._logStream?.end()
     this._logStream = createWriteStream(this.logPath, { flags: 'a' })
-    this.proc = spawn(BIN, args, {
+    const proc = spawn(BIN, args, {
       stdio: ['ignore', 'pipe', 'pipe'],
       env: { ...process.env, ...(options.env ?? {}) },
     })
-    this.proc.stdout.pipe(this._logStream)
-    this.proc.stderr.pipe(this._logStream)
-    this.proc.on('exit', code => console.log(`[${this.name}] exited code=${code}`))
+    this.proc = proc
+    proc.stdout.pipe(this._logStream)
+    proc.stderr.pipe(this._logStream)
+    // Record the exit so waitForRPC can fail fast (and respawn) on a startup crash
+    // instead of polling a dead process to the deadline. Guard on proc identity so a
+    // respawn's new process isn't clobbered by the old one's late exit event.
+    proc.on('exit', (code, signal) => {
+      console.log(`[${this.name}] exited code=${code}`)
+      if (this.proc === proc) this._exitInfo = { code, signal }
+    })
     return this
   }
 
@@ -168,13 +181,44 @@ export class LatticeNode {
   }
 
   async waitForRPC(timeoutMs = 30_000) {
-    return waitFor(async () => {
-      this.invalidateChainInfoCache()
-      const r = await this.rpc('GET', '/api/chain/info', null, { timeoutMs: 1_000 })
-      const info = r.ok ? r.json : null
-      if (info) { this._chainInfoCache = info; this._chainInfoCacheTs = Date.now() }
-      return info ? info : null
-    }, `${this.name} RPC up`, { timeoutMs, intervalMs: 300 })
+    const deadline = scaledMs(timeoutMs)
+    const startedAt = Date.now()
+    let respawns = 0
+    const maxRespawns = 2
+    while (Date.now() - startedAt < deadline) {
+      // A node that died before its RPC ever came up is a startup crash — typically
+      // a transient resource race under suite CPU/disk contention. Respawn a bounded
+      // number of times; a persistent crash exhausts the budget and fails FAST with
+      // the log path, instead of polling a dead process to the full deadline (which
+      // turned a ~5s crash into a 2-minute opaque "RPC up" timeout). Respawn ONLY in
+      // the pre-first-success startup window: once this node's RPC has answered, a
+      // later exit is a real mid-run crash and must surface, never be respawned.
+      if (this._exitInfo) {
+        const { code, signal } = this._exitInfo
+        const how = `code=${code}${signal ? ` signal=${signal}` : ''}`
+        if (!this._rpcCameUp && respawns < maxRespawns) {
+          respawns += 1
+          console.log(`[${this.name}] exited (${how}) before RPC up — respawn ${respawns}/${maxRespawns}`)
+          this.start(this._startArgs, this._startOptions)
+          await sleep(scaledMs(300))
+          continue
+        }
+        const ctx = this._rpcCameUp ? 'after its RPC was up' : `before RPC came up after ${respawns} respawns`
+        throw new Error(`${this.name} exited (${how}) ${ctx} — see ${this.logPath}`)
+      }
+      try {
+        this.invalidateChainInfoCache()
+        const r = await this.rpc('GET', '/api/chain/info', null, { timeoutMs: 1_000 })
+        if (r.ok && r.json) {
+          this._chainInfoCache = r.json
+          this._chainInfoCacheTs = Date.now()
+          this._rpcCameUp = true
+          return r.json
+        }
+      } catch { /* RPC socket not up yet — keep polling */ }
+      await sleep(300)
+    }
+    throw new Error(`timed out after ${deadline}ms: ${this.name} RPC up`)
   }
 
   async readIdentity() {
