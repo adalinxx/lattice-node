@@ -136,6 +136,7 @@ export class LatticeNode {
     this._startArgs = extraArgs
     this._startOptions = options
     this._exitInfo = null
+    this._rpcCameUp = false
     this._logStream?.end()
     this._logStream = createWriteStream(this.logPath, { flags: 'a' })
     const proc = spawn(BIN, args, {
@@ -185,22 +186,25 @@ export class LatticeNode {
     let respawns = 0
     const maxRespawns = 2
     while (Date.now() - startedAt < deadline) {
-      // A node that died before its RPC came up is a startup crash — typically a
-      // transient resource race under suite CPU/disk contention. Respawn a bounded
+      // A node that died before its RPC ever came up is a startup crash — typically
+      // a transient resource race under suite CPU/disk contention. Respawn a bounded
       // number of times; a persistent crash exhausts the budget and fails FAST with
       // the log path, instead of polling a dead process to the full deadline (which
-      // turned a ~5s crash into a 2-minute opaque "RPC up" timeout).
+      // turned a ~5s crash into a 2-minute opaque "RPC up" timeout). Respawn ONLY in
+      // the pre-first-success startup window: once this node's RPC has answered, a
+      // later exit is a real mid-run crash and must surface, never be respawned.
       if (this._exitInfo) {
         const { code, signal } = this._exitInfo
         const how = `code=${code}${signal ? ` signal=${signal}` : ''}`
-        if (respawns < maxRespawns) {
+        if (!this._rpcCameUp && respawns < maxRespawns) {
           respawns += 1
           console.log(`[${this.name}] exited (${how}) before RPC up — respawn ${respawns}/${maxRespawns}`)
           this.start(this._startArgs, this._startOptions)
           await sleep(scaledMs(300))
           continue
         }
-        throw new Error(`${this.name} exited (${how}) before RPC came up after ${respawns} respawns — see ${this.logPath}`)
+        const ctx = this._rpcCameUp ? 'after its RPC was up' : `before RPC came up after ${respawns} respawns`
+        throw new Error(`${this.name} exited (${how}) ${ctx} — see ${this.logPath}`)
       }
       try {
         this.invalidateChainInfoCache()
@@ -208,6 +212,7 @@ export class LatticeNode {
         if (r.ok && r.json) {
           this._chainInfoCache = r.json
           this._chainInfoCacheTs = Date.now()
+          this._rpcCameUp = true
           return r.json
         }
       } catch { /* RPC socket not up yet — keep polling */ }
