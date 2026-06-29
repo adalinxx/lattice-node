@@ -61,8 +61,11 @@ the same check and the error behavior stays consistent.
 Introduce a specific `HeaderChainError.cidMismatch(expected:actual:)`.
 
 This is not a fetch failure and not a PoW failure. It means the peer supplied
-bytes that do not satisfy the content-addressing contract. The current sync
-attempt should abort rather than falling through and storing poisoned data.
+bytes that do not satisfy the content-addressing contract. The offending batch is
+rejected and never falls through to store poisoned data — but the node does **not**
+abort the whole sync on it: it rolls back, penalizes that peer, and rotates to the
+next candidate, because one bad peer must not wedge sync. See
+[Source-agnostic header sync](source-agnostic-sync.md).
 
 Keep `HeaderChainError.chainContinuityBroken(expected:got:)` for a different
 case: the peer returned a tuple CID that does not match the next CID in the
