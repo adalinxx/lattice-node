@@ -38,8 +38,8 @@ struct LatticeMiningCoordinatorTool: AsyncParsableCommand {
     @Option(name: .long, help: "Parallel worker count (default: CPU count - 1)")
     var workers: Int = max(ProcessInfo.processInfo.activeProcessorCount - 1, 1)
 
-    @Option(name: .long, help: "Nonce batch size per worker per coordinator iteration")
-    var batchSize: UInt64 = 10_000
+    @Option(name: .long, help: "Nonce batch size per worker per coordinator iteration. Each batch (re)launches the worker, so a GPU/external worker wants a LARGE value (≈1e9+) or the run is dominated by worker startup, not hashing. Defaults: 10000 for the in-process CPU worker, 2000000000 when --worker-executable is set.")
+    var batchSize: UInt64?
 
     @Option(name: .long, help: "Path to the LatticeMiner worker executable. When set, nonce search runs in worker subprocesses instead of in-process.")
     var workerExecutable: String?
@@ -63,10 +63,19 @@ struct LatticeMiningCoordinatorTool: AsyncParsableCommand {
     var minBlockIntervalMs: UInt64 = 0
 
     func run() async throws {
+        // Line-buffer stdout/stderr so mining progress streams into container/journald
+        // logs live. Block-buffering (the default to a non-TTY) makes a running miner
+        // look hung — output only appears on clean exit, and is lost on SIGKILL.
+        setvbuf(stdout, nil, _IOLBF, 0)
+        setvbuf(stderr, nil, _IOLBF, 0)
         guard let apiBaseURL = URL(string: node) else {
             throw ValidationError("Invalid --node URL: \(node)")
         }
         let workerCount = max(workers, 1)
+        // Per-batch the worker process is (re)launched, so a tiny batch on an external
+        // worker spends all its time on startup. Default large for external workers,
+        // small for the in-process CPU worker; an explicit --batch-size always wins.
+        let resolvedBatchSize = batchSize ?? (workerExecutable != nil ? 2_000_000_000 : 10_000)
         // Validate auth config once at startup (fail fast on a missing/unreadable/empty
         // cookie), then re-read it on EVERY request via providers below — so a node that
         // regenerates its RPC cookie on restart is picked up automatically, instead of the
@@ -97,7 +106,7 @@ struct LatticeMiningCoordinatorTool: AsyncParsableCommand {
         let coordinatorWorkers = try makeWorkers(count: workerCount)
         // In --once mode --batch-size is the total nonce span fanned across all
         // workers; the steady-state loop keeps the per-worker semantics.
-        let totalBatchSize = once ? batchSize : batchSize &* UInt64(workerCount)
+        let totalBatchSize = once ? resolvedBatchSize : resolvedBatchSize &* UInt64(workerCount)
         let coordinator = MiningCoordinator(
             nodeClient: client,
             workers: coordinatorWorkers,
@@ -112,7 +121,7 @@ struct LatticeMiningCoordinatorTool: AsyncParsableCommand {
             return
         }
 
-        print("lattice-mining-coordinator starting - node=\(node) workers=\(workerCount) batchSize=\(batchSize)")
+        print("lattice-mining-coordinator starting - node=\(node) workers=\(workerCount) batchSize=\(resolvedBatchSize)")
         while !Task.isCancelled {
             let result = await coordinator.runBatch()
             try failClosedIfNeeded(result)
