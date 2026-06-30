@@ -116,7 +116,7 @@ struct NodeCommand: AsyncParsableCommand {
     @Option(name: .long, help: "Node-local minimum fee rate in units per serialized-body byte for mempool admission/relay (default 1). Relay policy only — not a consensus rule.")
     var minFeeRate: UInt64 = 1
 
-    @Option(name: .long, help: "Minimum proof-of-work bits a peer identity key must carry to be admitted (default 24; 0 disables). Raises the cost of Sybil/eclipse routing-table poisoning.")
+    @Option(name: .long, help: "Minimum proof-of-work bits a peer identity key must carry to be admitted (default 16 — the live-network value; 0 disables). Raises the cost of Sybil/eclipse routing-table poisoning; must match the network you join.")
     var minPeerKeyBits: Int = LatticeNodeConfig.defaultMinPeerKeyBits
 
     @Option(name: .long, help: "Default finality confirmations for all chains (default: no finality in PoW)")
@@ -270,8 +270,8 @@ struct NodeCommand: AsyncParsableCommand {
 
         // remote default-config nodes gate OUR identify key on their
         // minPeerKeyBits, so the node's own identity must carry the same work.
-        // #243: at the 24-bit default that grind is a multi-minute, one-time-
-        // per-data-dir cost on a COLD first boot. The grind only presents on the
+        // #243: the grind is a one-time-per-data-dir cost on a COLD first boot —
+        // quick at the 16-bit default, multi-minute only if raised. It only presents on the
         // wire (ivy.start, inside node.start()) — the local RPC control plane and
         // all the identity-independent boot prep (DNS seed resolution, peer-store
         // I/O, genesis decode/verify) do not need it. So kick the grind off in a

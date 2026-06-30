@@ -10,12 +10,13 @@ The published image is multi-arch (`linux/amd64` + `linux/arm64`), so this just 
 docker run -d --name lattice-node --pull always --user root \
   -p 127.0.0.1:8080:8080 -v lattice-data:/data \
   ghcr.io/adalinxx/lattice-node:main \
-  lattice-node --rpc-bind 0.0.0.0 --data-dir /data --min-peer-key-bits 16 --autosize
+  lattice-node --rpc-bind 0.0.0.0 --data-dir /data --autosize
 ```
 
-Then `curl http://localhost:8080/api/chain/info`. Notes: `--user root` lets the node
-write the named volume; `--min-peer-key-bits 16` is **required** to peer with the live
-network (see *Run a Node*).
+Then `curl http://localhost:8080/api/chain/info`. Note: `--user root` lets the node
+write the named volume. The node joins via its built-in bootstrap seeds and syncs on
+its own — no peer or `--min-peer-key-bits` to configure (the default already matches
+the live network; see *Run a Node*).
 
 ### From source
 
@@ -52,18 +53,19 @@ xcrun swift build -c release -Xswiftc -Onone     # or: xcrun swift build   (debu
 ### Run a Node
 
 ```bash
-# Join the Nexus (mainnet). --min-peer-key-bits 16 is required to peer with the seeds.
-lattice-node --autosize --rpc-port 8080 --min-peer-key-bits 16
+# Join the Nexus (mainnet) — bootstrap seeds are built in, nothing to configure.
+lattice-node --autosize --rpc-port 8080
 
 # Or with explicit resource settings
-lattice-node --memory 0.5 --disk 20 --rpc-port 8080 --min-peer-key-bits 16
+lattice-node --memory 0.5 --disk 20 --rpc-port 8080
 ```
 
-> **First boot grinds an identity key** (anti-Sybil PoW) before the RPC binds — at
-> the 24-bit default this takes minutes and can look like a hang. The live seed
-> nodes use 16-bit identities, so a joining node must set `--min-peer-key-bits 16`
-> (this also sets your own grind difficulty). Without it the node connects but
-> rejects the seeds and never syncs.
+> **First boot grinds an identity key** (anti-Sybil PoW) before the RPC binds. The
+> default `--min-peer-key-bits` is **16**, which matches the live network, so a bare
+> node joins its built-in seeds and syncs on its own (the grind is quick at 16 bits).
+> The flag is a per-network interop constant — only override it to match a network
+> running a different value, and only in lockstep with every node and the seeds; a
+> value above the network's makes the node reject the seeds and stall at height 0.
 
 #### Resource footprint
 
