@@ -356,6 +356,25 @@ extension LatticeNode {
             // never self-hashed. expectedChildPath is the proof's root-exclusive path.
             let chainPath = network.chainPath
             let expectedChildPath: [String]? = chainPath.count >= 2 ? Array(chainPath.dropFirst()) : nil
+            // Reputation-gated, SHUFFLED, bounded candidate set for the source-agnostic
+            // child walk:
+            //  - Tally-allowed only — a misbehaving peer is still skipped (audit H1).
+            //  - shuffled so the bounded window ROTATES across sync retries: an empty
+            //    response/timeout draws no Tally penalty, so without rotation an attacker
+            //    holding a fixed front-N of empty-serving peers could stall sync forever
+            //    (audit M3). A fresh shuffle each attempt means the honest tail is reached.
+            //  - admission-gate only a bounded slice (not every connected peer), so
+            //    building the set doesn't spend a Tally request token network-wide and
+            //    can't spuriously shrink under load (audit Low). downloadHeaders applies
+            //    the final per-batch cap.
+            let syncTally = await network.ivy.tally
+            // Tally-filter BEFORE slicing so the candidate window is filled with allowed
+            // peers, not silently shrunk when disallowed peers land in the shuffled prefix
+            // (audit Low). `shouldAllow` is a local in-memory check, so filtering the full
+            // set first costs nothing. downloadHeaders applies the final per-batch cap.
+            let allowedCandidates = Array((await network.ivy.connectedPeers).shuffled()
+                .filter { syncTally.shouldAllow(peer: $0) }
+                .prefix(HeaderChain.maxSyncCandidatePeers * 2))
             let headers = try await headerChain.downloadHeaders(
                 peerTipCID: activeTip,
                 fetcher: fetcher,
@@ -363,6 +382,7 @@ extension LatticeNode {
                 localWork: localWork,
                 network: network,
                 sourcePeer: activeSourcePeer,
+                candidatePeers: allowedCandidates,
                 expectedChildPath: expectedChildPath,
                 progress: { current, total in
                     if current % 100 == 0 {
@@ -442,7 +462,15 @@ extension LatticeNode {
 
         } catch {
             let peerCount2 = await network.ivy.directPeerCount
-            if peerCount2 > 0 {
+            // Don't blacklist the (honest) tip CID when the failure was lying peers —
+            // they were already Tally-penalized; a reshuffled retry should re-reach the
+            // tip via other peers. Blacklisting the content would lock honest peers out
+            // of serving it too (audit M1).
+            var lyingPeers = false
+            if let hce = error as? HeaderChain.HeaderChainError, case .allCandidatesServedInvalid = hce {
+                lyingPeers = true
+            }
+            if peerCount2 > 0, !lyingPeers {
                 recordFailedSyncTip(attemptedTip)
             }
             if let prefetch = statePrefetchTask {
@@ -1492,13 +1520,27 @@ extension LatticeNode {
         preferredPeer: PeerID? = nil
     ) async -> (String, PeerID?) {
         let connectedPeers = await network.ivy.connectedPeers
+        let tally = await network.ivy.tally
         let connectedPreferred = preferredPeer.flatMap { p in
             connectedPeers.first(where: { $0.publicKey == p.publicKey })
         }
+        // Source-agnostic but still reputation-gated: a peer is only a fetch hint
+        // (authority is PoW + ChildBlockProof), yet a peer that has misbehaved below
+        // Tally's allow-threshold must still be skipped — exactly as the recorded-tip
+        // loop skips it. Source agnosticism must not become a Tally bypass (audit H1).
+        // The preferred (announcing) peer is Tally-gated too: the original preferred
+        // path checked it, so the fallback must not silently re-admit a disallowed one.
+        let allowedPreferred = connectedPreferred.flatMap { tally.shouldAllow(peer: $0) ? $0 : nil }
+        let anyAllowedPeer = allowedPreferred ?? connectedPeers.first(where: { tally.shouldAllow(peer: $0) })
         guard let tips = knownPeerTips[chainKey(forPath: network.chainPath)], !tips.isEmpty else {
-            return (defaultTipCID, connectedPreferred)
+            // Source-agnostic: a peer is only a fetch hint — authority is PoW +
+            // ChildBlockProof, never peer identity (consensus-fork-choice.md: "the
+            // source does not make the data authoritative"; SOTA: Bitcoin IBD
+            // PR#2964 removed single-source dependence). With no preferred peer and
+            // no recorded tip, fall back to ANY connected same-chain peer rather
+            // than returning nil — which fails child sync closed while peers exist.
+            return (defaultTipCID, anyAllowedPeer)
         }
-        let tally = await network.ivy.tally
         var best: (key: String, height: UInt64, tipCID: String, peer: PeerID)? = nil
         for peer in connectedPeers {
             guard let entry = tips[peer.publicKey] else { continue }
@@ -1519,7 +1561,7 @@ extension LatticeNode {
         if let defaultTipHeight,
            !failedSyncTips.contains(defaultTipCID),
            best == nil || defaultTipHeight > best!.height {
-            return (defaultTipCID, connectedPreferred)
+            return (defaultTipCID, anyAllowedPeer)
         }
         if let preferredPeer,
            let connectedPreferred = connectedPeers.first(where: { $0.publicKey == preferredPeer.publicKey }),
@@ -1531,7 +1573,7 @@ extension LatticeNode {
             // choice. Header validation and cumulative work still decide adoption.
             return (preferredEntry.tipCID, connectedPreferred)
         }
-        return (best?.tipCID ?? defaultTipCID, best?.peer)
+        return (best?.tipCID ?? defaultTipCID, best?.peer ?? anyAllowedPeer)
     }
 
     func verifySyncWithPeers(tipCID: String, tipHeight: UInt64, network: ChainNetwork) async {
