@@ -21,8 +21,8 @@ struct ParentSubscriptionKeyFile: Codable {
 
 /// Load — or grind once and persist — the worked identity key for the dedicated
 /// parent-subscription Ivy. Grinding is Curve25519-keygen bound
-/// (≈2^minBits key generations), so at the 24-bit mainnet default it is minutes
-/// of one-time work; caching it in the data dir keeps that a per-identity cost
+/// (≈2^minBits key generations), so it is quick at the 16-bit mainnet default and
+/// minutes only if raised; caching it in the data dir keeps that a per-identity cost
 /// instead of a per-start cost. A cached key is re-ground only if it is
 /// unreadable, fails the private→public consistency check, or no longer meets a
 /// raised `minBits`.
@@ -199,8 +199,8 @@ func startParentChainSubscription(
         // the ParentChainBlockExtractor delegate.
         //
         // the worked subscription key is cached in the data dir so the
-        // key grind (≈2^minPeerKeyBits Curve25519 keygens — minutes at the
-        // 24-bit mainnet default) is a one-time per-data-dir cost, not a
+        // key grind (≈2^minPeerKeyBits Curve25519 keygens — quick at the
+        // 16-bit mainnet default, minutes only if raised) is a one-time per-data-dir cost, not a
         // per-start cost that delays the subscription.
         let minPeerKeyBits = await node.config.minPeerKeyBits
         let key = loadOrGrindParentSubscriptionKey(
