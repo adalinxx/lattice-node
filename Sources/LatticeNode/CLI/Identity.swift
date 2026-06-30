@@ -85,7 +85,8 @@ func writePrivateKeyFile(_ data: Data, to path: URL) throws {
 /// `LATTICE_PRIVATE_KEY` env override is always instant. Used by the daemon to
 /// decide whether to grind in the background and to log the right message while
 /// it boots the rest of the node (#243: a cold first boot must not block RPC on
-/// the multi-minute 24-bit grind any longer than necessary).
+/// the identity-key grind any longer than necessary — quick at the 16-bit default,
+/// minutes only if `--min-peer-key-bits` is raised).
 func identityGrindRequired(dataDir: URL, minKeyBits: Int) -> Bool {
     if minKeyBits == 0 { return false }
     if ProcessInfo.processInfo.environment["LATTICE_PRIVATE_KEY"] != nil { return false }

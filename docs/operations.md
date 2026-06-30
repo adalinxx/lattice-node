@@ -67,7 +67,7 @@ own gate; wait for the gate, don't sleep-and-hope:
 
 | Stage | What happens | Gate to wait on |
 |---|---|---|
-| 1. Identity grind → RPC bind | First boot grinds an anti-Sybil identity key *before* the RPC port opens (minutes at the 24-bit default). | `GET /api/chain/info` returns `200`. |
+| 1. Identity grind → RPC bind | First boot grinds an anti-Sybil identity key *before* the RPC port opens (quick at the 16-bit default; minutes if `--min-peer-key-bits` is raised). | `GET /api/chain/info` returns `200`. |
 | 2. Migrations + state warmup | After the RPC binds, the node runs schema migrations and warms its state stores. **`POST /api/chain/template` can hang or time out here even though `chain/info` already answers** — a coordinator started now blocks. | `POST /api/chain/template` returns `200`. |
 | 3. Peer discovery + sync | `"syncing": false` is **edge-triggered**: a just-booted node reads `false` *before* it discovers peers, then flips to `true` once it starts catching up. | `/api/peers` count ≥ 1 **and** `chain/info` `"syncing": false` **stable across two polls** a few seconds apart. |
 
