@@ -101,6 +101,15 @@ extension ChainNetwork: HeaderBatchSource {
         }
     }
 
+    /// A peer that served a well-formed-on-the-wire but consensus-invalid header batch
+    /// (bad PoW, broken CID continuity, or a proof that doesn't bind) is penalized in
+    /// Tally so it's deprioritized on subsequent syncs — the sync walk has already
+    /// rotated past it, this stops it being re-tried first next time.
+    public func recordInvalidHeaderBatch(peer: PeerID) async {
+        let tally = await ivy.tally
+        tally.recordFailure(peer: peer)
+    }
+
     internal func makeUniqueHeaderRequestID(
         randomData: @Sendable (Int) -> Data? = { ChainNetwork.secureRandomData(count: $0) }
     ) -> Data? {

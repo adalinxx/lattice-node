@@ -86,15 +86,3 @@ registry to build; the parent serves straight from its live connection set.
   *not* full network-wide discovery.
 - **Sybil** — the parent serves only endpoints currently-connected subscribers advertised,
   there is no on-chain authority claim, and the follower verifies every dialed peer.
-
-## Validation
-The `permissionless-child-join` smoke asserts **full headers-first sync**: B follows
-`Nexus/toy` (no `--peer`/`--subscribe-p2p`/`--genesis-hex`), its reconciler-spawned Toy finds
-A's Toy via `getChildPeers` over the parent link, connects, and converges to A's (frozen) Toy
-height — B runs no Toy miner, so reaching A's pre-join height proves a real same-chain
-backfill. Plus `ChildPeerProviderTests` for the wire codec, the responder-bound anti-spoof
-gate, the directory-filtered/asker-excluded serve, and timeout-to-empty.
-
-## Status
-Implemented. Discovery + follow + genesis self-resolution shipped earlier; this build adds the
-same-chain peer bootstrap with no Ivy or pinning changes.
