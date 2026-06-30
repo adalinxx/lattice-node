@@ -114,8 +114,17 @@ lattice-mining-coordinator \
 `--worker-executable` is the seam for **any** miner implementing the
 [Mining Worker Protocol](./mining-worker-protocol.md). The bundled `lattice-miner`
 is a CPU worker; for GPU mining point it at
-[`lattice-miner-gpu`](https://github.com/adalinxx/lattice-miner-gpu) (Apple
-Silicon / Metal) and raise `--batch-size` so each GPU dispatch is large.
+[`lattice-miner-gpu`](https://github.com/adalinxx/lattice-miner-gpu) (CUDA / Metal /
+OpenCL).
+
+> **Batch size matters for GPU/external workers.** Each batch relaunches the worker
+> process, so a small `--batch-size` spends the run on worker startup instead of
+> hashing — the GPU reads near-idle and a *running* miner can look hung. The
+> coordinator defaults to a large batch (`2e9`) whenever `--worker-executable` is set
+> (and `10000` for the in-process CPU worker); override with `--batch-size` only to
+> tune. To confirm a GPU is actually working, watch sustained utilization
+> (`nvidia-smi -l 1` → ~100% in bursts), not a single snapshot — the worker's per-batch
+> CUDA context is short-lived, so sparse sampling reads idle.
 
 ### Generate Keys
 
