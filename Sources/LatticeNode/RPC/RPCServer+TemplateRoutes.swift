@@ -408,11 +408,25 @@ extension RPCRoutes {
         // run on the combined set. Chain membership stays a NODE concern, not the miner's.
         let autoChildren = await node.registeredDirectChildEndpoints(parentPath: chain.path)
         if !autoChildren.isEmpty {
-            let merged = Array(Set((body.childNodes ?? []) + autoChildren.map(\.url)))
+            // Append auto-children only up to the fan-out cap and dedup by normalized (/api)
+            // URL, so they can NEVER push the set over maxChildNodesFanout and 400 the node's
+            // OWN template (a node serving >cap children would otherwise halt even Nexus work)
+            // — graceful degradation over total outage. Caller URLs are left as-is; the
+            // loopback/count checks below still run on the combined set.
+            func normAPI(_ s: String) -> String { s.hasSuffix("/api") ? s : s + "/api" }
+            var merged = body.childNodes ?? []
+            var seen = Set(merged.map(normAPI))
             var authMap = body.childNodeAuth ?? [:]
-            for c in autoChildren where c.auth != nil { authMap[c.url] = c.auth }
+            for c in autoChildren {
+                let key = normAPI(c.url)
+                guard !seen.contains(key), merged.count < maxChildNodesFanout else { continue }
+                seen.insert(key)
+                merged.append(c.url)
+                if let a = c.auth { authMap[c.url] = a }
+            }
             body = ChainTemplateRequestBody(chain: body.chain, chainPath: body.chainPath,
-                                            childNodes: merged, childNodeAuth: authMap.isEmpty ? nil : authMap)
+                                            childNodes: merged, childNodeAuth: authMap.isEmpty ? nil : authMap,
+                                            rewardAddress: body.rewardAddress)
         }
         let dir = chain.directory
         guard let chainState = await node.chain(forPath: chain.path),
