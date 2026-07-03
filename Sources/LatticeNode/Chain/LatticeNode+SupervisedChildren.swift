@@ -498,15 +498,17 @@ extension LatticeNode {
         // actually reproduces the announced CID BEFORE accepting. Deterministic genesis, so a
         // rebuild from (spec, txs, timestamp, target) must equal the anchored genesisCID — if it
         // doesn't, the hex is wrong/incomplete; return nil rather than spawn a divergent child.
-        let rebuilt = try? await BlockBuilder.buildGenesis(
-            spec: spec, transactions: genesisTxs,
-            timestamp: genesisBlock.timestamp, target: genesisBlock.target,
-            fetcher: parentNetwork.ivyFetcher)
-        let rebuiltCID: String? = rebuilt.flatMap { try? VolumeImpl<Block>(node: $0).rawCID }
-        if rebuiltCID != genesisCID {
-            log.error("supervised child '\(metadata.directory)': reconstructed genesis \(rebuiltCID ?? "nil") != announced \(genesisCID) — retrying (incomplete genesis content)")
-            return nil
+        var rebuiltCID: String? = nil
+        if let rebuilt = try? await BlockBuilder.buildGenesis(
+               spec: spec, transactions: genesisTxs,
+               timestamp: genesisBlock.timestamp, target: genesisBlock.target,
+               fetcher: parentNetwork.ivyFetcher),
+           let vol = try? VolumeImpl<Block>(node: rebuilt) {
+            rebuiltCID = vol.rawCID
         }
+        // Fail-closed: reconstructed genesis must reproduce the announced CID, else the hex is
+        // incomplete/wrong — return nil and let the reconciler re-probe rather than fork a child.
+        guard rebuiltCID == genesisCID else { return nil }
         let genesisHex = GenesisHexCodec.encodeEntries(entries).map { String(format: "%02x", $0) }.joined()
         return DeployedChainMetadata(
             chainPath: metadata.chainPath, directory: metadata.directory,
