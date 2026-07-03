@@ -471,16 +471,35 @@ extension LatticeNode {
         // buildGenesis(transactions:), so without these it constructs a DIFFERENT genesis block
         // (mismatched CID → the followed child forks a divergent chain that can never sync with
         // nodes on the real chain). Mirrors the deploy path's genesisBootstrapEntries.
-        if let txDict = try? await genesisBlock.transactions.resolveRecursive(fetcher: parentNetwork.ivyFetcher).node,
-           let txVols = try? txDict.allKeysAndValues() {
-            for (_, txVol) in txVols {
-                guard let tx = try? await txVol.resolve(fetcher: parentNetwork.ivyFetcher).node else { continue }
-                var body = tx.body.node
-                if body == nil { body = try? await tx.body.resolve(fetcher: parentNetwork.ivyFetcher).node }
-                if let bodyData = body?.toData() {
-                    entries.append(GenesisHexEntry(cid: tx.body.rawCID, data: bodyData))
-                }
-            }
+        //
+        // FAIL-CLOSED: a PARTIAL tx set (some bodies not yet fetchable) would still boot a
+        // divergent genesis — but silently, and get persisted. So require every tx body to
+        // resolve; on any miss return nil and let the reconciler re-probe next sweep (never
+        // emit an incomplete genesis-hex).
+        guard let spec,
+              let txDict = try? await genesisBlock.transactions.resolveRecursive(fetcher: parentNetwork.ivyFetcher).node,
+              let txVols = try? txDict.allKeysAndValues() else { return nil }
+        var genesisTxs: [Transaction] = []
+        for (_, txVol) in txVols {
+            guard let tx = try? await txVol.resolve(fetcher: parentNetwork.ivyFetcher).node else { return nil }
+            var body = tx.body.node
+            if body == nil { body = try? await tx.body.resolve(fetcher: parentNetwork.ivyFetcher).node }
+            guard let bodyData = body?.toData() else { return nil }
+            entries.append(GenesisHexEntry(cid: tx.body.rawCID, data: bodyData))
+            genesisTxs.append(tx)
+        }
+        // Invariant the follow path was missing entirely: verify the reconstructed genesis
+        // actually reproduces the announced CID BEFORE accepting. Deterministic genesis, so a
+        // rebuild from (spec, txs, timestamp, target) must equal the anchored genesisCID — if it
+        // doesn't, the hex is wrong/incomplete; return nil rather than spawn a divergent child.
+        guard let rebuilt = try? await BlockBuilder.buildGenesis(
+                  spec: spec, transactions: genesisTxs,
+                  timestamp: genesisBlock.timestamp, target: genesisBlock.target,
+                  fetcher: parentNetwork.ivyFetcher),
+              let rebuiltCID = try? VolumeImpl<Block>(node: rebuilt).rawCID,
+              rebuiltCID == genesisCID else {
+            log.warn("supervised child '\(metadata.directory)': reconstructed genesis != announced \(genesisCID) — retrying (incomplete genesis content)")
+            return nil
         }
         let genesisHex = GenesisHexCodec.encodeEntries(entries).map { String(format: "%02x", $0) }.joined()
         return DeployedChainMetadata(
