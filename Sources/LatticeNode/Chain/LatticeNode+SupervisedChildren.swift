@@ -498,13 +498,13 @@ extension LatticeNode {
         // actually reproduces the announced CID BEFORE accepting. Deterministic genesis, so a
         // rebuild from (spec, txs, timestamp, target) must equal the anchored genesisCID — if it
         // doesn't, the hex is wrong/incomplete; return nil rather than spawn a divergent child.
-        guard let rebuilt = try? await BlockBuilder.buildGenesis(
-                  spec: spec, transactions: genesisTxs,
-                  timestamp: genesisBlock.timestamp, target: genesisBlock.target,
-                  fetcher: parentNetwork.ivyFetcher),
-              let rebuiltCID = try? VolumeImpl<Block>(node: rebuilt).rawCID,
-              rebuiltCID == genesisCID else {
-            log.warn("supervised child '\(metadata.directory)': reconstructed genesis != announced \(genesisCID) — retrying (incomplete genesis content)")
+        let rebuilt = try? await BlockBuilder.buildGenesis(
+            spec: spec, transactions: genesisTxs,
+            timestamp: genesisBlock.timestamp, target: genesisBlock.target,
+            fetcher: parentNetwork.ivyFetcher)
+        let rebuiltCID: String? = rebuilt.flatMap { try? VolumeImpl<Block>(node: $0).rawCID }
+        if rebuiltCID != genesisCID {
+            log.error("supervised child '\(metadata.directory)': reconstructed genesis \(rebuiltCID ?? "nil") != announced \(genesisCID) — retrying (incomplete genesis content)")
             return nil
         }
         let genesisHex = GenesisHexCodec.encodeEntries(entries).map { String(format: "%02x", $0) }.joined()
