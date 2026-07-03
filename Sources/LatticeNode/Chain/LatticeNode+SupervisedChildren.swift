@@ -467,6 +467,21 @@ extension LatticeNode {
                 entries.append(GenesisHexEntry(cid: policy.moduleCID, data: moduleData))
             }
         }
+        // Include the genesis TRANSACTION bodies. The child rebuilds a fully-inline genesis via
+        // buildGenesis(transactions:), so without these it constructs a DIFFERENT genesis block
+        // (mismatched CID → the followed child forks a divergent chain that can never sync with
+        // nodes on the real chain). Mirrors the deploy path's genesisBootstrapEntries.
+        if let txDict = try? await genesisBlock.transactions.resolveRecursive(fetcher: parentNetwork.ivyFetcher).node,
+           let txVols = try? txDict.allKeysAndValues() {
+            for (_, txVol) in txVols {
+                guard let tx = try? await txVol.resolve(fetcher: parentNetwork.ivyFetcher).node else { continue }
+                var body = tx.body.node
+                if body == nil { body = try? await tx.body.resolve(fetcher: parentNetwork.ivyFetcher).node }
+                if let bodyData = body?.toData() {
+                    entries.append(GenesisHexEntry(cid: tx.body.rawCID, data: bodyData))
+                }
+            }
+        }
         let genesisHex = GenesisHexCodec.encodeEntries(entries).map { String(format: "%02x", $0) }.joined()
         return DeployedChainMetadata(
             chainPath: metadata.chainPath, directory: metadata.directory,
