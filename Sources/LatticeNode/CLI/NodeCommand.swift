@@ -603,6 +603,9 @@ struct NodeCommand: AsyncParsableCommand {
         if !bootstrapEntries.isEmpty,
            let network = await node.network(for: genesisConfig.directory) {
             await network.storeBatch(bootstrapEntries.map { ($0.cid, $0.data) })
+            // Retain the genesis entries so the child re-advertises them to its parent(s), which
+            // durably re-serve the genesis on the parent network (permissionless follow bootstrap).
+            await node.setChildGenesisBootstrapEntries(bootstrapEntries)
         }
 
         // Skip genesis hash verification for child chains bootstrapped from --genesis-hex

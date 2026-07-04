@@ -414,6 +414,12 @@ extension ChainNetwork {
             // hand to the node, which stores it against the peer for getChildPeers.
             guard childPeerRequestBuckets.tryConsume(peer) else { break }
             await delegate?.chainNetwork(self, handleChildPeerAdvertise: payload, from: peer)
+        case ChildPeerProvider.genesisTopic:
+            // A connected child pushed its genesis content. Rate-gate on the same
+            // bucket (an advertise-class message), then hand to the node, which
+            // verifies each entry's CID + the anchor match before durably re-serving.
+            guard childPeerRequestBuckets.tryConsume(peer) else { break }
+            await delegate?.chainNetwork(self, handleChildGenesisAdvertise: payload, from: peer)
         case ChildPeerProvider.requestTopic:
             // (serve): answer a followed child's same-chain-peer query from the live
             // spawn-trusted subscriber set and reply on THIS network. Rate gate FIRST

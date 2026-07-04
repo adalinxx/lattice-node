@@ -1,6 +1,8 @@
 import Foundation
 import Ivy
 import Tally
+import VolumeBroker  // SerializedVolume for durably re-serving a child's advertised genesis
+import cashew        // ContentAddressVerifier — verify advertised genesis entries hash to their CIDs
 
 /// Same-chain peer bootstrap (node side). See `ChildPeerProvider` for the why:
 /// the parent chain is the rendezvous, a child advertises its chain-gossip
@@ -14,6 +16,42 @@ extension LatticeNode {
     nonisolated public func chainNetwork(_ network: ChainNetwork, handleChildPeerAdvertise payload: Data, from peer: PeerID) async {
         guard let adv = ChildPeerProvider.decodeAdvertise(payload) else { return }
         await recordAdvertisedChildEndpoint(peer: peer, directory: adv.directory, endpoint: adv.endpoint, rpcUrl: adv.rpcUrl)
+    }
+
+    /// A connected child advertised its genesis content over the parent link. UNTRUSTED input, so
+    /// verify before serving: (a) every entry's bytes must hash to its CID, and (b) the genesis
+    /// block CID (the first entry) must equal the parent's ANNOUNCED child genesis for this path —
+    /// a peer cannot inject a fake or unrelated genesis. On success, durably store + pin + announce
+    /// the genesis on the PARENT network, so later followers resolving it via the parent network
+    /// succeed without a local hex even after the original deployer has left.
+    nonisolated public func chainNetwork(_ network: ChainNetwork, handleChildGenesisAdvertise payload: Data, from peer: PeerID) async {
+        guard let (directory, entries) = ChildPeerProvider.decodeGenesis(payload),
+              let genesisEntry = entries.first else { return }
+        // (a) content-address every entry — fail closed on any mismatch (no partial pin).
+        for (cid, data) in entries where !ContentAddressVerifier.data(data, matches: cid) { return }
+        // (b) the advertised genesis block must be exactly the one the parent anchored.
+        let childPath = network.chainPath + [directory]
+        guard let announced = await announcedChildGenesisCID(chainPath: childPath),
+              genesisEntry.cid == announced else { return }
+        let payloads = entries.map { SerializedVolume(root: $0.cid, entries: [$0.cid: $0.data]) }
+        try? await network.storeVolumesDurably(payloads)
+        try? await network.pinBatchDurably(
+            roots: entries.map(\.cid),
+            owner: "\(network.ownerNamespace):\(directory):genesis-served")
+        await network.ivy.announceBlock(cid: announced)
+    }
+
+    // MARK: - Client (a serving child pushes its genesis to its parent)
+
+    /// Push this child's own genesis entries to its parent(s) over the `directory` subscription
+    /// link, so the parent durably re-serves the genesis on the parent network. No-op on a root
+    /// node (no retained entries / no parent link). Bounded payload; the parent re-verifies.
+    func advertiseGenesisToParents(directory: String) async {
+        guard !childGenesisBootstrapEntries.isEmpty,
+              let ivy = parentConsensusLinks[directory]?.ivy else { return }
+        let payload = ChildPeerProvider.encodeGenesis(directory: directory, entries: childGenesisBootstrapEntries)
+        guard payload.count <= ChildPeerProvider.maxGenesisTotalBytes else { return }
+        await ivy.broadcastMessage(topic: ChildPeerProvider.genesisTopic, payload: payload)
     }
 
     func recordAdvertisedChildEndpoint(peer: PeerID, directory: String, endpoint: String, rpcUrl: String? = nil) {
