@@ -503,30 +503,41 @@ extension LatticeNode {
         // rebuild from (spec, txs, timestamp, target) must equal the anchored genesisCID — if it
         // doesn't, the hex is wrong/incomplete; return nil rather than spawn a divergent child.
         var rebuiltCID: String? = nil
+        var rebuiltBlock: Block? = nil
         if let rebuilt = try? await BlockBuilder.buildGenesis(
                spec: spec, transactions: genesisTxs,
                timestamp: genesisBlock.timestamp, target: genesisBlock.target,
                fetcher: parentNetwork.ivyFetcher),
            let vol = try? VolumeImpl<Block>(node: rebuilt) {
             rebuiltCID = vol.rawCID
+            rebuiltBlock = rebuilt  // fully-hydrated block for a multi-entry durable re-serve
         }
         // Fail-closed: reconstructed genesis must reproduce the announced CID, else the hex is
         // incomplete/wrong — return nil and let the reconciler re-probe rather than fork a child.
-        guard rebuiltCID == genesisCID else { return nil }
+        guard rebuiltCID == genesisCID, let rebuiltBlock else { return nil }
         // RE-SERVE the resolved genesis on the PARENT network so availability propagates. Only the
         // original deployer pins a child's genesis on the parent (deployChildChain); a follower
         // that resolved it here must now serve it too, or the genesis becomes unfetchable once the
         // deployer leaves and later followers get `notFound` — the reason a permissionless follow
-        // could stall. Durable-pin every verified genesis entry + announce the WHOLE closure.
-        let reservePayloads = entries.map { SerializedVolume(root: $0.cid, entries: [$0.cid: $0.data]) }
-        try? await parentNetwork.storeVolumesDurably(reservePayloads)
+        // could stall.
+        //
+        // The BLOCK must be stored as its FULL multi-entry volume (root + in-package
+        // transaction/children trie nodes) exactly like the deploy path (`storeBlockData`): a
+        // single-entry root stub can't serve those non-root internal nodes, so a cold re-serving
+        // node would satisfy `fetch(genesisCID)` but stall a follower's `transactions.resolveRecursive`.
+        // Spec, policy modules, and tx bodies (the entries after the block) are genuine single-node
+        // boundaries, stored as single-entry volumes.
+        let blockRoots = (await storeBlockData(rebuiltBlock, network: parentNetwork)) ?? []
+        let sideEntries = Array(entries.dropFirst())
+        try? await parentNetwork.storeVolumesDurably(
+            sideEntries.map { SerializedVolume(root: $0.cid, entries: [$0.cid: $0.data]) })
+        let reserveRoots = blockRoots + sideEntries.map(\.cid)
         try? await parentNetwork.pinBatchDurably(
-            roots: entries.map(\.cid),
+            roots: reserveRoots,
             owner: "\(parentNetwork.ownerNamespace):\(metadata.directory):genesis-reserve")
-        // Announce the ENTIRE closure (block + spec + policy modules + tx bodies), not just the
-        // block CID: a follower's pinner discovery must find a provider for every sub-CID it
-        // resolves — matching the deploy path (announceStoredRoots), not only announceBlock.
-        await announceStoredRoots(entries.map(\.cid), network: parentNetwork)
+        // Announce the ENTIRE closure so a follower's pinner discovery finds a provider for every
+        // sub-CID it resolves — matching the deploy path (announceStoredRoots).
+        await announceStoredRoots(reserveRoots, network: parentNetwork)
         let genesisHex = GenesisHexCodec.encodeEntries(entries).map { String(format: "%02x", $0) }.joined()
         return DeployedChainMetadata(
             chainPath: metadata.chainPath, directory: metadata.directory,
