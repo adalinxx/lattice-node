@@ -46,6 +46,16 @@ final class RelayPeerCountTests: XCTestCase {
                                                      knownRelayKeys: [relayStripped]), 0)
     }
 
+    /// Hex case must be folded (Ivy/Tally canonicalize connection keys with `.lowercased()`),
+    /// so a relay key entered in a different case than the connection key is still excluded.
+    func testRelayKeyCaseFolded() {
+        let relayUpper = "ED01" + String(repeating: "A", count: 64)   // --use-relay, upper-cased
+        // stripped, lower-case connection key vs upper-case prefixed relay key → excluded
+        XCTAssertEqual(LatticeNode.nonRelayPeerCount(connectedPeerKeys: [relayStripped],
+                                                     knownRelayKeys: [relayUpper]), 0)
+        XCTAssertEqual(LatticeNode.normalizedPeerKey(relayUpper), relayStripped)
+    }
+
     /// With no relays configured every connection counts (the non-NAT default path).
     func testNoRelaysCountsEverything() {
         let count = LatticeNode.nonRelayPeerCount(

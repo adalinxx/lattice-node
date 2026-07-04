@@ -164,6 +164,10 @@ struct NodeCommand: AsyncParsableCommand {
     static func isRootChainGossip(subscribeP2P: String?, chainPath: String?, chainDirectory: String?) -> Bool {
         if subscribeP2P != nil { return false }
         if (chainPath?.split(separator: "/").count ?? 0) > 1 { return false }
+        // INVARIANT: the only root chain-gossip directory is DEFAULT_ROOT_DIRECTORY. Any other
+        // explicit `--chain-directory` names a child, which must NOT seed the Nexus backbone/DNS.
+        // If a second root name is ever introduced, widen this check (else that root is silently
+        // misclassified as a child and never bootstraps from its backbone).
         if let dir = chainDirectory, dir != DEFAULT_ROOT_DIRECTORY { return false }
         return true
     }

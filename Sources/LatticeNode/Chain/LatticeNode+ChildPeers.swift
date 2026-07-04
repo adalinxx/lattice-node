@@ -186,8 +186,11 @@ extension LatticeNode {
     /// then never find real same-chain peers without an explicit `--peer`.
     func chainGossipPeerCount(directory: String) async -> Int {
         guard let network = network(for: directory) else { return 0 }
-        guard !config.knownRelays.isEmpty else { return await network.ivy.directPeerCount }
+        // Both branches derive from the SAME source (`connectedPeers` = connections +
+        // any mDNS local peers) so the count is consistent whether or not relays are
+        // configured; the relay branch just additionally drops known-relay keys.
         let connectedKeys = await network.ivy.connectedPeers.map { $0.publicKey }
+        guard !config.knownRelays.isEmpty else { return connectedKeys.count }
         return Self.nonRelayPeerCount(connectedPeerKeys: connectedKeys,
                                       knownRelayKeys: config.knownRelays.map { $0.publicKey })
     }
@@ -201,10 +204,14 @@ extension LatticeNode {
         return connectedPeerKeys.filter { !relays.contains(normalizedPeerKey($0)) }.count
     }
 
-    /// Strip the `ed01` multicodec prefix from an ed25519 peer key so keys from
-    /// different sources (Ivy connections vs config) compare equal.
+    /// Strip the `ed01` multicodec prefix from an ed25519 peer key and lowercase it
+    /// so keys from different sources (Ivy connections vs config) compare equal. Ivy
+    /// and Tally canonicalize connection keys with `.lowercased()` (see Tally's
+    /// `canonicalRawHex` / Ivy's `SpawnCertificate`), so a `--use-relay` key entered
+    /// in a different hex case must fold to the same form here to be excluded.
     static func normalizedPeerKey(_ key: String) -> String {
-        (key.hasPrefix("ed01") && key.count == 68) ? String(key.dropFirst(4)) : key
+        let lowered = key.lowercased()
+        return (lowered.hasPrefix("ed01") && lowered.count == 68) ? String(lowered.dropFirst(4)) : lowered
     }
 
     /// Whether a followed child still needs a same-chain peer: it has no peer on
