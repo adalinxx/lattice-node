@@ -1,6 +1,7 @@
 import Foundation
 import Lattice
 import cashew
+import VolumeBroker  // SerializedVolume for re-serving a resolved genesis on the parent
 import LatticeNodeRPCFuzzSupport  // GenesisHexCodec/GenesisHexEntry (shared genesis-hex codec)
 #if canImport(FoundationNetworking)
 import FoundationNetworking  // URLSession/URLRequest live here on Linux
@@ -512,6 +513,17 @@ extension LatticeNode {
         // Fail-closed: reconstructed genesis must reproduce the announced CID, else the hex is
         // incomplete/wrong — return nil and let the reconciler re-probe rather than fork a child.
         guard rebuiltCID == genesisCID else { return nil }
+        // RE-SERVE the resolved genesis on the PARENT network so availability propagates. Only the
+        // original deployer pins a child's genesis on the parent (deployChildChain); a follower
+        // that resolved it here must now serve it too, or the genesis becomes unfetchable once the
+        // deployer leaves and later followers get `notFound` — the reason a permissionless follow
+        // could stall. Durable-pin every verified genesis entry + re-announce the block CID.
+        let reservePayloads = entries.map { SerializedVolume(root: $0.cid, entries: [$0.cid: $0.data]) }
+        try? await parentNetwork.storeVolumesDurably(reservePayloads)
+        try? await parentNetwork.pinBatchDurably(
+            roots: entries.map(\.cid),
+            owner: "\(parentNetwork.ownerNamespace):\(metadata.directory):genesis-reserve")
+        await parentNetwork.ivy.announceBlock(cid: genesisCID)
         let genesisHex = GenesisHexCodec.encodeEntries(entries).map { String(format: "%02x", $0) }.joined()
         return DeployedChainMetadata(
             chainPath: metadata.chainPath, directory: metadata.directory,
