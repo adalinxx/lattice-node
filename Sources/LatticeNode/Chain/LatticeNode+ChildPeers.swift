@@ -177,10 +177,34 @@ extension LatticeNode {
         await ivy.broadcastMessage(topic: ChildPeerProvider.advertiseTopic, payload: payload)
     }
 
-    /// Direct peer count on the `directory` chain-gossip network.
+    /// Direct peer count on the `directory` chain-gossip network, EXCLUDING known
+    /// relay peers. A `--use-relay` circuit-relay peer is connected directly (it
+    /// lives in Ivy's `connections`, so `directPeerCount` counts it) but is a
+    /// cross-chain bootstrap node that never serves this child chain. Counting it
+    /// would make `needsSameChainPeer` return false once a NAT'd node is past
+    /// genesis, masking the getChildPeers rendezvous discovery — the node would
+    /// then never find real same-chain peers without an explicit `--peer`.
     func chainGossipPeerCount(directory: String) async -> Int {
         guard let network = network(for: directory) else { return 0 }
-        return await network.ivy.directPeerCount
+        guard !config.knownRelays.isEmpty else { return await network.ivy.directPeerCount }
+        let connectedKeys = await network.ivy.connectedPeers.map { $0.publicKey }
+        return Self.nonRelayPeerCount(connectedPeerKeys: connectedKeys,
+                                      knownRelayKeys: config.knownRelays.map { $0.publicKey })
+    }
+
+    /// Count of connected peers excluding known relays. Pure so it is unit-testable
+    /// independent of a live Ivy: Ivy stores connected keys stripped of the `ed01`
+    /// multicodec prefix while config/`--use-relay` keys keep it, so both sides are
+    /// normalized before comparison.
+    static func nonRelayPeerCount(connectedPeerKeys: [String], knownRelayKeys: [String]) -> Int {
+        let relays = Set(knownRelayKeys.map { normalizedPeerKey($0) })
+        return connectedPeerKeys.filter { !relays.contains(normalizedPeerKey($0)) }.count
+    }
+
+    /// Strip the `ed01` multicodec prefix from an ed25519 peer key so keys from
+    /// different sources (Ivy connections vs config) compare equal.
+    static func normalizedPeerKey(_ key: String) -> String {
+        (key.hasPrefix("ed01") && key.count == 68) ? String(key.dropFirst(4)) : key
     }
 
     /// Whether a followed child still needs a same-chain peer: it has no peer on
