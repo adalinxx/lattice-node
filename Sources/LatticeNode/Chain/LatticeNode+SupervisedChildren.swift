@@ -453,7 +453,7 @@ extension LatticeNode {
     /// WASM policy modules from CAS by CID (ivyFetcher does pinner discovery on a local miss),
     /// and encode with the shared `GenesisHexCodec`. Returns an updated metadata with
     /// genesisHash/genesisHex filled, or nil if the genesis isn't resolvable/available yet.
-    private func resolveFollowedGenesis(_ metadata: DeployedChainMetadata) async -> DeployedChainMetadata? {
+    func resolveFollowedGenesis(_ metadata: DeployedChainMetadata) async -> DeployedChainMetadata? {
         guard let parentNetwork = network(forPath: Array(metadata.chainPath.dropLast())) else { return nil }
         guard let genesisCID = await announcedChildGenesisCID(chainPath: metadata.chainPath) else { return nil }
         guard let genesisData = try? await parentNetwork.ivyFetcher.fetch(rawCid: genesisCID),
@@ -517,13 +517,16 @@ extension LatticeNode {
         // original deployer pins a child's genesis on the parent (deployChildChain); a follower
         // that resolved it here must now serve it too, or the genesis becomes unfetchable once the
         // deployer leaves and later followers get `notFound` — the reason a permissionless follow
-        // could stall. Durable-pin every verified genesis entry + re-announce the block CID.
+        // could stall. Durable-pin every verified genesis entry + announce the WHOLE closure.
         let reservePayloads = entries.map { SerializedVolume(root: $0.cid, entries: [$0.cid: $0.data]) }
         try? await parentNetwork.storeVolumesDurably(reservePayloads)
         try? await parentNetwork.pinBatchDurably(
             roots: entries.map(\.cid),
             owner: "\(parentNetwork.ownerNamespace):\(metadata.directory):genesis-reserve")
-        await parentNetwork.ivy.announceBlock(cid: genesisCID)
+        // Announce the ENTIRE closure (block + spec + policy modules + tx bodies), not just the
+        // block CID: a follower's pinner discovery must find a provider for every sub-CID it
+        // resolves — matching the deploy path (announceStoredRoots), not only announceBlock.
+        await announceStoredRoots(entries.map(\.cid), network: parentNetwork)
         let genesisHex = GenesisHexCodec.encodeEntries(entries).map { String(format: "%02x", $0) }.joined()
         return DeployedChainMetadata(
             chainPath: metadata.chainPath, directory: metadata.directory,

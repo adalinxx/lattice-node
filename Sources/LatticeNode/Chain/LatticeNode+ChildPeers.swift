@@ -1,7 +1,6 @@
 import Foundation
 import Ivy
 import Tally
-import VolumeBroker  // SerializedVolume for durably re-serving a child's advertised genesis
 import cashew        // ContentAddressVerifier — verify advertised genesis entries hash to their CIDs
 
 /// Same-chain peer bootstrap (node side). See `ChildPeerProvider` for the why:
@@ -27,18 +26,26 @@ extension LatticeNode {
     nonisolated public func chainNetwork(_ network: ChainNetwork, handleChildGenesisAdvertise payload: Data, from peer: PeerID) async {
         guard let (directory, entries) = ChildPeerProvider.decodeGenesis(payload),
               let genesisEntry = entries.first else { return }
-        // (a) content-address every entry — fail closed on any mismatch (no partial pin).
+        // (a) content-address every entry — fail closed on any mismatch (cheap, before any store).
         for (cid, data) in entries where !ContentAddressVerifier.data(data, matches: cid) { return }
-        // (b) the advertised genesis block must be exactly the one the parent anchored.
+        // (b) the advertised genesis block must be exactly the one the parent anchored (a peer
+        //     cannot serve a fake/unrelated genesis; `announced == nil` also fails closed).
         let childPath = network.chainPath + [directory]
         guard let announced = await announcedChildGenesisCID(chainPath: childPath),
               genesisEntry.cid == announced else { return }
-        let payloads = entries.map { SerializedVolume(root: $0.cid, entries: [$0.cid: $0.data]) }
-        try? await network.storeVolumesDurably(payloads)
-        try? await network.pinBatchDurably(
-            roots: entries.map(\.cid),
-            owner: "\(network.ownerNamespace):\(directory):genesis-served")
-        await network.ivy.announceBlock(cid: announced)
+        // (P2) Idempotent cost-gate: if we already hold this genesis, do nothing — the periodic
+        // re-advertise must not re-store/re-rebuild on every tick.
+        if await network.hasCID(announced) { return }
+        // (P1) Do NOT pin the advertised entries directly — a peer could append valid-CID junk
+        // blobs that pass (a) but aren't part of the genesis, and pinning is durable+permanent.
+        // Instead store them UNPINNED so the resolver can read them locally, then reuse
+        // resolveFollowedGenesis: it rebuilds the closure from the genesis block, verifies it
+        // reproduces the anchored CID, and durably pins + announces ONLY the real closure. Any
+        // junk entry stays unpinned and is GC-reclaimable; an incomplete closure pins nothing.
+        await network.storeBatch(entries.map { ($0.cid, $0.data) })
+        _ = await resolveFollowedGenesis(DeployedChainMetadata(
+            chainPath: childPath, directory: directory, parentDirectory: network.directory,
+            genesisHash: announced, genesisHex: "", timestamp: 0))
     }
 
     // MARK: - Client (a serving child pushes its genesis to its parent)
