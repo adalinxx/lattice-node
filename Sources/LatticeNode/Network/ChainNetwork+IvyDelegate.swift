@@ -463,8 +463,16 @@ extension ChainNetwork {
             var headers: [(cid: String, data: Data)] = []
             var currentCID = fromCID
             for _ in 0..<min(count, Self.maxHeaderBatchSize) {
-                guard let vol = await diskBroker.fetchVolumeLocal(root: currentCID),
-                      let blockData = vol.entries[currentCID],
+                // Serve by CID (cas_data), NOT by root-keyed volume. A block's own
+                // root-keyed volume_entries row only exists if it was ingested as a
+                // top-level volume on THIS chain; a toy block that arrived embedded in a
+                // Nexus parent volume (root=nexusHash) or was rebuilt by CID-only crash
+                // recovery has its bytes in cas_data (RPC serves it) but no
+                // volume_entries(root=blockHash) — so fetchVolumeLocal(root:) returned nil
+                // and header serving stalled at genesis. fetchDataLocal(cid:) is what the
+                // RPC block path and crash recovery already use; content-addressing
+                // guarantees the bytes are exactly this block.
+                guard let blockData = await diskBroker.fetchDataLocal(cid: currentCID),
                       let block = Block(data: blockData) else { break }
                 headers.append((cid: currentCID, data: blockData))
                 guard let parentCID = block.parent?.rawCID, !parentCID.isEmpty else { break }
@@ -496,8 +504,16 @@ extension ChainNetwork {
             var entries: [(cid: String, data: Data, proof: Data?)] = []
             var currentCID = fromCID
             for _ in 0..<min(count, Self.maxHeaderBatchSize) {
-                guard let vol = await diskBroker.fetchVolumeLocal(root: currentCID),
-                      let blockData = vol.entries[currentCID],
+                // Serve by CID (cas_data), NOT by root-keyed volume. A block's own
+                // root-keyed volume_entries row only exists if it was ingested as a
+                // top-level volume on THIS chain; a toy block that arrived embedded in a
+                // Nexus parent volume (root=nexusHash) or was rebuilt by CID-only crash
+                // recovery has its bytes in cas_data (RPC serves it) but no
+                // volume_entries(root=blockHash) — so fetchVolumeLocal(root:) returned nil
+                // and header serving stalled at genesis. fetchDataLocal(cid:) is what the
+                // RPC block path and crash recovery already use; content-addressing
+                // guarantees the bytes are exactly this block.
+                guard let blockData = await diskBroker.fetchDataLocal(cid: currentCID),
                       let block = Block(data: blockData) else { break }
                 let proof = await delegate?.chainNetwork(self, blockProofData: currentCID)
                 if proof == nil {
