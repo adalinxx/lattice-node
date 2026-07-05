@@ -52,7 +52,7 @@ regardless of how it stores or transports anything:
   (`parent.children ∋ child`) — never a self-hash fallback. This is what lets the
   node attribute inherited work without trusting a peer-supplied number.
 - **Child-only carriers (direct-child edge).** A securing carrier need not be
-  canonical, and — when it **is** the PoW root (a direct child of Nexus, proof
+  canonical, and — when it **is** the PoW root (the direct-child case — proof
   path length 1) — need not clear its own target. A shared grind that clears the
   child's easy target but not the root's hard target yields a **child-only
   carrier**: never a canonical Nexus block, yet a valid carrier for the child.
