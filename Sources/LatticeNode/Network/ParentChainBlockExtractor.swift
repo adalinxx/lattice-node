@@ -605,8 +605,13 @@ public actor ParentChainBlockExtractor: IvyDelegate {
                 unavailable += 1
                 continue
             }
-            // Does this parent commit OUR child? Absent entry ⇒ nothing to heal here — a
-            // terminal (converged) outcome for this parent, mark it processed.
+            // Does this parent commit OUR child? A nil here is TRUE absence, not a content
+            // miss: the `.targeted` resolve above already materialized the childDirectory
+            // key path (a content miss on that path THROWS at resolve → case (a),
+            // unavailable), so on an immutable parent a nil `get` means it genuinely commits
+            // no child for us — a terminal (converged) outcome; mark it processed. (Load-
+            // bearing on cashew `.targeted` fully materializing the path; revisit if that
+            // resolve ever becomes lazier.)
             guard let childHeader: VolumeImpl<Block> = try? childDict.get(key: childDirectory) else {
                 backfillProcessedParents.insert(cid)
                 continue
