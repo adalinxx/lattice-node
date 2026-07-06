@@ -463,6 +463,10 @@ extension LatticeNode {
     public func blockProofExists(directory: String, blockHash: String) -> Bool {
         !(stateStores[chainKey(forDirectory: directory)]?.getBlockProofs(blockHash: blockHash).isEmpty ?? true)
     }
+    /// True when the specific proof `proofID` (one committing grind) is stored for `blockHash`.
+    public func blockProofIDExists(directory: String, blockHash: String, proofID: String) -> Bool {
+        stateStores[chainKey(forDirectory: directory)]?.blockProofIDExists(blockHash: blockHash, proofID: proofID) ?? false
+    }
     /// Up to `limit` PoW-verified parent block hashes this node holds for `directory`
     /// (highest height first) — the proof self-heal fetches each by CID (source-agnostic)
     /// and heals what's available.

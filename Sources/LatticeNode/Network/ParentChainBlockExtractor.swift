@@ -620,10 +620,15 @@ public actor ParentChainBlockExtractor: IvyDelegate {
                 unavailable += 1   // child body not reachable yet — retry
                 continue
             }
-            // ONE valid proof per child is all availability (getHeaders2 serving) needs.
-            // Already have one ⇒ this parent's child is covered — terminal.
-            if await node.blockProofExists(directory: childDirectory, blockHash: childCID) {
-                backfillProcessedParents.insert(cid)
+            // This parent is ONE committing grind; persist a proof PER committer (keyed by
+            // proofID = rootCID+path), exactly as a freshly-synced node does, so a multiply-
+            // committed child ends up with every committer's proof and `restoreInheritedWeight`
+            // rebuilds the full per-grind UNION weight (not just one committer). Skip cheaply
+            // if THIS committer's proof is already stored — the proofID needs no re-derivation.
+            let committerProofID = ChildBlockProof(
+                rootCID: cid, directoryPath: [childDirectory], entries: []).proofPathID
+            if await node.blockProofIDExists(directory: childDirectory, blockHash: childCID, proofID: committerProofID) {
+                backfillProcessedParents.insert(cid)   // this committer already stored — terminal
                 continue
             }
             guard let proof = try? await ChildBlockProof.generate(
@@ -635,7 +640,7 @@ public actor ParentChainBlockExtractor: IvyDelegate {
             // isn't a valid carrier) — mark processed, don't persist. We do NOT fold inherited
             // weight or touch fork choice here: that is consensus's job — `restoreInheritedWeight`
             // rebuilds inherited weight from these persisted proofs. The self-heal restores
-            // AVAILABILITY (a servable proof per child); consensus derives weight from it.
+            // AVAILABILITY (servable proofs, one per committer); consensus derives weight from them.
             guard await MinedChildBlockSelection.accepts(
                     chainPath: (parentChainPath ?? []) + [childDirectory], block: childBlock,
                     childCID: childCID, rootHash: parentBlock.proofOfWorkHash(), proof: proof) else {

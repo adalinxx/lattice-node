@@ -1107,6 +1107,17 @@ public actor StateStore {
         return rows.compactMap { $0["proof"]?.blobValue }
     }
 
+    /// True when a specific proof (identified by `proofID`, i.e. a specific committing
+    /// grind) is already stored for `blockHash`. Lets the self-heal persist a proof PER
+    /// committer (matching a freshly-synced node) without re-deriving already-stored ones.
+    public nonisolated func blockProofIDExists(blockHash: String, proofID: String) -> Bool {
+        guard let rows = try? readDb.query(
+            "SELECT 1 FROM block_proofs WHERE blockHash = ?1 AND proofID = ?2 LIMIT 1",
+            params: [.text(blockHash), .text(proofID)]
+        ) else { return false }
+        return !rows.isEmpty
+    }
+
     public nonisolated func getAllBlockProofs() -> [(height: UInt64, blockHash: String, proofID: String, proof: Data)] {
         guard let rows = try? readDb.query(
             "SELECT height, blockHash, proofID, proof FROM block_proofs ORDER BY height ASC, blockHash ASC, proofID ASC"
