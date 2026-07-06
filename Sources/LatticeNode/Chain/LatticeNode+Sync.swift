@@ -1259,15 +1259,25 @@ extension LatticeNode {
               let chainState = await chain(for: directory) else { return }
         let log = NodeLogger("sync")
         let height = await chainState.getHighestBlockHeight()
-        let store = stateStore(for: directory)
-        // Converged short-circuit: nothing new since the last fully-successful pass.
-        if let wm = store?.getGeneral(key: stateHealWatermarkKey)
-            .flatMap({ UInt64(String(decoding: $0, as: UTF8.self)) }), wm >= height {
-            return
-        }
         let retained = retainedStateRootHeights(tipHeight: height)
         guard let lowest = retained.min() else { return }
         let retainedSet = Set(retained)
+        let store = stateStore(for: directory)
+        // Converged short-circuit: skip ONLY when a prior fully-successful pass covered the
+        // SAME canonical tip (by hash — a reorg to a numerically-lower tip must re-check, so
+        // we cannot key on height alone) AND a retained lower bound ≤ the current one (a
+        // widening of retention, e.g. stateful→historical, must re-materialize the newly
+        // in-scope lower heights). Watermark = "<lowest>:<tipHash>"; a tip-hash match implies
+        // the same height, so [lowest…height] ⊆ the previously-covered range.
+        let tipHash = await chainState.getMainChainTip()
+        if !tipHash.isEmpty,
+           let wm = store?.getGeneral(key: stateHealWatermarkKey).flatMap({ String(decoding: $0, as: UTF8.self) }) {
+            let parts = wm.split(separator: ":", maxSplits: 1)
+            if parts.count == 2, let wmLowest = UInt64(parts[0]),
+               String(parts[1]) == tipHash, wmLowest <= lowest {
+                return
+            }
+        }
         let source = recoverySource(directory: directory, network: network)
         let fetcher = CoalescingFetcher(source)
         var materialized = 0
@@ -1324,8 +1334,10 @@ extension LatticeNode {
             }
         }
         // Advance the watermark only on a fully-successful pass so failures/crashes retry.
-        if !incomplete {
-            try? await store?.setGeneral(key: stateHealWatermarkKey, value: Data(String(height).utf8), atHeight: height)
+        // Record the covered lower bound + tip hash so a later widening / reorg re-checks.
+        if !incomplete, !tipHash.isEmpty {
+            try? await store?.setGeneral(key: stateHealWatermarkKey,
+                value: Data("\(lowest):\(tipHash)".utf8), atHeight: height)
         }
         if materialized > 0 {
             log.info("\(directory): self-healed state for \(materialized) retained block(s) in [\(lowest)...\(height)]")
