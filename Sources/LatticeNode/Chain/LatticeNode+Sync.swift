@@ -1315,6 +1315,17 @@ extension LatticeNode {
         var rootsByHeight: [UInt64: [String]] = [:]
         var blocksByHeight: [UInt64: Block] = [:]
 
+        // State-completeness on sync: for the heights this mode RETAINS (just the tip
+        // for stateful/retention, all for historical) materialize the FULL state-boundary
+        // closure (state root + sub-roots), not only each block's created diff. A synced
+        // node that stores only diffs faults every full-state read to the network (slow
+        // candidate build / serving); completing the closure here — the same primitive the
+        // live accept path uses — keeps cold state reads LOCAL. Not stateful/historical
+        // specific: any non-stateless mode gets its retained heights completed.
+        let syncTipHeight = blocks.first(where: { $0.blockHash == tipHash })?.blockHeight
+            ?? (blocks.map(\.blockHeight).max() ?? 0)
+        let retainedStateHeights = Set(retainedStateRootHeights(tipHeight: syncTipHeight))
+
         for meta in blocks {
             let blockHeader = VolumeImpl<Block>(rawCID: meta.blockHash, node: nil, encryptionInfo: nil)
             // The sync source peer is a guaranteed holder of every synced block
@@ -1399,6 +1410,8 @@ extension LatticeNode {
             }
 
             var blockToStore = block
+            var syncedPostState: LatticeState? = nil
+            var syncedDiff: StateDiff? = nil
             if config.storageMode != .stateless {
                 // Forward state recompute — NEVER resolveRecursive-fetch the state
                 // trie. A block's content bundle carries only the trie nodes it
@@ -1420,7 +1433,7 @@ extension LatticeNode {
                 do {
                     let prevState = try await block.prevState.resolve(fetcher: fetcher)
                     let bodies = transactions.orderedBodies
-                    let (postState, _) = try await prevState.proveAndUpdateState(
+                    let (postState, diff) = try await prevState.proveAndUpdateState(
                         allAccountActions: bodies.flatMap(\.accountActions),
                         allActions: bodies.flatMap(\.actions),
                         allDepositActions: bodies.flatMap(\.depositActions),
@@ -1450,6 +1463,8 @@ extension LatticeNode {
                         timestamp: block.timestamp,
                         nonce: block.nonce
                     )
+                    syncedPostState = postState
+                    syncedDiff = diff
                 } catch {
                     log.error("\(network.directory): failed to recompute synced state \(String(meta.blockHash.prefix(16)))…: \(error)")
                     return nil
@@ -1461,7 +1476,36 @@ extension LatticeNode {
                     log.error("\(network.directory): failed to store synced block content \(String(meta.blockHash.prefix(16)))…")
                     return nil
                 }
-                rootsByHeight[meta.blockHeight] = storedRoots
+                var allRoots = storedRoots
+                // Complete the full state-boundary closure (state root + sub-roots) for the
+                // heights this mode retains — the SAME completion the live accept path runs
+                // (storeAndPinAcceptedBlock → storeAcceptedStateDiffRoots). storeBlockData
+                // alone persists only this block's created diff; unchanged sub-state
+                // boundaries stay unhydrated, so full-state reads (candidate build, deep
+                // serving) fault to the network. Reusing the recomputed diff + post-state
+                // (no re-fetch), this materializes+pins the boundary roots locally.
+                if retainedStateHeights.contains(meta.blockHeight),
+                   let diff = syncedDiff, let post = syncedPostState {
+                    if let stateRoots = await storeAcceptedStateDiffRoots(
+                           block: blockToStore, stateDiff: diff, materializedPostState: post,
+                           network: network, source: FetcherContentSource(fetcher),
+                           directory: network.directory) {
+                        allRoots.append(contentsOf: stateRoots)
+                    } else if meta.blockHash == tipHash {
+                        // The TIP's full closure is load-bearing (candidate build / deep
+                        // serving). Fail CLOSED like the live accept path so a later sync
+                        // retries the boundary source-agnostically, rather than reporting
+                        // success with an incomplete tip state (the exact gap this fixes).
+                        log.error("\(network.directory): synced tip \(String(meta.blockHash.prefix(16)))… state-boundary completion failed — failing sync to retry")
+                        return nil
+                    } else {
+                        // A deep retained (historical) height: don't stall a large sync on
+                        // one momentarily-unfetchable boundary — it completes when a live
+                        // block re-folds it (storeAndPinAcceptedBlock). Surface the gap.
+                        log.warn("\(network.directory): synced height \(meta.blockHeight) state closure incomplete (diff-only) — completes on next live block")
+                    }
+                }
+                rootsByHeight[meta.blockHeight] = allRoots
             }
 
             if meta.blockHash == tipHash {
