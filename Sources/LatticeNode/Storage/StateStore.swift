@@ -1322,6 +1322,17 @@ public actor StateStore {
         return (hash: hash, height: UInt64(height))
     }
 
+    /// Every PoW-verified parent block hash this node has persisted, highest height
+    /// first. The proof self-heal fetches each by CID (source-agnostic) and heals the
+    /// child it commits when the bytes are available — divergence is irrelevant, only
+    /// data availability is.
+    public nonisolated func allParentHeaderHashes() -> [String] {
+        (try? readDb.query(
+            "SELECT parent_hash FROM parent_headers ORDER BY height DESC",
+            params: []
+        ))?.compactMap { $0["parent_hash"]?.textValue } ?? []
+    }
+
     public func persistChildParentAnchor(childHash: String, parentHash: String, height: UInt64) throws {
         do {
             _ = try db.transaction {
