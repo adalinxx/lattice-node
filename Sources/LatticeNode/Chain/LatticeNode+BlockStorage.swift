@@ -463,10 +463,11 @@ extension LatticeNode {
     public func blockProofExists(directory: String, blockHash: String) -> Bool {
         !(stateStores[chainKey(forDirectory: directory)]?.getBlockProofs(blockHash: blockHash).isEmpty ?? true)
     }
-    /// Every PoW-verified parent block hash this node holds for `directory` — the proof
-    /// self-heal fetches each by CID (source-agnostic) and heals what's available.
-    public func allVerifiedParentHashes(directory: String) -> [String] {
-        stateStores[chainKey(forDirectory: directory)]?.allParentHeaderHashes() ?? []
+    /// Up to `limit` PoW-verified parent block hashes this node holds for `directory`
+    /// (highest height first) — the proof self-heal fetches each by CID (source-agnostic)
+    /// and heals what's available.
+    public func allVerifiedParentHashes(directory: String, limit: Int) -> [String] {
+        stateStores[chainKey(forDirectory: directory)]?.allParentHeaderHashes(limit: limit) ?? []
     }
     func persistAcceptedChildParentAnchor(
         directory: String,

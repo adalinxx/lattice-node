@@ -1326,10 +1326,10 @@ public actor StateStore {
     /// first. The proof self-heal fetches each by CID (source-agnostic) and heals the
     /// child it commits when the bytes are available — divergence is irrelevant, only
     /// data availability is.
-    public nonisolated func allParentHeaderHashes() -> [String] {
+    public nonisolated func allParentHeaderHashes(limit: Int) -> [String] {
         (try? readDb.query(
-            "SELECT parent_hash FROM parent_headers ORDER BY height DESC",
-            params: []
+            "SELECT parent_hash FROM parent_headers ORDER BY height DESC LIMIT ?1",
+            params: [.int(Int64(limit))]
         ))?.compactMap { $0["parent_hash"]?.textValue } ?? []
     }
 
