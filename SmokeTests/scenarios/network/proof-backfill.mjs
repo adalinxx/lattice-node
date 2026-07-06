@@ -73,11 +73,15 @@ aChild.start([
 ])
 await aChild.waitForRPC()
 
-let after = 0
+// Wait for the heal to COMPLETE (count > 0 and stable, i.e. the walk finished) so we
+// measure the full re-derivation, not a mid-walk snapshot.
+let after = 0, prev = -1, stable = 0
 await waitFor(async () => {
   after = Number(q('SELECT COUNT(*) FROM block_proofs'))
-  process.stdout.write(`\r  proofs re-derived: ${after}   `)
-  return after > 0 ? after : null
+  stable = (after > 0 && after === prev) ? stable + 1 : 0
+  prev = after
+  process.stdout.write(`\r  proofs re-derived: ${after} (stable ${stable})   `)
+  return (after > 0 && stable >= 4) ? after : null   // healed + no growth ~8s
 }, 'node self-heals proofs from the Nexus chain', { timeoutMs: 150_000, intervalMs: 2000 }).catch(() => null)
 
 console.log(`\n  proofs after restart: ${after} (was ${before}, gapped ${gap})`)

@@ -114,9 +114,6 @@ public actor ParentChainBlockExtractor: IvyDelegate {
     private var backfillInProgress = false
     /// Depth bound for the proof-backfill parent-chain walk.
     private let maxProofBackfillBlocks = 50_000
-    /// Stop the walk after this many consecutive already-proofed parents, so a healthy
-    /// node stays ~O(1) instead of re-walking the whole chain every session.
-    private let proofBackfillHealedRunStop = 32
     private struct PendingHeaderRequest {
         let targetPeer: PeerID
         let resume: @Sendable ([(cid: String, data: Data)]) -> Void
@@ -569,7 +566,10 @@ public actor ParentChainBlockExtractor: IvyDelegate {
     ///  - Fold inherited (securing) work in-session (`applyInheritedWeight`) so this node's
     ///    fork choice matches a live-synced node immediately, not only after the next
     ///    restart's `restoreInheritedWeight`.
-    ///  - Early-stop after a run of already-proofed parents (a healthy node stays ~O(1)).
+    ///  - Validate each re-derived proof (`MinedChildBlockSelection.accepts`) before
+    ///    persisting, and promote the authoritative union inherited weight from the
+    ///    trusted parent (`refreshTrustedInheritedWeight`) so a self-healed node's fork
+    ///    choice matches a live-synced node (a child may be secured by multiple parents).
     private func backfillMissingChildProofs(ivy: Ivy, from peer: PeerID) async -> Bool {
         guard let node else { return false }
         // Depth-1 only: a direct child of the PoW root has parentChainPath == [root].
@@ -587,7 +587,7 @@ public actor ParentChainBlockExtractor: IvyDelegate {
 
         NodeLogger("sync").info("\(childDirectory): proof self-heal starting from local parent tip \(String(tip.prefix(16)))…")
         var currentCID: String? = tip
-        var backfilled = 0, walked = 0, healedRun = 0
+        var backfilled = 0, walked = 0
         for _ in 0..<maxProofBackfillBlocks {
             guard let cid = currentCID, !cid.isEmpty else { break }   // genesis: clean end
             // Only touch parents this node ALREADY PoW-verified; stop at the first
@@ -602,29 +602,33 @@ public actor ParentChainBlockExtractor: IvyDelegate {
             }
             walked += 1
             // The direct child this parent commits — targeted (not .list) so we don't
-            // materialize sibling children we don't need.
+            // materialize sibling children we don't need. Persist only a NOT-yet-proofed
+            // child whose re-derived proof PASSES the same acceptance gate the live path
+            // uses (so a self-healed node never persists/serves a proof a follower would
+            // reject). No early-stop on already-proofed runs: a full walk each session is
+            // O(verified-chain) once, and stopping early could skip an interior gap.
             if let childDict = try? await parentBlock.children.resolve(
                     paths: [[childDirectory]: .targeted], fetcher: fetcher).node,
                let childHeader: VolumeImpl<Block> = try? childDict.get(key: childDirectory),
                let childBlock = try? await childHeader.resolve(fetcher: fetcher).node,
-               let childCID = (try? VolumeImpl<Block>(node: childBlock))?.rawCID {
-                if await node.blockProofExists(directory: childDirectory, blockHash: childCID) {
-                    healedRun += 1
-                    if healedRun >= proofBackfillHealedRunStop { break }   // contiguously healed
-                } else {
-                    healedRun = 0
-                    if let proof = try? await ChildBlockProof.generate(
-                           rootHeader: parentHeader, childDirectory: childDirectory, fetcher: fetcher) {
-                        await node.persistAcceptedBlockProof(
-                            directory: childDirectory, height: childBlock.height,
-                            blockHash: childCID, proof: proof)
-                        // Fold inherited (securing) work now so fork choice matches a
-                        // live-synced node immediately (mirrors the live .duplicate path).
-                        _ = await node.applyInheritedWeight(
-                            directory: childDirectory, blockHash: childCID, proof: proof, source: source)
-                        backfilled += 1
-                    }
-                }
+               let childCID = (try? VolumeImpl<Block>(node: childBlock))?.rawCID,
+               !(await node.blockProofExists(directory: childDirectory, blockHash: childCID)),
+               let proof = try? await ChildBlockProof.generate(
+                   rootHeader: parentHeader, childDirectory: childDirectory, fetcher: fetcher),
+               await MinedChildBlockSelection.accepts(
+                   chainPath: (parentChainPath ?? []) + [childDirectory], block: childBlock,
+                   childCID: childCID, rootHash: parentBlock.proofOfWorkHash(), proof: proof) {
+                await node.persistAcceptedBlockProof(
+                    directory: childDirectory, height: childBlock.height,
+                    blockHash: childCID, proof: proof)
+                // Fold this proof's securing work, then promote the AUTHORITATIVE union
+                // weight from the trusted parent — a child may be secured by MULTIPLE
+                // parents, so the single re-derived proof alone would under-count fork
+                // choice vs a live-synced node.
+                _ = await node.applyInheritedWeight(
+                    directory: childDirectory, blockHash: childCID, proof: proof, source: source)
+                await refreshTrustedInheritedWeight(childHash: childCID, node: node)
+                backfilled += 1
             }
             currentCID = parentBlock.parent?.rawCID
         }
