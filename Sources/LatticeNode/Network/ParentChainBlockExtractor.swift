@@ -107,10 +107,16 @@ public actor ParentChainBlockExtractor: IvyDelegate {
 
     private let parentFetcherBroker = MemoryBroker(capacity: 512)
     private var parentFetcher: (ivyID: ObjectIdentifier, fetcher: IvyFetcher)?
-    /// One-shot per-session guard for the proof self-heal backfill (below).
+    /// One-shot per-session guard for the proof self-heal backfill (below); latched
+    /// only on a COMPLETED walk. `backfillInProgress` (check-and-set with no intervening
+    /// await) prevents two concurrent walks from a connect race.
     private var didBackfillChildProofs = false
+    private var backfillInProgress = false
     /// Depth bound for the proof-backfill parent-chain walk.
     private let maxProofBackfillBlocks = 50_000
+    /// Stop the walk after this many consecutive already-proofed parents, so a healthy
+    /// node stays ~O(1) instead of re-walking the whole chain every session.
+    private let proofBackfillHealedRunStop = 32
     private struct PendingHeaderRequest {
         let targetPeer: PeerID
         let resume: @Sendable ([(cid: String, data: Data)]) -> Void
@@ -345,22 +351,22 @@ public actor ParentChainBlockExtractor: IvyDelegate {
     // MARK: - IvyDelegate (nonisolated: called from Ivy's context, dispatch to actor)
 
     public nonisolated func ivy(_ ivy: Ivy, didConnect peer: PeerID) {
-        Task {
+        Task { [weak self] in
+            guard let self else { return }
             NodeLogger("parent-extractor").info("\(self.childDirectory): connected to parent peer \(String(peer.publicKey.prefix(12)))…")
             await self.maybeBackfillProofsOnConnect(ivy: ivy, from: peer)
         }
     }
 
-    /// On (re)connect to a parent peer, kick the proof self-heal from our last-known
-    /// parent tip (persisted `parent_headers`) — no chainAnnounce required, since a
-    /// frozen parent may never re-announce to a reconnecting child. Once-guarded.
+    /// On (re)connect to a parent peer, kick the proof self-heal — walking OUR OWN
+    /// verified parent chain from the last-known tip (never a peer-announced tip), so
+    /// an untrusted peer can neither steer the walk nor feed it unverified blocks.
     private func maybeBackfillProofsOnConnect(ivy: Ivy, from peer: PeerID) async {
-        guard !didBackfillChildProofs, let node else { return }
-        guard let tip = await node.highestParentHeaderHash(directory: childDirectory) else { return }
+        guard !didBackfillChildProofs, !backfillInProgress, node != nil else { return }
         // Let the just-established parent connection warm up (provider records +
         // block-serving handshake) before we pull the parent chain.
         try? await Task.sleep(for: .seconds(8))
-        await backfillChildProofsOnce(tipCID: tip, ivy: ivy, from: peer)
+        await backfillChildProofsOnce(ivy: ivy, from: peer)
     }
 
     public nonisolated func ivy(_ ivy: Ivy, didDisconnect peer: PeerID) {
@@ -453,10 +459,6 @@ public actor ParentChainBlockExtractor: IvyDelegate {
                 for (cid, data, proof) in branch.reversed() {
                     await self.handle(cid: cid, data: data, ivy: ivy, from: peer, inboundProofData: proof)
                 }
-                // Self-heal proof-gapped children once per session: the walk above
-                // stops at the first verified parent edge, so it never re-derives a
-                // known child's missing proof. Data present ⇒ recover derived state.
-                await self.backfillChildProofsOnce(tipCID: announce.tipCID, ivy: ivy, from: peer)
             }
 
         case "headerBatch":
@@ -540,23 +542,42 @@ public actor ParentChainBlockExtractor: IvyDelegate {
         return result
     }
 
-    /// Trigger `backfillMissingChildProofs` at most once per session so a proof-gapped
-    /// node self-heals without re-walking the parent chain on every announce/connect.
-    private func backfillChildProofsOnce(tipCID: String, ivy: Ivy, from peer: PeerID) async {
-        guard !didBackfillChildProofs else { return }
-        didBackfillChildProofs = true
-        await backfillMissingChildProofs(tipCID: tipCID, ivy: ivy, from: peer)
+    /// Run the proof self-heal at most once per session. Latches `didBackfillChildProofs`
+    /// only on a COMPLETED walk, so a transient fetch miss doesn't permanently disable
+    /// self-heal — a later connect retries. `backfillInProgress` (check-and-set with no
+    /// intervening await) serializes concurrent connect triggers to a single walk.
+    private func backfillChildProofsOnce(ivy: Ivy, from peer: PeerID) async {
+        guard !didBackfillChildProofs, !backfillInProgress else { return }
+        backfillInProgress = true
+        let completed = await backfillMissingChildProofs(ivy: ivy, from: peer)
+        backfillInProgress = false
+        if completed { didBackfillChildProofs = true }
     }
 
     /// Self-heal (data present ⇒ recover derived state): re-derive and persist every
-    /// missing direct-child ChildBlockProof by walking the parent chain from `tipCID`.
-    /// Unlike the live announce path (`fetchAnnouncedParentBranch`), this does NOT stop
-    /// at the first verified parent edge — a verified parent whose committed child is
-    /// proof-gapped still needs its proof re-derived so this node can serve
-    /// proof-carrying headers to followers. Idempotent: it only fills empty proofs, and
-    /// the same `ChildBlockProof.generate` the extractor uses guarantees byte-identity.
-    private func backfillMissingChildProofs(tipCID: String, ivy: Ivy, from peer: PeerID) async {
-        guard let node else { return }
+    /// missing direct-child ChildBlockProof by walking OUR OWN verified parent chain
+    /// from the last-known tip. Returns true if the walk completed cleanly (reached the
+    /// verified-chain boundary / genesis / a fully-healed run), false if it aborted on a
+    /// transient fetch miss (so `backfillChildProofsOnce` won't latch and a later connect
+    /// retries). Hardened per adversarial review:
+    ///  - LOCAL tip only + `hasVerifiedParentHeaderEdge` gate + stop at the first
+    ///    unverified parent: re-derive proofs ONLY for parents this node already
+    ///    PoW-verified, never from peer-steerable/unverified data (no amplification vector).
+    ///  - Depth-1 only: `generate` yields a single hop; a deeper child's live proof is
+    ///    COMPOSED across levels, so re-deriving one hop would persist a wrong-anchored
+    ///    proof. Skip non-direct children rather than write invalid proofs.
+    ///  - Fold inherited (securing) work in-session (`applyInheritedWeight`) so this node's
+    ///    fork choice matches a live-synced node immediately, not only after the next
+    ///    restart's `restoreInheritedWeight`.
+    ///  - Early-stop after a run of already-proofed parents (a healthy node stays ~O(1)).
+    private func backfillMissingChildProofs(ivy: Ivy, from peer: PeerID) async -> Bool {
+        guard let node else { return false }
+        // Depth-1 only: a direct child of the PoW root has parentChainPath == [root].
+        guard (parentChainPath?.count ?? 0) == 1 else {
+            NodeLogger("sync").info("\(childDirectory): proof self-heal skipped — non-direct child (parent depth \(parentChainPath?.count ?? 0)); composed-proof backfill unsupported")
+            return true
+        }
+        guard let tip = await node.highestParentHeaderHash(directory: childDirectory) else { return true }
         let parentIvyFetcher = parentIvyFetcher(for: ivy)
         let childFetcher = await node.network(for: childDirectory)?.ivyFetcher
         let source: any ContentSource = childFetcher.map {
@@ -564,40 +585,51 @@ public actor ParentChainBlockExtractor: IvyDelegate {
         } ?? IvyContentSource(parentIvyFetcher)
         let fetcher: Fetcher = CoalescingFetcher(source)
 
-        NodeLogger("sync").info("\(childDirectory): proof self-heal starting from parent tip \(String(tipCID.prefix(16)))…")
-        var currentCID: String? = tipCID
-        var backfilled = 0
-        var walked = 0
+        NodeLogger("sync").info("\(childDirectory): proof self-heal starting from local parent tip \(String(tip.prefix(16)))…")
+        var currentCID: String? = tip
+        var backfilled = 0, walked = 0, healedRun = 0
         for _ in 0..<maxProofBackfillBlocks {
-            guard let cid = currentCID, !cid.isEmpty else { break }
-            walked += 1
-            await ivy.recordProvider(rootCID: cid, peer: peer)
-            // Use the extraction's own fetcher (child-ivy → parent-ivy composite,
-            // wave-batched) rather than a raw blocking fetchVolume, so a slow/absent
-            // peer doesn't wedge the walk.
+            guard let cid = currentCID, !cid.isEmpty else { break }   // genesis: clean end
+            // Only touch parents this node ALREADY PoW-verified; stop at the first
+            // unverified parent — the boundary of our vetted chain. This is what kills
+            // the attacker-tip vector and bounds the walk to real history.
+            guard await node.hasVerifiedParentHeaderEdge(directory: childDirectory, blockHash: cid) else { break }
             guard let data = try? await fetcher.fetch(rawCid: cid),
                   let parentBlock = Block(data: data),
-                  ChainNetwork.blockCIDMatches(cid, block: parentBlock) else { break }
-            let parentHeader = try! VolumeImpl<Block>(node: parentBlock)
-            // The direct child this parent commits (children[childDirectory]).
+                  ChainNetwork.blockCIDMatches(cid, block: parentBlock),
+                  let parentHeader = try? VolumeImpl<Block>(node: parentBlock) else {
+                return false   // transient fetch miss: don't latch — retry on a later connect
+            }
+            walked += 1
+            // The direct child this parent commits — targeted (not .list) so we don't
+            // materialize sibling children we don't need.
             if let childDict = try? await parentBlock.children.resolve(
-                    paths: [[""]: .list], fetcher: fetcher).node,
+                    paths: [[childDirectory]: .targeted], fetcher: fetcher).node,
                let childHeader: VolumeImpl<Block> = try? childDict.get(key: childDirectory),
-               let childBlock = try? await childHeader.resolve(fetcher: fetcher).node {
-                let childCID = try! VolumeImpl<Block>(node: childBlock).rawCID
-                let hasProof = await node.blockProofExists(directory: childDirectory, blockHash: childCID)
-                if !hasProof,
-                   let proof = try? await ChildBlockProof.generate(
-                       rootHeader: parentHeader, childDirectory: childDirectory, fetcher: fetcher) {
-                    await node.persistAcceptedBlockProof(
-                        directory: childDirectory, height: childBlock.height,
-                        blockHash: childCID, proof: proof)
-                    backfilled += 1
+               let childBlock = try? await childHeader.resolve(fetcher: fetcher).node,
+               let childCID = (try? VolumeImpl<Block>(node: childBlock))?.rawCID {
+                if await node.blockProofExists(directory: childDirectory, blockHash: childCID) {
+                    healedRun += 1
+                    if healedRun >= proofBackfillHealedRunStop { break }   // contiguously healed
+                } else {
+                    healedRun = 0
+                    if let proof = try? await ChildBlockProof.generate(
+                           rootHeader: parentHeader, childDirectory: childDirectory, fetcher: fetcher) {
+                        await node.persistAcceptedBlockProof(
+                            directory: childDirectory, height: childBlock.height,
+                            blockHash: childCID, proof: proof)
+                        // Fold inherited (securing) work now so fork choice matches a
+                        // live-synced node immediately (mirrors the live .duplicate path).
+                        _ = await node.applyInheritedWeight(
+                            directory: childDirectory, blockHash: childCID, proof: proof, source: source)
+                        backfilled += 1
+                    }
                 }
             }
             currentCID = parentBlock.parent?.rawCID
         }
-        NodeLogger("sync").info("\(childDirectory): proof self-heal done — backfilled \(backfilled) child proof(s), walked \(walked) parent block(s)")
+        NodeLogger("sync").info("\(childDirectory): proof self-heal done — backfilled \(backfilled), walked \(walked) parent block(s)")
+        return true
     }
 
     private func requiresInboundParentProof() async -> Bool {
