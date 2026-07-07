@@ -195,6 +195,38 @@ final class ContentServeSufficiencyTests: XCTestCase {
         }
     }
 
+    /// REVIEWER P1 (round 2): pin-reachability ALONE is not the serve predicate. A tx-value
+    /// root can be pin-reachable purely because it is an entry inside a pinned block bundle,
+    /// while its OWN grouping is missing — the serve gate then still refuses it
+    /// (`fetchVolumeLocal(root:)` is empty). So the recovery skip must use the full predicate
+    /// (`servableRootPayload`): pin-reachable AND non-empty own grouping.
+    func testPinReachableEntryWithoutOwnGroupingIsNotServable() async throws {
+        let disk = try tempDisk()
+        let network = try await makeNetwork(disk: disk)
+        let block = try await buildGenesisWithTxs(1, fetcher: cas())
+        let blockHash = try VolumeImpl<Block>(node: block).rawCID
+        let txValueRoot = try XCTUnwrap(block.transactions.node?.allKeysAndValues().values.first?.rawCID)
+
+        // Store ONLY the block-root grouping (which carries the tx-value bare root as an
+        // entry/edge), NOT the tx-value's own grouping — the exact shallow-recovery residue.
+        let storer = BrokerStorer(broker: disk)
+        try VolumeImpl<Block>(node: block).storeRecursively(storer: storer)
+        let blockBundleOnly = storer.collectVolumes(root: blockHash).filter { $0.root == blockHash }
+        try await network.storeVolumesDurably(blockBundleOnly)
+        try await network.pinBatchDurably(roots: [blockHash], owner: "Nexus:0")
+
+        // The tx-value root IS pin-reachable (entry of the pinned block bundle)...
+        let txReachable = await disk.isPinReachable(cid: txValueRoot)
+        XCTAssertTrue(txReachable, "tx-value root is pin-reachable via the block-bundle edge")
+        // ...but it has NO own grouping, so the serve gate refuses it and the skip must too.
+        let payload = await network.servableRootPayload(for: txValueRoot)
+        XCTAssertNil(payload,
+            "pin-reachable but no own grouping → NOT servable; an isPinReachable-only skip would wrongly skip it")
+        // And the block root itself IS servable (own grouping present + pinned).
+        let blockPayload = await network.servableRootPayload(for: blockHash)
+        XCTAssertNotNil(blockPayload, "block root is servable (own grouping + pinned)")
+    }
+
     /// INVARIANT: a block stored via the real node closure path and pinned at its
     /// root must be fully CONTENT-resolvable by a follower that can only fetch whole
     /// groupings by root. If this fails, the served block bundle is missing a node

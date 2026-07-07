@@ -660,19 +660,21 @@ extension LatticeNode {
                 log.warn("\(directory): reconstructBlockVolumes: could not content-resolve block \(String(blockHash.prefix(16)))… at height \(i)")
                 continue
             }
-            // The P2P serve gate (ChainNetwork+IvyDelegate `volumeData`) serves a root ONLY
-            // when it is PIN-REACHABLE — durable existence is not enough. A prior run may
-            // have written the volumes but crashed (or `pinBatchDurably` failed) between the
-            // store and the pin, leaving the block/tx roots present yet unservable; a
-            // durable-volume skip would then wrongly treat them as done. Compute the
+            // Skip only when every served boundary is genuinely servable over P2P, using
+            // the SAME predicate the serve gate applies (`servableRootPayload`): a root must
+            // be BOTH pin-reachable AND have its own non-empty grouping. Durable existence,
+            // or pin-reachability alone, is insufficient — a tx-value root can be
+            // pin-reachable purely because it is an entry inside a pinned block bundle while
+            // its OWN grouping is missing (the exact shallow-recovery failure), and a prior
+            // run may have stored volumes but crashed before `pinBatchDurably`. Compute the
             // AUTHORITATIVE served-boundary set (block root, spec, every per-tx volume, and
             // any other owned sub-volume) the same way `storeBlockData` does — against a
-            // throwaway in-memory broker, so no disk write — and skip ONLY when every one is
-            // pin-reachable. Otherwise fall through: `storeBlockData` + `pinBatchDurably` are
-            // idempotent and re-pin whatever a prior interrupted run left unpinned.
+            // throwaway in-memory broker, so no disk write. When any root is not servable,
+            // fall through: `storeBlockData` + `pinBatchDurably` are idempotent and rebuild /
+            // re-pin whatever a prior interrupted or shallow run left missing.
             let servedRoots = await storeBlockData(block, broker: MemoryBroker()) ?? []
             var servable = !servedRoots.isEmpty
-            for r in servedRoots where !(await network.diskBroker.isPinReachable(cid: r)) {
+            for r in servedRoots where (await network.servableRootPayload(for: r)) == nil {
                 servable = false
                 break
             }
