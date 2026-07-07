@@ -645,18 +645,40 @@ extension LatticeNode {
         var reconstructed = 0
         for i in lowest...height {
             guard let blockHash = await chainState.getMainChainBlockHash(atIndex: i) else { continue }
-            if await network.hasDurableVolume(rootCID: blockHash) { continue }
             let stub = VolumeImpl<Block>(rawCID: blockHash, node: nil, encryptionInfo: nil)
-            guard let block = try? await stub.resolve(source: source).node else {
-                log.warn("\(directory): reconstructBlockVolumes: could not resolve block \(String(blockHash.prefix(16)))… at height \(i)")
+            // A durable block ROOT volume is NOT sufficient. A block's transactions resolve
+            // into per-tx sub-volumes, each carrying a tx BODY as its own servable grouping.
+            // The prior recovery here shallow-resolved (`resolve(...).node` leaves
+            // transactions UNHYDRATED), so `storeRecursively` SKIPPED them and rebuilt only a
+            // bare root volume — every tx-value grouping stayed missing. A peer's root-keyed
+            // volume responder then notFounds on the tx body, so a synced follower downloads
+            // all headers but can never materialize block content. Content-resolve
+            // (`resolveBlockContent` = spec/transactions/children, hydrated from local CAS) so
+            // `storeRecursively` rebuilds every tx-value grouping and its body. postState is
+            // materialized separately and is intentionally NOT resolved here.
+            guard let block = try? await stub.resolveBlockContent(source: source).node else {
+                log.warn("\(directory): reconstructBlockVolumes: could not content-resolve block \(String(blockHash.prefix(16)))… at height \(i)")
                 continue
             }
+            // Idempotent skip only when the WHOLE content closure is already servable: the
+            // root volume AND every tx-value grouping. `hasDurableVolume(blockHash)` alone is
+            // exactly what the shallow bug satisfied while the tx bodies were stranded.
+            var servable = await network.hasDurableVolume(rootCID: blockHash)
+            if servable, let txDict = block.transactions.node, let txs = try? txDict.allKeysAndValues() {
+                for tx in txs.values where !(await network.hasDurableVolume(rootCID: tx.rawCID)) {
+                    servable = false
+                    break
+                }
+            } else {
+                servable = false
+            }
+            if servable { continue }
             guard let roots = await storeBlockData(block, network: network), !roots.isEmpty else { continue }
             try? await network.pinBatchDurably(roots: roots, owner: "\(network.ownerNamespace):\(i)")
             reconstructed += 1
         }
         if reconstructed > 0 {
-            log.info("\(directory): reconstructed \(reconstructed) missing block root volume(s) in [\(lowest)...\(height)] for P2P header serving")
+            log.info("\(directory): reconstructed \(reconstructed) block closure(s) (full sub-volume reindex) in [\(lowest)...\(height)] for P2P serving + content materialization")
         }
     }
 
