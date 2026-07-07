@@ -660,17 +660,21 @@ extension LatticeNode {
                 log.warn("\(directory): reconstructBlockVolumes: could not content-resolve block \(String(blockHash.prefix(16)))… at height \(i)")
                 continue
             }
-            // Idempotent skip only when the WHOLE content closure is already servable: the
-            // root volume AND every tx-value grouping. `hasDurableVolume(blockHash)` alone is
-            // exactly what the shallow bug satisfied while the tx bodies were stranded.
-            var servable = await network.hasDurableVolume(rootCID: blockHash)
-            if servable, let txDict = block.transactions.node, let txs = try? txDict.allKeysAndValues() {
-                for tx in txs.values where !(await network.hasDurableVolume(rootCID: tx.rawCID)) {
-                    servable = false
-                    break
-                }
-            } else {
+            // The P2P serve gate (ChainNetwork+IvyDelegate `volumeData`) serves a root ONLY
+            // when it is PIN-REACHABLE — durable existence is not enough. A prior run may
+            // have written the volumes but crashed (or `pinBatchDurably` failed) between the
+            // store and the pin, leaving the block/tx roots present yet unservable; a
+            // durable-volume skip would then wrongly treat them as done. Compute the
+            // AUTHORITATIVE served-boundary set (block root, spec, every per-tx volume, and
+            // any other owned sub-volume) the same way `storeBlockData` does — against a
+            // throwaway in-memory broker, so no disk write — and skip ONLY when every one is
+            // pin-reachable. Otherwise fall through: `storeBlockData` + `pinBatchDurably` are
+            // idempotent and re-pin whatever a prior interrupted run left unpinned.
+            let servedRoots = await storeBlockData(block, broker: MemoryBroker()) ?? []
+            var servable = !servedRoots.isEmpty
+            for r in servedRoots where !(await network.diskBroker.isPinReachable(cid: r)) {
                 servable = false
+                break
             }
             if servable { continue }
             guard let roots = await storeBlockData(block, network: network), !roots.isEmpty else { continue }

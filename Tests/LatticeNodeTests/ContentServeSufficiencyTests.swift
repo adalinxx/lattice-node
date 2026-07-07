@@ -163,6 +163,38 @@ final class ContentServeSufficiencyTests: XCTestCase {
             "FIX CONFIRMED: resolveBlockContent recovery preserves the tx-value grouping (body servable)")
     }
 
+    /// REVIEWER P1: the recovery skip must gate on PIN-REACHABILITY (the actual P2P serve
+    /// predicate in `volumeData`), not durable existence. A run that stored the volumes but
+    /// crashed / had `pinBatchDurably` fail before pinning leaves them durable-but-unpinned:
+    /// `hasDurableVolume` == true yet `isPinReachable` == false, so the serve gate refuses
+    /// them. This locks in that the two predicates diverge exactly in that window, and that
+    /// pinning every served root closes it.
+    func testDurableButUnpinnedIsNotServable() async throws {
+        let disk = try tempDisk()
+        let network = try await makeNetwork(disk: disk)
+        let block = try await buildGenesisWithTxs(1, fetcher: cas())
+        let blockHash = try VolumeImpl<Block>(node: block).rawCID
+
+        // Store durably but DO NOT pin — models a crash/failure between store and pin.
+        let storer = BrokerStorer(broker: disk)
+        try VolumeImpl<Block>(node: block).storeRecursively(storer: storer)
+        let volumes = storer.collectVolumes(root: blockHash)   // also populates storer.storedRoots
+        try await network.storeVolumesDurably(volumes)
+
+        let durable = await network.hasDurableVolume(rootCID: blockHash)
+        let reachableBefore = await disk.isPinReachable(cid: blockHash)
+        XCTAssertTrue(durable, "volume is durably stored")
+        XCTAssertFalse(reachableBefore,
+            "durable but NOT pin-reachable — the serve gate refuses it, so a hasDurableVolume skip is wrong")
+
+        // Pinning every served root makes the whole closure servable.
+        try await network.pinBatchDurably(roots: storer.storedRoots, owner: "Nexus:0")
+        for r in storer.storedRoots {
+            let ok = await disk.isPinReachable(cid: r)
+            XCTAssertTrue(ok, "served root not pin-reachable after pin: \(r)")
+        }
+    }
+
     /// INVARIANT: a block stored via the real node closure path and pinned at its
     /// root must be fully CONTENT-resolvable by a follower that can only fetch whole
     /// groupings by root. If this fails, the served block bundle is missing a node
