@@ -168,29 +168,23 @@ final class ChildSyncGossipRescueTests: XCTestCase {
         )
     }
 
-    /// Rescue boundary, case 2 — CHARACTERIZATION OF A KNOWN GAP (this test
-    /// pins today's behavior; it is NOT an endorsement of it).
+    /// Rescue boundary, case 2 — the held-heavier connector rescue (formerly a
+    /// characterization of a permanent stall; flipped now that the rescue
+    /// transport is wired).
     ///
     /// The heavier-secured branch is offered newest-first while the follower's
     /// cheap branch is TALLER — the realistic shape of the canonical branch
-    /// reaching a follower parked on a cheaper fork. Today the follower CANNOT
-    /// be rescued:
-    ///  - the interior connector BELOW the local tip height is hard-rejected by
-    ///    the gossip pipeline's height-monotonicity guard
-    ///    (processBlockAndRecoverReorgUnlocked: `block.height < localHeight`),
-    ///    so the heavier branch can never become contiguously body-present;
-    ///  - Lattice's held-heavier convergence transport
-    ///    (`ChainLevel.backfillHeldHeavierSubtree` /
-    ///    `chain.heldHeavierBackfillTarget()`) has NO call site in the node, so
-    ///    a held heavier subtree never requests its missing interior bodies;
-    ///  - child-chain SYNC admission is fast-forward-only by design, so sync
-    ///    cannot deliver the competing branch either.
-    ///
-    /// Net: gossip fork choice rescues only a fork at depth 1 (the equal-height
-    /// sibling swap proven above). Any deeper cheap-branch parking is permanent.
-    /// When the missing rescue transport is wired, this test MUST be flipped to
-    /// assert convergence on the heavier branch (tip == b2).
-    func testGossipCannotYetRescueCheaperTallerBranchWithForkBelowTipHeight() async throws {
+    /// reaching a follower parked on a cheaper fork:
+    ///  - B2 (equal height) is accepted DETACHED: the chain records its missing
+    ///    parent B1 in `missingBlockHashes` (a held, not-yet-connectable branch);
+    ///  - B1's push is still hard-rejected by the gossip height-monotonicity
+    ///    guard (cheap-DoS protection, unchanged) — but its fully verified
+    ///    evidence (bytes + committing anchor + work proofs) is cached;
+    ///  - the connector rescue replays the cached B1 precisely because the
+    ///    chain declared it missing (pull-shaped admission), the branch becomes
+    ///    contiguously body-present, and fork choice — the sole switch
+    ///    authority — reorgs onto the heavier-secured tip B2.
+    func testHeldHeavierRescueConvergesCheaperTallerBranchWithForkBelowTipHeight() async throws {
         let (node, fixture, nexusGenesis, midGenesis) = try await makeChildNode()
         let chainMaybe = await node.chain(for: "Mid")
         let chain = try XCTUnwrap(chainMaybe)
@@ -226,25 +220,27 @@ final class ChildSyncGossipRescueTests: XCTestCase {
         )
 
         // Deliver newest-first, the realistic gossip shape for a follower that
-        // just came back online. TODAY: B1 (height 1 < local tip height 2) is
-        // hard-rejected by the height-monotonicity guard, so the heavier branch
-        // can never connect, and the follower stays parked on the cheap branch.
+        // just came back online. B1 (height 1 < local tip height 2) is still
+        // hard-rejected by the push height-monotonicity guard — the rescue is
+        // PULL-shaped: its verified evidence is cached and replayed only
+        // because the chain declared B1 a missing ancestor of held B2.
         let b2Result = await node.submitProvenChildBlock(chainPath: ["Nexus", "Mid"], block: b2.block, proof: b2.proof)
         let b1Result = await node.submitProvenChildBlock(chainPath: ["Nexus", "Mid"], block: b1.block, proof: b1.proof)
         XCTAssertEqual(
             b1Result.status, .rejected,
-            "PINS THE GAP: the heavier branch's interior connector below the local tip height is undeliverable via gossip — flip this test to assert convergence once a held-heavier rescue transport exists"
+            "the push height guard must still drop the below-tip connector at arrival (the rescue is pull, not a guard relaxation)"
         )
 
-        // Give fork choice every chance to converge; today it cannot.
+        // The connector rescue drains asynchronously: B1 replays, the branch
+        // connects, and fork choice must converge on the heavier-secured B2.
         var tip = await chain.getMainChainTip()
-        for _ in 0..<20 where tip != b2.midCID {
+        for _ in 0..<100 where tip != b2.midCID {
             try await Task.sleep(for: .milliseconds(100))
             tip = await chain.getMainChainTip()
         }
         XCTAssertEqual(
-            tip, a2.midCID,
-            "PINS THE GAP: the follower remains on the cheaper taller branch (b2Result=\(b2Result.status), b1Result=\(b1Result.status)) — no gossip rescue for forks deeper than the tip sibling"
+            tip, b2.midCID,
+            "held-heavier rescue must converge the follower onto the heavier-secured branch (b2Result=\(b2Result.status), b1Result=\(b1Result.status))"
         )
     }
 }
