@@ -1267,7 +1267,27 @@ extension LatticeNode {
         }
 
         do {
-            try await chainState.resetFrom(result.persisted, retentionDepth: config.retentionDepth)
+            // Anchored (mid-chain) segments: `result.persisted` contains ONLY
+            // the segment, so resetFrom(it) would shrink the in-memory window
+            // to the segment and under-count windowed cumulative work until a
+            // restart re-projects it — temporarily weakening the whole-window
+            // admission compare (review High). The durable commit above just
+            // made prefix+segment contiguous in the authoritative store, so
+            // reproject the FULL retained window from it instead — the same
+            // walk boot recovery uses. Genesis-rooted results already ARE the
+            // full window and keep the direct path.
+            var projection = result.persisted
+            if lowest.blockHeight > 0 {
+                let source = recoverySource(directory: directory, network: network)
+                if let rebuilt = await Self.rebuildChainState(
+                    tipCID: result.tipBlockHash, source: source, retentionDepth: config.retentionDepth) {
+                    projection = rebuilt
+                    log.info("\(directory): reprojected full retained window from durable store after anchored sync")
+                } else {
+                    log.warn("\(directory): could not reproject retained window after anchored sync; using segment-only projection (window heals on restart)")
+                }
+            }
+            try await chainState.resetFrom(projection, retentionDepth: config.retentionDepth)
         } catch {
             log.error("\(directory): failed to project synced state into ChainState: \(error)")
             await markChainUnhealthy(directory: directory, reason: "failed to project synced state after durable commit")
