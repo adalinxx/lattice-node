@@ -158,7 +158,14 @@ extension LatticeNode {
 
         // Pre-check: if estimated peer work is clearly less than ours, skip the
         // bandwidth cost — the sync would fail with insufficientWork anyway.
-        if localWork > UInt256.zero && estimatedPeerWork < localWork {
+        // Own-target estimate veto — ROOT chains only. A child chain's real
+        // weight is the securing work in its anchoring proofs (child-only
+        // carriers may have a near-trivial own target), which this estimate
+        // cannot see — vetoing a child sync on own-work silently freezes
+        // followers behind a carrier-era chain. Child chains fall through to
+        // the height gate here; the real work decision happens at admission,
+        // after the segment's proofs are downloaded and verified.
+        if network.chainPath.count == 1, localWork > UInt256.zero, estimatedPeerWork < localWork {
             return false
         }
 
@@ -375,11 +382,27 @@ extension LatticeNode {
             let allowedCandidates = Array((await network.ivy.connectedPeers).shuffled()
                 .filter { syncTally.shouldAllow(peer: $0) }
                 .prefix(HeaderChain.maxSyncCandidatePeers * 2))
+            // Segment-anchored catch-up: hand the walk this node's RETAINED
+            // main-chain CIDs as stop points, so it terminates at the fork point
+            // instead of walking clear back to genesis. Without this, every sync
+            // must download a full genesis-anchored header path — impossible once
+            // the chain outgrows any single peer's served window (retention
+            // pruning), which froze every follower with genesisMismatch retry
+            // loops. Restricting the stop set to the retained window (never the
+            // pruned prefix) is what makes the aboveHeight work comparison below
+            // sound: the local side of the compare can always be fully summed.
+            var knownCIDs: Set<String> = []
+            if let localChain = await chain(forPath: network.chainPath) {
+                let tipHeight = await localChain.getHighestBlockHeight()
+                let floor = tipHeight > config.retentionDepth ? tipHeight - config.retentionDepth : 0
+                knownCIDs = await localChain.mainChainHashesFrom(index: floor)
+            }
             let headers = try await headerChain.downloadHeaders(
                 peerTipCID: activeTip,
                 fetcher: fetcher,
                 genesisBlockHash: genesisResult.blockHash,
                 localWork: localWork,
+                knownBlockCIDs: knownCIDs,
                 network: network,
                 sourcePeer: activeSourcePeer,
                 candidatePeers: allowedCandidates,
@@ -413,14 +436,77 @@ extension LatticeNode {
                 retentionDepth: config.retentionDepth,
                 validateBlockConsensus: true
             )
+            // If the walk stopped at one of OUR retained main-chain blocks (the
+            // fork point), validate the segment against a trusted-local anchor
+            // CONTEXT (attach block + enough local ancestors for the retarget/
+            // MTP windows) and compare work fork-point-relative: segment work
+            // vs local work strictly above the attach point. Comparing a
+            // partial segment against the WHOLE local chain would refuse every
+            // catch-up (the segment can never outweigh a chain that includes
+            // its own shared prefix).
+            var knownAnchors: [SyncBlockHeader] = []
+            var localWorkForAdmission = localWork
+            // downloadHeaders returns OLDEST-FIRST; the attach point is the
+            // oldest header's parent.
+            if let oldest = headers.first, let anchorCID = oldest.previousBlockCID,
+               anchorCID != genesisResult.blockHash, knownCIDs.contains(anchorCID),
+               let localChain = await chain(forPath: network.chainPath),
+               // CHILD chains anchor only as a pure FAST-FORWARD (attach == the
+               // current local tip): a child sync must never decide a REORG on
+               // own-target work sums — child-fork weight is trueCumWork
+               // (subtree + inherited securing work), owned by gossip fork
+               // choice. Appending fully-validated, proof-carrying blocks to
+               // our own tip evicts nothing and is exactly the frozen-follower
+               // catch-up this path exists for. Root chains keep the fork-point
+               // compare (headers are self-PoW-verified there).
+               await isAnchorEligible(anchorCID: anchorCID, chainPath: network.chainPath, localChain: localChain) {
+                var cursor: String? = anchorCID
+                var context: [SyncBlockHeader] = []
+                var contextDepth = ChainSyncer.requiredAnchorContextDepth(
+                    retargetWindow: genesisResult.block.spec.node?.retargetWindow ?? 0)
+                while let cid = cursor, context.count < Int(contextDepth),
+                      let block = try? await VolumeImpl<Block>(rawCID: cid).resolve(fetcher: fetcher).node {
+                    if context.isEmpty, let attachWindow = block.spec.node?.retargetWindow {
+                        // Depth per the ATTACH block's spec (a spec update may
+                        // have raised the window since genesis).
+                        contextDepth = max(contextDepth, ChainSyncer.requiredAnchorContextDepth(retargetWindow: attachWindow))
+                    }
+                    context.append(SyncBlockHeader(
+                        cid: cid,
+                        height: block.height,
+                        previousBlockCID: block.parent?.rawCID,
+                        target: block.target,
+                        nextTarget: block.nextTarget,
+                        timestamp: block.timestamp,
+                        specCID: block.spec.rawCID,
+                        spec: block.spec.node
+                    ))
+                    cursor = block.parent?.rawCID
+                }
+                // Only anchor when the context is deep enough for consensus
+                // validation of the first segment headers (or reaches genesis):
+                // an under-deep context would fail validation anyway, so fall
+                // back to the legacy genesis-anchored path in that case. This
+                // means fork points within contextDepth of the retention floor
+                // cannot anchor — log it distinctly rather than loop silently.
+                let reachedGenesis = context.last?.height == 0
+                if let attach = context.first,
+                   context.count >= Int(contextDepth) || reachedGenesis {
+                    knownAnchors = context.reversed()   // oldest-first, ending at attach
+                    localWorkForAdmission = await localChain.getCumulativeWork(aboveHeight: attach.height)
+                } else {
+                    log.warn("\(network.directory): segment fork point \(String(anchorCID.prefix(16)))… too close to the retention floor to anchor (context \(context.count)/\(contextDepth)); falling back to genesis-anchored sync")
+                }
+            }
             let headersForSync = HeaderChain.headersByInheritingMissingSpecCIDs(
                 headers,
-                initialSpecCID: genesisResult.block.spec.rawCID
+                initialSpecCID: knownAnchors.last?.specCID ?? genesisResult.block.spec.rawCID
             )
             let result = try await syncer.syncFromHeaders(
                 headersForSync,
                 cumulativeWork: headerChain.totalWork,
-                localCumulativeWork: localWork
+                localCumulativeWork: localWorkForAdmission,
+                knownAnchors: knownAnchors
             )
 
             log.info("Sync complete: height \(result.tipBlockHeight), applying to chain...")
@@ -550,6 +636,22 @@ extension LatticeNode {
         }
     }
 
+    /// Serves the CID-addressed entries carried inside the synced blocks'
+    /// ChildBlockProofs before falling back to the network fetcher. Child-only
+    /// CARRIER blocks exist only as proof material — no CAS anywhere serves
+    /// their bytes — so the parent-continuity walk must read them from the
+    /// proofs the sync already downloaded and verified (this is exactly how
+    /// live proof-relay ingestion records the same edges). Safe against junk
+    /// entries: every consumer re-derives the CID from the bytes before use.
+    private struct ProofEntriesFirstFetcher: Fetcher {
+        let entries: [String: Data]
+        let base: Fetcher
+        func fetch(rawCid: String) async throws -> Data {
+            if let data = entries[rawCid] { return data }
+            return try await base.fetch(rawCid: rawCid)
+        }
+    }
+
     func validateSyncedParentAnchorConsistency(
         directory: String,
         headers: [SyncBlockHeader],
@@ -557,6 +659,20 @@ extension LatticeNode {
         fetcher: Fetcher
     ) async throws -> [String: ParentAnchor] {
         guard let store = stateStores[chainKey(forDirectory: directory)] else { return [:] }
+        // Collect every proof's CAS entries up front so the continuity walk
+        // below can resolve carrier blocks that only exist as proof material.
+        var proofEntryBytes: [String: Data] = [:]
+        for proofData in proofs.values {
+            guard let decoded = ChildBlockProofEnvelope.deserialize(proofData) else { continue }
+            for proof in decoded {
+                for entry in proof.entries where proofEntryBytes[entry.cid] == nil {
+                    proofEntryBytes[entry.cid] = entry.data
+                }
+            }
+        }
+        let continuityFetcher: Fetcher = proofEntryBytes.isEmpty
+            ? fetcher
+            : ProofEntriesFirstFetcher(entries: proofEntryBytes, base: fetcher)
         var anchorsByChild: [String: [ParentAnchor]] = [:]
         for header in headers where header.height > 0 {
             guard let proofData = proofs[header.cid],
@@ -611,7 +727,7 @@ extension LatticeNode {
             }
             if let previousChild = header.previousBlockCID, header.height > 1 {
                 guard let currentRoot = selected.prevStateCID,
-                      let previousChildData = try? await fetcher.fetch(rawCid: previousChild),
+                      let previousChildData = try? await continuityFetcher.fetch(rawCid: previousChild),
                       let previousChildBlock = Block(data: previousChildData),
                       try VolumeImpl<Block>(node: previousChildBlock).rawCID == previousChild else {
                     NodeLogger("sync").warn("\(directory): synced child header \(String(header.cid.prefix(16)))… cannot resolve previous child block for parent state root continuity")
@@ -632,7 +748,7 @@ extension LatticeNode {
                         previousRoot: previousRoot,
                         currentRoot: currentRoot,
                         committingParentHash: selected.blockHash,
-                        fetcher: fetcher
+                        fetcher: continuityFetcher
                     )
                 }
                 guard backfilled,
@@ -908,11 +1024,61 @@ extension LatticeNode {
     /// makes it strictly heavier and the network converges on that. Admission
     /// stays verify-not-trust: the synced chain passed full PoW + consensus
     /// validation in the header path before reaching here.
-    private func admitSyncedChainAgainstCurrentChain(
+    /// Anchor eligibility for a downloaded segment: root chains may anchor at
+    /// any retained main-chain fork point; child chains only at the CURRENT
+    /// tip (pure fast-forward — see the call site and admission for why).
+    func isAnchorEligible(anchorCID: String, chainPath: [String], localChain: ChainState) async -> Bool {
+        if chainPath.count == 1 { return true }
+        return anchorCID == (await localChain.getMainChainTip())
+    }
+
+    func admitSyncedChainAgainstCurrentChain(
         _ result: SyncResult,
         chainState: ChainState,
         chainPath: [String]
     ) async -> SyncAdmissionDecision {
+        // Segment-anchored result: when the synced segment attaches to a block
+        // that is on OUR CURRENT main chain, it competes only against the local
+        // blocks strictly above that fork point — the shared prefix cancels on
+        // both sides. Comparing the segment against the whole local chain would
+        // refuse every catch-up shorter than the local chain itself. The
+        // isOnMainChain check is re-evaluated HERE (post-materialization), so a
+        // reorg that removed the anchor mid-sync falls through to the legacy
+        // whole-chain compare and fails closed. Exact ties still hold the
+        // incumbent (strictly-greater compare, unchanged).
+        let sortedBlocks = result.persisted.blocks.sorted { $0.blockHeight < $1.blockHeight }
+        // CHILD chains admit ONLY pure fast-forwards of the current tip via
+        // sync — enforced HERE at the single admission choke point so no
+        // branch below can decide a child reorg on own-target work sums (a
+        // below-retention fork otherwise reaches the legacy whole-window
+        // compare, where a long cheap-target fork with no inherited securing
+        // work could outweigh the properly-secured chain — audit P2-1). Child
+        // fork resolution belongs exclusively to gossip fork choice
+        // (trueCumWork = subtree + inherited securing work).
+        if chainPath.count > 1 {
+            let currentTip = await chainState.getMainChainTip()
+            guard let lowest = sortedBlocks.first, lowest.blockHeight > 0,
+                  lowest.parentBlockHash == currentTip else {
+                return .refuse
+            }
+            let localBeyondFork = await chainState.getCumulativeWork(aboveHeight: lowest.blockHeight - 1)
+            if Self.shouldAdmitSyncedChain(peerWork: result.cumulativeWork, localWork: localBeyondFork) { return .admit }
+            return .refuse
+        }
+        if let lowest = sortedBlocks.first, lowest.blockHeight > 0,
+           let anchorCID = lowest.parentBlockHash,
+           await chainState.isOnMainChain(hash: anchorCID) {
+            // ROOT chains compare at the fork point: their headers are
+            // self-PoW-verified, so segment work vs local-work-above-fork is
+            // the correct Nakamoto comparison. (Children never reach here —
+            // handled fast-forward-only above.) NOTE: a root gap larger than
+            // retentionDepth truncates the result below the retained window
+            // (lowest.parent off the main chain) and intentionally falls to
+            // the legacy whole-window compare below.
+            let localBeyondFork = await chainState.getCumulativeWork(aboveHeight: lowest.blockHeight - 1)
+            if Self.shouldAdmitSyncedChain(peerWork: result.cumulativeWork, localWork: localBeyondFork) { return .admit }
+            return .refuse
+        }
         let localWork = await localCumulativeWork(chainPath: chainPath)
         if Self.shouldAdmitSyncedChain(peerWork: result.cumulativeWork, localWork: localWork) { return .admit }
         return .refuse
@@ -1156,7 +1322,16 @@ extension LatticeNode {
         directory: String,
         fetcher: Fetcher
     ) async -> [PreparedAcceptedBlockEffects]? {
-        let txSource = await buildMempoolAwareSource(directory: directory, baseFetcher: fetcher)
+        // Grain-independent, LOCAL-FIRST resolution for the synced replay: the
+        // recompute reads state-trie grains that exist in the local CAS but are
+        // NOT servable volume roots, so the wave-batched IvyContentSource (a
+        // remote volume-root optimization the baseFetcher overload would pick
+        // here) reports notFound for bytes this node already holds — killing
+        // the publish of an otherwise-valid deep catch-up. FetcherContentSource
+        // over IvyFetcher is the documented semantics-exact bridge: per-CID,
+        // local broker first, remote poll second.
+        let txSource = await buildMempoolAwareSource(
+            directory: directory, baseSource: FetcherContentSource(fetcher))
         var prepared: [PreparedAcceptedBlockEffects] = []
         prepared.reserveCapacity(blocks.count)
         for meta in blocks {

@@ -21,7 +21,9 @@ let package = Package(
         // Lattice 16.0.0 = 15.0.0 + inherited work credited per-grind (MAX cleared
         // difficulty, counted once by rootCID), not per-level (SUM). Consensus-breaking at
         // depth >= 2; depth-1 (direct children) byte-identical.
-        .package(url: "https://github.com/adalinxx/Lattice.git", exact: "16.0.0"),
+        // TEMP-BRANCH for fix/sync-known-anchor iteration — restore to the tagged
+        // exact pin (16.1.0) before merge.
+        .package(url: "https://github.com/adalinxx/Lattice.git", branch: "fix/segment-anchor-sync"),
         // cashew 3.2.0 = 3.1.0 + Overlay/Composite ContentSource composition
         // adapters (Module 2: generic adapters co-located with the protocol).
         // cashew 3.3.0 = 3.2.0 + Header.walkOwnedSubtree (Module 11: generic
