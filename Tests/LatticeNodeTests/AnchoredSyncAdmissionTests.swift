@@ -226,6 +226,24 @@ final class AnchoredSyncAdmissionTests: XCTestCase {
         }
     }
 
+    /// Review P2: every stop point offered to the header walk must be
+    /// anchorable — stop points within contextDepth of the retention floor are
+    /// excluded so a stopped walk never strands the sync with a segment that
+    /// can neither anchor (context too shallow) nor reach genesis (already
+    /// truncated at the stop).
+    func testAnchorableStopFloorExcludesNearFloorStops() {
+        // Deep chain: floor sits contextDepth above the retention floor.
+        XCTAssertEqual(LatticeNode.anchorableStopFloor(tipHeight: 2000, retentionDepth: 1000, contextDepth: 12),
+                       1012)
+        // Tip just past retention+context: still elevated.
+        XCTAssertEqual(LatticeNode.anchorableStopFloor(tipHeight: 1013, retentionDepth: 1000, contextDepth: 12),
+                       25)
+        // Short chains: everything anchorable or genesis-reachable — floor 0.
+        XCTAssertEqual(LatticeNode.anchorableStopFloor(tipHeight: 1012, retentionDepth: 1000, contextDepth: 12), 0)
+        XCTAssertEqual(LatticeNode.anchorableStopFloor(tipHeight: 500, retentionDepth: 1000, contextDepth: 12), 0)
+        XCTAssertEqual(LatticeNode.anchorableStopFloor(tipHeight: 0, retentionDepth: 1000, contextDepth: 12), 0)
+    }
+
     // MARK: - Helpers
 
     private enum FixtureError: Error { case unavailable }

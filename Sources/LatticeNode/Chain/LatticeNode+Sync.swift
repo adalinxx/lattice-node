@@ -394,7 +394,12 @@ extension LatticeNode {
             var knownCIDs: Set<String> = []
             if let localChain = await chain(forPath: network.chainPath) {
                 let tipHeight = await localChain.getHighestBlockHeight()
-                let floor = tipHeight > config.retentionDepth ? tipHeight - config.retentionDepth : 0
+                let contextDepthFloor = ChainSyncer.requiredAnchorContextDepth(
+                    retargetWindow: genesisResult.block.spec.node?.retargetWindow ?? 0)
+                let floor = Self.anchorableStopFloor(
+                    tipHeight: tipHeight,
+                    retentionDepth: config.retentionDepth,
+                    contextDepth: contextDepthFloor)
                 knownCIDs = await localChain.mainChainHashesFrom(index: floor)
             }
             let headers = try await headerChain.downloadHeaders(
@@ -495,7 +500,12 @@ extension LatticeNode {
                     knownAnchors = context.reversed()   // oldest-first, ending at attach
                     localWorkForAdmission = await localChain.getCumulativeWork(aboveHeight: attach.height)
                 } else {
-                    log.warn("\(network.directory): segment fork point \(String(anchorCID.prefix(16)))… too close to the retention floor to anchor (context \(context.count)/\(contextDepth)); falling back to genesis-anchored sync")
+                    // Defense-in-depth: the stop set (anchorableStopFloor)
+                    // should make this unreachable. If hit, the truncated
+                    // segment cannot validate (it neither anchors nor reaches
+                    // genesis) — log loudly; the sync attempt will fail and
+                    // retry against a fresh download.
+                    log.warn("\(network.directory): segment fork point \(String(anchorCID.prefix(16)))… lacks anchor context (\(context.count)/\(contextDepth)) despite the anchorable stop floor — sync attempt will fail validation")
                 }
             }
             let headersForSync = HeaderChain.headersByInheritingMissingSpecCIDs(
@@ -1024,6 +1034,21 @@ extension LatticeNode {
     /// makes it strictly heavier and the network converges on that. Admission
     /// stays verify-not-trust: the synced chain passed full PoW + consensus
     /// validation in the header path before reaching here.
+    /// Lowest height offered to the header walk as a stop point. Every stop
+    /// point must be ANCHORABLE: the anchor context needs `contextDepth` local
+    /// ancestors below it (or to reach genesis), so stop points within
+    /// `contextDepth` of the retention floor are excluded — the walk continues
+    /// past them to a deeper (anchorable) block or to genesis. Without this, a
+    /// walk stopped at a near-floor block strands the sync: the segment is
+    /// already truncated at that stop, no anchor context can be built, and the
+    /// genesis-anchored validation can only ever fail on it (review P2).
+    /// Near genesis (tip within retention + context) everything is anchorable
+    /// or genesis-reachable, so the floor is 0.
+    static func anchorableStopFloor(tipHeight: UInt64, retentionDepth: UInt64, contextDepth: UInt64) -> UInt64 {
+        guard tipHeight > retentionDepth + contextDepth else { return 0 }
+        return tipHeight - retentionDepth + contextDepth
+    }
+
     /// Anchor eligibility for a downloaded segment: root chains may anchor at
     /// any retained main-chain fork point; child chains only at the CURRENT
     /// tip (pure fast-forward — see the call site and admission for why).
