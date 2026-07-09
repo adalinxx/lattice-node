@@ -17,17 +17,28 @@ final class ChainApplyTests: XCTestCase {
     private let candidate = CandidateExtension(
         tipCID: "bafycandidate", tipHeight: 589, claimedWork: UInt256(1_000), source: nil)
 
+    /// Test gather kinds (the payload for `.complete` is the candidate itself).
+    private enum GatherKind { case complete, incomplete, mismatch(String) }
+
     /// Build a `ChainApply` whose steps return the given results and log their calls.
+    /// `Gathered = CandidateExtension` — gather passes the candidate through.
     private func makeApply(
         log: CallLog,
         heavier: Bool = true,
-        gather: GatherResult = .complete,
+        gather: GatherKind = .complete,
         validate: ValidationResult = .valid,
         adopt: AdoptResult = .adopted
-    ) -> ChainApply {
+    ) -> ChainApply<CandidateExtension> {
         ChainApply(
             isStrictlyHeavier: { _ in await log.add("forkChoice"); return heavier },
-            gather: { _ in await log.add("gather"); return gather },
+            gather: { c in
+                await log.add("gather")
+                switch gather {
+                case .complete:        return .complete(c)
+                case .incomplete:      return .incomplete
+                case .mismatch(let r): return .contentMismatch(r)
+                }
+            },
             validate: { _ in await log.add("validate"); return validate },
             adopt: { _ in await log.add("adopt"); return adopt }
         )
@@ -59,7 +70,7 @@ final class ChainApplyTests: XCTestCase {
 
     func testInvalidWhenContentMismatch() async {
         let log = CallLog()
-        let outcome = await makeApply(log: log, gather: .contentMismatch("cid≠hash")).apply(candidate)
+        let outcome = await makeApply(log: log, gather: .mismatch("cid≠hash")).apply(candidate)
         XCTAssertEqual(outcome, .invalid(reason: "cid≠hash"), "content-binding failure is attributable → invalid")
         let steps = await log.steps
         XCTAssertEqual(steps, ["forkChoice", "gather"])

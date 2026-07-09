@@ -45,9 +45,12 @@ extension ChainOutcome {
     }
 }
 
-/// Result of gathering a candidate's reachable blocks/proofs by content hash.
-enum GatherResult: Equatable, Sendable {
-    case complete                  // everything reachable is present + content-bound
+/// Result of gathering a candidate's reachable blocks/proofs by content hash. On
+/// success it CARRIES the gathered payload (`Gathered`) that `validate` and `adopt`
+/// then consume — e.g. the downloaded+persisted segment for sync, or the resolved
+/// block for gossip. This data flow is what lets `apply()` wrap real node code.
+enum GatherOutcome<Gathered: Sendable>: Sendable {
+    case complete(Gathered)        // everything reachable is present + content-bound
     case incomplete                // some bytes not fetchable yet (transient, not fraud)
     case contentMismatch(String)   // bytes served don't hash to their CID (attributable)
 }
@@ -73,16 +76,17 @@ enum AdoptResult: Equatable, Sendable {
 /// Collaborators are injected as closures so the whole contract is testable with
 /// fakes — no actor, no live network. The real wiring passes closures that call the
 /// node's fork-choice / fetcher / validator / commit paths.
-struct ChainApply: Sendable {
+struct ChainApply<Gathered: Sendable>: Sendable {
     /// Cheap pre-filter: is the candidate plausibly heavier (may use claimedWork)?
     /// Not authoritative — `adopt` re-checks against verified data under the lock.
     var isStrictlyHeavier: @Sendable (CandidateExtension) async -> Bool
-    /// Fetch the reachable blocks/proofs by content hash from any peer/CAS.
-    var gather: @Sendable (CandidateExtension) async -> GatherResult
+    /// Fetch the reachable blocks/proofs by content hash from any peer/CAS, producing
+    /// the `Gathered` payload that `validate`/`adopt` consume.
+    var gather: @Sendable (CandidateExtension) async -> GatherOutcome<Gathered>
     /// PoW + proofs + state re-execution over the gathered data.
-    var validate: @Sendable (CandidateExtension) async -> ValidationResult
-    /// Re-check fork choice under the commit lock, then commit/reorg.
-    var adopt: @Sendable (CandidateExtension) async -> AdoptResult
+    var validate: @Sendable (Gathered) async -> ValidationResult
+    /// Re-check fork choice under the commit lock, then commit/reorg the gathered data.
+    var adopt: @Sendable (Gathered) async -> AdoptResult
 
     func apply(_ candidate: CandidateExtension) async -> ChainOutcome {
         // 1. Fork choice first — cheapest gate. A not-heavier candidate is dropped
@@ -93,19 +97,20 @@ struct ChainApply: Sendable {
         // 2. Availability — gather the reachable path. Missing bytes are NOT a
         //    validity verdict: they are transient and retried. Only bytes that fail
         //    content binding are attributable and rejected here.
+        let gathered: Gathered
         switch await gather(candidate) {
         case .incomplete:              return .pendingUnavailable
         case .contentMismatch(let r):  return .invalid(reason: r)
-        case .complete:                break
+        case .complete(let g):         gathered = g
         }
 
         // 3. Validate — verify-not-trust: PoW + proofs + re-execute state.
-        if case .invalid(let r) = await validate(candidate) { return .invalid(reason: r) }
+        if case .invalid(let r) = await validate(gathered) { return .invalid(reason: r) }
 
         // 4. Adopt — the authoritative fork-choice re-check happens HERE, under the
         //    commit lock, because the local chain may have advanced during 2–3. A
         //    transient commit-time miss retries rather than dead-ends.
-        switch await adopt(candidate) {
+        switch await adopt(gathered) {
         case .adopted:                 return .adopted(tipCID: candidate.tipCID)
         case .supersededByHeavierLocal: return .ignoredLighter
         case .transientFailure:        return .pendingUnavailable
