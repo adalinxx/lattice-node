@@ -179,7 +179,9 @@ extension LatticeNode {
         activeSyncGaps[syncKey] = gap
         let task = Task { [weak self] in
             guard let self = self else { return }
-            await withTaskGroup(of: Void.self) { group in
+            // Race the sync against the timeout; the winner's ChainOutcome (nil = the
+            // timeout fired first) drives the retry decision below.
+            let outcome: ChainOutcome? = await withTaskGroup(of: ChainOutcome?.self) { group in
                 group.addTask {
                     await self.performHeadersFirstSync(
                         peerTipCID: peerTipCID,
@@ -190,37 +192,38 @@ extension LatticeNode {
                 }
                 group.addTask {
                     _ = await sleepUnlessCancelled(syncTimeout)
+                    return nil
                 }
-                await group.next()
+                let first = await group.next() ?? nil
                 group.cancelAll()
+                return first
             }
             if Task.isCancelled {
                 let log = NodeLogger("sync")
                 log.warn("Sync timed out — will retry on next peer block")
             }
 
-            // Transient-failure retry. A sync that downloaded a strictly-heavier
-            // peer chain but could not materialize its content — e.g. the source
-            // peer JUST restarted (a partition heal) and was not serving its
-            // volumes yet — leaves the local tip unchanged WITHOUT marking the tip
-            // refused. The trigger to retry is normally "next peer block / new
-            // announcement", but an announce-driven target is intentionally not
-            // recorded in `knownPeerTips` (unvalidated), and a stopped/idle source
-            // never re-announces — so the node would otherwise wait forever on a
-            // gap that is one fetch away from closing. Re-attempt the SAME target
-            // with bounded backoff; a genuinely-unreachable peer simply exhausts
-            // the budget, and a work-refused tip is skipped (it IS marked refused).
-            if let peerTipHeight, retryCount < Self.maxSyncRetries, !Task.isCancelled,
-               let chainState = await self.chain(forPath: network.chainPath) {
-                let localHeight = await chainState.getHighestBlockHeight()
-                let localTip = await chainState.getMainChainTip()
-                if localHeight < peerTipHeight, !(await self.isRefusedSyncTip(peerTipCID, localTip: localTip)) {
-                    await self.clearSyncTaskForRetry(network: network)
-                    let backoffSeconds = UInt64(min(30, 1 << min(retryCount, 5)))   // 1,2,4,8,16,30…
-                    guard await sleepUnlessCancelled(.seconds(backoffSeconds)) else { return }
-                    await self.startSync(peerTipCID: peerTipCID, network: network, gap: gap, sourcePeer: sourcePeer, peerTipHeight: peerTipHeight, retryCount: retryCount + 1)
-                    return
-                }
+            // Transient-failure retry, driven by the sync OUTCOME (not height). A sync
+            // that downloaded a strictly-heavier peer chain but could not materialize
+            // its content — e.g. the source peer JUST restarted (a partition heal) and
+            // was not serving its volumes yet — returns `.pendingUnavailable`. The
+            // trigger to retry is normally "next peer block / new announcement", but an
+            // announce-driven target is not recorded in `knownPeerTips` (unvalidated),
+            // and a stopped/idle source never re-announces — so the node would wait
+            // forever on a gap one fetch from closing. Crucially, the peer can be
+            // strictly heavier at the SAME or LOWER height (work-aware fork choice), so
+            // a height-gated retry would miss it entirely. Re-attempt the SAME target
+            // with bounded backoff while the outcome is retriable-transient (a content
+            // miss or a timeout, `outcome == nil`); a genuinely-unreachable peer simply
+            // exhausts the budget. TERMINAL outcomes stop: `.adopted` (done),
+            // `.ignoredLighter` (work-refused — retrying is churn), `.invalid` (bad
+            // data), `.degraded` (local failure — not fixable by waiting).
+            if (outcome?.isRetriableTransient ?? true), retryCount < Self.maxSyncRetries, !Task.isCancelled {
+                await self.clearSyncTaskForRetry(network: network)
+                let backoffSeconds = UInt64(min(30, 1 << min(retryCount, 5)))   // 1,2,4,8,16,30…
+                guard await sleepUnlessCancelled(.seconds(backoffSeconds)) else { return }
+                await self.startSync(peerTipCID: peerTipCID, network: network, gap: gap, sourcePeer: sourcePeer, peerTipHeight: peerTipHeight, retryCount: retryCount + 1)
+                return
             }
             await self.clearSyncTask(completedNetwork: network)
         }
@@ -314,7 +317,10 @@ extension LatticeNode {
         }
     }
 
-    func performHeadersFirstSync(peerTipCID: String, network: ChainNetwork, sourcePeer: PeerID? = nil, peerTipHeight: UInt64? = nil) async {
+    /// Returns the terminal `ChainOutcome` of the attempt so `startSync` can decide
+    /// whether to retry: `.pendingUnavailable` (content miss / timeout / threw) is
+    /// retriable regardless of height; every other outcome is terminal.
+    func performHeadersFirstSync(peerTipCID: String, network: ChainNetwork, sourcePeer: PeerID? = nil, peerTipHeight: UInt64? = nil) async -> ChainOutcome {
         let log = NodeLogger("sync")
         log.info("Starting headers-first sync from \(String(peerTipCID.prefix(16)))...")
 
@@ -565,6 +571,7 @@ extension LatticeNode {
             }
 
             log.info("Headers-first sync complete")
+            return outcome
 
         } catch {
             let peerCount2 = await network.ivy.peerConnectionCount
@@ -584,6 +591,10 @@ extension LatticeNode {
                 await prefetch.value
             }
             log.error("Headers-first sync failed: \(error)")
+            // A throw = the attempt did not complete = transient. A reshuffled retry
+            // (bounded) can re-reach the tip via other peers; a genuinely-dead source
+            // just exhausts the budget. Terminal validity is decided at finalize, not here.
+            return .pendingUnavailable
         }
     }
 
@@ -1949,7 +1960,9 @@ extension LatticeNode {
         await withTaskGroup(of: Void.self) { group in
             for candidate in candidates {
                 group.addTask { [weak self] in
-                    await self?.performHeadersFirstSync(
+                    // Recursive child wave: children reorg via gossip / held-heavier
+                    // rescue, not this transient-retry loop, so the outcome is discarded.
+                    _ = await self?.performHeadersFirstSync(
                         peerTipCID: candidate.tipCID,
                         network: candidate.network
                     )

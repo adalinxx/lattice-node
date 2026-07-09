@@ -35,6 +35,14 @@ extension ChainOutcome {
     /// `finalizeSyncResult` while call sites migrate to the full outcome.)
     var wasAdopted: Bool { if case .adopted = self { return true } else { return false } }
 
+    /// Should a bounded transient-failure retry be scheduled for this outcome? ONLY a
+    /// content-availability miss retries by waiting — and it retries regardless of
+    /// height (a strictly-heavier-at-same-or-lower-height chain is exactly the case a
+    /// height-gated retry misses). `.adopted`/`.ignoredLighter`/`.invalid`/`.degraded`
+    /// are terminal: retrying churns (lighter), is futile (invalid), or can't be fixed
+    /// by waiting (degraded/local failure).
+    var isRetriableTransient: Bool { if case .pendingUnavailable = self { return true } else { return false } }
+
     /// Metric suffix so each outcome is observable — the transient case (the seed-496
     /// class) must be a visible signal, not a silent stall.
     var metricSuffix: String {

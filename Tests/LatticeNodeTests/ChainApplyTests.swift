@@ -114,4 +114,15 @@ final class ChainApplyTests: XCTestCase {
         XCTAssertEqual(ChainOutcome.degraded(reason: "r").metricSuffix, "degraded",
                        "degraded is a distinct signal from pending_unavailable (not 'retriable by waiting')")
     }
+
+    /// Retry gating: ONLY a content-availability miss retries by waiting; every other
+    /// outcome is terminal. (This is what makes startSync re-attempt a strictly-heavier
+    /// chain at the same/lower height — the case a height-gated retry misses.)
+    func testOnlyPendingUnavailableIsRetriableTransient() {
+        XCTAssertTrue(ChainOutcome.pendingUnavailable.isRetriableTransient)
+        XCTAssertFalse(ChainOutcome.adopted(tipCID: "x").isRetriableTransient, "adopted is done")
+        XCTAssertFalse(ChainOutcome.ignoredLighter.isRetriableTransient, "work-refused → retry is churn")
+        XCTAssertFalse(ChainOutcome.invalid(reason: "r").isRetriableTransient, "bad data → no retry")
+        XCTAssertFalse(ChainOutcome.degraded(reason: "r").isRetriableTransient, "local failure → not fixable by waiting")
+    }
 }
