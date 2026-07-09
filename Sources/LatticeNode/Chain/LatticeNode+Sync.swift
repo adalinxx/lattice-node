@@ -542,7 +542,7 @@ extension LatticeNode {
             case .invalid(let reason):
                 log.warn("\(network.directory): sync rejected invalid chain: \(reason)")
             case .degraded(let reason):
-                log.error("\(network.directory): sync could not publish — chain degraded: \(reason) (marked unhealthy; not retriable by waiting)")
+                log.error("\(network.directory): sync could not publish — local storage/config failure: \(reason) (not retriable by waiting)")
             }
 
             // F5-4: child blocks just synced carry verified anchoring proofs. Persist

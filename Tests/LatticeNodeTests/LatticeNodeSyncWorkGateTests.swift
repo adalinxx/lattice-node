@@ -122,6 +122,32 @@ final class LatticeNodeSyncWorkGateTests: XCTestCase {
         }
     }
 
+    /// A heavier result with an EMPTY canonical segment passes the work gate but fails
+    /// the non-empty-segment guard → `.degraded` (a LOCAL structural failure, distinct
+    /// from a content miss's `.pendingUnavailable` — degraded is not retriable-by-waiting).
+    func testFinalizeReturnsDegradedOnEmptyCanonicalSegment() async throws {
+        try await withSyncNode { node in
+            let originalTip = await node.lattice.nexus.chain.getMainChainTip()
+            let localWork = await node.localCumulativeWork(chainPath: ["Nexus"])
+            let maybeNetwork = await node.network(forPath: ["Nexus"])
+            let network = try XCTUnwrap(maybeNetwork)
+            let fetcher = await network.ivyFetcher
+            let empty = PersistedChainState(
+                chainTip: "bafyempty", tipPostStateCID: nil, tipPrevStateCID: nil, tipSpecCID: nil,
+                tipTarget: nil, tipNextTarget: nil, tipHeight: nil, tipTimestamp: nil,
+                mainChainHashes: [], blocks: [], parentChainMap: [:], missingBlockHashes: [])
+            let result = SyncResult(
+                persisted: empty, tipBlockHash: "bafyempty", tipBlockHeight: 999,
+                cumulativeWork: localWork + UInt256(1))
+
+            let outcome = await node.finalizeSyncResult(result, localWork: localWork, network: network, fetcher: fetcher)
+
+            XCTAssertEqual(outcome, .degraded(reason: "missing StateStore or empty canonical segment"))
+            let tipAfter = await node.lattice.nexus.chain.getMainChainTip()
+            XCTAssertEqual(tipAfter, originalTip, "a structural failure must not change the committed tip")
+        }
+    }
+
     private func withSyncNode(_ body: (LatticeNode) async throws -> Void) async throws {
         let keyPair = CryptoUtils.generateKeyPair()
         let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
