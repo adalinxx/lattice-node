@@ -557,7 +557,7 @@ extension LatticeNode {
             log.info("Headers-first sync complete")
 
         } catch {
-            let peerCount2 = await network.ivy.directPeerCount
+            let peerCount2 = await network.ivy.peerConnectionCount
             // Don't blacklist the (honest) tip CID when the failure was lying peers —
             // they were already Tally-penalized; a reshuffled retry should re-reach the
             // tip via other peers. Blacklisting the content would lock honest peers out
@@ -2004,7 +2004,7 @@ extension LatticeNode {
 
     func verifySyncWithPeers(tipCID: String, tipHeight: UInt64, network: ChainNetwork) async {
         let log = NodeLogger("sync")
-        let peerCount = await network.ivy.directPeerCount
+        let peerCount = await network.ivy.peerConnectionCount
         if peerCount < 2 {
             log.warn("Sync completed with only \(peerCount) peer(s) — insufficient for cross-verification")
             return
