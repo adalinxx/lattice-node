@@ -252,7 +252,7 @@ extension LatticeNode {
             syncTasks.removeAll()
             activeSyncGaps.removeAll()
         }
-        failedSyncTips.removeAll()
+        syncOutcomes.clearFailed()
         updateSyncActiveMetric()
 
         // Replay gossip blocks that arrived while sync was running. These were
@@ -1006,14 +1006,13 @@ extension LatticeNode {
     }
 
     func recordRefusedSyncTip(_ peerTip: String, localTip: String) {
-        if refusedSyncTipPairs.count > 512 { refusedSyncTipPairs.removeAll() }
-        refusedSyncTipPairs.insert("\(peerTip)|\(localTip)")
+        syncOutcomes.recordRefused(peerTip: peerTip, localTip: localTip)
     }
 
     /// Was `peerTip` already fully synced and refused while our tip was `localTip`?
     /// Re-syncing it is pure churn until either tip changes.
     func isRefusedSyncTip(_ peerTip: String, localTip: String) -> Bool {
-        refusedSyncTipPairs.contains("\(peerTip)|\(localTip)")
+        syncOutcomes.isRefused(peerTip: peerTip, localTip: localTip)
     }
 
     enum SyncAdmissionDecision {
@@ -1975,7 +1974,7 @@ extension LatticeNode {
         for peer in connectedPeers {
             guard let entry = tips[peer.publicKey] else { continue }
             guard tally.shouldAllow(peer: peer) else { continue }
-            guard !failedSyncTips.contains(entry.tipCID) else { continue }
+            guard !syncOutcomes.isFailed(tip: entry.tipCID) else { continue }
             if best == nil || entry.height > best!.height {
                 best = (key: peer.publicKey, height: entry.height, tipCID: entry.tipCID, peer: peer)
             }
@@ -1989,7 +1988,7 @@ extension LatticeNode {
         // Targeting it is safe: the headers-first path fully validates (PoW +
         // cumulative work) before any adoption.
         if let defaultTipHeight,
-           !failedSyncTips.contains(defaultTipCID),
+           !syncOutcomes.isFailed(tip: defaultTipCID),
            best == nil || defaultTipHeight > best!.height {
             return (defaultTipCID, anyAllowedPeer)
         }
@@ -1997,7 +1996,7 @@ extension LatticeNode {
            let connectedPreferred = connectedPeers.first(where: { $0.publicKey == preferredPeer.publicKey }),
            let preferredEntry = tips[preferredPeer.publicKey],
            tally.shouldAllow(peer: connectedPreferred),
-           !failedSyncTips.contains(preferredEntry.tipCID),
+           !syncOutcomes.isFailed(tip: preferredEntry.tipCID),
            best == nil || preferredEntry.height >= best!.height {
             // Preferred peer is a source hint for this announced tip, not fork
             // choice. Header validation and cumulative work still decide adoption.

@@ -26,6 +26,33 @@ enum SyncAttemptOutcome: Equatable, Sendable {
     case admitted
 }
 
+/// Co-locates the two former sync failure caches behind one typed store (step
+/// toward the unified `SyncAttemptOutcome` model). BEHAVIOR-PRESERVING: it keeps
+/// the two distinct lifecycles the code relies on today — a `refused` set keyed
+/// `peerTip|localTip` that is sticky (only a >512 flush, so it frees when a tip
+/// changes and the key stops matching), and a `failed` set keyed by tip CID that
+/// gates peer selection and is cleared on peer-connect / sync-completion. Unifying
+/// their *lifecycles* into a single outcome state machine is the follow-on
+/// behavior change (needs the fake-availability harness to test — see plan F1/F2).
+struct SyncOutcomeStore: Sendable {
+    private var refused: Set<String> = []
+    private var failed: Set<String> = []
+
+    // refused (deterministic, work-verified) — sticky until a tip changes.
+    mutating func recordRefused(peerTip: String, localTip: String) {
+        if refused.count > 512 { refused.removeAll() }
+        refused.insert("\(peerTip)|\(localTip)")
+    }
+    func isRefused(peerTip: String, localTip: String) -> Bool {
+        refused.contains("\(peerTip)|\(localTip)")
+    }
+
+    // failed (transient) — gates peer selection; cleared on connect / completion.
+    mutating func recordFailed(tip: String) { failed.insert(tip) }
+    func isFailed(tip: String) -> Bool { failed.contains(tip) }
+    mutating func clearFailed() { failed.removeAll() }
+}
+
 extension SyncPolicy {
 
     /// Backoff (seconds) for a transient-unavailable retry — bounded exponential,
