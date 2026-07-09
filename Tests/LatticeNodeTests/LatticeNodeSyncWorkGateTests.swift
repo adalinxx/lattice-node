@@ -95,6 +95,33 @@ final class LatticeNodeSyncWorkGateTests: XCTestCase {
         }
     }
 
+    /// F2 repro (the seed-496 class): a STRICTLY HEAVIER peer chain whose content is
+    /// not fetchable must resolve to `.pendingUnavailable` — NOT adopted, and crucially
+    /// NOT the same as a work-refusal (`.ignoredLighter`). The old `Bool` return
+    /// collapsed this into `false`, indistinguishable from "refused forever" → the
+    /// silent stall. This pins the distinction the fix depends on.
+    func testFinalizeReturnsPendingUnavailableWhenContentUnavailable() async throws {
+        try await withSyncNode { node in
+            let originalTip = await node.lattice.nexus.chain.getMainChainTip()
+            let localWork = await node.localCumulativeWork(chainPath: ["Nexus"])
+            // Heavier than local, but the block content was never stored → materialize
+            // cannot resolve it.
+            let fixture = try await Self.makeUnavailablePeerSyncFixture(on: node, cumulativeWork: localWork + UInt256(1))
+
+            let outcome = await node.finalizeSyncResult(
+                fixture.result, localWork: localWork, network: fixture.network, fetcher: fixture.fetcher)
+
+            XCTAssertEqual(outcome, .pendingUnavailable,
+                           "heavier but unfetchable → pending (retry), never adopted and never a refusal")
+            let tip = await node.lattice.nexus.chain.getMainChainTip()
+            XCTAssertEqual(tip, originalTip, "unavailable content must not change the committed tip")
+            // And it must NOT be memoized as refused (that would wrongly make a transient
+            // miss permanent until our own tip moves — the stuck-refusal class).
+            let isRefused = await node.isRefusedSyncTip(fixture.result.tipBlockHash, localTip: tip)
+            XCTAssertFalse(isRefused, "a transient content miss must NOT be recorded as a permanent refusal")
+        }
+    }
+
     private func withSyncNode(_ body: (LatticeNode) async throws -> Void) async throws {
         let keyPair = CryptoUtils.generateKeyPair()
         let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -136,6 +163,38 @@ final class LatticeNodeSyncWorkGateTests: XCTestCase {
             throw SyncFixtureError.storeFailed
         }
 
+        let peerChain = ChainState.fromGenesis(block: genesis.block)
+        let peerHeader = try VolumeImpl<Block>(node: peerBlock)
+        _ = await peerChain.submitBlock(parentBlockHeaderAndIndex: nil, blockHeader: peerHeader, block: peerBlock)
+        await peerChain.updateTipSnapshot(block: peerBlock)
+        let persisted = await peerChain.persist()
+        let result = SyncResult(
+            persisted: persisted,
+            tipBlockHash: peerHeader.rawCID,
+            tipBlockHeight: peerBlock.height,
+            cumulativeWork: cumulativeWork
+        )
+        return (network, fetcher, result)
+    }
+
+    /// Like `makePeerSyncFixture` but deliberately does NOT `storeBlockData` — the
+    /// block's content is unavailable, so `materializeSyncedCanonicalContent` cannot
+    /// resolve it. Models a heavier peer whose bytes aren't fetchable yet.
+    private static func makeUnavailablePeerSyncFixture(
+        on node: LatticeNode,
+        cumulativeWork: UInt256
+    ) async throws -> (network: ChainNetwork, fetcher: Fetcher, result: SyncResult) {
+        let maybeNetwork = await node.network(forPath: ["Nexus"])
+        let network = try XCTUnwrap(maybeNetwork)
+        let fetcher = await network.ivyFetcher
+        let genesis = await node.genesisResult
+        let peerBlock = try await BlockBuilder.buildBlock(
+            previous: genesis.block,
+            timestamp: genesis.block.timestamp + 1_000,
+            target: genesis.block.nextTarget,
+            fetcher: fetcher
+        )
+        // NB: no storeBlockData — the content is intentionally unavailable.
         let peerChain = ChainState.fromGenesis(block: genesis.block)
         let peerHeader = try VolumeImpl<Block>(node: peerBlock)
         _ = await peerChain.submitBlock(parentBlockHeaderAndIndex: nil, blockHeader: peerHeader, block: peerBlock)
