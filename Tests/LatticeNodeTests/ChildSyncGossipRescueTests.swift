@@ -243,4 +243,37 @@ final class ChildSyncGossipRescueTests: XCTestCase {
             "held-heavier rescue must converge the follower onto the heavier-secured branch (b2Result=\(b2Result.status), b1Result=\(b1Result.status))"
         )
     }
+
+    /// Memory-pin hardening: the detached-evidence cache must DECLINE to hold a
+    /// body larger than `maxDetachedEvidenceBytes` so an attacker cannot pin
+    /// 64 × maxBlockSize per followed chain by gossiping large below-tip proven
+    /// connectors. An at-cap body is still cached (adoption/backfill unaffected);
+    /// an over-cap body is dropped from the speculative FIFO.
+    func testDetachedEvidenceCacheRejectsOversizedBodies() async throws {
+        let (node, _, _, _) = try await makeChildNode()
+        let key = await node.chainKey(forDirectory: "Mid")
+        let anchor = ParentAnchor(blockHash: "anchor", parentHash: nil, height: 0)
+
+        // At the cap: cached.
+        let atCap = Data(repeating: 0xAB, count: LatticeNode.maxDetachedEvidenceBytes)
+        await node.cacheDetachedChildEvidence(
+            directory: "Mid", chainPath: nil, cid: "cid-at-cap",
+            blockData: atCap, selectedAnchor: anchor,
+            processingRootHash: .zero, verified: []
+        )
+        var cached = await node.detachedChildEvidence[key] ?? [:]
+        XCTAssertNotNil(cached["cid-at-cap"], "an at-cap body must be cached")
+
+        // Over the cap: declined.
+        let overCap = Data(repeating: 0xAB, count: LatticeNode.maxDetachedEvidenceBytes + 1)
+        await node.cacheDetachedChildEvidence(
+            directory: "Mid", chainPath: nil, cid: "cid-over-cap",
+            blockData: overCap, selectedAnchor: anchor,
+            processingRootHash: .zero, verified: []
+        )
+        cached = await node.detachedChildEvidence[key] ?? [:]
+        XCTAssertNil(cached["cid-over-cap"], "an over-cap body must NOT be cached (memory-pin hardening)")
+        let order = await node.detachedChildEvidenceOrder[key] ?? []
+        XCTAssertFalse(order.contains("cid-over-cap"), "an over-cap body must not enter the FIFO order")
+    }
 }
