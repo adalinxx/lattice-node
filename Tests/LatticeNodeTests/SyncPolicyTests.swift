@@ -126,4 +126,50 @@ final class SyncPolicyTests: XCTestCase {
             gap: 100, catchUpThreshold: 32, localWork: .zero,
             estimatedPeerWork: UInt256(1), peerWorkPerBlock: UInt256(1), isRootChain: true))
     }
+
+    // MARK: SyncOutcome — unified failure model (kills silent-stall + stuck-refusal)
+
+    func testTransientRetryBackoffLadder() {
+        // 1,2,4,8,16 then capped at 30.
+        XCTAssertEqual(SyncPolicy.transientRetryDelaySeconds(attempt: 0), 0)
+        XCTAssertEqual(SyncPolicy.transientRetryDelaySeconds(attempt: 1), 1)
+        XCTAssertEqual(SyncPolicy.transientRetryDelaySeconds(attempt: 2), 2)
+        XCTAssertEqual(SyncPolicy.transientRetryDelaySeconds(attempt: 3), 4)
+        XCTAssertEqual(SyncPolicy.transientRetryDelaySeconds(attempt: 4), 8)
+        XCTAssertEqual(SyncPolicy.transientRetryDelaySeconds(attempt: 5), 16)
+        XCTAssertEqual(SyncPolicy.transientRetryDelaySeconds(attempt: 6), 30, "1<<5=32 capped to 30")
+        XCTAssertEqual(SyncPolicy.transientRetryDelaySeconds(attempt: 50), 30, "no overflow, stays capped")
+    }
+
+    func testShouldRetryFirstAttempt() {
+        XCTAssertTrue(SyncPolicy.shouldRetrySync(lastOutcome: nil, tipsUnchanged: true, maxRetries: 8),
+                      "no prior outcome → try")
+    }
+
+    func testShouldRetryAdmittedIsTerminal() {
+        XCTAssertFalse(SyncPolicy.shouldRetrySync(lastOutcome: .admitted, tipsUnchanged: false, maxRetries: 8))
+    }
+
+    func testShouldRetryRefusedUnsticksOnlyOnTipChange() {
+        // THE stuck-refusal fix: refused stays refused while tips are unchanged,
+        // and frees the moment a tip changes.
+        XCTAssertFalse(SyncPolicy.shouldRetrySync(lastOutcome: .refusedPermanent, tipsUnchanged: true, maxRetries: 8),
+                       "tips unchanged → stay refused (no churn)")
+        XCTAssertTrue(SyncPolicy.shouldRetrySync(lastOutcome: .refusedPermanent, tipsUnchanged: false, maxRetries: 8),
+                      "a tip changed → re-evaluate")
+    }
+
+    func testShouldRetryInvalidDoesNotAutoRetry() {
+        XCTAssertFalse(SyncPolicy.shouldRetrySync(lastOutcome: .invalid, tipsUnchanged: false, maxRetries: 8),
+                       "bad data → no auto-retry (call site penalizes the peer)")
+    }
+
+    func testShouldRetryTransientAlwaysRetriesUntilBudget() {
+        // THE silent-stall fix: a content miss ALWAYS schedules a retry (never a
+        // silent nothing) until the retry budget is exhausted.
+        XCTAssertTrue(SyncPolicy.shouldRetrySync(lastOutcome: .unavailableTransient(attempt: 0), tipsUnchanged: true, maxRetries: 8))
+        XCTAssertTrue(SyncPolicy.shouldRetrySync(lastOutcome: .unavailableTransient(attempt: 7), tipsUnchanged: true, maxRetries: 8))
+        XCTAssertFalse(SyncPolicy.shouldRetrySync(lastOutcome: .unavailableTransient(attempt: 8), tipsUnchanged: true, maxRetries: 8),
+                       "budget exhausted → stop (bounded)")
+    }
 }
