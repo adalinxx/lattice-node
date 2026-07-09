@@ -99,4 +99,19 @@ final class ChainApplyTests: XCTestCase {
         let outcome = await makeApply(log: log, adopt: .transientFailure).apply(candidate)
         XCTAssertEqual(outcome, .pendingUnavailable, "a commit-time miss retries, never dead-ends silently")
     }
+
+    /// Properties of every ChainOutcome — only `.adopted` is adopted; each has a
+    /// distinct metric suffix (so degraded/pending are observably different signals).
+    func testChainOutcomeProperties() {
+        XCTAssertTrue(ChainOutcome.adopted(tipCID: "x").wasAdopted)
+        for o: ChainOutcome in [.ignoredLighter, .pendingUnavailable, .invalid(reason: "r"), .degraded(reason: "r")] {
+            XCTAssertFalse(o.wasAdopted, "\(o) must not count as adopted")
+        }
+        XCTAssertEqual(ChainOutcome.adopted(tipCID: "x").metricSuffix, "adopted")
+        XCTAssertEqual(ChainOutcome.ignoredLighter.metricSuffix, "ignored_lighter")
+        XCTAssertEqual(ChainOutcome.pendingUnavailable.metricSuffix, "pending_unavailable")
+        XCTAssertEqual(ChainOutcome.invalid(reason: "r").metricSuffix, "invalid")
+        XCTAssertEqual(ChainOutcome.degraded(reason: "r").metricSuffix, "degraded",
+                       "degraded is a distinct signal from pending_unavailable (not 'retriable by waiting')")
+    }
 }

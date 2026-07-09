@@ -38,28 +38,17 @@ extension LatticeNode {
         isChainUnhealthy(chainPath: chainPath(forDirectory: directory))
     }
 
-    /// Availability gate for MINING / building-on (strict): don't build a template on a
-    /// chain that is unhealthy or mid-deep-sync (a soon-to-be-reorged tip wastes work).
     func isChainUnavailable(chainPath: [String]) -> Bool {
         if isChainUnhealthy(chainPath: chainPath) { return true }
+        // Fail closed only for deep/initial syncs (gap unknown = .max). Shallow
+        // catch-ups within the finality window keep only that chain readable
+        // and mining (the documented shallowSyncThreshold intent);
+        // announce-driven gap=1 syncs would otherwise blank reads and stall
+        // mining for the whole sync tail. A forged small-gap announcement at
+        // worst keeps the node serving its own canonical state.
         let key = chainKey(forPath: chainPath)
         return syncTasks[key] != nil
             && (activeSyncGaps[key] ?? UInt64.max) > shallowSyncThreshold
-    }
-
-    /// READ availability (RPC), looser than the mining gate: a chain serves reads unless it
-    /// is genuinely unhealthy or in an UNKNOWN-depth sync (initial/deep-reorg with nothing
-    /// valid to serve yet). A KNOWN-gap catch-up keeps serving its materialized committed
-    /// chain (readable-stale, the optimistic-SYNCING model) — that is the seed-496 fix.
-    /// Serving stale-but-valid reads is safe; only mining a soon-to-be-reorged tip isn't.
-    func isChainReadable(chainPath: [String]) -> Bool {
-        if isChainUnhealthy(chainPath: chainPath) { return false }
-        let key = chainKey(forPath: chainPath)
-        return !SyncPolicy.syncMakesChainUnavailable(hasActiveSync: syncTasks[key] != nil, gap: activeSyncGaps[key])
-    }
-
-    func isChainReadable(directory: String) -> Bool {
-        isChainReadable(chainPath: chainPath(forDirectory: directory))
     }
 
     func isChainUnavailable(directory: String) -> Bool {
@@ -552,6 +541,8 @@ extension LatticeNode {
                 log.warn("\(network.directory): sync pending — canonical content unavailable; will retry when data/peers arrive (not refused, stays retriable)")
             case .invalid(let reason):
                 log.warn("\(network.directory): sync rejected invalid chain: \(reason)")
+            case .degraded(let reason):
+                log.error("\(network.directory): sync could not publish — chain degraded: \(reason) (marked unhealthy; not retriable by waiting)")
             }
 
             // F5-4: child blocks just synced carry verified anchoring proofs. Persist
@@ -1182,7 +1173,7 @@ extension LatticeNode {
               let lowest = sortedBlocks.first,
               let tipMeta = sortedBlocks.last else {
             log.error("\(directory): cannot publish sync without StateStore and a non-empty canonical segment")
-            return .pendingUnavailable
+            return .degraded(reason: "missing StateStore or empty canonical segment")
         }
 
         guard let materialized = await materializeSyncedCanonicalContent(
@@ -1247,7 +1238,7 @@ extension LatticeNode {
         } catch {
             log.error("\(directory): failed to pre-protect synced state retained roots before sync publish: \(error)")
             await markChainStorageDegraded(directory: directory, reason: "failed to advance synced state retained roots")
-            return .pendingUnavailable
+            return .degraded(reason: "failed to advance synced state retained roots")
         }
 
         for meta in sortedBlocks {
@@ -1260,7 +1251,7 @@ extension LatticeNode {
             } catch {
                 log.error("\(directory): failed to pre-pin synced block \(String(meta.blockHash.prefix(16)))… at height \(meta.blockHeight): \(error)")
                 await markChainStorageDegraded(directory: directory, reason: "failed to pin synced canonical content before durable commit")
-                return .pendingUnavailable
+                return .degraded(reason: "failed to pin synced canonical content")
             }
         }
 
@@ -1281,7 +1272,7 @@ extension LatticeNode {
             } catch {
                 log.error("\(directory): failed to persist synced stored roots for \(String(meta.blockHash.prefix(16)))… at height \(meta.blockHeight): \(error)")
                 await markChainStorageDegraded(directory: directory, reason: "failed to persist synced canonical content roots after durable commit")
-                return .pendingUnavailable
+                return .degraded(reason: "failed to persist synced canonical content roots")
             }
         }
 
@@ -1322,7 +1313,7 @@ extension LatticeNode {
         } catch {
             log.error("\(directory): failed to project synced state into ChainState: \(error)")
             await markChainUnhealthy(directory: directory, reason: "failed to project synced state after durable commit")
-            return .pendingUnavailable
+            return .degraded(reason: "failed to project synced state after durable commit")
         }
         await chainState.updateTipSnapshot(block: tipBlock)
 

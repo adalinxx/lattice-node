@@ -26,6 +26,8 @@ enum ChainOutcome: Equatable, Sendable {
     case ignoredLighter            // fork choice: not strictly heavier → hold incumbent
     case pendingUnavailable        // data not fetchable yet → retry later (never a ban)
     case invalid(reason: String)   // bad PoW / proof / content-binding / state → reject
+    case degraded(reason: String)  // LOCAL storage/config failure (not the peer's fault, not
+                                    // retriable-by-waiting) — the chain was marked unhealthy
 }
 
 extension ChainOutcome {
@@ -41,6 +43,7 @@ extension ChainOutcome {
         case .ignoredLighter:     return "ignored_lighter"
         case .pendingUnavailable: return "pending_unavailable"
         case .invalid:            return "invalid"
+        case .degraded:           return "degraded"
         }
     }
 }
@@ -68,14 +71,16 @@ enum AdoptResult: Equatable, Sendable {
     case transientFailure          // a commit-time availability/IO miss → retry
 }
 
-/// THE single apply operation — our `ActivateBestChain`. Gossip, sync, and rescue
-/// are just gatherers that call this. The four steps map 1:1 to the SOTA-validated
+/// The single apply operation — our `ActivateBestChain`, the choke point gossip,
+/// sync, and rescue will funnel into. The four steps map 1:1 to the SOTA-validated
 /// model: fork choice (cheap, first) → availability (missing = pending) → validate
 /// (verify-not-trust) → adopt (authoritative re-check under lock, then commit).
 ///
-/// Collaborators are injected as closures so the whole contract is testable with
-/// fakes — no actor, no live network. The real wiring passes closures that call the
-/// node's fork-choice / fetcher / validator / commit paths.
+/// STATUS: proposed choke point — NOT YET WIRED into the live sync/gossip paths.
+/// It is fully contract-tested with fakes (ChainApplyTests), and its shape is what the
+/// redirect step will use: real closures that call the node's fork-choice / fetcher /
+/// validator / commit paths, replacing the duplicate flows. Until that redirect lands,
+/// only `ChainOutcome` (finalizeSyncResult's return) is live; this struct is scaffolding.
 struct ChainApply<Gathered: Sendable>: Sendable {
     /// Cheap pre-filter: is the candidate plausibly heavier (may use claimedWork)?
     /// Not authoritative — `adopt` re-checks against verified data under the lock.

@@ -49,20 +49,6 @@ enum SyncPolicy {
         return tipHeight - retentionDepth + contextDepth
     }
 
-    // MARK: - Availability vs health
-
-    /// Does an IN-PROGRESS sync make the chain unavailable for reads/mining? Availability
-    /// is NOT health: a catch-up with a KNOWN gap keeps serving its already-committed,
-    /// materialized chain (readable-stale, the optimistic-SYNCING model), so only an
-    /// UNKNOWN-depth sync (`gap == nil`/`.max` — an initial or deep-reorg sync building
-    /// state from scratch, nothing valid to serve yet) fails closed. Genuine storage
-    /// unhealth is a separate signal. This aligns the gate to its own documented intent
-    /// ("fail closed only for deep/initial syncs, gap unknown = .max"); the prior
-    /// `gap > shallowThreshold` needlessly 503'd known-gap catch-ups (the seed-496 class).
-    static func syncMakesChainUnavailable(hasActiveSync: Bool, gap: UInt64?) -> Bool {
-        hasActiveSync && (gap ?? UInt64.max) == UInt64.max
-    }
-
     // MARK: - Sync triggers
 
     /// Announce-driven trigger when NO block body is available (unvalidated

@@ -61,8 +61,8 @@ extension SyncPolicy {
     /// site per plan T4). `attempt` is 1-based (first retry = attempt 1).
     static func transientRetryDelaySeconds(attempt: Int, maxDelaySeconds: Int = 30) -> Int {
         guard attempt > 0 else { return 0 }
-        let shift = min(attempt - 1, 20)                 // avoid UInt overflow
-        let doubling = 1 << shift                          // 1,2,4,8,16,32,...
+        let shift = min(attempt - 1, 20)                 // cap the shift so 1<<shift stays small
+        let doubling = 1 << shift                          // 1,2,4,8,16,32,... (Int, well below overflow)
         return min(doubling, maxDelaySeconds)
     }
 
