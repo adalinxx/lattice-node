@@ -55,6 +55,18 @@ extension LatticeNode {
     static let maxDetachedEvidencePerChain = 64
     static let maxRescuePassesPerDrain = 16
 
+    /// Per-connector body-size cap for the speculative detached-evidence cache.
+    /// A valid block may be as large as the chain's `maxBlockSize` (up to the
+    /// Ivy frame cap, ~megabytes), so 64 valid-but-below-tip proven connectors
+    /// could otherwise pin 64 × maxBlockSize of memory per followed chain. We
+    /// only DECLINE TO CACHE bodies above this cap: an oversized detached
+    /// connector can still be re-gossiped, or — once its linkage is known —
+    /// rescued through the index-known held-heavier backfill transport, which
+    /// fetches bodies on demand rather than holding them. 256 KiB comfortably
+    /// covers realistic child connectors while bounding the cache to
+    /// 64 × 256 KiB = 16 MiB per chain.
+    static let maxDetachedEvidenceBytes = 256 * 1024
+
     /// Cache a proof-verified child block that could not enter the chain (below
     /// the tip height, or otherwise not promoted) so the connector rescue can
     /// replay it when the chain declares its CID missing. Bounded FIFO per chain.
@@ -67,6 +79,11 @@ extension LatticeNode {
         processingRootHash: UInt256,
         verified: [VerifiedChildProofEvidence]
     ) {
+        // Decline to speculatively cache oversized bodies (memory-pin hardening):
+        // they can still be re-gossiped or backfilled on demand once linkage is
+        // known. Fork choice and the push guard are unaffected — this only bounds
+        // what the detached-evidence FIFO is willing to hold.
+        guard blockData.count <= Self.maxDetachedEvidenceBytes else { return }
         let key = chainPath.map { chainKey(forPath: $0) } ?? chainKey(forDirectory: directory)
         if detachedChildEvidence[key]?[cid] == nil {
             detachedChildEvidenceOrder[key, default: []].append(cid)
