@@ -524,7 +524,7 @@ extension LatticeNode {
                 )
             }
 
-            let finalized = await finalizeSyncResult(result, localWork: localWork, network: network, fetcher: fetcher, sourcePeer: activeSourcePeer)
+            let finalized = await finalizeSyncResult(result, localWork: localWork, network: network, fetcher: fetcher, sourcePeer: activeSourcePeer).wasAdopted
 
             // F5-4: child blocks just synced carry verified anchoring proofs. Persist
             // each (so this node can serve it onward) and fold its securing work into
@@ -1118,7 +1118,7 @@ extension LatticeNode {
     /// this — a refused or failed finalize means the segment was
     /// never committed.
     @discardableResult
-    func finalizeSyncResult(_ result: SyncResult, localWork: UInt256, network: ChainNetwork, fetcher: Fetcher, sourcePeer: PeerID? = nil) async -> Bool {
+    func finalizeSyncResult(_ result: SyncResult, localWork: UInt256, network: ChainNetwork, fetcher: Fetcher, sourcePeer: PeerID? = nil) async -> ChainOutcome {
         let key = chainKey(forPath: network.chainPath)
         return await withChainMutation(key) {
             await finalizeSyncResultUnlocked(
@@ -1132,10 +1132,10 @@ extension LatticeNode {
     }
 
     @discardableResult
-    private func finalizeSyncResultUnlocked(_ result: SyncResult, localWork: UInt256, network: ChainNetwork, fetcher: Fetcher, sourcePeer: PeerID? = nil) async -> Bool {
+    private func finalizeSyncResultUnlocked(_ result: SyncResult, localWork: UInt256, network: ChainNetwork, fetcher: Fetcher, sourcePeer: PeerID? = nil) async -> ChainOutcome {
         let log = NodeLogger("sync")
         let directory = network.directory
-        guard let chainState = await chain(for: directory) else { return false }
+        guard let chainState = await chain(for: directory) else { return .pendingUnavailable }
 
         // Gate against the CURRENT chain, not the caller's pre-download
         // `localWork` snapshot: a block mined or accepted during the sync must
@@ -1146,7 +1146,7 @@ extension LatticeNode {
         case .refuse:
             log.warn("\(directory): sync refused: peer work \(result.cumulativeWork) does not beat the current local chain")
             recordRefusedSyncTip(result.tipBlockHash, localTip: await chainState.getMainChainTip())
-            return false
+            return .ignoredLighter
         }
 
         let sortedBlocks = result.persisted.blocks.sorted { $0.blockHeight < $1.blockHeight }
@@ -1154,7 +1154,7 @@ extension LatticeNode {
               let lowest = sortedBlocks.first,
               let tipMeta = sortedBlocks.last else {
             log.error("\(directory): cannot publish sync without StateStore and a non-empty canonical segment")
-            return false
+            return .pendingUnavailable
         }
 
         guard let materialized = await materializeSyncedCanonicalContent(
@@ -1165,7 +1165,7 @@ extension LatticeNode {
             sourcePeer: sourcePeer
         ) else {
             log.warn("\(directory): could not materialize synced canonical content; retrying before durable publish")
-            return false
+            return .pendingUnavailable
         }
         let tipBlock = materialized.tipBlock
         let oldTip = await chainState.getMainChainTip()
@@ -1175,7 +1175,7 @@ extension LatticeNode {
         // that advanced mid-sync is never durably replaced by a stale result.
         guard case .admit = await admitSyncedChainAgainstCurrentChain(result, chainState: chainState, chainPath: network.chainPath) else {
             log.info("\(directory): sync abandoned after materialization: local chain advanced past the synced chain")
-            return false
+            return .ignoredLighter
         }
 
         // Publish the synced canonical chain as ONE atomic segment commit before
@@ -1204,7 +1204,7 @@ extension LatticeNode {
             directory: directory,
             fetcher: fetcher
         ) else {
-            return false
+            return .pendingUnavailable
         }
 
         do {
@@ -1219,7 +1219,7 @@ extension LatticeNode {
         } catch {
             log.error("\(directory): failed to pre-protect synced state retained roots before sync publish: \(error)")
             await markChainStorageDegraded(directory: directory, reason: "failed to advance synced state retained roots")
-            return false
+            return .pendingUnavailable
         }
 
         for meta in sortedBlocks {
@@ -1232,7 +1232,7 @@ extension LatticeNode {
             } catch {
                 log.error("\(directory): failed to pre-pin synced block \(String(meta.blockHash.prefix(16)))… at height \(meta.blockHeight): \(error)")
                 await markChainStorageDegraded(directory: directory, reason: "failed to pin synced canonical content before durable commit")
-                return false
+                return .pendingUnavailable
             }
         }
 
@@ -1243,7 +1243,7 @@ extension LatticeNode {
             )
         } catch {
             log.error("\(directory): failed to publish synced canonical segment: \(error)")
-            return false
+            return .pendingUnavailable
         }
 
         for meta in sortedBlocks {
@@ -1253,7 +1253,7 @@ extension LatticeNode {
             } catch {
                 log.error("\(directory): failed to persist synced stored roots for \(String(meta.blockHash.prefix(16)))… at height \(meta.blockHeight): \(error)")
                 await markChainStorageDegraded(directory: directory, reason: "failed to persist synced canonical content roots after durable commit")
-                return false
+                return .pendingUnavailable
             }
         }
 
@@ -1294,7 +1294,7 @@ extension LatticeNode {
         } catch {
             log.error("\(directory): failed to project synced state into ChainState: \(error)")
             await markChainUnhealthy(directory: directory, reason: "failed to project synced state after durable commit")
-            return false
+            return .pendingUnavailable
         }
         await chainState.updateTipSnapshot(block: tipBlock)
 
@@ -1312,14 +1312,14 @@ extension LatticeNode {
             newTip: result.tipBlockHash,
             transition: syncedTransition
         ) else {
-            return false
+            return .pendingUnavailable
         }
 
         // Parent sync must not rewrite descendant fork choice. Child chains are
         // independent proof-validated chains; parent canonicity only changes the
         // local parent data available to prove future child work.
         guard await reprocessSyncedBlocksForChildChains(persisted: result.persisted, fetcher: fetcher, network: network) else {
-            return false
+            return .pendingUnavailable
         }
         await reconcileChildChainStatesAfterSync(
             persisted: result.persisted,
@@ -1329,7 +1329,7 @@ extension LatticeNode {
         await verifySyncWithPeers(tipCID: result.tipBlockHash, tipHeight: result.tipBlockHeight, network: network)
 
         await syncSubscribedChildren(of: directory)
-        return true
+        return .adopted(tipCID: result.tipBlockHash)
     }
 
     private func syncedCanonicalTransition(

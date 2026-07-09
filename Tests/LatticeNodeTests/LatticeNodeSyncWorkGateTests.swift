@@ -44,12 +44,13 @@ final class LatticeNodeSyncWorkGateTests: XCTestCase {
             let localWork = await node.localCumulativeWork(chainPath: ["Nexus"])
             let fixture = try await Self.makePeerSyncFixture(on: node, cumulativeWork: localWork)
 
-            await node.finalizeSyncResult(
+            let equalOutcome = await node.finalizeSyncResult(
                 fixture.result,
                 localWork: localWork,
                 network: fixture.network,
                 fetcher: fixture.fetcher
             )
+            XCTAssertEqual(equalOutcome, .ignoredLighter, "equal work holds the incumbent")
 
             let equalWorkTip = await node.lattice.nexus.chain.getMainChainTip()
             let equalWorkCommitted = await Self.committedBlockHash(on: node, height: fixture.result.tipBlockHeight)
@@ -57,12 +58,13 @@ final class LatticeNodeSyncWorkGateTests: XCTestCase {
             XCTAssertNil(equalWorkCommitted)
 
             let lowerWorkResult = Self.resultLike(fixture.result, cumulativeWork: .zero)
-            await node.finalizeSyncResult(
+            let lowerOutcome = await node.finalizeSyncResult(
                 lowerWorkResult,
                 localWork: localWork,
                 network: fixture.network,
                 fetcher: fixture.fetcher
             )
+            XCTAssertEqual(lowerOutcome, .ignoredLighter, "lower work is refused")
 
             let lowerWorkTip = await node.lattice.nexus.chain.getMainChainTip()
             let lowerWorkCommitted = await Self.committedBlockHash(on: node, height: fixture.result.tipBlockHeight)
@@ -77,12 +79,13 @@ final class LatticeNodeSyncWorkGateTests: XCTestCase {
             let localWork = await node.localCumulativeWork(chainPath: ["Nexus"])
             let fixture = try await Self.makePeerSyncFixture(on: node, cumulativeWork: localWork + UInt256(1))
 
-            await node.finalizeSyncResult(
+            let outcome = await node.finalizeSyncResult(
                 fixture.result,
                 localWork: localWork,
                 network: fixture.network,
                 fetcher: fixture.fetcher
             )
+            XCTAssertEqual(outcome, .adopted(tipCID: fixture.result.tipBlockHash), "strictly heavier is adopted")
 
             let finalTip = await node.lattice.nexus.chain.getMainChainTip()
             let committed = await Self.committedBlockHash(on: node, height: fixture.result.tipBlockHeight)

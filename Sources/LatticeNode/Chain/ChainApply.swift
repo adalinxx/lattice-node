@@ -28,6 +28,12 @@ enum ChainOutcome: Equatable, Sendable {
     case invalid(reason: String)   // bad PoW / proof / content-binding / state → reject
 }
 
+extension ChainOutcome {
+    /// Did the candidate get adopted? (bridges the former `Bool` return of
+    /// `finalizeSyncResult` while call sites migrate to the full outcome.)
+    var wasAdopted: Bool { if case .adopted = self { return true } else { return false } }
+}
+
 /// Result of gathering a candidate's reachable blocks/proofs by content hash.
 enum GatherResult: Equatable, Sendable {
     case complete                  // everything reachable is present + content-bound
