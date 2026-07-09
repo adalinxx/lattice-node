@@ -32,6 +32,17 @@ extension ChainOutcome {
     /// Did the candidate get adopted? (bridges the former `Bool` return of
     /// `finalizeSyncResult` while call sites migrate to the full outcome.)
     var wasAdopted: Bool { if case .adopted = self { return true } else { return false } }
+
+    /// Metric suffix so each outcome is observable — the transient case (the seed-496
+    /// class) must be a visible signal, not a silent stall.
+    var metricSuffix: String {
+        switch self {
+        case .adopted:            return "adopted"
+        case .ignoredLighter:     return "ignored_lighter"
+        case .pendingUnavailable: return "pending_unavailable"
+        case .invalid:            return "invalid"
+        }
+    }
 }
 
 /// Result of gathering a candidate's reachable blocks/proofs by content hash.

@@ -38,17 +38,28 @@ extension LatticeNode {
         isChainUnhealthy(chainPath: chainPath(forDirectory: directory))
     }
 
+    /// Availability gate for MINING / building-on (strict): don't build a template on a
+    /// chain that is unhealthy or mid-deep-sync (a soon-to-be-reorged tip wastes work).
     func isChainUnavailable(chainPath: [String]) -> Bool {
         if isChainUnhealthy(chainPath: chainPath) { return true }
-        // Fail closed only for deep/initial syncs (gap unknown = .max). Shallow
-        // catch-ups within the finality window keep only that chain readable
-        // and mining (the documented shallowSyncThreshold intent);
-        // announce-driven gap=1 syncs would otherwise blank reads and stall
-        // mining for the whole sync tail. A forged small-gap announcement at
-        // worst keeps the node serving its own canonical state.
         let key = chainKey(forPath: chainPath)
         return syncTasks[key] != nil
             && (activeSyncGaps[key] ?? UInt64.max) > shallowSyncThreshold
+    }
+
+    /// READ availability (RPC), looser than the mining gate: a chain serves reads unless it
+    /// is genuinely unhealthy or in an UNKNOWN-depth sync (initial/deep-reorg with nothing
+    /// valid to serve yet). A KNOWN-gap catch-up keeps serving its materialized committed
+    /// chain (readable-stale, the optimistic-SYNCING model) — that is the seed-496 fix.
+    /// Serving stale-but-valid reads is safe; only mining a soon-to-be-reorged tip isn't.
+    func isChainReadable(chainPath: [String]) -> Bool {
+        if isChainUnhealthy(chainPath: chainPath) { return false }
+        let key = chainKey(forPath: chainPath)
+        return !SyncPolicy.syncMakesChainUnavailable(hasActiveSync: syncTasks[key] != nil, gap: activeSyncGaps[key])
+    }
+
+    func isChainReadable(directory: String) -> Bool {
+        isChainReadable(chainPath: chainPath(forDirectory: directory))
     }
 
     func isChainUnavailable(directory: String) -> Bool {
@@ -524,7 +535,24 @@ extension LatticeNode {
                 )
             }
 
-            let finalized = await finalizeSyncResult(result, localWork: localWork, network: network, fetcher: fetcher, sourcePeer: activeSourcePeer).wasAdopted
+            let outcome = await finalizeSyncResult(result, localWork: localWork, network: network, fetcher: fetcher, sourcePeer: activeSourcePeer)
+            let finalized = outcome.wasAdopted
+            // Act on the outcome — make each fate an observable signal so a transient
+            // content miss (the seed-496 class) is VISIBLE, not a silent stall.
+            // `.pendingUnavailable` is deliberately NOT recorded as refused/failed, so
+            // it stays retriable when data/peers arrive; only `.ignoredLighter` is the
+            // settled work-refusal (already memoized inside finalizeSyncResult).
+            metrics.increment("lattice_sync_outcome_\(outcome.metricSuffix)")
+            switch outcome {
+            case .adopted:
+                break  // logged below as "Headers-first sync complete"
+            case .ignoredLighter:
+                log.info("\(network.directory): sync settled — incumbent held (peer chain not heavier)")
+            case .pendingUnavailable:
+                log.warn("\(network.directory): sync pending — canonical content unavailable; will retry when data/peers arrive (not refused, stays retriable)")
+            case .invalid(let reason):
+                log.warn("\(network.directory): sync rejected invalid chain: \(reason)")
+            }
 
             // F5-4: child blocks just synced carry verified anchoring proofs. Persist
             // each (so this node can serve it onward) and fold its securing work into

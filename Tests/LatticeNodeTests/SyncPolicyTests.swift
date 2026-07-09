@@ -127,6 +127,25 @@ final class SyncPolicyTests: XCTestCase {
             estimatedPeerWork: UInt256(1), peerWorkPerBlock: UInt256(1), isRootChain: true))
     }
 
+    // MARK: Availability vs health — a known-gap catch-up stays readable
+
+    func testSyncMakesChainUnavailableOnlyForUnknownDepth() {
+        // Known-gap catch-up (the seed-496 class) serves its materialized committed
+        // chain → readable. Availability is NOT health.
+        XCTAssertFalse(SyncPolicy.syncMakesChainUnavailable(hasActiveSync: true, gap: 93),
+                       "deep KNOWN-gap catch-up stays readable (was wrongly 503'd)")
+        XCTAssertFalse(SyncPolicy.syncMakesChainUnavailable(hasActiveSync: true, gap: 1))
+        XCTAssertFalse(SyncPolicy.syncMakesChainUnavailable(hasActiveSync: true, gap: 0))
+        // Unknown-depth sync (initial / deep-reorg building state from scratch) fails closed.
+        XCTAssertTrue(SyncPolicy.syncMakesChainUnavailable(hasActiveSync: true, gap: nil),
+                      "unknown depth (nil) has nothing valid to serve → fail closed")
+        XCTAssertTrue(SyncPolicy.syncMakesChainUnavailable(hasActiveSync: true, gap: UInt64.max),
+                      "unknown depth (.max) fails closed")
+        // No active sync → this gate never makes the chain unavailable.
+        XCTAssertFalse(SyncPolicy.syncMakesChainUnavailable(hasActiveSync: false, gap: nil))
+        XCTAssertFalse(SyncPolicy.syncMakesChainUnavailable(hasActiveSync: false, gap: UInt64.max))
+    }
+
     // MARK: SyncOutcome — unified failure model (kills silent-stall + stuck-refusal)
 
     func testTransientRetryBackoffLadder() {

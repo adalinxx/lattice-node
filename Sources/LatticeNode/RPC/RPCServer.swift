@@ -490,14 +490,17 @@ enum RPCRoutes {
     }
 
     static func chainUnavailableResponse(node: LatticeNode, directory: String) async -> Response? {
-        if await node.isChainUnavailable(directory: directory) {
+        // Reads use the looser readability gate: a known-gap catch-up serves its
+        // materialized committed chain (readable-stale), only unknown-depth/initial
+        // syncs and genuine unhealth 503 (availability ≠ health).
+        if await !node.isChainReadable(directory: directory) {
             return jsonError("Chain \(directory) is unavailable", status: .serviceUnavailable)
         }
         return nil
     }
 
     static func chainUnavailableResponse(node: LatticeNode, chainPath: [String]) async -> Response? {
-        if await node.isChainUnavailable(chainPath: chainPath) {
+        if await !node.isChainReadable(chainPath: chainPath) {
             return jsonError("Chain \(chainPath.joined(separator: "/")) is unavailable", status: .serviceUnavailable)
         }
         return nil
