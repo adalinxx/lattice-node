@@ -218,7 +218,13 @@ extension LatticeNode {
             // exhausts the budget. TERMINAL outcomes stop: `.adopted` (done),
             // `.ignoredLighter` (work-refused — retrying is churn), `.invalid` (bad
             // data), `.degraded` (local failure — not fixable by waiting).
-            if (outcome?.isRetriableTransient ?? true), retryCount < Self.maxSyncRetries, !Task.isCancelled {
+            // The `!isChainUnhealthy` guard closes the timeout-race edge (M1): if the
+            // sync and the timeout complete near-simultaneously, `group.next()` can
+            // surface the timeout's `nil` and mask a real `.degraded` outcome — whose
+            // markChain* already called `network.stop()`. Without this guard the retry
+            // would re-run against a deliberately-stopped/unhealthy chain.
+            if (outcome?.isRetriableTransient ?? true), retryCount < Self.maxSyncRetries, !Task.isCancelled,
+               !(await self.isChainUnhealthy(chainPath: network.chainPath)) {
                 await self.clearSyncTaskForRetry(network: network)
                 let backoffSeconds = UInt64(min(30, 1 << min(retryCount, 5)))   // 1,2,4,8,16,30…
                 guard await sleepUnlessCancelled(.seconds(backoffSeconds)) else { return }
