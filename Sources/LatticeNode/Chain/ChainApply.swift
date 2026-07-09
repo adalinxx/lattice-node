@@ -26,8 +26,10 @@ enum ChainOutcome: Equatable, Sendable {
     case ignoredLighter            // fork choice: not strictly heavier → hold incumbent
     case pendingUnavailable        // data not fetchable yet → retry later (never a ban)
     case invalid(reason: String)   // bad PoW / proof / content-binding / state → reject
-    case degraded(reason: String)  // LOCAL storage/config failure (not the peer's fault, not
-                                    // retriable-by-waiting) — the chain was marked unhealthy
+    case degraded(reason: String)  // LOCAL/post-commit failure (not the peer's fault, not
+                                    // retriable-by-waiting): storage/config error, or a
+                                    // post-commit step failing after the segment already
+                                    // committed. TERMINAL — a sync retry is wrong/futile.
 }
 
 extension ChainOutcome {

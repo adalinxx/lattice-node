@@ -1342,14 +1342,21 @@ extension LatticeNode {
             newTip: result.tipBlockHash,
             transition: syncedTransition
         ) else {
-            return .pendingUnavailable
+            // POST-COMMIT (segment committed + ChainState reset): a sync retry would
+            // re-attempt an already-committed segment, so this is TERMINAL, not
+            // wait-and-retry availability.
+            return .degraded(reason: "failed to publish synced canonical side effects after commit")
         }
 
         // Parent sync must not rewrite descendant fork choice. Child chains are
         // independent proof-validated chains; parent canonicity only changes the
         // local parent data available to prove future child work.
         guard await reprocessSyncedBlocksForChildChains(persisted: result.persisted, fetcher: fetcher, network: network) else {
-            return .pendingUnavailable
+            // POST-COMMIT: the canonical segment is already committed and ChainState
+            // reset; this helper marks storage degraded on missing durable content. A
+            // sync retry is wrong here (it would re-attempt an already-committed segment
+            // on a stopped/unhealthy chain), so this is TERMINAL, not wait-and-retry.
+            return .degraded(reason: "failed to reprocess synced blocks for child chains after commit")
         }
         await reconcileChildChainStatesAfterSync(
             persisted: result.persisted,
