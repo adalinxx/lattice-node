@@ -1213,12 +1213,14 @@ public actor LatticeNode: ChainNetworkDelegate {
         for task in cancellableMaintenanceTasks {
             await task.value
         }
-        let cancellableNetworkTasks = [peerRefreshTask].compactMap { $0 } + Array(syncTasks.values)
+        let cancellableNetworkTasks = [peerRefreshTask].compactMap { $0 }
+            + Array(syncTasks.values) + Array(childRescueTasks.values)
         for task in cancellableNetworkTasks {
             task.cancel()
         }
         peerRefreshTask = nil
         syncTasks.removeAll()
+        childRescueTasks.removeAll()
         activeSyncGaps.removeAll()
         for task in cancellableNetworkTasks {
             await task.value
