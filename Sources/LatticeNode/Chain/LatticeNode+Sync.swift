@@ -106,7 +106,7 @@ extension LatticeNode {
         let localTip = await chainState.getMainChainTip()
         // Exact ties hold the incumbent — only a higher peer tip (gap > 0) is
         // worth an announce-driven sync; equal-height siblings are not adopted.
-        let shouldSync = announceOnly ? gap > 0 : gap > catchUpSyncThreshold
+        let shouldSync = SyncPolicy.heightGapTrigger(gap: gap, announceOnly: announceOnly, catchUpThreshold: catchUpSyncThreshold)
         guard shouldSync else { return false }
         guard !isRefusedSyncTip(peerTipCID, localTip: localTip) else { return false }
         guard syncTasks[syncKey] == nil else { return true }
@@ -142,32 +142,23 @@ extension LatticeNode {
         let peerChainDepth = UInt256(peerBlock.height + 1)
         let estimatedPeerWork = peerWorkPerBlock * peerChainDepth
 
-        let aheadByHeight = gap > catchUpSyncThreshold
-        // Require the peer to have at least one full block's worth more work to
-        // avoid spurious syncs from estimation rounding at equal target.
-        let aheadByWork = localWork > UInt256.zero && estimatedPeerWork > localWork + peerWorkPerBlock
-
-        // Exact ties hold the incumbent (docs/protocol.md §fork-choice,
-        // docs/whitepaper.md): only a STRICTLY heavier fork is worth syncing.
-        // Equal-work siblings are never adopted on receipt — the next block to
-        // extend either fork makes it strictly heavier and the network converges
-        // on that, so there is no permanent-fork hazard while mining continues.
+        // Exact ties hold the incumbent (docs/protocol.md §fork-choice): only a
+        // STRICTLY heavier fork is worth syncing. Equal-work siblings are never
+        // adopted on receipt — the next extending block breaks the tie and the
+        // network converges, so there is no permanent-fork hazard while mining.
         let localTip = await chainState.getMainChainTip()
 
-        guard aheadByHeight || aheadByWork else { return false }
-
-        // Pre-check: if estimated peer work is clearly less than ours, skip the
-        // bandwidth cost — the sync would fail with insufficientWork anyway.
-        // Own-target estimate veto — ROOT chains only. A child chain's real
-        // weight is the securing work in its anchoring proofs (child-only
-        // carriers may have a near-trivial own target), which this estimate
-        // cannot see — vetoing a child sync on own-work silently freezes
-        // followers behind a carrier-era chain. Child chains fall through to
-        // the height gate here; the real work decision happens at admission,
-        // after the segment's proofs are downloaded and verified.
-        if network.chainPath.count == 1, localWork > UInt256.zero, estimatedPeerWork < localWork {
-            return false
-        }
+        // Ahead-by-height OR heavier-even-at-lower-height, with a root-only own-work
+        // veto (a child's real weight is inherited securing work, decided at
+        // admission after its proofs are verified). See SyncPolicy.workAwareTrigger.
+        guard SyncPolicy.workAwareTrigger(
+            gap: gap,
+            catchUpThreshold: catchUpSyncThreshold,
+            localWork: localWork,
+            estimatedPeerWork: estimatedPeerWork,
+            peerWorkPerBlock: peerWorkPerBlock,
+            isRootChain: network.chainPath.count == 1
+        ) else { return false }
 
         // A tip we already fully synced and refused stays refused while our own
         // tip is unchanged — re-syncing it every announce round is pure churn.
@@ -1003,23 +994,15 @@ extension LatticeNode {
     // finalizeSyncResult is chain-agnostic — `network` identifies which chain
     // was just synced. After applying the result, child chains are synced
     // recursively via the same performHeadersFirstSync path.
+    // Behavior-preserving delegation to the pure `SyncPolicy` module (plan 3a);
+    // full docs live there. Kept as thin wrappers so existing call sites + tests
+    // are the characterization net during the extraction.
     static func shouldAdmitSyncedChain(peerWork: UInt256, localWork: UInt256) -> Bool {
-        peerWork > localWork
+        SyncPolicy.shouldAdmit(peerWork: peerWork, localWork: localWork)
     }
 
-    /// The local-work floor handed to the syncer's pre-admission gate
-    /// (`ChainSyncer.syncFromHeaders` throws `insufficientWork` when the
-    /// segment's work is below it). ROOT chains pass their whole-chain work
-    /// (self-PoW-verified headers make that the correct Nakamoto pre-filter;
-    /// the anchor-context branch overwrites it fork-point-relative when the
-    /// segment attaches to a retained block). CHILD chains pass ZERO: their
-    /// own-target sums are meaningless for ordering (real weight = inherited
-    /// securing work, invisible to this gate), so a whole-chain floor
-    /// pre-refuses every valid carrier fast-forward before the single
-    /// admission choke point (`admitSyncedChainAgainstCurrentChain`) can
-    /// decide it — the live "insufficientWork" freeze.
     static func syncerWorkFloor(chainPath: [String], localWork: UInt256) -> UInt256 {
-        chainPath.count > 1 ? .zero : localWork
+        SyncPolicy.workFloor(chainPath: chainPath, localWork: localWork)
     }
 
     func recordRefusedSyncTip(_ peerTip: String, localTip: String) {
@@ -1060,8 +1043,7 @@ extension LatticeNode {
     /// Near genesis (tip within retention + context) everything is anchorable
     /// or genesis-reachable, so the floor is 0.
     static func anchorableStopFloor(tipHeight: UInt64, retentionDepth: UInt64, contextDepth: UInt64) -> UInt64 {
-        guard tipHeight > retentionDepth + contextDepth else { return 0 }
-        return tipHeight - retentionDepth + contextDepth
+        SyncPolicy.anchorableStopFloor(tipHeight: tipHeight, retentionDepth: retentionDepth, contextDepth: contextDepth)
     }
 
     /// Anchor eligibility for a downloaded segment: root chains may anchor at
