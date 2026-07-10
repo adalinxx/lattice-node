@@ -1240,7 +1240,12 @@ extension LatticeNode {
             directory: directory,
             fetcher: fetcher
         ) else {
-            return .pendingUnavailable
+            // prepareSyncedCanonicalEffects marks the chain unhealthy on ALL its nil
+            // paths, so this is a degraded (terminal) failure, not a wait-and-retry
+            // availability miss. Return .degraded so the classification is self-
+            // consistent (any markChain*-degrade → .degraded) rather than relying on
+            // the retry loop's !isChainUnhealthy guard to suppress a wrong retry.
+            return .degraded(reason: "failed to prepare synced canonical effects (chain marked unhealthy)")
         }
 
         do {
