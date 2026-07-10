@@ -420,10 +420,12 @@ extension LatticeNode {
         return outcome
     }
 
-    /// Opt-in switch to the self-similar per-block adopt (P2). DORMANT by default while
-    /// the new path is validated beside the old finalizeSyncResult path; flipped on
-    /// (and the old path deleted) in P4 once the child-reorg/deep-catchup smoke is green.
-    static let syncAdoptViaForkChoice = ProcessInfo.processInfo.environment["SYNC_ADOPT_VIA_FORK_CHOICE"] == "1"
+    /// The self-similar per-block adopt is now the DEFAULT live path (P4): sync feeds
+    /// each block through the same `processBlockAndRecoverReorg` gossip/rescue use, one
+    /// GHOST decides. Retains an opt-OUT (`SYNC_ADOPT_VIA_FORK_CHOICE=0`) as a safety
+    /// valve for this live-consensus change until the old finalizeSyncResult path is
+    /// deleted. Validated: full 970-test suite green with this path on; smoke on #31.
+    static let syncAdoptViaForkChoice = ProcessInfo.processInfo.environment["SYNC_ADOPT_VIA_FORK_CHOICE"] != "0"
 
     /// P2: the SELF-SIMILAR adopt. Feed each gathered block through the SAME
     /// `processBlockAndRecoverReorg` gossip and held-heavier rescue already use, one
@@ -432,7 +434,7 @@ extension LatticeNode {
     /// identical. Root chains take the same loop with no proofs (inherited-0). No bespoke
     /// admission, no segment commit, no work-gate (validity is the filter; reorg depth is
     /// bounded by the local retentionDepth). Mirrors `submitRescuedChildConnector`.
-    private func adoptSyncedSegmentViaForkChoice(_ seg: GatheredSyncSegment, network: ChainNetwork, fetcher: IvyFetcher) async -> ChainOutcome {
+    func adoptSyncedSegmentViaForkChoice(_ seg: GatheredSyncSegment, network: ChainNetwork, fetcher: IvyFetcher) async -> ChainOutcome {
         let log = NodeLogger("sync")
         let directory = network.directory
         guard let chainState = await chain(for: directory) else { return .pendingUnavailable }
