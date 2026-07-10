@@ -148,6 +148,38 @@ final class LatticeNodeSyncWorkGateTests: XCTestCase {
         }
     }
 
+    /// P2/P3: the new SELF-SIMILAR per-block adopt (`adoptSyncedSegmentViaForkChoice`)
+    /// must fast-forward a strictly-heavier ROOT segment through the shared
+    /// `processBlockAndRecoverReorg` ingest — no bespoke admission, fork choice per
+    /// block, root = the inherited-0 case. Proves the loop + fork-choice + tip
+    /// adoption end-to-end on the root path.
+    func testForkChoiceAdoptRootFastForwardAdopts() async throws {
+        try await withSyncNode { node in
+            let originalTip = await node.lattice.nexus.chain.getMainChainTip()
+            let localWork = await node.localCumulativeWork(chainPath: ["Nexus"])
+            let fixture = try await Self.makePeerSyncFixture(on: node, cumulativeWork: localWork + UInt256(1))
+            let genesisBlock = await node.genesisResult.block
+            let ivyFetcher = await fixture.network.ivyFetcher
+            let resolvedTip = try await VolumeImpl<Block>(rawCID: fixture.result.tipBlockHash).resolve(fetcher: fixture.fetcher).node
+            let tipBlock = try XCTUnwrap(resolvedTip, "peer tip block must resolve")
+            let seg = LatticeNode.GatheredSyncSegment(
+                result: fixture.result, headers: [], acceptedProofs: [:],
+                parentAnchors: [:], processingRootHashes: [:], expectedChildPath: nil,
+                localWork: localWork, sourcePeer: nil,
+                materialized: LatticeNode.MaterializedSyncContent(
+                    tipBlock: tipBlock, rootsByHeight: [:],
+                    blocksByHeight: [genesisBlock.height: genesisBlock, tipBlock.height: tipBlock]))
+
+            let outcome = await node.adoptSyncedSegmentViaForkChoice(seg, network: fixture.network, fetcher: ivyFetcher)
+
+            XCTAssertEqual(outcome, .adopted(tipCID: fixture.result.tipBlockHash),
+                           "a strictly-heavier root fast-forward must adopt through the per-block fork-choice loop")
+            let finalTip = await node.lattice.nexus.chain.getMainChainTip()
+            XCTAssertEqual(finalTip, fixture.result.tipBlockHash)
+            XCTAssertNotEqual(finalTip, originalTip)
+        }
+    }
+
     private func withSyncNode(_ body: (LatticeNode) async throws -> Void) async throws {
         let keyPair = CryptoUtils.generateKeyPair()
         let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)

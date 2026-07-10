@@ -169,6 +169,58 @@ final class ChildSyncGossipRescueTests: XCTestCase {
             "a selected parent anchor must accompany the surfaced root")
     }
 
+    /// P2/P3 — the SELF-SIMILARITY payoff: a proof-carrying CHILD block, routed through
+    /// the new per-block adopt (`adoptSyncedSegmentViaForkChoice`), is ACCEPTED by the
+    /// SAME `processBlockAndRecoverReorg` ingest gossip/rescue use — with the surfaced
+    /// processingRootHash + proof overlay + preloaded inherited weight. This is the
+    /// end-to-end proof that H2's surfaced root is correct (a wrong root ⇒ rejected).
+    /// Child sync is now just gossip-with-pull-transport.
+    func testForkChoiceAdoptChildBlockAdopts() async throws {
+        let (node, fixture, nexusGenesis, midGenesis) = try await makeChildNode()
+        let (midCID, child, proof) = try await minedChild(
+            node: node, fixture: fixture, previousMid: midGenesis,
+            nexusGenesis: nexusGenesis, carrierClears: true, nonceSeed: 1,
+            ts: midGenesis.timestamp + 1)
+
+        let maybeMidNetwork = await node.network(for: "Mid")
+        let midNetwork = try XCTUnwrap(maybeMidNetwork)
+        let ivyFetcher = await midNetwork.ivyFetcher
+
+        // Build a Mid segment (genesis + the one proof-carrying child).
+        let peerChain = ChainState.fromGenesis(block: midGenesis)
+        let childHeader = try VolumeImpl<Block>(node: child)
+        _ = await peerChain.submitBlock(parentBlockHeaderAndIndex: nil, blockHeader: childHeader, block: child)
+        await peerChain.updateTipSnapshot(block: child)
+        let persisted = await peerChain.persist()
+        let result = SyncResult(
+            persisted: persisted, tipBlockHash: midCID, tipBlockHeight: child.height, cumulativeWork: .zero)
+
+        let header = SyncBlockHeader(
+            cid: midCID, height: child.height, previousBlockCID: child.parent?.rawCID,
+            target: child.target, nextTarget: child.nextTarget, timestamp: child.timestamp,
+            specCID: child.spec.rawCID, spec: child.spec.node)
+        let proofsMap = [midCID: ChildBlockProofEnvelope.serialize([proof])]
+        // Anchors + processing roots exactly as gather surfaces them (P1).
+        let validated = try await node.validateSyncedParentAnchorConsistency(
+            directory: "Mid", headers: [header], proofs: proofsMap, fetcher: fixture)
+
+        let seg = LatticeNode.GatheredSyncSegment(
+            result: result, headers: [header], acceptedProofs: proofsMap,
+            parentAnchors: validated.anchors, processingRootHashes: validated.processingRootHashes,
+            expectedChildPath: ["Mid"], localWork: .zero, sourcePeer: nil,
+            materialized: LatticeNode.MaterializedSyncContent(
+                tipBlock: child, rootsByHeight: [:],
+                blocksByHeight: [midGenesis.height: midGenesis, child.height: child]))
+
+        let outcome = await node.adoptSyncedSegmentViaForkChoice(seg, network: midNetwork, fetcher: ivyFetcher)
+
+        XCTAssertEqual(
+            outcome, .adopted(tipCID: midCID),
+            "a proof-carrying child must adopt through the per-block loop using the surfaced processing root")
+        let midTip = await node.chain(for: "Mid")?.getMainChainTip()
+        XCTAssertEqual(midTip, midCID, "the child block must become the canonical Mid tip")
+    }
+
     /// Rescue boundary, case 1 (WORKS?): the competing heavier-secured branch
     /// forks at the tip's parent — its block arrives at the SAME height as the
     /// local tip, so the gossip pipeline's height-monotonicity guard
