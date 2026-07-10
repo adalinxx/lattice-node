@@ -79,7 +79,4 @@ jobs:
           SMOKE_TIMEOUT_SCALE: ${{ matrix.timeout_scale || '4' }}
           SMOKE_TAGS: ${{ matrix.tags }}
           SMOKE_DURATION_MIN: ${{ github.event_name == 'pull_request' && '5' || '30' }}
-          # TEMP (P3 validation): exercise the new per-block sync adopt on the full smoke
-          # matrix while the code default stays the old path. Reverted with the P4 flip.
-          SYNC_ADOPT_VIA_FORK_CHOICE: "1"
         run: npm run all
