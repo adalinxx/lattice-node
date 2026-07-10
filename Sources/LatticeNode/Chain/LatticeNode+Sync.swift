@@ -587,6 +587,19 @@ extension LatticeNode {
         log.info("Starting headers-first sync from \(String(peerTipCID.prefix(16)))...")
 
         let fetcher = network.ivyFetcher
+        // Data gathering is SOURCE-AGNOSTIC: to get a CID, look LOCALLY first, then
+        // expand outward to the network — the memory→storage→network hierarchy. The
+        // DiskBroker is SHARED across every chain this process runs, so a local lookup
+        // sees ALL locally-held content — including a child's blocks/carriers/proofs
+        // embedded in the parent carriers this node holds. That's the foundational
+        // availability guarantee: a followed child never depends on a child peer serving
+        // content the process already has locally under its parent (previously it looped
+        // on genesisMismatch when a child peer pruned/withheld content). Local shared
+        // broker first, then the network fetcher; correct for root chains too.
+        let contentFetcher: Fetcher = CoalescingFetcher(CompositeContentSource([
+            FetcherContentSource(network.canonicalContentFetcher()),
+            IvyContentSource(fetcher),
+        ]))
         let headerChain = HeaderChain()
         var attemptedTip = peerTipCID
         var statePrefetchTask: Task<Void, Never>? = nil
@@ -694,7 +707,7 @@ extension LatticeNode {
             // invalidBlock(N). downloadHeaders already verified PoW and state
             // chain continuity — the second pass is pure redundant I/O.
             let syncer = ChainSyncer(
-                fetcher: fetcher,
+                fetcher: contentFetcher,
                 store: { _, _ in },
                 genesisBlockHash: genesisResult.blockHash,
                 chainPath: config.fullChainPath ?? [genesisConfig.directory],
@@ -730,7 +743,7 @@ extension LatticeNode {
                 var contextDepth = ChainSyncer.requiredAnchorContextDepth(
                     retargetWindow: genesisResult.block.spec.node?.retargetWindow ?? 0)
                 while let cid = cursor, context.count < Int(contextDepth),
-                      let block = try? await VolumeImpl<Block>(rawCID: cid).resolve(fetcher: fetcher).node {
+                      let block = try? await VolumeImpl<Block>(rawCID: cid).resolve(fetcher: contentFetcher).node {
                     if context.isEmpty, let attachWindow = block.spec.node?.retargetWindow {
                         // Depth per the ATTACH block's spec (a spec update may
                         // have raised the window since genesis).
@@ -790,7 +803,7 @@ extension LatticeNode {
                     directory: directory,
                     headers: headers,
                     proofs: syncedProofs,
-                    fetcher: fetcher
+                    fetcher: contentFetcher
                 )
                 syncedParentAnchors = validated.anchors
                 syncedProcessingRootHashes = validated.processingRootHashes
@@ -812,7 +825,7 @@ extension LatticeNode {
                     blocks: sortedForMaterialize,
                     tipHash: tipMetaForMaterialize.blockHash,
                     network: network,
-                    fetcher: fetcher,
+                    fetcher: contentFetcher,
                     sourcePeer: activeSourcePeer
                 ) else {
                     log.warn("\(network.directory): synced segment content not yet available; retrying (pending)")
