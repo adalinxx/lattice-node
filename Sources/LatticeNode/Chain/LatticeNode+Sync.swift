@@ -420,12 +420,13 @@ extension LatticeNode {
         return outcome
     }
 
-    /// The self-similar per-block adopt is now the DEFAULT live path (P4): sync feeds
-    /// each block through the same `processBlockAndRecoverReorg` gossip/rescue use, one
-    /// GHOST decides. Retains an opt-OUT (`SYNC_ADOPT_VIA_FORK_CHOICE=0`) as a safety
-    /// valve for this live-consensus change until the old finalizeSyncResult path is
-    /// deleted. Validated: full 970-test suite green with this path on; smoke on #31.
-    static let syncAdoptViaForkChoice = ProcessInfo.processInfo.environment["SYNC_ADOPT_VIA_FORK_CHOICE"] != "0"
+    /// The self-similar per-block adopt (P2). Opt-IN (`SYNC_ADOPT_VIA_FORK_CHOICE=1`)
+    /// while two reorg-tx-settlement smoke scenarios (safety-a reorg-mempool-readmit,
+    /// swap toytoy-compound-swap) that regress under it are root-caused — the reorg
+    /// itself succeeds but orphaned/withdrawal txs don't re-land. 970-unit-test suite +
+    /// 9/11 smoke groups are green with it on; default stays the proven finalizeSyncResult
+    /// path until those two are fixed, then this flips to default + the old path is deleted.
+    static let syncAdoptViaForkChoice = ProcessInfo.processInfo.environment["SYNC_ADOPT_VIA_FORK_CHOICE"] == "1"
 
     /// P2: the SELF-SIMILAR adopt. Feed each gathered block through the SAME
     /// `processBlockAndRecoverReorg` gossip and held-heavier rescue already use, one
