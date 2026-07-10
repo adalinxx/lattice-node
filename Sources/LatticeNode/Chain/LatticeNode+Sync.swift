@@ -326,6 +326,17 @@ extension LatticeNode {
     /// A downloaded, PoW/proof-validated sync segment (the `gather` output) — carries the
     /// SyncResult that `adopt` commits plus the byproducts the post-commit child-proof
     /// recording needs. Sendable so it flows through the ChainApply pipeline closures.
+    /// The recomputed canonical content of a synced segment: the tip block, each
+    /// block by height, and each height's durable state-boundary roots. Content-
+    /// addressed and immutable (`Block: Node: Sendable`), so it is safe to gather
+    /// OUTSIDE the commit lock and carry into adopt — the availability stage owns
+    /// the heavy fetch/recompute; adopt just re-checks fork choice and commits it.
+    struct MaterializedSyncContent: Sendable {
+        let tipBlock: Block
+        let rootsByHeight: [UInt64: [String]]
+        let blocksByHeight: [UInt64: Block]
+    }
+
     struct GatheredSyncSegment: Sendable {
         let result: SyncResult
         let headers: [SyncBlockHeader]
@@ -334,6 +345,11 @@ extension LatticeNode {
         let expectedChildPath: [String]?
         let localWork: UInt256
         let sourcePeer: PeerID?
+        /// Recomputed under the availability stage (gather), OFF the commit lock.
+        /// `nil` only for the structural cases adopt rejects before it would be used
+        /// (no StateStore / empty segment → `.degraded`); a content-availability miss
+        /// makes gather return `.incomplete` instead of carrying `nil` here.
+        let materialized: MaterializedSyncContent?
     }
 
     /// Headers-first sync as the single `apply()` operation: gather (download + validate a
@@ -380,7 +396,8 @@ extension LatticeNode {
     /// "accepted" proofs would leave durable state for blocks we never adopted. Terminal.
     private func adoptSyncedSegment(_ seg: GatheredSyncSegment, network: ChainNetwork, fetcher: IvyFetcher) async -> ChainOutcome {
         let outcome = await finalizeSyncResult(
-            seg.result, localWork: seg.localWork, network: network, fetcher: fetcher, sourcePeer: seg.sourcePeer)
+            seg.result, localWork: seg.localWork, network: network, fetcher: fetcher,
+            sourcePeer: seg.sourcePeer, preMaterialized: seg.materialized)
         if outcome.wasAdopted, seg.expectedChildPath != nil {
             await recordSyncedChildProofs(
                 directory: network.directory,
@@ -607,8 +624,33 @@ extension LatticeNode {
                 )
             }
 
-            // Gathered a fully-downloaded, PoW/proof-validated segment. adopt (finalize)
-            // + the child-proof recording happen in adoptSyncedSegment / the caller.
+            // Availability stage: recompute the segment's canonical content OFF the
+            // commit lock (content is immutable + content-addressed, so this is safe
+            // outside the lock; adopt re-checks fork choice under it). A content miss
+            // here is an availability failure, not fraud — apply() maps `.incomplete`
+            // → `.pendingUnavailable`, so startSync retries source-agnostically. The
+            // structural cases (no StateStore / empty segment) are NOT materialized
+            // here; adopt rejects them as `.degraded`, so leave `materialized` nil and
+            // let finalize hit that guard.
+            var materializedContent: MaterializedSyncContent? = nil
+            let sortedForMaterialize = result.persisted.blocks.sorted { $0.blockHeight < $1.blockHeight }
+            if stateStores[chainKey(forDirectory: network.directory)] != nil,
+               let tipMetaForMaterialize = sortedForMaterialize.last {
+                guard let content = await materializeSyncedCanonicalContent(
+                    blocks: sortedForMaterialize,
+                    tipHash: tipMetaForMaterialize.blockHash,
+                    network: network,
+                    fetcher: fetcher,
+                    sourcePeer: activeSourcePeer
+                ) else {
+                    log.warn("\(network.directory): synced segment content not yet available; retrying (pending)")
+                    return .incomplete
+                }
+                materializedContent = content
+            }
+
+            // Gathered a fully-downloaded, PoW/proof-validated, materialized segment.
+            // adopt (finalize) + the child-proof recording happen in adoptSyncedSegment.
             return .complete(GatheredSyncSegment(
                 result: result,
                 headers: headers,
@@ -616,7 +658,8 @@ extension LatticeNode {
                 parentAnchors: syncedParentAnchors,
                 expectedChildPath: expectedChildPath,
                 localWork: localWork,
-                sourcePeer: activeSourcePeer
+                sourcePeer: activeSourcePeer,
+                materialized: materializedContent
             ))
 
         } catch {
@@ -1194,7 +1237,11 @@ extension LatticeNode {
     /// this — a refused or failed finalize means the segment was
     /// never committed.
     @discardableResult
-    func finalizeSyncResult(_ result: SyncResult, localWork: UInt256, network: ChainNetwork, fetcher: Fetcher, sourcePeer: PeerID? = nil) async -> ChainOutcome {
+    /// `preMaterialized`: the segment content recomputed off-lock by the gather stage
+    /// (`gatherSyncSegment`), so the commit does NOT re-run the heavy materialize under
+    /// the lock. `nil` when called directly (e.g. unit tests) — finalize then
+    /// materializes internally, exactly as before, so it stays independently testable.
+    func finalizeSyncResult(_ result: SyncResult, localWork: UInt256, network: ChainNetwork, fetcher: Fetcher, sourcePeer: PeerID? = nil, preMaterialized: MaterializedSyncContent? = nil) async -> ChainOutcome {
         let key = chainKey(forPath: network.chainPath)
         return await withChainMutation(key) {
             await finalizeSyncResultUnlocked(
@@ -1202,13 +1249,14 @@ extension LatticeNode {
                 localWork: localWork,
                 network: network,
                 fetcher: fetcher,
-                sourcePeer: sourcePeer
+                sourcePeer: sourcePeer,
+                preMaterialized: preMaterialized
             )
         }
     }
 
     @discardableResult
-    private func finalizeSyncResultUnlocked(_ result: SyncResult, localWork: UInt256, network: ChainNetwork, fetcher: Fetcher, sourcePeer: PeerID? = nil) async -> ChainOutcome {
+    private func finalizeSyncResultUnlocked(_ result: SyncResult, localWork: UInt256, network: ChainNetwork, fetcher: Fetcher, sourcePeer: PeerID? = nil, preMaterialized: MaterializedSyncContent? = nil) async -> ChainOutcome {
         let log = NodeLogger("sync")
         let directory = network.directory
         guard let chainState = await chain(for: directory) else { return .pendingUnavailable }
@@ -1233,13 +1281,21 @@ extension LatticeNode {
             return .degraded(reason: "missing StateStore or empty canonical segment")
         }
 
-        guard let materialized = await materializeSyncedCanonicalContent(
+        // In production the gather stage already recomputed this OFF the commit lock
+        // and handed it in. Only a direct caller (tests) leaves it nil → materialize
+        // here, as before; a content miss is still `.pendingUnavailable` (retry).
+        let materialized: MaterializedSyncContent
+        if let preMaterialized {
+            materialized = preMaterialized
+        } else if let content = await materializeSyncedCanonicalContent(
             blocks: sortedBlocks,
             tipHash: tipMeta.blockHash,
             network: network,
             fetcher: fetcher,
             sourcePeer: sourcePeer
-        ) else {
+        ) {
+            materialized = content
+        } else {
             log.warn("\(directory): could not materialize synced canonical content; retrying before durable publish")
             return .pendingUnavailable
         }
@@ -1782,7 +1838,7 @@ extension LatticeNode {
         network: ChainNetwork,
         fetcher: Fetcher,
         sourcePeer: PeerID? = nil
-    ) async -> (tipBlock: Block, rootsByHeight: [UInt64: [String]], blocksByHeight: [UInt64: Block])? {
+    ) async -> MaterializedSyncContent? {
         let log = NodeLogger("sync")
         var syncedTip: Block?
         var rootsByHeight: [UInt64: [String]] = [:]
@@ -1988,7 +2044,7 @@ extension LatticeNode {
         }
 
         guard let syncedTip else { return nil }
-        return (syncedTip, rootsByHeight, blocksByHeight)
+        return MaterializedSyncContent(tipBlock: syncedTip, rootsByHeight: rootsByHeight, blocksByHeight: blocksByHeight)
     }
 
     /// Recursive multi-chain sync wave. A chain syncs and finalizes itself first;
