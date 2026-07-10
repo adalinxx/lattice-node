@@ -75,12 +75,6 @@ enum ValidationResult: Equatable, Sendable {
 
 /// Result of the authoritative adopt step, which re-checks fork choice UNDER the
 /// commit lock (the chain may have advanced during gather/validate) and then commits.
-enum AdoptResult: Equatable, Sendable {
-    case adopted
-    case supersededByHeavierLocal  // local chain advanced under us → hold incumbent
-    case transientFailure          // a commit-time availability/IO miss → retry
-}
-
 /// The single apply operation — our `ActivateBestChain`, the choke point gossip,
 /// sync, and rescue will funnel into. The four steps map 1:1 to the SOTA-validated
 /// model: fork choice (cheap, first) → availability (missing = pending) → validate
@@ -101,7 +95,10 @@ struct ChainApply<Gathered: Sendable>: Sendable {
     /// PoW + proofs + state re-execution over the gathered data.
     var validate: @Sendable (Gathered) async -> ValidationResult
     /// Re-check fork choice under the commit lock, then commit/reorg the gathered data.
-    var adopt: @Sendable (Gathered) async -> AdoptResult
+    /// Returns the TERMINAL outcome directly: `.adopted` (committed), `.ignoredLighter`
+    /// (local chain advanced under us → hold incumbent), `.pendingUnavailable` (a
+    /// transient commit-time miss → retry), or `.degraded` (a local post-commit failure).
+    var adopt: @Sendable (Gathered) async -> ChainOutcome
 
     func apply(_ candidate: CandidateExtension) async -> ChainOutcome {
         // 1. Fork choice first — cheapest gate. A not-heavier candidate is dropped
@@ -123,12 +120,8 @@ struct ChainApply<Gathered: Sendable>: Sendable {
         if case .invalid(let r) = await validate(gathered) { return .invalid(reason: r) }
 
         // 4. Adopt — the authoritative fork-choice re-check happens HERE, under the
-        //    commit lock, because the local chain may have advanced during 2–3. A
-        //    transient commit-time miss retries rather than dead-ends.
-        switch await adopt(gathered) {
-        case .adopted:                 return .adopted(tipCID: candidate.tipCID)
-        case .supersededByHeavierLocal: return .ignoredLighter
-        case .transientFailure:        return .pendingUnavailable
-        }
+        //    commit lock (the local chain may have advanced during 2–3). `adopt`
+        //    returns the terminal ChainOutcome directly — it IS the apply result.
+        return await adopt(gathered)
     }
 }
