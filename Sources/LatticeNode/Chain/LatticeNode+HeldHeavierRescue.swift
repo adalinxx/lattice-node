@@ -172,6 +172,10 @@ extension LatticeNode {
                     // Memoize against the CURRENT tip so an unserved/invalid
                     // heavier claim can't spin the node; a tip change re-arms.
                     memoizeRefusedRescueConnector(cid, localTip: localTip)
+                case .deferredWhileSyncing:
+                    // Transient (ancestor state not yet materialized) — NOT a refusal.
+                    // Do not memoize; a later pass retries once the gap heals.
+                    break
                 }
             }
             if !progressed { return }
