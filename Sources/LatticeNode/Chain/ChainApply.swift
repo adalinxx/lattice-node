@@ -80,11 +80,11 @@ enum ValidationResult: Equatable, Sendable {
 /// model: fork choice (cheap, first) → availability (missing = pending) → validate
 /// (verify-not-trust) → adopt (authoritative re-check under lock, then commit).
 ///
-/// STATUS: proposed choke point — NOT YET WIRED into the live sync/gossip paths.
-/// It is fully contract-tested with fakes (ChainApplyTests), and its shape is what the
-/// redirect step will use: real closures that call the node's fork-choice / fetcher /
-/// validator / commit paths, replacing the duplicate flows. Until that redirect lands,
-/// only `ChainOutcome` (finalizeSyncResult's return) is live; this struct is scaffolding.
+/// STATUS: WIRED for the SYNC path — `performHeadersFirstSync` builds a
+/// `ChainApply<GatheredSyncSegment>` (gather = download+validate a segment, adopt =
+/// finalize/commit) and routes through `apply()`. Contract-tested with fakes
+/// (ChainApplyTests). REMAINING: redirect the gossip single-block path + the rescue
+/// path through the same `apply()`, then delete their duplicate flows.
 struct ChainApply<Gathered: Sendable>: Sendable {
     /// Cheap pre-filter: is the candidate plausibly heavier (may use claimedWork)?
     /// Not authoritative — `adopt` re-checks against verified data under the lock.

@@ -323,10 +323,81 @@ extension LatticeNode {
         }
     }
 
-    /// Returns the terminal `ChainOutcome` of the attempt so `startSync` can decide
-    /// whether to retry: `.pendingUnavailable` (content miss / timeout / threw) is
-    /// retriable regardless of height; every other outcome is terminal.
+    /// A downloaded, PoW/proof-validated sync segment (the `gather` output) — carries the
+    /// SyncResult that `adopt` commits plus the byproducts the post-commit child-proof
+    /// recording needs. Sendable so it flows through the ChainApply pipeline closures.
+    struct GatheredSyncSegment: Sendable {
+        let result: SyncResult
+        let headers: [SyncBlockHeader]
+        let acceptedProofs: [String: Data]
+        let parentAnchors: [String: ParentAnchor]
+        let expectedChildPath: [String]?
+        let localWork: UInt256
+        let sourcePeer: PeerID?
+    }
+
+    /// Headers-first sync as the single `apply()` operation: gather (download + validate a
+    /// segment) → adopt (finalize/commit). isStrictlyHeavier is trivially true here (the
+    /// trigger, checkSyncNeeded, already decided a sync is worthwhile); validate is folded
+    /// into gather (downloadHeaders verifies PoW + continuity, child parent-anchor
+    /// consistency in the walk). Returns the terminal ChainOutcome so startSync's retry
+    /// can act on it (`.pendingUnavailable` retriable; everything else terminal).
     func performHeadersFirstSync(peerTipCID: String, network: ChainNetwork, sourcePeer: PeerID? = nil, peerTipHeight: UInt64? = nil) async -> ChainOutcome {
+        let log = NodeLogger("sync")
+        let fetcher = network.ivyFetcher
+        let candidate = CandidateExtension(
+            tipCID: peerTipCID, tipHeight: peerTipHeight ?? 0, claimedWork: nil, source: sourcePeer)
+        let apply = ChainApply<GatheredSyncSegment>(
+            isStrictlyHeavier: { _ in true },
+            gather: { [self] _ in
+                await self.gatherSyncSegment(peerTipCID: peerTipCID, network: network, sourcePeer: sourcePeer, peerTipHeight: peerTipHeight)
+            },
+            validate: { _ in .valid },
+            adopt: { [self] seg in await self.adoptSyncedSegment(seg, network: network, fetcher: fetcher) }
+        )
+        let outcome = await apply.apply(candidate)
+        // Observe the outcome — a transient content miss (the seed-496 class) must be a
+        // VISIBLE signal, not a silent stall; `.pendingUnavailable` stays retriable.
+        metrics.increment("lattice_sync_outcome_\(outcome.metricSuffix)")
+        switch outcome {
+        case .adopted:
+            log.info("Headers-first sync complete")
+        case .ignoredLighter:
+            log.info("\(network.directory): sync settled — incumbent held (peer chain not heavier)")
+        case .pendingUnavailable:
+            log.warn("\(network.directory): sync pending — canonical content unavailable; will retry when data/peers arrive (not refused, stays retriable)")
+        case .invalid(let reason):
+            log.warn("\(network.directory): sync rejected invalid chain: \(reason)")
+        case .degraded(let reason):
+            log.error("\(network.directory): sync could not publish — local storage/config failure: \(reason) (not retriable by waiting)")
+        }
+        return outcome
+    }
+
+    /// Adopt a gathered segment: re-check fork choice + commit (finalizeSyncResult), then
+    /// — ONLY if adopted — record the child's securing proofs (folding inherited work into
+    /// fork choice). A refused/failed finalize never committed the segment, so recording
+    /// "accepted" proofs would leave durable state for blocks we never adopted. Terminal.
+    private func adoptSyncedSegment(_ seg: GatheredSyncSegment, network: ChainNetwork, fetcher: IvyFetcher) async -> ChainOutcome {
+        let outcome = await finalizeSyncResult(
+            seg.result, localWork: seg.localWork, network: network, fetcher: fetcher, sourcePeer: seg.sourcePeer)
+        if outcome.wasAdopted, seg.expectedChildPath != nil {
+            await recordSyncedChildProofs(
+                directory: network.directory,
+                headers: seg.headers,
+                proofs: seg.acceptedProofs,
+                parentAnchors: seg.parentAnchors,
+                source: IvyContentSource(fetcher)
+            )
+        }
+        return outcome
+    }
+
+    /// Gather (the availability + validation stage of apply): download the header segment
+    /// from any peer/CAS, build + PoW/proof-validate the SyncResult, and (for children)
+    /// validate parent-anchor consistency. Returns the segment on success, `.incomplete`
+    /// on any download/validation failure (transient — startSync retries).
+    private func gatherSyncSegment(peerTipCID: String, network: ChainNetwork, sourcePeer: PeerID? = nil, peerTipHeight: UInt64? = nil) async -> GatherOutcome<GatheredSyncSegment> {
         let log = NodeLogger("sync")
         log.info("Starting headers-first sync from \(String(peerTipCID.prefix(16)))...")
 
@@ -536,48 +607,17 @@ extension LatticeNode {
                 )
             }
 
-            let outcome = await finalizeSyncResult(result, localWork: localWork, network: network, fetcher: fetcher, sourcePeer: activeSourcePeer)
-            let finalized = outcome.wasAdopted
-            // Act on the outcome — make each fate an observable signal so a transient
-            // content miss (the seed-496 class) is VISIBLE, not a silent stall.
-            // `.pendingUnavailable` is deliberately NOT recorded as refused/failed, so
-            // it stays retriable when data/peers arrive; only `.ignoredLighter` is the
-            // settled work-refusal (already memoized inside finalizeSyncResult).
-            metrics.increment("lattice_sync_outcome_\(outcome.metricSuffix)")
-            switch outcome {
-            case .adopted:
-                break  // logged below as "Headers-first sync complete"
-            case .ignoredLighter:
-                log.info("\(network.directory): sync settled — incumbent held (peer chain not heavier)")
-            case .pendingUnavailable:
-                log.warn("\(network.directory): sync pending — canonical content unavailable; will retry when data/peers arrive (not refused, stays retriable)")
-            case .invalid(let reason):
-                log.warn("\(network.directory): sync rejected invalid chain: \(reason)")
-            case .degraded(let reason):
-                log.error("\(network.directory): sync could not publish — local storage/config failure: \(reason) (not retriable by waiting)")
-            }
-
-            // F5-4: child blocks just synced carry verified anchoring proofs. Persist
-            // each (so this node can serve it onward) and fold its securing work into
-            // fork choice — the same accumulate→reevaluate the live ingestion runs, so
-            // sync is not a special path for inherited weight.
-            // Gated on finalize: a refused or failed finalize never committed
-            // the segment, so persisting "accepted" proofs or applying inherited
-            // weight for it would leave durable state for blocks we never adopted.
-            if finalized, expectedChildPath != nil {
-                let directory = network.directory
-                let syncedProofs = await headerChain.acceptedProofs
-                await recordSyncedChildProofs(
-                    directory: directory,
-                    headers: headers,
-                    proofs: syncedProofs,
-                    parentAnchors: syncedParentAnchors,
-                    source: IvyContentSource(fetcher)
-                )
-            }
-
-            log.info("Headers-first sync complete")
-            return outcome
+            // Gathered a fully-downloaded, PoW/proof-validated segment. adopt (finalize)
+            // + the child-proof recording happen in adoptSyncedSegment / the caller.
+            return .complete(GatheredSyncSegment(
+                result: result,
+                headers: headers,
+                acceptedProofs: await headerChain.acceptedProofs,
+                parentAnchors: syncedParentAnchors,
+                expectedChildPath: expectedChildPath,
+                localWork: localWork,
+                sourcePeer: activeSourcePeer
+            ))
 
         } catch {
             let peerCount2 = await network.ivy.peerConnectionCount
@@ -597,10 +637,10 @@ extension LatticeNode {
                 await prefetch.value
             }
             log.error("Headers-first sync failed: \(error)")
-            // A throw = the attempt did not complete = transient. A reshuffled retry
-            // (bounded) can re-reach the tip via other peers; a genuinely-dead source
-            // just exhausts the budget. Terminal validity is decided at finalize, not here.
-            return .pendingUnavailable
+            // A throw = the download/validation did not complete = transient. apply()
+            // maps `.incomplete` → `.pendingUnavailable`, so startSync's bounded retry
+            // re-reaches the tip via other peers; a dead source just exhausts the budget.
+            return .incomplete
         }
     }
 
