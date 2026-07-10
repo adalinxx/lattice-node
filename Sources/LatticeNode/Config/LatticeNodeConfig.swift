@@ -39,7 +39,6 @@ public struct LatticeNodeConfig: Sendable {
     /// Operational tunables (timeouts, caps, dedup windows, token-bucket rates,
     /// intervals). Node-local, never consensus-affecting — see `NodeTuning`.
     public let tuning: NodeTuning
-    public let finality: FinalityConfig
     public let maxPeerConnections: Int
     public let discoveryOnly: Bool
     public let storageMode: StorageMode
@@ -127,7 +126,6 @@ public struct LatticeNodeConfig: Sendable {
         retentionDepth: UInt64 = DEFAULT_RETENTION_DEPTH,
         resources: NodeResourceConfig = .default,
         tuning: NodeTuning = .default,
-        finality: FinalityConfig = FinalityConfig(),
         maxPeerConnections: Int = BootstrapPeers.maxPeerConnections,
         discoveryOnly: Bool = false,
         storageMode: StorageMode = .stateful,
@@ -157,7 +155,6 @@ public struct LatticeNodeConfig: Sendable {
         self.retentionDepth = retentionDepth
         self.resources = resources
         self.tuning = tuning
-        self.finality = finality
         self.maxPeerConnections = maxPeerConnections
         self.discoveryOnly = discoveryOnly
         self.storageMode = storageMode
