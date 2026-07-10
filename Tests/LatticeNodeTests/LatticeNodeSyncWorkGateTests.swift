@@ -164,7 +164,7 @@ final class LatticeNodeSyncWorkGateTests: XCTestCase {
             let tipBlock = try XCTUnwrap(resolvedTip, "peer tip block must resolve")
             let seg = LatticeNode.GatheredSyncSegment(
                 result: fixture.result, headers: [], acceptedProofs: [:],
-                parentAnchors: [:], processingRootHashes: [:], expectedChildPath: nil,
+                parentAnchors: [:], processingRootHashes: [:], preSyncTip: nil, expectedChildPath: nil,
                 localWork: localWork, sourcePeer: nil,
                 materialized: LatticeNode.MaterializedSyncContent(
                     tipBlock: tipBlock, rootsByHeight: [:],
