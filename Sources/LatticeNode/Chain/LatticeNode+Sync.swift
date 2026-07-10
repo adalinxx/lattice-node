@@ -348,6 +348,13 @@ extension LatticeNode {
         /// ingest). Empty for root chains (self-PoW, no cross-chain anchor). Surfaced here
         /// by gather; consumed by the per-block adopt (P2).
         let processingRootHashes: [String: UInt256]
+        /// This chain's main-chain tip at gather start — the orphan-recovery anchor for
+        /// the whole sync-driven transition. The per-block adopt's incremental tip moves
+        /// (fragmented by interleaved gossip) can orphan blocks across several small moves
+        /// that each recover only their own fragment; recovering ONCE over
+        /// `preSyncTip → adopted-tip` (walk to the common ancestor) catches the complete
+        /// orphan set — the txs that must return to the mempool. `nil` = fresh chain.
+        let preSyncTip: String?
         let expectedChildPath: [String]?
         let localWork: UInt256
         let sourcePeer: PeerID?
@@ -542,6 +549,22 @@ extension LatticeNode {
             return .ignoredLighter
         }
 
+        // Whole-transition orphan recovery. The per-block reorg above recovers orphans
+        // per individual tip move, but a sync-driven fork switch can advance the tip in
+        // several small moves (fragmented by interleaved gossip), so no single move sees
+        // the complete orphan set — blocks orphaned across fragments (e.g. a tx mined on
+        // our pre-sync fork) never return to the mempool. Recover ONCE over the full
+        // preSyncTip → newTip transition (boundedReorgWalk finds the common ancestor and
+        // the complete orphan set); recoverOrphanedTransactions is idempotent, so
+        // re-covering an already-recovered fragment is safe. Mirrors the old
+        // finalizeSyncResult path's single explicit recovery.
+        if let preSyncTip = seg.preSyncTip, preSyncTip != newTip {
+            let transition = await boundedReorgWalk(oldTip: preSyncTip, newTip: newTip, chain: chainState)
+            await recoverOrphanedTransactions(
+                transition: transition, oldTip: preSyncTip, newTip: newTip,
+                directory: directory, source: IvyContentSource(network.ivyFetcher))
+        }
+
         // Re-home the post-adopt child-recursion tail (H1) — the parent-before-child engine.
         // `reprocessSyncedBlocksForChildChains` is dropped (its durability assertion is
         // already enforced per-block by requireDurableResolvedBlock).
@@ -570,6 +593,7 @@ extension LatticeNode {
 
         do {
             let localWork = await localCumulativeWork(chainPath: network.chainPath)
+            let preSyncTip = await chain(forPath: network.chainPath)?.getMainChainTip()
             let (activeTip, activeSourcePeer) = await bestConnectedPeerTipWithPeer(
                 defaultTipCID: peerTipCID,
                 defaultTipHeight: peerTipHeight,
@@ -805,6 +829,7 @@ extension LatticeNode {
                 acceptedProofs: await headerChain.acceptedProofs,
                 parentAnchors: syncedParentAnchors,
                 processingRootHashes: syncedProcessingRootHashes,
+                preSyncTip: preSyncTip,
                 expectedChildPath: expectedChildPath,
                 localWork: localWork,
                 sourcePeer: activeSourcePeer,

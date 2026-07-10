@@ -207,7 +207,7 @@ final class ChildSyncGossipRescueTests: XCTestCase {
         let seg = LatticeNode.GatheredSyncSegment(
             result: result, headers: [header], acceptedProofs: proofsMap,
             parentAnchors: validated.anchors, processingRootHashes: validated.processingRootHashes,
-            expectedChildPath: ["Mid"], localWork: .zero, sourcePeer: nil,
+            preSyncTip: nil, expectedChildPath: ["Mid"], localWork: .zero, sourcePeer: nil,
             materialized: LatticeNode.MaterializedSyncContent(
                 tipBlock: child, rootsByHeight: [:],
                 blocksByHeight: [midGenesis.height: midGenesis, child.height: child]))
