@@ -21,6 +21,13 @@ extension LatticeNode {
         case rejected
         case storageFailed
         /// processBlockHeader failed because a sub-CID fetch exhausted all sources.
+        /// A TRANSIENT defer while the chain is actively syncing: the block passed
+        /// PoW/proof pre-validation but its ancestor state isn't materialized yet
+        /// (defer-don't-fault). Distinct from `.rejected` (hard invalid) so the pull
+        /// (sync) path can RETRY it (stop-at-prefix, no peer penalty) rather than
+        /// conflate it with fraud. Gossip/rescue treat it exactly like `.rejected`
+        /// (drop + re-deliver) — it is load-bearing only on the sync adopt loop (N1).
+        case deferredWhileSyncing
     }
 
     private func failDurable(_ reason: String, directory: String, chainPath: [String]? = nil) async -> BlockProcessOutcome {
@@ -444,7 +451,7 @@ extension LatticeNode {
                 let chainIsSyncing = blockChainPath.map { isChainSyncing(chainPath: $0) } ?? isSyncing
                 if chainIsSyncing {
                     NodeLogger("blocks").info("\(directory): deferring premature block \(String(header.rawCID.prefix(16)))… while syncing (\(failureReason)); sync will re-deliver")
-                    return .rejected
+                    return .deferredWhileSyncing
                 }
                 return await failStorageDegraded(failureReason, directory: directory, chainPath: blockChainPath)
             }
@@ -757,13 +764,14 @@ extension LatticeNode {
             await publishAcceptedBlock(block: block, cid: cid, data: data, network: network)
         case .duplicate:
             tally.recordSuccess(peer: peer)
-        case .rejected:
+        case .rejected, .deferredWhileSyncing:
             // Do not penalize for soft rejections. The block passed all pre-validation
             // checks (PoW, timestamp, size) so the peer is not misbehaving — the
             // rejection is due to fork divergence or missing state, not fraud.
             // Penalizing here causes legitimate bootstrap peers on minority forks
             // to be demoted from the anchor list, severing the connection that
-            // would allow them to eventually sync and converge.
+            // would allow them to eventually sync and converge. (Gossip treats a
+            // sync-defer identically to a soft reject: drop, re-deliver later.)
             break
         case .storageFailed:
             NodeLogger("blocks").error("\(directory): accepted block \(String(cid.prefix(16)))… was not durably stored; withholding tip publish")
@@ -948,7 +956,7 @@ extension LatticeNode {
             await maybePersist(directory: directory)
         case .duplicate:
             tally.recordSuccess(peer: peer)
-        case .rejected:
+        case .rejected, .deferredWhileSyncing:
             break
         case .storageFailed:
             NodeLogger("blocks").error("\(directory): announced block \(String(cid.prefix(16)))… was accepted but not durably stored; withholding relay")

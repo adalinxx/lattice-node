@@ -375,7 +375,11 @@ extension LatticeNode {
                 await self.gatherSyncSegment(peerTipCID: peerTipCID, network: network, sourcePeer: sourcePeer, peerTipHeight: peerTipHeight)
             },
             validate: { _ in .valid },
-            adopt: { [self] seg in await self.adoptSyncedSegment(seg, network: network, fetcher: fetcher) }
+            adopt: { [self] seg in
+                Self.syncAdoptViaForkChoice
+                    ? await self.adoptSyncedSegmentViaForkChoice(seg, network: network, fetcher: fetcher)
+                    : await self.adoptSyncedSegment(seg, network: network, fetcher: fetcher)
+            }
         )
         let outcome = await apply.apply(candidate)
         // Observe the outcome — a transient content miss (the seed-496 class) must be a
@@ -414,6 +418,138 @@ extension LatticeNode {
             )
         }
         return outcome
+    }
+
+    /// Opt-in switch to the self-similar per-block adopt (P2). DORMANT by default while
+    /// the new path is validated beside the old finalizeSyncResult path; flipped on
+    /// (and the old path deleted) in P4 once the child-reorg/deep-catchup smoke is green.
+    static let syncAdoptViaForkChoice = ProcessInfo.processInfo.environment["SYNC_ADOPT_VIA_FORK_CHOICE"] == "1"
+
+    /// P2: the SELF-SIMILAR adopt. Feed each gathered block through the SAME
+    /// `processBlockAndRecoverReorg` gossip and held-heavier rescue already use, one
+    /// block oldest→newest, letting ChainState's ONE GHOST decide (weight = subtree +
+    /// inherited). Transport is the only thing that made sync special; the ingest is
+    /// identical. Root chains take the same loop with no proofs (inherited-0). No bespoke
+    /// admission, no segment commit, no work-gate (validity is the filter; reorg depth is
+    /// bounded by the local retentionDepth). Mirrors `submitRescuedChildConnector`.
+    private func adoptSyncedSegmentViaForkChoice(_ seg: GatheredSyncSegment, network: ChainNetwork, fetcher: IvyFetcher) async -> ChainOutcome {
+        let log = NodeLogger("sync")
+        let directory = network.directory
+        guard let chainState = await chain(for: directory) else { return .pendingUnavailable }
+        let sortedBlocks = seg.result.persisted.blocks.sorted { $0.blockHeight < $1.blockHeight }
+        guard let lowest = sortedBlocks.first, let materialized = seg.materialized else {
+            // Empty segment or no materialized content — structural (matches the old
+            // finalize `.degraded` guard), never a wait-and-retry availability miss.
+            return .degraded(reason: "empty synced segment or missing materialized content")
+        }
+
+        // Anchor-presence guard (F7): the lowest block's parent must still be on our
+        // current main chain (the retention floor can advance between gather and adopt).
+        // If not, a fresh gather anchored to the new floor is needed — availability, retry.
+        if lowest.blockHeight > 0 {
+            var parentOnChain = false
+            if let parentHash = lowest.parentBlockHash {
+                parentOnChain = await chainState.isOnMainChain(hash: parentHash)
+            }
+            if !parentOnChain {
+                log.info("\(directory): synced segment anchor no longer on main chain; retry with fresh gather")
+                return .pendingUnavailable
+            }
+        }
+
+        let isChild = seg.expectedChildPath != nil
+        for meta in sortedBlocks {
+            let cid = meta.blockHash
+            guard let block = materialized.blocksByHeight[meta.blockHeight] else {
+                // Materialized content missing for this height — availability, retry.
+                return .pendingUnavailable
+            }
+
+            let outcome: BlockProcessOutcome
+            if isChild, let proofData = seg.acceptedProofs[cid],
+               let decodedProofs = ChildBlockProofEnvelope.deserialize(proofData) {
+                // CHILD: preload inherited securing weight BEFORE fork choice so the GHOST
+                // decision sees it (parent-synced ⇒ it's already recorded), then route
+                // through the shared ingest with the surfaced processing root + anchor.
+                for proof in decodedProofs {
+                    await preloadInheritedWeight(directory: directory, blockHash: cid, proof: proof)
+                }
+                var proofEntries: [String: Data] = [:]
+                for proof in decodedProofs {
+                    for entry in proof.entries where proofEntries[entry.cid] == nil {
+                        proofEntries[entry.cid] = entry.data
+                    }
+                }
+                let overlay = OverlayContentSource(entries: proofEntries, fallback: IvyContentSource(network.ivyFetcher))
+                outcome = await processBlockAndRecoverReorg(
+                    header: VolumeImpl<Block>(rawCID: cid),
+                    directory: directory,
+                    chainPath: network.chainPath,
+                    fetcher: CoalescingFetcher(overlay),
+                    resolvedBlock: block,
+                    rootHash: seg.processingRootHashes[cid],
+                    parentAnchor: seg.parentAnchors[cid],
+                    requireDurableResolvedBlock: true,
+                    baseValidationSourceOverride: overlay,
+                    allowBelowTipHeight: true
+                )
+                if outcome == .accepted || outcome == .duplicate {
+                    for proof in decodedProofs {
+                        await persistAcceptedBlockProof(directory: directory, height: meta.blockHeight, blockHash: cid, proof: proof)
+                    }
+                    for proof in decodedProofs {
+                        guard await applyInheritedWeight(directory: directory, blockHash: cid, proof: proof, source: overlay) else { break }
+                    }
+                }
+            } else {
+                // ROOT (self-PoW headers, inherited-0): same loop, no proofs/overlay/root/anchor.
+                outcome = await processBlockAndRecoverReorg(
+                    header: VolumeImpl<Block>(rawCID: cid),
+                    directory: directory,
+                    chainPath: network.chainPath,
+                    fetcher: fetcher,
+                    resolvedBlock: block,
+                    requireDurableResolvedBlock: true,
+                    allowBelowTipHeight: true
+                )
+            }
+
+            switch outcome {
+            case .accepted, .duplicate:
+                continue
+            case .deferredWhileSyncing:
+                // N1: transient (ancestor state not yet materialized) — stop at the valid
+                // committed prefix and retry from here. NOT a refusal: never memoized.
+                log.info("\(directory): synced segment deferred at height \(meta.blockHeight); retry from prefix")
+                return .pendingUnavailable
+            case .rejected:
+                // Hard invalid (bad PoW/proof/state) — terminal; the peer is attributed by
+                // processBlockHeader's own validation path. Validity is the filter (P-A).
+                return .invalid(reason: "synced block \(String(cid.prefix(16)))… rejected by fork-choice ingest at height \(meta.blockHeight)")
+            case .storageFailed:
+                // Local durable-storage failure (not the peer's fault, not retriable by waiting).
+                return .degraded(reason: "durable storage failed for synced block at height \(meta.blockHeight)")
+            }
+        }
+
+        // Every block ingested. Fork choice decided per block; did the tip actually become
+        // canonical, or did GHOST hold a heavier incumbent (blocks landed as a dormant fork)?
+        let newTip = await chainState.getMainChainTip()
+        guard newTip == seg.result.tipBlockHash else {
+            return .ignoredLighter
+        }
+
+        // Re-home the post-adopt child-recursion tail (H1) — the parent-before-child engine.
+        // `reprocessSyncedBlocksForChildChains` is dropped (its durability assertion is
+        // already enforced per-block by requireDurableResolvedBlock).
+        await reconcileChildChainStatesAfterSync(
+            persisted: seg.result.persisted,
+            fetcher: fetcher,
+            currentMutationKey: chainKey(forDirectory: directory)
+        )
+        await verifySyncWithPeers(tipCID: seg.result.tipBlockHash, tipHeight: seg.result.tipBlockHeight, network: network)
+        await syncSubscribedChildren(of: directory)
+        return .adopted(tipCID: seg.result.tipBlockHash)
     }
 
     /// Gather (the availability + validation stage of apply): download the header segment
