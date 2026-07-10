@@ -239,8 +239,6 @@ enum RPCRoutes {
         api.get("receipt/{txCID}") { req, ctx in try await getReceipt(node: node, txCID: ctx.parameters.require("txCID"), request: req) }
         api.get("transaction/{txCID}") { req, ctx in try await getTransaction(node: node, txCID: ctx.parameters.require("txCID"), request: req) }
         api.get("transactions/{address}") { req, ctx in try await getTransactionHistory(node: node, address: ctx.parameters.require("address"), request: req) }
-        api.get("finality/{height}") { req, ctx in try await getFinality(node: node, height: ctx.parameters.require("height"), request: req) }
-        api.get("finality/config") { _, _ in try await getFinalityConfig(node: node) }
         api.get("block/{id}/state") { req, ctx in try await getBlockState(node: node, blockId: ctx.parameters.require("id"), request: req) }
         api.get("block/{id}/state/account/{address}") { req, ctx in try await getBlockAccountState(node: node, blockId: ctx.parameters.require("id"), address: ctx.parameters.require("address"), request: req) }
         let light = api.group("light")
