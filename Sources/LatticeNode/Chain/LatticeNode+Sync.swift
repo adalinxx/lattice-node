@@ -342,6 +342,12 @@ extension LatticeNode {
         let headers: [SyncBlockHeader]
         let acceptedProofs: [String: Data]
         let parentAnchors: [String: ParentAnchor]
+        /// childCID → merged-mining processing root of its SELECTED committing-parent
+        /// anchor (the `rootHash` fed to `processBlockHeader.validateProofOfWork(nexusHash:)`
+        /// when the per-block adopt path routes a synced child block through the shared
+        /// ingest). Empty for root chains (self-PoW, no cross-chain anchor). Surfaced here
+        /// by gather; consumed by the per-block adopt (P2).
+        let processingRootHashes: [String: UInt256]
         let expectedChildPath: [String]?
         let localWork: UInt256
         let sourcePeer: PeerID?
@@ -613,15 +619,18 @@ extension LatticeNode {
             log.info("Sync complete: height \(result.tipBlockHeight), applying to chain...")
 
             var syncedParentAnchors: [String: ParentAnchor] = [:]
+            var syncedProcessingRootHashes: [String: UInt256] = [:]
             if expectedChildPath != nil {
                 let directory = network.directory
                 let syncedProofs = await headerChain.acceptedProofs
-                syncedParentAnchors = try await validateSyncedParentAnchorConsistency(
+                let validated = try await validateSyncedParentAnchorConsistency(
                     directory: directory,
                     headers: headers,
                     proofs: syncedProofs,
                     fetcher: fetcher
                 )
+                syncedParentAnchors = validated.anchors
+                syncedProcessingRootHashes = validated.processingRootHashes
             }
 
             // Availability stage: recompute the segment's canonical content OFF the
@@ -656,6 +665,7 @@ extension LatticeNode {
                 headers: headers,
                 acceptedProofs: await headerChain.acceptedProofs,
                 parentAnchors: syncedParentAnchors,
+                processingRootHashes: syncedProcessingRootHashes,
                 expectedChildPath: expectedChildPath,
                 localWork: localWork,
                 sourcePeer: activeSourcePeer,
@@ -777,8 +787,8 @@ extension LatticeNode {
         headers: [SyncBlockHeader],
         proofs: [String: Data],
         fetcher: Fetcher
-    ) async throws -> [String: ParentAnchor] {
-        guard let store = stateStores[chainKey(forDirectory: directory)] else { return [:] }
+    ) async throws -> (anchors: [String: ParentAnchor], processingRootHashes: [String: UInt256]) {
+        guard let store = stateStores[chainKey(forDirectory: directory)] else { return (anchors: [:], processingRootHashes: [:]) }
         // Collect every proof's CAS entries up front so the continuity walk
         // below can resolve carrier blocks that only exist as proof material.
         var proofEntryBytes: [String: Data] = [:]
@@ -794,6 +804,12 @@ extension LatticeNode {
             ? fetcher
             : ProofEntriesFirstFetcher(entries: proofEntryBytes, base: fetcher)
         var anchorsByChild: [String: [ParentAnchor]] = [:]
+        // childCID → (committing-parent anchor hash → merged-mining processing root).
+        // The adopt path feeds the SELECTED anchor's root to
+        // processBlockHeader.validateProofOfWork(nexusHash:) — mirroring the gossip
+        // side-effect path (LatticeNode+BlockSideEffects: selectChildParentAnchor →
+        // verified.first{ $0.anchor.blockHash == parentAnchor.blockHash }.rootHash).
+        var rootHashByChildAnchor: [String: [String: UInt256]] = [:]
         for header in headers where header.height > 0 {
             guard let proofData = proofs[header.cid],
                   let decodedProofs = ChildBlockProofEnvelope.deserialize(proofData),
@@ -808,12 +824,16 @@ extension LatticeNode {
                     throw HeaderChain.HeaderChainError.invalidPoW(header.cid)
                 }
                 anchors.append(anchor)
+                if let root = await proof.anchorRoot()?.hash {
+                    rootHashByChildAnchor[header.cid, default: [:]][anchor.blockHash] = root
+                }
             }
             anchorsByChild[header.cid] = anchors.canonicalAnchorSorted()
         }
 
         var pendingChildAnchors: [String: String] = [:]
         var selectedAnchors: [String: ParentAnchor] = [:]
+        var selectedRootHashes: [String: UInt256] = [:]
         for header in headers where header.height > 0 {
             guard let orderedAnchors = anchorsByChild[header.cid], !orderedAnchors.isEmpty else {
                 throw HeaderChain.HeaderChainError.invalidPoW(header.cid)
@@ -883,8 +903,9 @@ extension LatticeNode {
             }
             pendingChildAnchors[header.cid] = selected.blockHash
             selectedAnchors[header.cid] = selected
+            selectedRootHashes[header.cid] = rootHashByChildAnchor[header.cid]?[selected.blockHash]
         }
-        return selectedAnchors
+        return (anchors: selectedAnchors, processingRootHashes: selectedRootHashes)
     }
 
     /// Historical child sync receives a proof for each child block's committing
