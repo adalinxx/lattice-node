@@ -122,12 +122,6 @@ struct NodeCommand: AsyncParsableCommand {
     @Option(name: .long, help: "Minimum proof-of-work bits a peer identity key must carry to be admitted (default 16 — the live-network value; 0 disables). Raises the cost of Sybil/eclipse routing-table poisoning; must match the network you join.")
     var minPeerKeyBits: Int = LatticeNodeConfig.defaultMinPeerKeyBits
 
-    @Option(name: .long, help: "Default finality confirmations for all chains (default: no finality in PoW)")
-    var finalityConfirmations: UInt64 = UInt64.max
-
-    @Option(name: .long, parsing: .singleValue, help: "Per-chain finality (chain:confirmations, repeatable)")
-    var finalityPolicy: [String] = []
-
     @Option(name: .long, help: "Path to JSON config file (overrides CLI defaults)")
     var config: String?
 
@@ -198,8 +192,6 @@ struct NodeCommand: AsyncParsableCommand {
         var effectiveMaxPeersOpt = maxPeers
         var effectiveMaxFrameSize = maxFrameSize
         var effectiveMinFeeRate = minFeeRate
-        var effectiveFinalityConfirmations = finalityConfirmations
-        var effectiveFinalityPolicy = finalityPolicy
         var effectiveKeyPassword = keyPassword ?? ProcessInfo.processInfo.environment["LATTICE_KEY_PASSWORD"]
         var effectiveTestnet = testnet
         var effectiveMinPeerKeyBits = minPeerKeyBits
@@ -227,12 +219,10 @@ struct NodeCommand: AsyncParsableCommand {
                 if let v = json["maxFrameSize"] as? Int, v > 0, v <= Int(UInt32.max) { effectiveMaxFrameSize = UInt32(v) }
                 if let v = json["minFeeRate"] as? Int, v >= 0 { effectiveMinFeeRate = UInt64(v) }
                 if let v = json["autosize"] as? Bool { effectiveAutosize = v }
-                if let v = json["finalityConfirmations"] as? Int { effectiveFinalityConfirmations = UInt64(v) }
                 if let v = json["keyPassword"] as? String { effectiveKeyPassword = v }
                 if let v = json["testnet"] as? Bool { effectiveTestnet = v }
                 if let v = json["minPeerKeyBits"] as? Int, v >= 0 { effectiveMinPeerKeyBits = v }
                 if let peers = json["peers"] as? [String] { effectivePeer = peers }
-                if let policies = json["finalityPolicy"] as? [String] { effectiveFinalityPolicy = policies }
             } else {
                 print("  WARNING: Could not load config file: \(configPath)")
             }
@@ -394,11 +384,6 @@ struct NodeCommand: AsyncParsableCommand {
             print("  Bootstrap:   \(allPeers.count) peer(s) (\(savedCount) persisted)")
         }
 
-        let parsedFinality = FinalityConfig(
-            policies: effectiveFinalityPolicy.compactMap { FinalityPolicy.parse($0) },
-            defaultConfirmations: effectiveFinalityConfirmations
-        )
-
         let retentionDepth = ProcessInfo.processInfo.environment["RETENTION_DEPTH"].flatMap(UInt64.init) ?? DEFAULT_RETENTION_DEPTH
         let pinExpiry = ProcessInfo.processInfo.environment["PIN_ANNOUNCE_EXPIRY"].flatMap(UInt64.init) ?? 86400
         let reannounceSeconds = ProcessInfo.processInfo.environment["REANNOUNCE_INTERVAL"].flatMap(Double.init) ?? 86400
@@ -451,7 +436,6 @@ struct NodeCommand: AsyncParsableCommand {
             retentionDepth: retentionDepth,
             resources: resources,
             tuning: NodeTuning.fromEnvironment(),
-            finality: parsedFinality,
             maxPeerConnections: effectiveMaxPeers,
             discoveryOnly: effectiveDiscoveryOnly,
             storageMode: parsedStorageMode,

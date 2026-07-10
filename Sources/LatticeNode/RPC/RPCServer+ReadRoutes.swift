@@ -548,51 +548,6 @@ extension RPCRoutes {
         ))
     }
 
-    // MARK: - Finality
-
-    static func getFinality(node: LatticeNode, height: String, request: Request) async throws -> Response {
-        guard let blockHeight = UInt64(height) else {
-            return jsonError("Invalid height", status: .badRequest)
-        }
-        let chain: ResolvedChain
-        switch await resolveChainResult(node: node, request: request) {
-        case .success(let resolved): chain = resolved
-        case .failure(let response): return response
-        }
-        guard let chainState = await node.chain(forPath: chain.path) else {
-            return jsonError("Chain not found: \(chain.key)", status: .notFound)
-        }
-        let currentHeight = await chainState.getHighestBlockHeight()
-        let finality = await node.config.finality
-        let isFinal = finality.isFinal(chain: chain.directory, blockHeight: blockHeight, currentHeight: currentHeight)
-        let confirmations = currentHeight >= blockHeight ? currentHeight - blockHeight : 0
-        let required = finality.confirmations(for: chain.directory)
-
-        struct R: Encodable {
-            let height: UInt64; let currentHeight: UInt64
-            let confirmations: UInt64; let required: UInt64
-            let isFinal: Bool; let chain: String
-        }
-        return json(R(
-            height: blockHeight, currentHeight: currentHeight,
-            confirmations: confirmations, required: required,
-            isFinal: isFinal, chain: chain.directory
-        ))
-    }
-
-    static func getFinalityConfig(node: LatticeNode) async throws -> Response {
-        let finality = await node.config.finality
-        let chains = await node.chainStatus()
-        struct ChainFinality: Encodable {
-            let chain: String; let confirmations: UInt64; let currentHeight: UInt64
-        }
-        let configs = chains.map {
-            ChainFinality(chain: $0.directory, confirmations: finality.confirmations(for: $0.directory), currentHeight: $0.height)
-        }
-        struct R: Encodable { let chains: [ChainFinality]; let defaultConfirmations: UInt64 }
-        return json(R(chains: configs, defaultConfirmations: finality.defaultConfirmations))
-    }
-
     // MARK: - State Explorer
 
     static func getAccountState(node: LatticeNode, address: String, request: Request) async throws -> Response {
