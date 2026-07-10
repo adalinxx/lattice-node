@@ -446,6 +446,21 @@ extension LatticeNode {
         let log = NodeLogger("sync")
         let directory = network.directory
         guard let chainState = await chain(for: directory) else { return .pendingUnavailable }
+
+        // CHILD chains are NOT self-similar with root chains for sync. A child's real
+        // weight is its inherited securing work, which lives in ChildBlockProofs and is
+        // NOT visible at sync time — it's decided by gossip fork choice. So a child
+        // follower must catch up by a STRICT FAST-FORWARD of its tip (append the
+        // proof-anchored segment, evict nothing), NOT by routing each block through
+        // per-block fork choice — which gates the append on weight the follower can't
+        // see and refuses valid carrier catch-ups (the frozen-follower "insufficientWork"
+        // loop; audit P2-1). The old fast-forward-and-commit path (finalizeSyncResult /
+        // admitSyncedChainAgainstCurrentChain child branch) is the proven mechanism.
+        // Keep the per-block adopt for ROOT chains, where it's the correct self-similar
+        // model; delegate children to the fast-forward path.
+        if seg.expectedChildPath != nil {
+            return await adoptSyncedSegment(seg, network: network, fetcher: fetcher)
+        }
         let sortedBlocks = seg.result.persisted.blocks.sorted { $0.blockHeight < $1.blockHeight }
         guard let lowest = sortedBlocks.first, let materialized = seg.materialized else {
             // Empty segment or no materialized content — structural (matches the old

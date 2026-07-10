@@ -295,6 +295,18 @@ extension LatticeNode {
         // the Lattice framework validates the target transition there.
         var blockForProcessing = resolvedBlock
         var durablyStoredCIDs = preStoredCIDs
+
+        // Parent-receipt availability (child chains). A child block's cross-chain txs
+        // (e.g. a withdrawal) are validated by proving a receipt held in the PARENT's
+        // `parentState.receiptState`. Chains execute only their OWN state — the child
+        // never re-executes the parent — but it must READ the parent receipt, and this
+        // node holds only the parentState ROOT, not the subtree. So before validating,
+        // PRE-WARM the parent state from the parent fetcher (loopback to the local parent
+        // process) so the receipt subtree resolves locally during validation instead of
+        // failing the block. Root chains (no parent fetcher) skip this.
+        if let block = blockForProcessing, let parentStateFetcher = parentStateFetchers[directory] {
+            _ = try? await block.parentState.resolve(fetcher: parentStateFetcher)
+        }
         // Height-monotonicity DoS guard: a PUSHED block below the local tip
         // height costs a full validation for something that can never extend
         // the tip, so gossip drops it cheaply. `allowBelowTipHeight` is the
