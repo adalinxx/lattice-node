@@ -798,17 +798,16 @@ public actor LatticeNode: ChainNetworkDelegate {
             // persists the state trie to DiskBroker and validation works without parent help.
             if let prebuilt = prebuiltGenesisBlock {
                 let txs = prebuiltGenesisTransactions ?? []
+                // Thread the prebuilt child genesis's parentState CID verbatim so the
+                // rebuilt block reproduces the anchored genesis CID (child parentState =
+                // carrier prevState); a root genesis has an empty-state parentState anyway.
                 return try await BlockBuilder.buildGenesis(
                     spec: genesisConfig.spec,
                     transactions: txs,
                     timestamp: prebuilt.timestamp,
                     target: prebuilt.target,
-                    // Thread the prebuilt child genesis's parentState CID verbatim so the
-                    // rebuilt block reproduces the anchored genesis CID (child parentState =
-                    // carrier prevState); a root genesis has an empty-state parentState anyway.
-                    parentState: prebuilt.parentState,
                     fetcher: fetcher
-                )
+                ).reanchoredGenesisParentState(prebuilt.parentState)
             }
             if let genesisBuilder {
                 return try await genesisBuilder(genesisConfig, fetcher)
