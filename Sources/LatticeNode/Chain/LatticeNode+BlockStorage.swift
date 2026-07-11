@@ -454,26 +454,54 @@ extension LatticeNode {
         let directory = network.directory
         guard let proofData = stateStores[chainKey(forDirectory: directory)]?.getBlockProofs(blockHash: cid),
               !proofData.isEmpty else { return nil }
-        var proofs = proofData.compactMap { ChildBlockProof.deserialize($0) }
+        let proofs = proofData.compactMap { ChildBlockProof.deserialize($0) }
         guard !proofs.isEmpty else { return nil }
-        // (B) SELF-CONTAINED CROSS-CHAIN VALIDATION. A child block's withdrawal is
-        // validated by proving its receipt exists in the PARENT's
-        // `parentState.receiptState`. Fold that sparse existence proof into the served
-        // ChildBlockProof so a syncing peer validates the withdrawal from the proof
-        // ALONE — it never has to hold the parent chain locally or fetch parent state
-        // across a subscription (the availability-vs-validity split that stalled the
-        // adopt path). The serving node has the parent state; the verifier just needs
-        // the bytes, which are content-addressed and self-verifying. Best-effort: no
-        // withdrawals or unresolved parent state ⇒ the base proof is served unchanged.
-        let witness = await selfContainedReceiptWitnessEntries(directory: directory, blockCID: cid)
-        if !witness.isEmpty {
-            let base = proofs[0]
-            var seen = Set(base.entries.map { $0.cid })
-            var merged = base.entries
-            for e in witness where seen.insert(e.cid).inserted { merged.append(e) }
-            proofs[0] = ChildBlockProof(rootCID: base.rootCID, directoryPath: base.directoryPath, entries: merged)
+        // P1-2 SELF-CONTAINED CROSS-CHAIN VALIDATION, DURABLE. The parent-`receiptState`
+        // witness a peer needs to validate this block's withdrawals is folded into the
+        // proof at ACCEPTANCE (finalizeAcceptedChildProofs) and stored in `block_proofs`,
+        // so it is retention-scoped with the block and served VERBATIM here — NOT
+        // synthesized on demand against a parentState that may since have been evicted
+        // (the earlier best-effort approach could silently serve a base proof after
+        // pruning). FAIL CLOSED: if this is a withdrawal-bearing block whose stored proof
+        // is not actually self-contained, withhold it (nil) rather than present an
+        // incomplete proof as self-contained — the peer then defers and retries another
+        // source instead of accepting an unvalidatable block or a false invalidity verdict.
+        if await storedProofOmitsRequiredReceiptWitness(directory: directory, blockCID: cid, proofs: proofs) {
+            NodeLogger("sync").warn("\(directory): withholding non-self-contained proof for withdrawal block \(String(cid.prefix(16)))… (receipt witness missing from stored proof)")
+            return nil
         }
         return ChildBlockProofEnvelope.serialize(proofs)
+    }
+
+    /// P1-2 fail-closed guard for `blockProofData`: true when `blockCID` is a
+    /// withdrawal-bearing child block whose stored `proofs` do NOT already contain the
+    /// parent-`receiptState` witness (i.e. the withdrawals cannot be proven from the
+    /// proof's OWN entries alone). Loads the block locally to read its withdrawals, then
+    /// verifies the receipts against an in-memory source over the proof entries — a pure
+    /// self-containment check, no parent-state fetch. False when there are no withdrawals,
+    /// the block can't be read locally (nothing to withhold), or the witness is present.
+    func storedProofOmitsRequiredReceiptWitness(directory: String, blockCID: String, proofs: [ChildBlockProof]) async -> Bool {
+        guard let network = network(for: directory) else { return false }
+        let localSource = FetcherContentSource(network.canonicalContentFetcher())
+        guard let block = try? await VolumeImpl<Block>(rawCID: blockCID).resolve(source: localSource).node,
+              !block.parentState.rawCID.isEmpty else { return false }
+        var withdrawals: [WithdrawalAction] = []
+        for (_, txVol) in await resolveBlockTransactions(block: block, source: localSource) {
+            if let tx = try? await txVol.resolve(source: localSource).node,
+               let body = try? await tx.body.resolve(fetcher: CoalescingFetcher(localSource)).node {
+                withdrawals.append(contentsOf: body.withdrawalActions)
+            }
+        }
+        guard !withdrawals.isEmpty else { return false }
+        // Resolve + prove the receipts using ONLY the proof's own entries.
+        let proofOnly = InMemoryContentSource(Dictionary(
+            proofs.flatMap { $0.entries }.map { ($0.cid, $0.data) }, uniquingKeysWith: { first, _ in first }))
+        let fetcher = CoalescingFetcher(proofOnly)
+        guard let parentState = try? await LatticeStateHeader(rawCID: block.parentState.rawCID).resolve(fetcher: fetcher).node,
+              (try? await parentState.receiptState.proveExistenceAndVerifyWithdrawers(
+                  directory: directory, withdrawalActions: withdrawals, fetcher: fetcher)) != nil
+        else { return true }  // withdrawals present but not provable from the proof alone → withhold
+        return false
     }
 
     /// (B) The sparse `parentState → receiptState → receiptKey` existence proof for

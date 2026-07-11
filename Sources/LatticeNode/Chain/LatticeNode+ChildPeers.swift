@@ -241,6 +241,16 @@ extension LatticeNode {
         return height + tolerance >= bestPeerHeight
     }
 
+    /// Whether we have recorded ANY peer's advertised tip for this chain — i.e. whether
+    /// `chainCaughtUpToBestKnownPeer` has data to assess against. A chain fed its blocks via
+    /// PARENT-EXTRACTION (embedded in parent carriers) rather than peer sync never records a
+    /// peer tip (`recordPeerTip` runs only on the gossip/sync paths), so the caught-up gate
+    /// has nothing to measure and must NOT be applied — otherwise it defers forever.
+    func hasKnownPeerTip(directory: String) -> Bool {
+        guard let network = network(for: directory) else { return false }
+        return !(knownPeerTips[chainKey(forPath: network.chainPath)]?.isEmpty ?? true)
+    }
+
     /// Ask every connected parent for this chain's same-chain peers and dial any
     /// returned endpoints on the chain-gossip network. Verify-not-trust: the dial
     /// authenticates the identity and consensus validates the chain, so a bogus

@@ -485,11 +485,15 @@ extension LatticeNode {
                     allowBelowTipHeight: true
                 )
                 if outcome == .accepted || outcome == .duplicate {
-                    for proof in decodedProofs {
-                        await persistAcceptedBlockProof(directory: directory, height: meta.blockHeight, blockHash: cid, proof: proof)
-                    }
-                    for proof in decodedProofs {
-                        guard await applyInheritedWeight(directory: directory, blockHash: cid, proof: proof, source: overlay) else { break }
+                    // ONE shared proof-finalization contract (finalizeAcceptedChildProofs):
+                    // a durable finalization failure must NOT be adopted — degrade, exactly like
+                    // the block-outcome `.storageFailed` case below. Previously this loop `break`ed
+                    // and fell through to `case .accepted: continue`, silently adopting a block whose
+                    // inherited-weight effects failed to persist (the P1-1 divergence).
+                    if case .storageFailed = await finalizeAcceptedChildProofs(
+                        directory: directory, height: meta.blockHeight, blockHash: cid,
+                        proofs: decodedProofs, source: overlay) {
+                        return .degraded(reason: "durable proof/inherited-weight finalization failed for synced block at height \(meta.blockHeight)")
                     }
                 }
             } else {

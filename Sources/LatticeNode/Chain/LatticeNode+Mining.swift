@@ -254,8 +254,11 @@ extension LatticeNode {
             await unpinBlockStorageForRejectedCandidate(block, storedRoots: storedRoots, network: network)
         }
         if accepted || outcome == .duplicate {
-            await persistAcceptedBlockProof(directory: directory, height: block.height, blockHash: header.rawCID, proof: proof)
-            guard await applyInheritedWeight(directory: directory, blockHash: header.rawCID, proof: proof, source: IvyContentSource(network.ivyFetcher)) else {
+            // ONE shared proof-finalization contract (finalizeAcceptedChildProofs): a durable
+            // finalization failure fails the submission, matching sync (degrade) and gossip (stop).
+            if case .storageFailed = await finalizeAcceptedChildProofs(
+                directory: directory, height: block.height, blockHash: header.rawCID,
+                proofs: [proof], source: IvyContentSource(network.ivyFetcher)) {
                 return false
             }
         }

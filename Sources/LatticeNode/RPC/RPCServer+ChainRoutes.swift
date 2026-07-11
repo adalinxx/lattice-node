@@ -581,10 +581,14 @@ extension RPCRoutes {
         }
 
         let timestamp = Int64(Date().timeIntervalSince1970 * 1000)
-        // CORE INVARIANT ([[child-parentstate-is-carrier-prevstate]]): a child GENESIS is
-        // carried by the parent block that mines its genesis action, so it must anchor at
-        // that block's prevState = the parent's tip post-state at deploy. Fail closed if the
-        // parent tip can't be resolved.
+        // BOOTSTRAP ANCHOR (node-level, NOT a consensus invariant): record the parent's
+        // current tip post-state at DEPLOY time as the child genesis parentState, so a
+        // follower rebuilding the genesis reproduces its CID. This is a deploy-time
+        // checkpoint, not a guarantee that it equals the prevState of the parent block that
+        // eventually mines the GenesisAction (deploy and announcement are separate; the
+        // parent may mine in between). Consensus binds only (directory, blockCID) and does
+        // not check genesis parentState — see reanchoredGenesisParentState. Fail closed if
+        // the parent tip can't be resolved.
         let parentTipPostState: LatticeStateHeader?
         if let tipHash = await node.chain(forPath: parentNetwork.chainPath)?.getMainChainTip(),
            let tipBlock = try? await node.getBlock(hash: tipHash, directory: parentDir) {

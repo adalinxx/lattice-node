@@ -2,15 +2,22 @@ import Lattice
 import cashew
 
 extension Block {
-    /// Re-anchor a freshly built GENESIS block onto the correct parent state.
+    /// Re-anchor a freshly built child GENESIS block onto a parent-state BOOTSTRAP anchor.
     ///
-    /// CORE INVARIANT (child-parentstate-is-carrier-prevstate): a child block's
-    /// `parentState` is the CARRIER parent block's PRE-state. A child genesis is carried
-    /// by the parent block that mines its genesis action, so it must anchor at that
-    /// block's prevState (= the parent tip's post-state at deploy) — NOT the empty state
-    /// `BlockBuilder.buildGenesis` defaults to. This re-anchor is done node-side (rather
-    /// than in the consensus `buildGenesis`) so the node depends only on the pinned
-    /// Lattice API. It is a PURE field-preserving reconstruction — only `parentState`
+    /// SCOPE — this is a NODE-LEVEL, deploy-time bootstrap checkpoint, NOT a consensus
+    /// invariant. `BlockBuilder.buildGenesis` anchors a genesis at the empty state; a
+    /// child genesis instead records the parent's current tip post-state at DEPLOY time,
+    /// so a follower rebuilding the genesis reproduces its CID. The consensus library does
+    /// NOT model or check this: `GenesisAction` binds only (directory, blockCID), and
+    /// `validateGenesis` never validates the genesis `parentState` against a creation
+    /// carrier. Concretely, it is a checkpoint, NOT a guarantee that this value equals the
+    /// prevState of the parent block that eventually MINES the GenesisAction: deploy and
+    /// announcement are separate steps, so if the parent mines blocks between them the
+    /// actual carrier's prevState will differ. Binding the genesis to its true creation
+    /// carrier is a consensus concern (tracked as a Lattice change), not something this
+    /// node-side helper can enforce.
+    ///
+    /// Mechanically it is a PURE field-preserving reconstruction — only `parentState`
     /// changes; `prevState` (the child's own empty start), `postState`, and all tx/spec/
     /// children roots are carried verbatim, so a deploy and a later subscribe/follow
     /// rebuild that thread the SAME `parentState` reproduce the identical genesis CID.
