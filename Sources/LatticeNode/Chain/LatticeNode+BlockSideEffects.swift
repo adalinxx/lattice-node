@@ -274,6 +274,10 @@ extension LatticeNode {
             block: prepared.block,
             blockHash: prepared.blockHash
         )
+        // Record this chain's OWN prevState→postState edge into its own store, so a
+        // descendant can establish parent-state continuity by pull-based backfill
+        // (verify-not-trust) against these verified edges.
+        await persistVerifiedParentStateEdge(directory: directory, parentBlock: prepared.block)
 
         // Pin CIDs for transactions involving our account
         await pinAccountData(

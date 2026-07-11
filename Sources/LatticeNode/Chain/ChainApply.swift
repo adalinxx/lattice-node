@@ -33,8 +33,8 @@ enum ChainOutcome: Equatable, Sendable {
 }
 
 extension ChainOutcome {
-    /// Did the candidate get adopted? (bridges the former `Bool` return of
-    /// `finalizeSyncResult` while call sites migrate to the full outcome.)
+    /// Did the candidate get adopted? (the full outcome returned by
+    /// `adoptSyncedSegmentViaForkChoice`, projected down to a Bool.)
     var wasAdopted: Bool { if case .adopted = self { return true } else { return false } }
 
     /// Should a bounded transient-failure retry be scheduled for this outcome? ONLY a

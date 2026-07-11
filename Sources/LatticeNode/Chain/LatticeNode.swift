@@ -703,9 +703,16 @@ public actor LatticeNode: ChainNetworkDelegate {
         self.childRPCBasePort = childRPCBasePort
         self.childInheritedArguments = childInheritedArguments
         self.spawnCertChain = spawnCertChain
-        // The tree root every trusted chain must terminate at is the issuer of our
-        // own chain's first link; a node with no chain trusts no one (federated).
-        self.spawnTrust = SpawnTrust(trustedRoot: spawnCertChain.first?.issuerPublicKey)
+        // The tree root every trusted chain must terminate at is the issuer of our own
+        // chain's first link. For a SPAWN-TREE ROOT (a multichain node with no cert chain
+        // of its own — e.g. a Nexus that supervises toy/toytoy), that anchor is the node's
+        // OWN key: it ISSUES its children's certs (config.publicKey is the parent identity,
+        // SupervisedChildren), so it must trust chains terminating at itself to classify +
+        // SERVE consensus queries (inherited weight, parent-state continuity) to its own
+        // descendants. Without this the root trusts no one and refuses every child query.
+        // Safe: it only trusts certs it actually issued (unforgeable), so a standalone root
+        // that spawned nobody still trusts nobody.
+        self.spawnTrust = SpawnTrust(trustedRoot: spawnCertChain.first?.issuerPublicKey ?? config.publicKey)
 
         let resourcesWithIdentity = config.resources.withIdentity(publicKey: config.publicKey)
         let chainCount = 1
@@ -796,6 +803,10 @@ public actor LatticeNode: ChainNetworkDelegate {
                     transactions: txs,
                     timestamp: prebuilt.timestamp,
                     target: prebuilt.target,
+                    // Thread the prebuilt child genesis's parentState CID verbatim so the
+                    // rebuilt block reproduces the anchored genesis CID (child parentState =
+                    // carrier prevState); a root genesis has an empty-state parentState anyway.
+                    parentState: prebuilt.parentState,
                     fetcher: fetcher
                 )
             }

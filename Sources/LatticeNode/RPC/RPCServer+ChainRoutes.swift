@@ -581,6 +581,20 @@ extension RPCRoutes {
         }
 
         let timestamp = Int64(Date().timeIntervalSince1970 * 1000)
+        // CORE INVARIANT ([[child-parentstate-is-carrier-prevstate]]): a child GENESIS is
+        // carried by the parent block that mines its genesis action, so it must anchor at
+        // that block's prevState = the parent's tip post-state at deploy. Fail closed if the
+        // parent tip can't be resolved.
+        let parentTipPostState: LatticeStateHeader?
+        if let tipHash = await node.chain(forPath: parentNetwork.chainPath)?.getMainChainTip(),
+           let tipBlock = try? await node.getBlock(hash: tipHash, directory: parentDir) {
+            parentTipPostState = tipBlock.postState
+        } else {
+            parentTipPostState = nil
+        }
+        guard let parentGenesisAnchor = parentTipPostState else {
+            return jsonError("Cannot resolve parent tip post-state to anchor child genesis parentState", status: .internalServerError)
+        }
         let genesisBlock: Block
         do {
             genesisBlock = try await BlockBuilder.buildGenesis(
@@ -588,6 +602,7 @@ extension RPCRoutes {
                 transactions: genesisTransactions,
                 timestamp: timestamp,
                 target: UInt256.max,
+                parentState: Reference(parentGenesisAnchor),
                 fetcher: parentNetwork.ivyFetcher
             )
         } catch {
