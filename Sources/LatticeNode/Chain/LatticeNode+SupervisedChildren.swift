@@ -1,5 +1,7 @@
 import Foundation
 import Lattice
+import Ivy  // SpawnCertificate — issue a spawn-cert chain for each supervised child
+import Tally  // PeerID — verify the child's spawn-tree authorization at registration
 import cashew
 import VolumeBroker  // SerializedVolume for re-serving a resolved genesis on the parent
 import LatticeNodeRPCFuzzSupport  // GenesisHexCodec/GenesisHexEntry (shared genesis-hex codec)
@@ -291,6 +293,38 @@ extension LatticeNode {
         // own local SOURCE of the chain (other nodes follow IT) and needs no bootstrap
         // peer to find itself. So leave it empty in both cases.
         let childBootstrapPeer: String? = nil
+        // SPAWN-CERT ISSUANCE (query-as-sole-path-within-the-tree): provision the child's
+        // identity (a worked key meeting minPeerKeyBits) and issue a cert that EXTENDS our
+        // OWN spawn-cert chain with a link to that identity at the child's chainPath. The
+        // child presents this chain (via --spawn-cert-chain) so we — and every ancestor —
+        // classify it as a spawn-tree member and SERVE it consensus queries (inherited
+        // weight, parent-state continuity). Without a cert the child boots federated and
+        // every parent query is refused (mayServe fails on an empty scope). Fail-open: on
+        // any issuance error the child still boots, just federated (queries refused).
+        // SPAWN-CERT ISSUANCE — FAIL CLOSED (P1-4). A supervised child MUST be provisioned
+        // as a spawn-tree member: without a cert every parent consensus query (inherited
+        // weight) is refused (mayServe fails on an empty scope), and a child that merely
+        // answered RPC would otherwise be classified `.registered` with no authority-repair
+        // path. So an issuance failure is a RECOVERABLE condition — defer the spawn and let
+        // the reconcile loop retry — NOT a silent downgrade to federated mode. (A
+        // deliberately-federated child is an explicit operator mode, not this internal-
+        // failure fallback.)
+        guard let issuerPriv = Data(hex: config.privateKey) else {
+            log.warn("supervised child '\(dir)': issuer private key undecodable; deferring spawn (will retry)")
+            return .recovering
+        }
+        let (childPub, childPriv) = grindWorkedIdentityKey(minBits: config.minPeerKeyBits)
+        guard let cert = SpawnCertificate.issue(
+                  childPublicKey: childPub,
+                  chainPath: metadata.chainPath,
+                  issuerKeyPair: (publicKey: config.publicKey, privateKey: issuerPriv)),
+              let encoded = try? JSONEncoder().encode(spawnCertChain + [cert]) else {
+            log.warn("supervised child '\(dir)': spawn-cert issuance failed; deferring spawn (will retry)")
+            return .recovering
+        }
+        let childSpawnCertBase64: String? = encoded.base64EncodedString()
+        let childProvisionedPrivHex: String? = childPriv.map { String(format: "%02x", $0) }.joined()
+        let childPeerID = PeerID(publicKey: childPub)
         let spec = ChildSpec(
             directory: dir, chainPath: metadata.chainPath,
             genesisHex: metadata.genesisHex,
@@ -300,7 +334,9 @@ extension LatticeNode {
             // Inherit the parent's payout address so the child claims its block reward too;
             // without it the child mines empty-reward templates (forfeiting the reward).
             dataDir: childDataDir, coinbaseAddress: config.coinbaseAddress,
-            inheritedArguments: childInheritedArguments
+            inheritedArguments: childInheritedArguments,
+            spawnCertChainBase64: childSpawnCertBase64,
+            provisionedPrivateKeyHex: childProvisionedPrivHex
         )
         do {
             _ = try await supervisor.spawn(spec.launch(nodeExecutable: ChildProcessSupervisor.selfExecutableURL()))
@@ -322,15 +358,28 @@ extension LatticeNode {
             // Honor a detach landing mid-poll: stop the process and stop trying to register.
             guard stillManaged() else { await supervisor.stop(label: dir); return .detached }
             if let token = readChildCookie(dataDir: childDataDir),
-               await probeChildEndpoint(endpoint, token: token) == .aliveAuthValid {
+               await probeChildEndpoint(endpoint, token: token) == .aliveAuthValid,
+               // P1-4: a FRESH registration requires BOTH authenticated RPC health AND
+               // verified parent-link authorization — the child must have connected its
+               // parent subscription and been classified by our SpawnTrust as an authorized
+               // descendant for its chain path. RPC-cookie health (an admin capability) is
+               // NOT consensus authority; conflating them is what let a cert-less child be
+               // permanently `.registered`. Not yet classified ⇒ keep polling / retry.
+               await spawnTrust.mayServeConsensus(to: childPeerID, forChainPath: metadata.chainPath) {
                 guard stillManaged() else { await supervisor.stop(label: dir); return .detached }
                 registerRPCEndpoint(chainPath: metadata.chainPath, endpoint: endpoint, authToken: token)
-                log.info("registered supervised child '\(dir)' RPC \(endpoint) for mined-block delivery")
+                log.info("registered supervised child '\(dir)' RPC \(endpoint) (parent-authorized) for mined-block delivery")
                 return .registered
             }
             try? await Task.sleep(nanoseconds: 250_000_000)
         }
-        log.info("supervised child '\(dir)' spawned but not yet authenticated; reconcile loop will register it once its RPC is up")
+        // NOTE (P1-4 residual): the reconcile-entry fast path (`.aliveAuthValid`) re-registers
+        // an ALREADY-RUNNING child on RPC health alone. That is safe here because fail-closed
+        // issuance guarantees every spawned child carries a cert (so it is authorizable) and a
+        // child only reaches "running + our cookie authenticates" via a prior authorized
+        // registration; fully re-verifying live classification there would require reading the
+        // child's persisted identity across reconcile passes (a follow-up).
+        log.info("supervised child '\(dir)' spawned but not yet RPC-authenticated + parent-authorized; reconcile loop will register it once both hold")
         return .recovering
     }
 
@@ -365,6 +414,21 @@ extension LatticeNode {
         let ownDir = ownChainPath.last ?? genesisConfig.directory
         if await needsSameChainPeer(directory: ownDir) {
             log.info("\(ownChainPath.joined(separator: "/")): no same-chain connectivity yet; deferring child auto-follow until synced")
+            return
+        }
+        // PARENT-FIRST READINESS (P1-3). Connectivity alone is not enough: a followed
+        // middle chain can be connected to a peer thousands of blocks ahead and still be
+        // at height 1. Spawning descendants then hands them a parent subscription whose
+        // local parent lacks the carrier blocks and state-continuity their blocks anchor
+        // to. When we KNOW a peer's tip for this chain, require the parent to be caught up
+        // to it (within tolerance — a live chain is never EXACTLY at tip) before spawning
+        // children. Gated on `hasKnownPeerTip`: a parent-extraction-fed child records no
+        // peer tip, so applying the caught-up test to it would defer forever — fall back
+        // to the connectivity gate above in that case. This is the follower path; a
+        // producer is ahead of its peers (trivially caught up) and deploys children via
+        // explicit spawn, not this auto-follow sweep.
+        if hasKnownPeerTip(directory: ownDir), !(await chainCaughtUpToBestKnownPeer(directory: ownDir)) {
+            log.info("\(ownChainPath.joined(separator: "/")): parent not caught up to best known peer tip; deferring child auto-follow until caught up")
             return
         }
         let announced: [(directory: String, genesisHash: String)]
@@ -509,10 +573,13 @@ extension LatticeNode {
         // doesn't, the hex is wrong/incomplete; return nil rather than spawn a divergent child.
         var rebuiltCID: String? = nil
         var rebuiltBlock: Block? = nil
-        if let rebuilt = try? await BlockBuilder.buildGenesis(
+        if let base = try? await BlockBuilder.buildGenesis(
                spec: spec, transactions: genesisTxs,
                timestamp: genesisBlock.timestamp, target: genesisBlock.target,
                fetcher: parentNetwork.ivyFetcher),
+           // Thread the ORIGINAL genesis's parentState (its deploy-time bootstrap anchor)
+           // verbatim so the rebuild reproduces the anchored genesis CID.
+           case let rebuilt = base.reanchoredGenesisParentState(genesisBlock.parentState),
            let vol = try? VolumeImpl<Block>(node: rebuilt) {
             rebuiltCID = vol.rawCID
             rebuiltBlock = rebuilt  // fully-hydrated block for a multi-entry durable re-serve

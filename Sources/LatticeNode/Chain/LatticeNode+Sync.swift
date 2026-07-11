@@ -323,20 +323,274 @@ extension LatticeNode {
         }
     }
 
-    /// Returns the terminal `ChainOutcome` of the attempt so `startSync` can decide
-    /// whether to retry: `.pendingUnavailable` (content miss / timeout / threw) is
-    /// retriable regardless of height; every other outcome is terminal.
+    /// A downloaded, PoW/proof-validated sync segment (the `gather` output) — carries the
+    /// SyncResult that `adopt` commits plus the byproducts the post-commit child-proof
+    /// recording needs. Sendable so it flows through the ChainApply pipeline closures.
+    /// The recomputed canonical content of a synced segment: the tip block, each
+    /// block by height, and each height's durable state-boundary roots. Content-
+    /// addressed and immutable (`Block: Node: Sendable`), so it is safe to gather
+    /// OUTSIDE the commit lock and carry into adopt — the availability stage owns
+    /// the heavy fetch/recompute; adopt just re-checks fork choice and commits it.
+    struct MaterializedSyncContent: Sendable {
+        let tipBlock: Block
+        let rootsByHeight: [UInt64: [String]]
+        let blocksByHeight: [UInt64: Block]
+    }
+
+    struct GatheredSyncSegment: Sendable {
+        let result: SyncResult
+        let headers: [SyncBlockHeader]
+        let acceptedProofs: [String: Data]
+        let parentAnchors: [String: ParentAnchor]
+        /// childCID → merged-mining processing root of its SELECTED committing-parent
+        /// anchor (the `rootHash` fed to `processBlockHeader.validateProofOfWork(nexusHash:)`
+        /// when the per-block adopt path routes a synced child block through the shared
+        /// ingest). Empty for root chains (self-PoW, no cross-chain anchor). Surfaced here
+        /// by gather; consumed by the per-block adopt (P2).
+        let processingRootHashes: [String: UInt256]
+        /// This chain's main-chain tip at gather start — the orphan-recovery anchor for
+        /// the whole sync-driven transition. The per-block adopt's incremental tip moves
+        /// (fragmented by interleaved gossip) can orphan blocks across several small moves
+        /// that each recover only their own fragment; recovering ONCE over
+        /// `preSyncTip → adopted-tip` (walk to the common ancestor) catches the complete
+        /// orphan set — the txs that must return to the mempool. `nil` = fresh chain.
+        let preSyncTip: String?
+        let expectedChildPath: [String]?
+        let localWork: UInt256
+        let sourcePeer: PeerID?
+        /// Recomputed under the availability stage (gather), OFF the commit lock.
+        /// `nil` only for the structural cases adopt rejects before it would be used
+        /// (no StateStore / empty segment → `.degraded`); a content-availability miss
+        /// makes gather return `.incomplete` instead of carrying `nil` here.
+        let materialized: MaterializedSyncContent?
+    }
+
+    /// Headers-first sync as the single `apply()` operation: gather (download + validate a
+    /// segment) → adopt (finalize/commit). isStrictlyHeavier is trivially true here (the
+    /// trigger, checkSyncNeeded, already decided a sync is worthwhile); validate is folded
+    /// into gather (downloadHeaders verifies PoW + continuity, child parent-anchor
+    /// consistency in the walk). Returns the terminal ChainOutcome so startSync's retry
+    /// can act on it (`.pendingUnavailable` retriable; everything else terminal).
     func performHeadersFirstSync(peerTipCID: String, network: ChainNetwork, sourcePeer: PeerID? = nil, peerTipHeight: UInt64? = nil) async -> ChainOutcome {
+        let log = NodeLogger("sync")
+        let fetcher = network.ivyFetcher
+        let candidate = CandidateExtension(
+            tipCID: peerTipCID, tipHeight: peerTipHeight ?? 0, claimedWork: nil, source: sourcePeer)
+        let apply = ChainApply<GatheredSyncSegment>(
+            isStrictlyHeavier: { _ in true },
+            gather: { [self] _ in
+                await self.gatherSyncSegment(peerTipCID: peerTipCID, network: network, sourcePeer: sourcePeer, peerTipHeight: peerTipHeight)
+            },
+            validate: { _ in .valid },
+            adopt: { [self] seg in
+                await self.adoptSyncedSegmentViaForkChoice(seg, network: network, fetcher: fetcher)
+            }
+        )
+        let outcome = await apply.apply(candidate)
+        // Observe the outcome — a transient content miss (the seed-496 class) must be a
+        // VISIBLE signal, not a silent stall; `.pendingUnavailable` stays retriable.
+        metrics.increment("lattice_sync_outcome_\(outcome.metricSuffix)")
+        switch outcome {
+        case .adopted:
+            log.info("Headers-first sync complete")
+        case .ignoredLighter:
+            log.info("\(network.directory): sync settled — incumbent held (peer chain not heavier)")
+        case .pendingUnavailable:
+            log.warn("\(network.directory): sync pending — canonical content unavailable; will retry when data/peers arrive (not refused, stays retriable)")
+        case .invalid(let reason):
+            log.warn("\(network.directory): sync rejected invalid chain: \(reason)")
+        case .degraded(let reason):
+            log.error("\(network.directory): sync could not publish — local storage/config failure: \(reason) (not retriable by waiting)")
+        }
+        return outcome
+    }
+
+    /// P2: the SELF-SIMILAR adopt. Feed each gathered block through the SAME
+    /// `processBlockAndRecoverReorg` gossip and held-heavier rescue already use, one
+    /// block oldest→newest, letting ChainState's ONE GHOST decide (weight = subtree +
+    /// inherited). Transport is the only thing that made sync special; the ingest is
+    /// identical. Root chains take the same loop with no proofs (inherited-0). No bespoke
+    /// admission, no segment commit, no work-gate (validity is the filter; reorg depth is
+    /// bounded by the local retentionDepth). Mirrors `submitRescuedChildConnector`.
+    func adoptSyncedSegmentViaForkChoice(_ seg: GatheredSyncSegment, network: ChainNetwork, fetcher: IvyFetcher) async -> ChainOutcome {
+        let log = NodeLogger("sync")
+        let directory = network.directory
+        guard let chainState = await chain(for: directory) else { return .pendingUnavailable }
+
+        let sortedBlocks = seg.result.persisted.blocks.sorted { $0.blockHeight < $1.blockHeight }
+        guard let lowest = sortedBlocks.first, let materialized = seg.materialized else {
+            // Empty segment or no materialized content — structural (matches the old
+            // finalize `.degraded` guard), never a wait-and-retry availability miss.
+            return .degraded(reason: "empty synced segment or missing materialized content")
+        }
+
+        // Anchor-presence guard (F7): the lowest block's parent must still be on our
+        // current main chain (the retention floor can advance between gather and adopt).
+        // If not, a fresh gather anchored to the new floor is needed — availability, retry.
+        if lowest.blockHeight > 0 {
+            var parentOnChain = false
+            if let parentHash = lowest.parentBlockHash {
+                parentOnChain = await chainState.isOnMainChain(hash: parentHash)
+            }
+            if !parentOnChain {
+                log.info("\(directory): synced segment anchor no longer on main chain; retry with fresh gather")
+                return .pendingUnavailable
+            }
+        }
+
+        let isChild = seg.expectedChildPath != nil
+        for meta in sortedBlocks {
+            let cid = meta.blockHash
+            guard let block = materialized.blocksByHeight[meta.blockHeight] else {
+                // Materialized content missing for this height — availability, retry.
+                return .pendingUnavailable
+            }
+
+            let outcome: BlockProcessOutcome
+            if isChild, let proofData = seg.acceptedProofs[cid],
+               let decodedProofs = ChildBlockProofEnvelope.deserialize(proofData) {
+                // CHILD: preload inherited securing weight BEFORE fork choice so the GHOST
+                // decision sees it (parent-synced ⇒ it's already recorded), then route
+                // through the shared ingest with the surfaced processing root + anchor.
+                for proof in decodedProofs {
+                    await preloadInheritedWeight(directory: directory, blockHash: cid, proof: proof)
+                }
+                var proofEntries: [String: Data] = [:]
+                for proof in decodedProofs {
+                    for entry in proof.entries where proofEntries[entry.cid] == nil {
+                        proofEntries[entry.cid] = entry.data
+                    }
+                }
+                // Fallback must include the SHARED DURABLE BROKER, not just the network
+                // ivy path. Validate through `canonicalContentFetcher()` (the process-wide
+                // DiskBroker) so a followed child resolves the PARENT state it needs (e.g. a
+                // withdrawal's receipt in `parentState.receiptState`) from content THIS NODE
+                // ALREADY HOLDS locally — never depending on a peer to re-serve it. A bare
+                // `ivyFetcher` leaves the parent receipt subtree unreachable and defers the
+                // block forever, so compose broker first, then network.
+                let overlay = OverlayContentSource(entries: proofEntries, fallback: CompositeContentSource([
+                    FetcherContentSource(network.canonicalContentFetcher()),
+                    IvyContentSource(network.ivyFetcher),
+                ]))
+                outcome = await processBlockAndRecoverReorg(
+                    header: VolumeImpl<Block>(rawCID: cid),
+                    directory: directory,
+                    chainPath: network.chainPath,
+                    fetcher: CoalescingFetcher(overlay),
+                    resolvedBlock: block,
+                    rootHash: seg.processingRootHashes[cid],
+                    parentAnchor: seg.parentAnchors[cid],
+                    requireDurableResolvedBlock: true,
+                    baseValidationSourceOverride: overlay,
+                    allowBelowTipHeight: true
+                )
+                if outcome == .accepted || outcome == .duplicate {
+                    // ONE shared proof-finalization contract (finalizeAcceptedChildProofs):
+                    // a durable finalization failure must NOT be adopted — degrade, exactly like
+                    // the block-outcome `.storageFailed` case below. Previously this loop `break`ed
+                    // and fell through to `case .accepted: continue`, silently adopting a block whose
+                    // inherited-weight effects failed to persist (the P1-1 divergence).
+                    if case .storageFailed = await finalizeAcceptedChildProofs(
+                        directory: directory, height: meta.blockHeight, blockHash: cid,
+                        proofs: decodedProofs, source: overlay) {
+                        return .degraded(reason: "durable proof/inherited-weight finalization failed for synced block at height \(meta.blockHeight)")
+                    }
+                }
+            } else {
+                // ROOT (self-PoW headers, inherited-0): same loop, no proofs/overlay/root/anchor.
+                outcome = await processBlockAndRecoverReorg(
+                    header: VolumeImpl<Block>(rawCID: cid),
+                    directory: directory,
+                    chainPath: network.chainPath,
+                    fetcher: fetcher,
+                    resolvedBlock: block,
+                    requireDurableResolvedBlock: true,
+                    allowBelowTipHeight: true
+                )
+            }
+
+            switch outcome {
+            case .accepted, .duplicate:
+                continue
+            case .deferredWhileSyncing:
+                // N1: transient (ancestor state not yet materialized) — stop at the valid
+                // committed prefix and retry from here. NOT a refusal: never memoized.
+                log.info("\(directory): synced segment deferred at height \(meta.blockHeight); retry from prefix")
+                return .pendingUnavailable
+            case .rejected:
+                // Hard invalid (bad PoW/proof/state) — terminal; the peer is attributed by
+                // processBlockHeader's own validation path. Validity is the filter (P-A).
+                return .invalid(reason: "synced block \(String(cid.prefix(16)))… rejected by fork-choice ingest at height \(meta.blockHeight)")
+            case .storageFailed:
+                // Local durable-storage failure (not the peer's fault, not retriable by waiting).
+                return .degraded(reason: "durable storage failed for synced block at height \(meta.blockHeight)")
+            }
+        }
+
+        // Every block ingested. Fork choice decided per block; did the tip actually become
+        // canonical, or did GHOST hold a heavier incumbent (blocks landed as a dormant fork)?
+        let newTip = await chainState.getMainChainTip()
+        guard newTip == seg.result.tipBlockHash else {
+            return .ignoredLighter
+        }
+
+        // Whole-transition orphan recovery. The per-block reorg above recovers orphans
+        // per individual tip move, but a sync-driven fork switch can advance the tip in
+        // several small moves (fragmented by interleaved gossip), so no single move sees
+        // the complete orphan set — blocks orphaned across fragments (e.g. a tx mined on
+        // our pre-sync fork) never return to the mempool. Recover ONCE over the full
+        // preSyncTip → newTip transition (boundedReorgWalk finds the common ancestor and
+        // the complete orphan set); recoverOrphanedTransactions is idempotent, so
+        // re-covering an already-recovered fragment is safe.
+        if let preSyncTip = seg.preSyncTip, preSyncTip != newTip {
+            let transition = await boundedReorgWalk(oldTip: preSyncTip, newTip: newTip, chain: chainState)
+            await recoverOrphanedTransactions(
+                transition: transition, oldTip: preSyncTip, newTip: newTip,
+                directory: directory, source: IvyContentSource(network.ivyFetcher))
+        }
+
+        // Re-home the post-adopt child-recursion tail (H1) — the parent-before-child engine.
+        // Child canonical-content durability is enforced per-block by
+        // requireDurableResolvedBlock, so no separate reprocess pass is needed.
+        await reconcileChildChainStatesAfterSync(
+            persisted: seg.result.persisted,
+            fetcher: fetcher,
+            currentMutationKey: chainKey(forDirectory: directory)
+        )
+        await verifySyncWithPeers(tipCID: seg.result.tipBlockHash, tipHeight: seg.result.tipBlockHeight, network: network)
+        await syncSubscribedChildren(of: directory)
+        return .adopted(tipCID: seg.result.tipBlockHash)
+    }
+
+    /// Gather (the availability + validation stage of apply): download the header segment
+    /// from any peer/CAS, build + PoW/proof-validate the SyncResult, and (for children)
+    /// validate parent-anchor consistency. Returns the segment on success, `.incomplete`
+    /// on any download/validation failure (transient — startSync retries).
+    private func gatherSyncSegment(peerTipCID: String, network: ChainNetwork, sourcePeer: PeerID? = nil, peerTipHeight: UInt64? = nil) async -> GatherOutcome<GatheredSyncSegment> {
         let log = NodeLogger("sync")
         log.info("Starting headers-first sync from \(String(peerTipCID.prefix(16)))...")
 
         let fetcher = network.ivyFetcher
+        // Data gathering is SOURCE-AGNOSTIC: to get a CID, look LOCALLY first, then
+        // expand outward to the network — the memory→storage→network hierarchy. The
+        // DiskBroker is SHARED across every chain this process runs, so a local lookup
+        // sees ALL locally-held content — including a child's blocks/carriers/proofs
+        // embedded in the parent carriers this node holds. That's the foundational
+        // availability guarantee: a followed child never depends on a child peer serving
+        // content the process already has locally under its parent (previously it looped
+        // on genesisMismatch when a child peer pruned/withheld content). Local shared
+        // broker first, then the network fetcher; correct for root chains too.
+        let contentFetcher: Fetcher = CoalescingFetcher(CompositeContentSource([
+            FetcherContentSource(network.canonicalContentFetcher()),
+            IvyContentSource(fetcher),
+        ]))
         let headerChain = HeaderChain()
         var attemptedTip = peerTipCID
         var statePrefetchTask: Task<Void, Never>? = nil
 
         do {
             let localWork = await localCumulativeWork(chainPath: network.chainPath)
+            let preSyncTip = await chain(forPath: network.chainPath)?.getMainChainTip()
             let (activeTip, activeSourcePeer) = await bestConnectedPeerTipWithPeer(
                 defaultTipCID: peerTipCID,
                 defaultTipHeight: peerTipHeight,
@@ -437,7 +691,7 @@ extension LatticeNode {
             // invalidBlock(N). downloadHeaders already verified PoW and state
             // chain continuity — the second pass is pure redundant I/O.
             let syncer = ChainSyncer(
-                fetcher: fetcher,
+                fetcher: contentFetcher,
                 store: { _, _ in },
                 genesisBlockHash: genesisResult.blockHash,
                 chainPath: config.fullChainPath ?? [genesisConfig.directory],
@@ -473,7 +727,7 @@ extension LatticeNode {
                 var contextDepth = ChainSyncer.requiredAnchorContextDepth(
                     retargetWindow: genesisResult.block.spec.node?.retargetWindow ?? 0)
                 while let cid = cursor, context.count < Int(contextDepth),
-                      let block = try? await VolumeImpl<Block>(rawCID: cid).resolve(fetcher: fetcher).node {
+                      let block = try? await VolumeImpl<Block>(rawCID: cid).resolve(fetcher: contentFetcher).node {
                     if context.isEmpty, let attachWindow = block.spec.node?.retargetWindow {
                         // Depth per the ATTACH block's spec (a spec update may
                         // have raised the window since genesis).
@@ -525,59 +779,59 @@ extension LatticeNode {
             log.info("Sync complete: height \(result.tipBlockHeight), applying to chain...")
 
             var syncedParentAnchors: [String: ParentAnchor] = [:]
+            var syncedProcessingRootHashes: [String: UInt256] = [:]
             if expectedChildPath != nil {
                 let directory = network.directory
                 let syncedProofs = await headerChain.acceptedProofs
-                syncedParentAnchors = try await validateSyncedParentAnchorConsistency(
+                let validated = try await validateSyncedParentAnchorConsistency(
                     directory: directory,
                     headers: headers,
                     proofs: syncedProofs,
-                    fetcher: fetcher
+                    fetcher: contentFetcher
                 )
+                syncedParentAnchors = validated.anchors
+                syncedProcessingRootHashes = validated.processingRootHashes
             }
 
-            let outcome = await finalizeSyncResult(result, localWork: localWork, network: network, fetcher: fetcher, sourcePeer: activeSourcePeer)
-            let finalized = outcome.wasAdopted
-            // Act on the outcome — make each fate an observable signal so a transient
-            // content miss (the seed-496 class) is VISIBLE, not a silent stall.
-            // `.pendingUnavailable` is deliberately NOT recorded as refused/failed, so
-            // it stays retriable when data/peers arrive; only `.ignoredLighter` is the
-            // settled work-refusal (already memoized inside finalizeSyncResult).
-            metrics.increment("lattice_sync_outcome_\(outcome.metricSuffix)")
-            switch outcome {
-            case .adopted:
-                break  // logged below as "Headers-first sync complete"
-            case .ignoredLighter:
-                log.info("\(network.directory): sync settled — incumbent held (peer chain not heavier)")
-            case .pendingUnavailable:
-                log.warn("\(network.directory): sync pending — canonical content unavailable; will retry when data/peers arrive (not refused, stays retriable)")
-            case .invalid(let reason):
-                log.warn("\(network.directory): sync rejected invalid chain: \(reason)")
-            case .degraded(let reason):
-                log.error("\(network.directory): sync could not publish — local storage/config failure: \(reason) (not retriable by waiting)")
+            // Availability stage: recompute the segment's canonical content OFF the
+            // commit lock (content is immutable + content-addressed, so this is safe
+            // outside the lock; adopt re-checks fork choice under it). A content miss
+            // here is an availability failure, not fraud — apply() maps `.incomplete`
+            // → `.pendingUnavailable`, so startSync retries source-agnostically. The
+            // structural cases (no StateStore / empty segment) are NOT materialized
+            // here; adopt rejects them as `.degraded`, so leave `materialized` nil and
+            // let finalize hit that guard.
+            var materializedContent: MaterializedSyncContent? = nil
+            let sortedForMaterialize = result.persisted.blocks.sorted { $0.blockHeight < $1.blockHeight }
+            if stateStores[chainKey(forDirectory: network.directory)] != nil,
+               let tipMetaForMaterialize = sortedForMaterialize.last {
+                guard let content = await materializeSyncedCanonicalContent(
+                    blocks: sortedForMaterialize,
+                    tipHash: tipMetaForMaterialize.blockHash,
+                    network: network,
+                    fetcher: contentFetcher,
+                    sourcePeer: activeSourcePeer
+                ) else {
+                    log.warn("\(network.directory): synced segment content not yet available; retrying (pending)")
+                    return .incomplete
+                }
+                materializedContent = content
             }
 
-            // F5-4: child blocks just synced carry verified anchoring proofs. Persist
-            // each (so this node can serve it onward) and fold its securing work into
-            // fork choice — the same accumulate→reevaluate the live ingestion runs, so
-            // sync is not a special path for inherited weight.
-            // Gated on finalize: a refused or failed finalize never committed
-            // the segment, so persisting "accepted" proofs or applying inherited
-            // weight for it would leave durable state for blocks we never adopted.
-            if finalized, expectedChildPath != nil {
-                let directory = network.directory
-                let syncedProofs = await headerChain.acceptedProofs
-                await recordSyncedChildProofs(
-                    directory: directory,
-                    headers: headers,
-                    proofs: syncedProofs,
-                    parentAnchors: syncedParentAnchors,
-                    source: IvyContentSource(fetcher)
-                )
-            }
-
-            log.info("Headers-first sync complete")
-            return outcome
+            // Gathered a fully-downloaded, PoW/proof-validated, materialized segment.
+            // Adopt + the child-proof recording happen in adoptSyncedSegmentViaForkChoice.
+            return .complete(GatheredSyncSegment(
+                result: result,
+                headers: headers,
+                acceptedProofs: await headerChain.acceptedProofs,
+                parentAnchors: syncedParentAnchors,
+                processingRootHashes: syncedProcessingRootHashes,
+                preSyncTip: preSyncTip,
+                expectedChildPath: expectedChildPath,
+                localWork: localWork,
+                sourcePeer: activeSourcePeer,
+                materialized: materializedContent
+            ))
 
         } catch {
             let peerCount2 = await network.ivy.peerConnectionCount
@@ -597,10 +851,10 @@ extension LatticeNode {
                 await prefetch.value
             }
             log.error("Headers-first sync failed: \(error)")
-            // A throw = the attempt did not complete = transient. A reshuffled retry
-            // (bounded) can re-reach the tip via other peers; a genuinely-dead source
-            // just exhausts the budget. Terminal validity is decided at finalize, not here.
-            return .pendingUnavailable
+            // A throw = the download/validation did not complete = transient. apply()
+            // maps `.incomplete` → `.pendingUnavailable`, so startSync's bounded retry
+            // re-reaches the tip via other peers; a dead source just exhausts the budget.
+            return .incomplete
         }
     }
 
@@ -634,45 +888,6 @@ extension LatticeNode {
         return false
     }
 
-    /// Persist each synced child block's anchoring proof and fold its inherited
-    /// (securing) work into fork choice. The proofs were already anchored-verified by
-    /// HeaderChain during download, so this mirrors the live ingestion's
-    /// persist→accumulate→reevaluate exactly — sync is not special. Keyed by block hash,
-    /// so a re-delivered block (gossip overlap) stays exactly-once in the accumulator.
-    private func recordSyncedChildProofs(
-        directory: String,
-        headers: [SyncBlockHeader],
-        proofs: [String: Data],
-        parentAnchors: [String: ParentAnchor],
-        source: any ContentSource
-    ) async {
-        for header in headers {
-            guard let proofData = proofs[header.cid],
-                  let decodedProofs = ChildBlockProofEnvelope.deserialize(proofData) else { continue }
-            for proof in decodedProofs {
-                await persistAcceptedBlockProof(directory: directory, height: header.height, blockHash: header.cid, proof: proof)
-            }
-            if let anchor = parentAnchors[header.cid] {
-                do {
-                    try await persistAcceptedChildParentAnchor(
-                        directory: directory,
-                        blockHash: header.cid,
-                        height: header.height,
-                        parentAnchor: anchor,
-                        replaceExisting: true
-                    )
-                } catch {
-                    NodeLogger("sync").error("\(directory): persistChildParentAnchor failed at height \(header.height): \(error)")
-                }
-            }
-            for proof in decodedProofs {
-                guard await applyInheritedWeight(directory: directory, blockHash: header.cid, proof: proof, source: source) else {
-                    return
-                }
-            }
-        }
-    }
-
     /// Serves the CID-addressed entries carried inside the synced blocks'
     /// ChildBlockProofs before falling back to the network fetcher. Child-only
     /// CARRIER blocks exist only as proof material — no CAS anywhere serves
@@ -694,8 +909,8 @@ extension LatticeNode {
         headers: [SyncBlockHeader],
         proofs: [String: Data],
         fetcher: Fetcher
-    ) async throws -> [String: ParentAnchor] {
-        guard let store = stateStores[chainKey(forDirectory: directory)] else { return [:] }
+    ) async throws -> (anchors: [String: ParentAnchor], processingRootHashes: [String: UInt256]) {
+        guard let store = stateStores[chainKey(forDirectory: directory)] else { return (anchors: [:], processingRootHashes: [:]) }
         // Collect every proof's CAS entries up front so the continuity walk
         // below can resolve carrier blocks that only exist as proof material.
         var proofEntryBytes: [String: Data] = [:]
@@ -711,6 +926,12 @@ extension LatticeNode {
             ? fetcher
             : ProofEntriesFirstFetcher(entries: proofEntryBytes, base: fetcher)
         var anchorsByChild: [String: [ParentAnchor]] = [:]
+        // childCID → (committing-parent anchor hash → merged-mining processing root).
+        // The adopt path feeds the SELECTED anchor's root to
+        // processBlockHeader.validateProofOfWork(nexusHash:) — mirroring the gossip
+        // side-effect path (LatticeNode+BlockSideEffects: selectChildParentAnchor →
+        // verified.first{ $0.anchor.blockHash == parentAnchor.blockHash }.rootHash).
+        var rootHashByChildAnchor: [String: [String: UInt256]] = [:]
         for header in headers where header.height > 0 {
             guard let proofData = proofs[header.cid],
                   let decodedProofs = ChildBlockProofEnvelope.deserialize(proofData),
@@ -725,12 +946,16 @@ extension LatticeNode {
                     throw HeaderChain.HeaderChainError.invalidPoW(header.cid)
                 }
                 anchors.append(anchor)
+                if let root = await proof.anchorRoot()?.hash {
+                    rootHashByChildAnchor[header.cid, default: [:]][anchor.blockHash] = root
+                }
             }
             anchorsByChild[header.cid] = anchors.canonicalAnchorSorted()
         }
 
         var pendingChildAnchors: [String: String] = [:]
         var selectedAnchors: [String: ParentAnchor] = [:]
+        var selectedRootHashes: [String: UInt256] = [:]
         for header in headers where header.height > 0 {
             guard let orderedAnchors = anchorsByChild[header.cid], !orderedAnchors.isEmpty else {
                 throw HeaderChain.HeaderChainError.invalidPoW(header.cid)
@@ -771,37 +996,33 @@ extension LatticeNode {
                     throw HeaderChain.HeaderChainError.invalidPoW(header.cid)
                 }
                 let previousRoot = previousChildBlock.parentState.rawCID
-                let alreadyContinuous = await parentStateRootIsContinuous(
-                    previousRoot: previousRoot,
-                    currentRoot: currentRoot,
-                    directory: directory
-                )
+                // CONTINUITY = pull-based backfill (verify-not-trust, the query-done-right). We
+                // establish continuity by fetching + PoW-verifying the parent carriers from ANY
+                // source — the sync source (at the tip), the proof entries, or the parent link —
+                // and recording the prevState→postState edges. Fetching VERIFIABLE DATA (vs a
+                // trusted boolean from the parent) means the answer is cacheable and the child is
+                // never bounded by its parent's sync pace, so a deep tree never cascades on lag.
+                let alreadyLocal = await parentStateRootIsContinuous(
+                    previousRoot: previousRoot, currentRoot: currentRoot, directory: directory)
                 let backfilled: Bool
-                if alreadyContinuous {
+                if alreadyLocal {
                     backfilled = true
                 } else {
                     backfilled = await backfillSyncedParentStatePath(
-                        directory: directory,
-                        previousRoot: previousRoot,
-                        currentRoot: currentRoot,
-                        committingParentHash: selected.blockHash,
-                        fetcher: continuityFetcher
-                    )
+                        directory: directory, previousRoot: previousRoot, currentRoot: currentRoot,
+                        committingParentHash: selected.blockHash, fetcher: continuityFetcher)
                 }
-                guard backfilled,
-                      await parentStateRootIsContinuous(
-                        previousRoot: previousChildBlock.parentState.rawCID,
-                        currentRoot: currentRoot,
-                        directory: directory
-                      ) else {
+                guard backfilled, await parentStateRootIsContinuous(
+                        previousRoot: previousRoot, currentRoot: currentRoot, directory: directory) else {
                     NodeLogger("sync").warn("\(directory): synced child header \(String(header.cid.prefix(16)))… breaks parent state root continuity")
                     throw HeaderChain.HeaderChainError.invalidPoW(header.cid)
                 }
             }
             pendingChildAnchors[header.cid] = selected.blockHash
             selectedAnchors[header.cid] = selected
+            selectedRootHashes[header.cid] = rootHashByChildAnchor[header.cid]?[selected.blockHash]
         }
-        return selectedAnchors
+        return (anchors: selectedAnchors, processingRootHashes: selectedRootHashes)
     }
 
     /// Historical child sync receives a proof for each child block's committing
@@ -877,54 +1098,6 @@ extension LatticeNode {
 
         return store.hasParentStatePath(from: previousRoot, to: currentRoot)
     }
-
-    private func reprocessSyncedBlocksForChildChains(
-        persisted: PersistedChainState,
-        fetcher: Fetcher,
-        network: ChainNetwork
-    ) async -> Bool {
-        // Child blocks at all depths live in child-chain CAS stores, not the nexus CAS.
-        // Build a composite fetcher that falls back through all registered child networks
-        // so grandchild (and deeper) block data can be resolved during replay.
-        _ = fetcher
-        let durableFetcher = network.canonicalContentFetcher()
-        let allChildFetchers = networks.values.compactMap { $0 === network ? nil : $0.canonicalContentFetcher() as Fetcher }
-        // Byte-identical mirror of the prior per-CID composite (durable broker
-        // primary, child-broker fallbacks): durable broker first, then each child
-        // broker in order. LOCAL-BROKER tiers (canonicalContentFetcher, not network
-        // ivy), so bridging each via FetcherContentSource is semantics-exact —
-        // no network wave-batching to gain.
-        let compositeSource: any ContentSource = allChildFetchers.isEmpty
-            ? FetcherContentSource(durableFetcher)
-            : CompositeContentSource([FetcherContentSource(durableFetcher)] + allChildFetchers.map { FetcherContentSource($0) })
-
-        let sortedBlocks = persisted.blocks.sorted { $0.blockHeight < $1.blockHeight }
-
-        for blockMeta in sortedBlocks {
-            let stub = VolumeImpl<Block>(rawCID: blockMeta.blockHash, node: nil, encryptionInfo: nil)
-            do {
-                // Migrate this durable-presence check onto the source API
-                // (resolve(paths:source:)) to complete the fetcher→ContentSource
-                // cutover. This is a LOCAL-BROKER site (canonicalContentFetcher,
-                // not network ivy), so there is no network wave-batching to gain:
-                // bridging the EXACT composite fetcher via FetcherContentSource
-                // is byte-identical to the prior resolution (sequential per-CID over
-                // the local broker; no network round-trips to batch). This is an
-                // API-consistency bridge, not a perf win — that win lives only on
-                // the network tier (#287).
-                guard (try await stub.resolve(paths: Block.contentResolutionPaths, source: compositeSource).node) != nil else {
-                    await markChainStorageDegraded(directory: network.directory, reason: "synced child canonical content not durable")
-                    return false
-                }
-            } catch {
-                NodeLogger("sync").error("\(network.directory): synced canonical block \(String(blockMeta.blockHash.prefix(16)))… missing from durable CAS during child reprocess: \(error)")
-                await markChainStorageDegraded(directory: network.directory, reason: "synced child canonical content not durable")
-                return false
-            }
-        }
-        return true
-    }
-
 
     /// After sync replaces the nexus chain, ensure each existing child
     /// chain's tipSnapshot reflects the new nexus state. If the synced
@@ -1027,8 +1200,8 @@ extension LatticeNode {
 
     // DESIGN CONSTRAINT: Every chain behaves identically. A chain that is a
     // child of Nexus behaves exactly as Nexus does for its own children.
-    // finalizeSyncResult is chain-agnostic — `network` identifies which chain
-    // was just synced. After applying the result, child chains are synced
+    // adoptSyncedSegmentViaForkChoice is chain-agnostic — `network` identifies which
+    // chain was just synced. After applying the result, child chains are synced
     // recursively via the same performHeadersFirstSync path.
     // Behavior-preserving delegation to the pure `SyncPolicy` module (plan 3a);
     // full docs live there. Kept as thin wrappers so existing call sites + tests
@@ -1146,331 +1319,6 @@ extension LatticeNode {
         let localWork = await localCumulativeWork(chainPath: chainPath)
         if Self.shouldAdmitSyncedChain(peerWork: result.cumulativeWork, localWork: localWork) { return .admit }
         return .refuse
-    }
-
-    /// Returns true only when the synced segment was durably published AND
-    /// projected into ChainState. Callers running accepted-only side effects
-    /// (e.g. persisting child proofs / folding inherited weight) MUST gate on
-    /// this — a refused or failed finalize means the segment was
-    /// never committed.
-    @discardableResult
-    func finalizeSyncResult(_ result: SyncResult, localWork: UInt256, network: ChainNetwork, fetcher: Fetcher, sourcePeer: PeerID? = nil) async -> ChainOutcome {
-        let key = chainKey(forPath: network.chainPath)
-        return await withChainMutation(key) {
-            await finalizeSyncResultUnlocked(
-                result,
-                localWork: localWork,
-                network: network,
-                fetcher: fetcher,
-                sourcePeer: sourcePeer
-            )
-        }
-    }
-
-    @discardableResult
-    private func finalizeSyncResultUnlocked(_ result: SyncResult, localWork: UInt256, network: ChainNetwork, fetcher: Fetcher, sourcePeer: PeerID? = nil) async -> ChainOutcome {
-        let log = NodeLogger("sync")
-        let directory = network.directory
-        guard let chainState = await chain(for: directory) else { return .pendingUnavailable }
-
-        // Gate against the CURRENT chain, not the caller's pre-download
-        // `localWork` snapshot: a block mined or accepted during the sync must
-        // never be rolled back by an equal/lower-work synced chain.
-        switch await admitSyncedChainAgainstCurrentChain(result, chainState: chainState, chainPath: network.chainPath) {
-        case .admit:
-            break
-        case .refuse:
-            log.warn("\(directory): sync refused: peer work \(result.cumulativeWork) does not beat the current local chain")
-            recordRefusedSyncTip(result.tipBlockHash, localTip: await chainState.getMainChainTip())
-            return .ignoredLighter
-        }
-
-        let sortedBlocks = result.persisted.blocks.sorted { $0.blockHeight < $1.blockHeight }
-        guard let store = stateStores[chainKey(forDirectory: directory)],
-              let lowest = sortedBlocks.first,
-              let tipMeta = sortedBlocks.last else {
-            log.error("\(directory): cannot publish sync without StateStore and a non-empty canonical segment")
-            return .degraded(reason: "missing StateStore or empty canonical segment")
-        }
-
-        guard let materialized = await materializeSyncedCanonicalContent(
-            blocks: sortedBlocks,
-            tipHash: tipMeta.blockHash,
-            network: network,
-            fetcher: fetcher,
-            sourcePeer: sourcePeer
-        ) else {
-            log.warn("\(directory): could not materialize synced canonical content; retrying before durable publish")
-            return .pendingUnavailable
-        }
-        let tipBlock = materialized.tipBlock
-        let oldTip = await chainState.getMainChainTip()
-
-        // Materialization fetches remote content and can take seconds — re-run
-        // the admission gate against the chain as it stands NOW, so a chain
-        // that advanced mid-sync is never durably replaced by a stale result.
-        guard case .admit = await admitSyncedChainAgainstCurrentChain(result, chainState: chainState, chainPath: network.chainPath) else {
-            log.info("\(directory): sync abandoned after materialization: local chain advanced past the synced chain")
-            return .ignoredLighter
-        }
-
-        // Publish the synced canonical chain as ONE atomic segment commit before
-        // mutating ChainState. StateStore is authoritative; ChainState is only the
-        // in-memory projection of this durable commit.
-        let connectsBelow = lowest.blockHeight == 0
-            || store.getBlockHash(atHeight: lowest.blockHeight - 1) == lowest.parentBlockHash
-        let syncedTransition = await syncedCanonicalTransition(
-            oldTip: oldTip,
-            newTip: tipMeta.blockHash,
-            syncedBlocks: sortedBlocks,
-            connectsBelow: connectsBelow,
-            chain: chainState
-        )
-        let segment = CanonicalSegment(
-            blocks: sortedBlocks.map {
-                CanonicalSegmentBlock(
-                    height: $0.blockHeight, hash: $0.blockHash,
-                    stateRoot: $0.blockHash == tipMeta.blockHash ? tipBlock.postState.rawCID : nil)
-            },
-            connectsBelow: connectsBelow)
-
-        guard let preparedEffects = await prepareSyncedCanonicalEffects(
-            blocks: sortedBlocks,
-            materializedBlocks: materialized.blocksByHeight,
-            directory: directory,
-            fetcher: fetcher
-        ) else {
-            // prepareSyncedCanonicalEffects marks the chain unhealthy on ALL its nil
-            // paths, so this is a degraded (terminal) failure, not a wait-and-retry
-            // availability miss. Return .degraded so the classification is self-
-            // consistent (any markChain*-degrade → .degraded) rather than relying on
-            // the retry loop's !isChainUnhealthy guard to suppress a wrong retry.
-            return .degraded(reason: "failed to prepare synced canonical effects (chain marked unhealthy)")
-        }
-
-        do {
-            try await advanceStateRetainedRoots(
-                directory: directory,
-                network: network,
-                tipHeight: tipMeta.blockHeight,
-                tipHash: tipMeta.blockHash,
-                materializedBlocks: materialized.blocksByHeight,
-                preserveExistingRoots: true
-            )
-        } catch {
-            log.error("\(directory): failed to pre-protect synced state retained roots before sync publish: \(error)")
-            await markChainStorageDegraded(directory: directory, reason: "failed to advance synced state retained roots")
-            return .degraded(reason: "failed to advance synced state retained roots")
-        }
-
-        for meta in sortedBlocks {
-            let owner = "\(network.ownerNamespace):\(meta.blockHeight)"
-            do {
-                let pinRoots = materialized.blocksByHeight[meta.blockHeight].map {
-                    consensusPinRoots(block: $0)
-                } ?? [meta.blockHash]
-                try await network.pinBatchDurably(roots: pinRoots, owner: owner)
-            } catch {
-                log.error("\(directory): failed to pre-pin synced block \(String(meta.blockHash.prefix(16)))… at height \(meta.blockHeight): \(error)")
-                await markChainStorageDegraded(directory: directory, reason: "failed to pin synced canonical content before durable commit")
-                return .degraded(reason: "failed to pin synced canonical content")
-            }
-        }
-
-        do {
-            try await store.commitCanonicalSegment(
-                segment,
-                blockEffects: preparedEffects.map(\.storeEffects)
-            )
-        } catch {
-            log.error("\(directory): failed to publish synced canonical segment: \(error)")
-            return .pendingUnavailable
-        }
-
-        for meta in sortedBlocks {
-            let storedRoots = materialized.rootsByHeight[meta.blockHeight] ?? [meta.blockHash]
-            do {
-                try await store.persistStoredRoots(height: meta.blockHeight, roots: storedRoots)
-            } catch {
-                log.error("\(directory): failed to persist synced stored roots for \(String(meta.blockHash.prefix(16)))… at height \(meta.blockHeight): \(error)")
-                await markChainStorageDegraded(directory: directory, reason: "failed to persist synced canonical content roots after durable commit")
-                return .degraded(reason: "failed to persist synced canonical content roots")
-            }
-        }
-
-        do {
-            try await advanceStateRetainedRoots(
-                directory: directory,
-                network: network,
-                tipHeight: tipMeta.blockHeight,
-                tipHash: tipMeta.blockHash,
-                materializedBlocks: materialized.blocksByHeight
-            )
-        } catch {
-            log.warn("\(directory): failed to shrink synced state retained roots after publish; retaining previous roots until the next successful advance: \(error)")
-        }
-
-        do {
-            // Anchored (mid-chain) segments: `result.persisted` contains ONLY
-            // the segment, so resetFrom(it) would shrink the in-memory window
-            // to the segment and under-count windowed cumulative work until a
-            // restart re-projects it — temporarily weakening the whole-window
-            // admission compare (review High). The durable commit above just
-            // made prefix+segment contiguous in the authoritative store, so
-            // reproject the FULL retained window from it instead — the same
-            // walk boot recovery uses. Genesis-rooted results already ARE the
-            // full window and keep the direct path.
-            var projection = result.persisted
-            if lowest.blockHeight > 0 {
-                let source = recoverySource(directory: directory, network: network)
-                if let rebuilt = await Self.rebuildChainState(
-                    tipCID: result.tipBlockHash, source: source, retentionDepth: config.retentionDepth) {
-                    projection = rebuilt
-                    log.info("\(directory): reprojected full retained window from durable store after anchored sync")
-                } else {
-                    log.warn("\(directory): could not reproject retained window after anchored sync; using segment-only projection (window heals on restart)")
-                }
-            }
-            try await chainState.resetFrom(projection, retentionDepth: config.retentionDepth)
-        } catch {
-            log.error("\(directory): failed to project synced state into ChainState: \(error)")
-            await markChainUnhealthy(directory: directory, reason: "failed to project synced state after durable commit")
-            return .degraded(reason: "failed to project synced state after durable commit")
-        }
-        await chainState.updateTipSnapshot(block: tipBlock)
-
-        tipCaches[chainKey(forDirectory: directory)]?.update(result.tipBlockHash)
-        postStateCaches[chainKey(forDirectory: directory)]?.invalidate()
-
-        await persistChainState(directory: directory)
-
-        guard await publishPreparedSyncedCanonicalSideEffects(
-            preparedEffects,
-            directory: directory,
-            fetcher: fetcher,
-            chain: chainState,
-            oldTip: oldTip,
-            newTip: result.tipBlockHash,
-            transition: syncedTransition
-        ) else {
-            // POST-COMMIT (segment committed + ChainState reset): a sync retry would
-            // re-attempt an already-committed segment, so this is TERMINAL, not
-            // wait-and-retry availability.
-            return .degraded(reason: "failed to publish synced canonical side effects after commit")
-        }
-
-        // Parent sync must not rewrite descendant fork choice. Child chains are
-        // independent proof-validated chains; parent canonicity only changes the
-        // local parent data available to prove future child work.
-        guard await reprocessSyncedBlocksForChildChains(persisted: result.persisted, fetcher: fetcher, network: network) else {
-            // POST-COMMIT: the canonical segment is already committed and ChainState
-            // reset; this helper marks storage degraded on missing durable content. A
-            // sync retry is wrong here (it would re-attempt an already-committed segment
-            // on a stopped/unhealthy chain), so this is TERMINAL, not wait-and-retry.
-            return .degraded(reason: "failed to reprocess synced blocks for child chains after commit")
-        }
-        await reconcileChildChainStatesAfterSync(
-            persisted: result.persisted,
-            fetcher: fetcher,
-            currentMutationKey: chainKey(forDirectory: directory)
-        )
-        await verifySyncWithPeers(tipCID: result.tipBlockHash, tipHeight: result.tipBlockHeight, network: network)
-
-        await syncSubscribedChildren(of: directory)
-        return .adopted(tipCID: result.tipBlockHash)
-    }
-
-    private func syncedCanonicalTransition(
-        oldTip: String,
-        newTip: String,
-        syncedBlocks: [PersistedBlockMeta],
-        connectsBelow: Bool,
-        chain: ChainState
-    ) async -> BoundedReorgWalkResult? {
-        guard !oldTip.isEmpty, oldTip != newTip else { return nil }
-        var newChainHashes = Set(syncedBlocks.map(\.blockHash))
-        if connectsBelow, let lowerParent = syncedBlocks.first?.parentBlockHash, !lowerParent.isEmpty {
-            newChainHashes.insert(lowerParent)
-        }
-        let walked = await Self.walkOrphansToCommonAncestor(
-            oldTip: oldTip,
-            newChainHashes: newChainHashes,
-            retentionDepth: config.retentionDepth
-        ) { hash in
-            await chain.getConsensusBlock(hash: hash)?.parentBlockHash
-        }
-        return BoundedReorgWalkResult(
-            orphaned: walked.orphans,
-            promoted: syncedBlocks.reversed().map { (hash: $0.blockHash, height: $0.blockHeight) },
-            newChainHashes: newChainHashes,
-            foundCommonAncestor: walked.foundCommonAncestor
-        )
-    }
-
-    /// Prepare the same deterministic block effects used by live acceptance
-    /// before the synced segment is published. This keeps consensus data
-    /// (transaction actions and declared state roots) ahead of local projections
-    /// (receipts, tx_history, nonce floors) and lets StateStore commit the
-    /// canonical segment plus query indexes atomically.
-    private func prepareSyncedCanonicalEffects(
-        blocks: [PersistedBlockMeta],
-        materializedBlocks: [UInt64: Block],
-        directory: String,
-        fetcher: Fetcher
-    ) async -> [PreparedAcceptedBlockEffects]? {
-        // Grain-independent, LOCAL-FIRST resolution for the synced replay: the
-        // recompute reads state-trie grains that exist in the local CAS but are
-        // NOT servable volume roots, so the wave-batched IvyContentSource (a
-        // remote volume-root optimization the baseFetcher overload would pick
-        // here) reports notFound for bytes this node already holds — killing
-        // the publish of an otherwise-valid deep catch-up. FetcherContentSource
-        // over IvyFetcher is the documented semantics-exact bridge: per-CID,
-        // local broker first, remote poll second.
-        let txSource = await buildMempoolAwareSource(
-            directory: directory, baseSource: FetcherContentSource(fetcher))
-        var prepared: [PreparedAcceptedBlockEffects] = []
-        prepared.reserveCapacity(blocks.count)
-        for meta in blocks {
-            guard let block = materializedBlocks[meta.blockHeight] else {
-                NodeLogger("sync").error("\(directory): synced canonical block \(String(meta.blockHash.prefix(16)))…@\(meta.blockHeight) was not materialized for effect preparation")
-                await markChainUnhealthy(directory: directory, reason: "failed to materialize synced canonical effects")
-                return nil
-            }
-            guard let transactions = await resolveCompleteSyncedBlockTransactions(
-                block: block,
-                blockHash: meta.blockHash,
-                blockHeight: meta.blockHeight,
-                directory: directory,
-                source: txSource
-            ) else {
-                await markChainUnhealthy(directory: directory, reason: "failed to resolve synced canonical transactions")
-                return nil
-            }
-            guard await verifySyncedStateTransition(
-                block: block,
-                blockHash: meta.blockHash,
-                blockHeight: meta.blockHeight,
-                directory: directory,
-                transactions: transactions,
-                source: txSource
-            ) else {
-                await markChainUnhealthy(directory: directory, reason: "failed to verify synced canonical state transition")
-                return nil
-            }
-            guard let effects = await prepareAcceptedBlockEffects(
-                block: block,
-                blockHash: meta.blockHash,
-                txEntries: transactions.entriesByKey,
-                directory: directory,
-                allowLowerHeightReplay: true
-            ) else {
-                NodeLogger("sync").error("\(directory): synced canonical block \(String(meta.blockHash.prefix(16)))…@\(meta.blockHeight) could not prepare canonical effects")
-                await markChainUnhealthy(directory: directory, reason: "failed to prepare synced canonical effects")
-                return nil
-            }
-            prepared.append(effects)
-        }
-        return prepared
     }
 
     private struct SyncedBlockTransactions {
@@ -1667,82 +1515,13 @@ extension LatticeNode {
     // to re-run the (now unconditional-recompute) pass once, healing the deep closure, then converge.
     private var stateHealWatermarkKey: String { "state-materialized-height-v2" }
 
-    private func verifySyncedStateTransition(
-        block: Block,
-        blockHash: String,
-        blockHeight: UInt64,
-        directory: String,
-        transactions: SyncedBlockTransactions,
-        source: any ContentSource
-    ) async -> Bool {
-        let fetcher = CoalescingFetcher(source)
-        do {
-            let prevState = try await block.prevState.resolve(fetcher: fetcher)
-            let bodies = transactions.orderedBodies
-            let (updatedState, _) = try await prevState.proveAndUpdateState(
-                allAccountActions: bodies.flatMap(\.accountActions),
-                allActions: bodies.flatMap(\.actions),
-                allDepositActions: bodies.flatMap(\.depositActions),
-                allGenesisActions: bodies.flatMap(\.genesisActions),
-                allReceiptActions: bodies.flatMap(\.receiptActions),
-                allWithdrawalActions: bodies.flatMap(\.withdrawalActions),
-                transactionBodies: bodies,
-                fetcher: fetcher
-            )
-            let updatedHeader = try LatticeStateHeader(node: updatedState)
-            guard updatedHeader.rawCID == block.postState.rawCID else {
-                NodeLogger("sync").error("\(directory): synced canonical block \(String(blockHash.prefix(16)))…@\(blockHeight) computed postState \(String(updatedHeader.rawCID.prefix(16)))… but declares \(String(block.postState.rawCID.prefix(16)))…")
-                return false
-            }
-            return true
-        } catch {
-            NodeLogger("sync").error("\(directory): synced canonical block \(String(blockHash.prefix(16)))…@\(blockHeight) failed Cashew state replay: \(error)")
-            return false
-        }
-    }
-
-    /// Publish the non-SQLite side effects for an already-committed synced
-    /// canonical segment. The canonical segment, receipts, tx_history, and
-    /// applied-through marker have already moved together in StateStore.
-    @discardableResult
-    private func publishPreparedSyncedCanonicalSideEffects(
-        _ preparedEffects: [PreparedAcceptedBlockEffects],
-        directory: String,
-        fetcher: Fetcher,
-        chain: ChainState,
-        oldTip: String,
-        newTip: String,
-        transition: BoundedReorgWalkResult?
-    ) async -> Bool {
-        let source = FetcherContentSource(fetcher)
-        if let transition, oldTip != newTip {
-            await recoverOrphanedTransactions(
-                transition: transition,
-                oldTip: oldTip,
-                newTip: newTip,
-                directory: directory,
-                source: source
-            )
-        }
-
-        for effects in preparedEffects {
-            await applyPreparedAcceptedBlockEffects(effects, recoverReplacedCanonicalBlock: false)
-        }
-        if let tipBlock = preparedEffects.last?.block {
-            await chain.updateTipSnapshot(block: tipBlock)
-        }
-        tipCaches[chainKey(forDirectory: directory)]?.update(newTip)
-        postStateCaches[chainKey(forDirectory: directory)]?.invalidate()
-        return true
-    }
-
     private func materializeSyncedCanonicalContent(
         blocks: [PersistedBlockMeta],
         tipHash: String,
         network: ChainNetwork,
         fetcher: Fetcher,
         sourcePeer: PeerID? = nil
-    ) async -> (tipBlock: Block, rootsByHeight: [UInt64: [String]], blocksByHeight: [UInt64: Block])? {
+    ) async -> MaterializedSyncContent? {
         let log = NodeLogger("sync")
         var syncedTip: Block?
         var rootsByHeight: [UInt64: [String]] = [:]
@@ -1855,8 +1634,8 @@ extension LatticeNode {
                 // Instead re-execute this block's transactions against its prev
                 // post-state. Blocks are applied height-ascending and each is stored
                 // below before the next, so prevState resolves from LOCAL CAS — the
-                // same transition `verifySyncedStateTransition` checks, but here we
-                // KEEP the materialized frontier to store. Fails closed: a recompute
+                // same prevState→postState transition the accept path checks, but here
+                // we KEEP the materialized frontier to store. Fails closed: a recompute
                 // that does not reproduce the declared postState root is rejected.
                 let source = FetcherContentSource(fetcher)
                 guard let transactions = await resolveCompleteSyncedBlockTransactions(
@@ -1948,7 +1727,7 @@ extension LatticeNode {
         }
 
         guard let syncedTip else { return nil }
-        return (syncedTip, rootsByHeight, blocksByHeight)
+        return MaterializedSyncContent(tipBlock: syncedTip, rootsByHeight: rootsByHeight, blocksByHeight: blocksByHeight)
     }
 
     /// Recursive multi-chain sync wave. A chain syncs and finalizes itself first;
@@ -2075,15 +1854,6 @@ extension LatticeNode {
             log.warn("Sync verification: could not resolve tip block from CAS")
         }
     }
-
-    func isChildChainSyncing(directory: String) -> Bool {
-        isChainSyncing(directory: directory) || isChainUnhealthy(directory: directory)
-    }
-
-    func isChildChainSyncing(chainPath: [String]) -> Bool {
-        isChainSyncing(chainPath: chainPath) || isChainUnhealthy(chainPath: chainPath)
-    }
-
 
     /// Sum the proof-of-work for all blocks in the local retention window.
     /// Underestimates when blocks have been pruned beyond `retentionDepth`,

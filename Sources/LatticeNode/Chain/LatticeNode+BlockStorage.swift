@@ -456,7 +456,92 @@ extension LatticeNode {
               !proofData.isEmpty else { return nil }
         let proofs = proofData.compactMap { ChildBlockProof.deserialize($0) }
         guard !proofs.isEmpty else { return nil }
+        // P1-2 SELF-CONTAINED CROSS-CHAIN VALIDATION, DURABLE. The parent-`receiptState`
+        // witness a peer needs to validate this block's withdrawals is folded into the
+        // proof at ACCEPTANCE (finalizeAcceptedChildProofs) and stored in `block_proofs`,
+        // so it is retention-scoped with the block and served VERBATIM here — NOT
+        // synthesized on demand against a parentState that may since have been evicted
+        // (the earlier best-effort approach could silently serve a base proof after
+        // pruning). FAIL CLOSED: if this is a withdrawal-bearing block whose stored proof
+        // is not actually self-contained, withhold it (nil) rather than present an
+        // incomplete proof as self-contained — the peer then defers and retries another
+        // source instead of accepting an unvalidatable block or a false invalidity verdict.
+        if await storedProofOmitsRequiredReceiptWitness(directory: directory, blockCID: cid, proofs: proofs) {
+            NodeLogger("sync").warn("\(directory): withholding non-self-contained proof for withdrawal block \(String(cid.prefix(16)))… (receipt witness missing from stored proof)")
+            return nil
+        }
         return ChildBlockProofEnvelope.serialize(proofs)
+    }
+
+    /// P1-2 fail-closed guard for `blockProofData`: true when `blockCID` is a
+    /// withdrawal-bearing child block whose stored `proofs` do NOT already contain the
+    /// parent-`receiptState` witness (i.e. the withdrawals cannot be proven from the
+    /// proof's OWN entries alone). Loads the block locally to read its withdrawals, then
+    /// verifies the receipts against an in-memory source over the proof entries — a pure
+    /// self-containment check, no parent-state fetch. False when there are no withdrawals,
+    /// the block can't be read locally (nothing to withhold), or the witness is present.
+    func storedProofOmitsRequiredReceiptWitness(directory: String, blockCID: String, proofs: [ChildBlockProof]) async -> Bool {
+        guard let network = network(for: directory) else { return false }
+        let localSource = FetcherContentSource(network.canonicalContentFetcher())
+        guard let block = try? await VolumeImpl<Block>(rawCID: blockCID).resolve(source: localSource).node,
+              !block.parentState.rawCID.isEmpty else { return false }
+        var withdrawals: [WithdrawalAction] = []
+        for (_, txVol) in await resolveBlockTransactions(block: block, source: localSource) {
+            if let tx = try? await txVol.resolve(source: localSource).node,
+               let body = try? await tx.body.resolve(fetcher: CoalescingFetcher(localSource)).node {
+                withdrawals.append(contentsOf: body.withdrawalActions)
+            }
+        }
+        guard !withdrawals.isEmpty else { return false }
+        // Resolve + prove the receipts using ONLY the proof's own entries.
+        let proofOnly = InMemoryContentSource(Dictionary(
+            proofs.flatMap { $0.entries }.map { ($0.cid, $0.data) }, uniquingKeysWith: { first, _ in first }))
+        let fetcher = CoalescingFetcher(proofOnly)
+        guard let parentState = try? await LatticeStateHeader(rawCID: block.parentState.rawCID).resolve(fetcher: fetcher).node,
+              (try? await parentState.receiptState.proveExistenceAndVerifyWithdrawers(
+                  directory: directory, withdrawalActions: withdrawals, fetcher: fetcher)) != nil
+        else { return true }  // withdrawals present but not provable from the proof alone → withhold
+        return false
+    }
+
+    /// (B) The sparse `parentState → receiptState → receiptKey` existence proof for
+    /// every withdrawal in `blockCID`'s block, as CAS entries to fold into the served
+    /// ChildBlockProof (see `blockProofData`). Local-first resolution (durable broker →
+    /// parent subscription → network) — the serving node holds the parent receiptState.
+    /// Empty (best-effort) when the block has no withdrawals or the parent state can't
+    /// be resolved; the peer still gets the base securing-work proof.
+    func selfContainedReceiptWitnessEntries(directory: String, blockCID: String) async -> [(cid: String, data: Data)] {
+        guard let network = network(for: directory) else { return [] }
+        var sources: [any ContentSource] = [FetcherContentSource(network.canonicalContentFetcher())]
+        if let psf = parentStateFetchers[directory] {
+            sources.append((psf as? IvyFetcher).map { IvyContentSource($0) } ?? FetcherContentSource(psf))
+        }
+        sources.append(IvyContentSource(network.ivyFetcher))
+        let source = CompositeContentSource(sources)
+
+        guard let block = try? await VolumeImpl<Block>(rawCID: blockCID).resolve(source: source).node,
+              !block.parentState.rawCID.isEmpty else { return [] }
+
+        // Collect withdrawals across the block's transactions.
+        var withdrawals: [WithdrawalAction] = []
+        for (_, txVol) in await resolveBlockTransactions(block: block, source: source) {
+            if let tx = try? await txVol.resolve(source: source).node,
+               let body = try? await tx.body.resolve(fetcher: CoalescingFetcher(source)).node {
+                withdrawals.append(contentsOf: body.withdrawalActions)
+            }
+        }
+        guard !withdrawals.isEmpty else { return [] }
+
+        // Sparse existence proof over parentState walking `receiptState[receiptKey]`.
+        var paths = [[String]: SparseMerkleProof]()
+        for wa in withdrawals {
+            paths[["receiptState", ReceiptKey(withdrawalAction: wa, directory: directory).description]] = .mutation
+        }
+        guard let proven = try? await LatticeStateHeader(rawCID: block.parentState.rawCID)
+            .proof(paths: paths, fetcher: CoalescingFetcher(source)) else { return [] }
+        let storer = _CollectingStorer()
+        try? proven.storeRecursively(storer: storer)
+        return storer.entries
     }
     /// True when a ChildBlockProof is already persisted for `blockHash` in `directory`.
     /// Used by the proof self-heal backfill to skip blocks that already have a proof.

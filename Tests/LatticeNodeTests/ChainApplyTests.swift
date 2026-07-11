@@ -27,7 +27,7 @@ final class ChainApplyTests: XCTestCase {
         heavier: Bool = true,
         gather: GatherKind = .complete,
         validate: ValidationResult = .valid,
-        adopt: AdoptResult = .adopted
+        adopt: ChainOutcome = .adopted(tipCID: "bafycandidate")
     ) -> ChainApply<CandidateExtension> {
         ChainApply(
             isStrictlyHeavier: { _ in await log.add("forkChoice"); return heavier },
@@ -88,7 +88,7 @@ final class ChainApplyTests: XCTestCase {
         // Everything passed, but the local chain advanced during gather/validate —
         // the authoritative re-check under the lock holds the (now-heavier) incumbent.
         let log = CallLog()
-        let outcome = await makeApply(log: log, adopt: .supersededByHeavierLocal).apply(candidate)
+        let outcome = await makeApply(log: log, adopt: .ignoredLighter).apply(candidate)
         XCTAssertEqual(outcome, .ignoredLighter, "mid-apply local advance → hold incumbent (twice-check)")
         let steps = await log.steps
         XCTAssertEqual(steps, ["forkChoice", "gather", "validate", "adopt"])
@@ -96,7 +96,7 @@ final class ChainApplyTests: XCTestCase {
 
     func testPendingWhenAdoptTransientFailure() async {
         let log = CallLog()
-        let outcome = await makeApply(log: log, adopt: .transientFailure).apply(candidate)
+        let outcome = await makeApply(log: log, adopt: .pendingUnavailable).apply(candidate)
         XCTAssertEqual(outcome, .pendingUnavailable, "a commit-time miss retries, never dead-ends silently")
     }
 

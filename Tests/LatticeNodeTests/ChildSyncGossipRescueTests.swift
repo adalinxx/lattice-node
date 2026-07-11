@@ -1,6 +1,7 @@
 import XCTest
 @testable import Lattice
 @testable import LatticeNode
+import LatticeNodeWire
 import Ivy
 import UInt256
 import cashew
@@ -123,6 +124,101 @@ final class ChildSyncGossipRescueTests: XCTestCase {
             try await storeBlockFixtureVolumes(nexusGenesis, in: network)
         }
         return (try VolumeImpl<Block>(node: child).rawCID, child, proof)
+    }
+
+    /// P1 (H2): gather must surface the correct merged-mining PROCESSING ROOT per
+    /// synced child block — the SELECTED committing-parent anchor's root, i.e. the
+    /// exact `rootHash` that `processBlockHeader.validateProofOfWork(nexusHash:)`
+    /// consumes when the per-block adopt (P2) routes a synced child block through the
+    /// shared ingest. This is the highest-fragility bit of the unification: a wrong
+    /// root ⇒ every synced child block rejected ⇒ permanent child-sync stall. Prove it
+    /// before wiring the consumer.
+    func testSyncSurfacesSelectedAnchorProcessingRootHash() async throws {
+        let (node, fixture, nexusGenesis, midGenesis) = try await makeChildNode()
+        // A CLEARING carrier: contributes real inherited securing work and resolves a
+        // real merged-mining anchor root (a child-only carrier's root is still valid,
+        // but the clearing case is the load-bearing one for fork choice).
+        let (midCID, child, proof) = try await minedChild(
+            node: node, fixture: fixture, previousMid: midGenesis,
+            nexusGenesis: nexusGenesis, carrierClears: true, nonceSeed: 1,
+            ts: midGenesis.timestamp + 1)
+
+        // The quantity we surface is defined to be the carrier's merged-mining root.
+        let anchorRootHash = await proof.anchorRoot()?.hash
+        let expectedRoot = try XCTUnwrap(
+            anchorRootHash,
+            "a clearing carrier's proof must resolve an anchor root")
+
+        let header = SyncBlockHeader(
+            cid: midCID, height: child.height, previousBlockCID: child.parent?.rawCID,
+            target: child.target, nextTarget: child.nextTarget, timestamp: child.timestamp,
+            specCID: child.spec.rawCID, spec: child.spec.node)
+        let proofsMap = [midCID: ChildBlockProofEnvelope.serialize([proof])]
+
+        let result = try await node.validateSyncedParentAnchorConsistency(
+            directory: "Mid", headers: [header], proofs: proofsMap, fetcher: fixture)
+
+        let surfaced = try XCTUnwrap(
+            result.processingRootHashes[midCID],
+            "processingRootHash must be surfaced for a proof-carrying synced child")
+        XCTAssertEqual(
+            surfaced, expectedRoot,
+            "surfaced processing root must equal the SELECTED anchor's root (what validateProofOfWork consumes)")
+        XCTAssertNotNil(
+            result.anchors[midCID],
+            "a selected parent anchor must accompany the surfaced root")
+    }
+
+    /// P2/P3 — the SELF-SIMILARITY payoff: a proof-carrying CHILD block, routed through
+    /// the new per-block adopt (`adoptSyncedSegmentViaForkChoice`), is ACCEPTED by the
+    /// SAME `processBlockAndRecoverReorg` ingest gossip/rescue use — with the surfaced
+    /// processingRootHash + proof overlay + preloaded inherited weight. This is the
+    /// end-to-end proof that H2's surfaced root is correct (a wrong root ⇒ rejected).
+    /// Child sync is now just gossip-with-pull-transport.
+    func testForkChoiceAdoptChildBlockAdopts() async throws {
+        let (node, fixture, nexusGenesis, midGenesis) = try await makeChildNode()
+        let (midCID, child, proof) = try await minedChild(
+            node: node, fixture: fixture, previousMid: midGenesis,
+            nexusGenesis: nexusGenesis, carrierClears: true, nonceSeed: 1,
+            ts: midGenesis.timestamp + 1)
+
+        let maybeMidNetwork = await node.network(for: "Mid")
+        let midNetwork = try XCTUnwrap(maybeMidNetwork)
+        let ivyFetcher = await midNetwork.ivyFetcher
+
+        // Build a Mid segment (genesis + the one proof-carrying child).
+        let peerChain = ChainState.fromGenesis(block: midGenesis)
+        let childHeader = try VolumeImpl<Block>(node: child)
+        _ = await peerChain.submitBlock(parentBlockHeaderAndIndex: nil, blockHeader: childHeader, block: child)
+        await peerChain.updateTipSnapshot(block: child)
+        let persisted = await peerChain.persist()
+        let result = SyncResult(
+            persisted: persisted, tipBlockHash: midCID, tipBlockHeight: child.height, cumulativeWork: .zero)
+
+        let header = SyncBlockHeader(
+            cid: midCID, height: child.height, previousBlockCID: child.parent?.rawCID,
+            target: child.target, nextTarget: child.nextTarget, timestamp: child.timestamp,
+            specCID: child.spec.rawCID, spec: child.spec.node)
+        let proofsMap = [midCID: ChildBlockProofEnvelope.serialize([proof])]
+        // Anchors + processing roots exactly as gather surfaces them (P1).
+        let validated = try await node.validateSyncedParentAnchorConsistency(
+            directory: "Mid", headers: [header], proofs: proofsMap, fetcher: fixture)
+
+        let seg = LatticeNode.GatheredSyncSegment(
+            result: result, headers: [header], acceptedProofs: proofsMap,
+            parentAnchors: validated.anchors, processingRootHashes: validated.processingRootHashes,
+            preSyncTip: nil, expectedChildPath: ["Mid"], localWork: .zero, sourcePeer: nil,
+            materialized: LatticeNode.MaterializedSyncContent(
+                tipBlock: child, rootsByHeight: [:],
+                blocksByHeight: [midGenesis.height: midGenesis, child.height: child]))
+
+        let outcome = await node.adoptSyncedSegmentViaForkChoice(seg, network: midNetwork, fetcher: ivyFetcher)
+
+        XCTAssertEqual(
+            outcome, .adopted(tipCID: midCID),
+            "a proof-carrying child must adopt through the per-block loop using the surfaced processing root")
+        let midTip = await node.chain(for: "Mid")?.getMainChainTip()
+        XCTAssertEqual(midTip, midCID, "the child block must become the canonical Mid tip")
     }
 
     /// Rescue boundary, case 1 (WORKS?): the competing heavier-secured branch

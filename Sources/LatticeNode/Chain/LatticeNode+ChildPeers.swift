@@ -224,6 +224,33 @@ extension LatticeNode {
         return height == 0
     }
 
+    /// PARENT-FIRST gate: whether THIS chain has caught up to the best tip any connected
+    /// peer has advertised (within `tolerance`). A supervising node must not spawn/follow a
+    /// CHILD until this (parent) chain is caught up — otherwise the child outruns the parent
+    /// and its continuity queries against the parent defer forever (the parent hasn't yet synced the
+    /// carriers the child's blocks anchor to). A perpetually-mining chain is never EXACTLY at
+    /// the tip, hence the tolerance. No advertised peer tip yet ⇒ we can't assert caught-up,
+    /// so treat as NOT caught up (keep waiting) rather than spawn a child prematurely.
+    func chainCaughtUpToBestKnownPeer(directory: String, tolerance: UInt64 = 2) async -> Bool {
+        guard let network = network(for: directory) else { return false }
+        let height = await chain(for: directory)?.getHighestBlockHeight() ?? 0
+        guard let tips = knownPeerTips[chainKey(forPath: network.chainPath)], !tips.isEmpty else {
+            return false
+        }
+        let bestPeerHeight = tips.values.map { $0.height }.max() ?? 0
+        return height + tolerance >= bestPeerHeight
+    }
+
+    /// Whether we have recorded ANY peer's advertised tip for this chain — i.e. whether
+    /// `chainCaughtUpToBestKnownPeer` has data to assess against. A chain fed its blocks via
+    /// PARENT-EXTRACTION (embedded in parent carriers) rather than peer sync never records a
+    /// peer tip (`recordPeerTip` runs only on the gossip/sync paths), so the caught-up gate
+    /// has nothing to measure and must NOT be applied — otherwise it defers forever.
+    func hasKnownPeerTip(directory: String) -> Bool {
+        guard let network = network(for: directory) else { return false }
+        return !(knownPeerTips[chainKey(forPath: network.chainPath)]?.isEmpty ?? true)
+    }
+
     /// Ask every connected parent for this chain's same-chain peers and dial any
     /// returned endpoints on the chain-gossip network. Verify-not-trust: the dial
     /// authenticates the identity and consensus validates the chain, so a bogus

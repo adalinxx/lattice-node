@@ -172,6 +172,10 @@ extension LatticeNode {
                     // Memoize against the CURRENT tip so an unserved/invalid
                     // heavier claim can't spin the node; a tip change re-arms.
                     memoizeRefusedRescueConnector(cid, localTip: localTip)
+                case .deferredWhileSyncing:
+                    // Transient (ancestor state not yet materialized) — NOT a refusal.
+                    // Do not memoize; a later pass retries once the gap heals.
+                    break
                 }
             }
             if !progressed { return }
@@ -222,13 +226,13 @@ extension LatticeNode {
             allowBelowTipHeight: true
         )
         if outcome == .accepted || outcome == .duplicate {
-            for item in evidence.verified {
-                await persistAcceptedBlockProof(directory: directory, height: block.height, blockHash: cid, proof: item.proof)
-            }
-            for item in evidence.verified {
-                guard await applyInheritedWeight(directory: directory, blockHash: cid, proof: item.proof, source: validationBaseSource) else {
-                    break
-                }
+            // ONE shared proof-finalization contract (finalizeAcceptedChildProofs): surface a
+            // durable finalization failure as `.storageFailed` instead of `break`-ing and
+            // returning the `.accepted` outcome (the P1-1 swallow bug, twin of sync's).
+            if case .storageFailed = await finalizeAcceptedChildProofs(
+                directory: directory, height: block.height, blockHash: cid,
+                proofs: evidence.verified.map(\.proof), source: validationBaseSource) {
+                return .storageFailed
             }
         }
         return outcome

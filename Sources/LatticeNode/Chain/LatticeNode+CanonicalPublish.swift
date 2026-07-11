@@ -332,7 +332,7 @@ extension LatticeNode {
         let foundCommonAncestor: Bool
     }
 
-    private func boundedReorgWalk(
+    func boundedReorgWalk(
         oldTip: String,
         newTip: String,
         chain: ChainState

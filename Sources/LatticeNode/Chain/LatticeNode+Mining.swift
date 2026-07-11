@@ -254,8 +254,11 @@ extension LatticeNode {
             await unpinBlockStorageForRejectedCandidate(block, storedRoots: storedRoots, network: network)
         }
         if accepted || outcome == .duplicate {
-            await persistAcceptedBlockProof(directory: directory, height: block.height, blockHash: header.rawCID, proof: proof)
-            guard await applyInheritedWeight(directory: directory, blockHash: header.rawCID, proof: proof, source: IvyContentSource(network.ivyFetcher)) else {
+            // ONE shared proof-finalization contract (finalizeAcceptedChildProofs): a durable
+            // finalization failure fails the submission, matching sync (degrade) and gossip (stop).
+            if case .storageFailed = await finalizeAcceptedChildProofs(
+                directory: directory, height: block.height, blockHash: header.rawCID,
+                proofs: [proof], source: IvyContentSource(network.ivyFetcher)) {
                 return false
             }
         }
@@ -292,11 +295,6 @@ extension LatticeNode {
                 childRelayRootHash: rootHash,
                 childRelayProofs: [proof],
                 announceCurrentTipWhenNotPromoted: true
-            )
-            await forwardParentContinuityToRegisteredDirectChildren(
-                parentPath: chainPath,
-                parentDirectory: directory,
-                blockData: blockData
             )
         }
         if outcome != .storageFailed {
@@ -363,32 +361,6 @@ extension LatticeNode {
             proof: proof,
             forwarder: forwarder
         )
-    }
-
-    /// Push a freshly-minted parent block to one child node for state continuity
-    /// (see RPCRoutes.parentContinuity). Fire-and-forget best effort: the child
-    /// also learns the same transition via gossip and can fetch it on demand, so
-    /// a dropped push only forgoes the synchronous fast path, never correctness.
-    private nonisolated static func forwardParentContinuity(
-        parentDirectory: String,
-        blockHex: String,
-        forwarder: ChildRPCForwarder
-    ) async {
-        guard let url = URL(string: forwarder.endpoint + "/chain/parent-continuity") else { return }
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        if let authToken = forwarder.authToken,
-           !authToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            request.setValue("Bearer \(authToken)", forHTTPHeaderField: "Authorization")
-        }
-        request.httpBody = try? JSONSerialization.data(withJSONObject: [
-            "parentDirectory": parentDirectory,
-            "blockHex": blockHex
-        ])
-        let session = RPCRoutes.childFanoutSession()
-        defer { session.invalidateAndCancel() }
-        _ = try? await session.data(for: request)
     }
 
     private func forwardMinedChildBlock(
@@ -531,23 +503,6 @@ extension LatticeNode {
                 acceptedAny = true
                 acceptedHash = sealedCID
                 acceptedHeight = sealed.height
-                // Push this parent transition to EVERY child, embedded or not, so
-                // each child's continuity index stays current as the parent
-                // advances (user directive: a block minted on the parent but not on
-                // a child must still reach the child for state continuity). The
-                // child verifies the block itself; this is best-effort and never
-                // gates parent acceptance.
-                if let parentDirectory = chainPath.last,
-                   let blockData = sealed.toData() {
-                    await forwardParentContinuityToDirectChildren(
-                        parentDirectory: parentDirectory,
-                        blockData: blockData,
-                        forwarders: directChildForwarders(
-                            parentPath: chainPath,
-                            from: childRPCForwarders
-                        )
-                    )
-                }
             }
         }
         for child in validChildren {
@@ -639,68 +594,6 @@ extension LatticeNode {
             )
         }
         return forwarders
-    }
-
-    private func directChildForwarders(
-        parentPath: [String],
-        from forwarders: [String: ChildRPCForwarder]
-    ) -> [ChildRPCForwarder] {
-        forwarders.compactMap { key, forwarder in
-            let path = key.split(separator: "/").map(String.init)
-            guard path.count == parentPath.count + 1,
-                  Array(path.dropLast()) == parentPath else {
-                return nil
-            }
-            return forwarder
-        }
-    }
-
-    private func registeredDirectChildForwarders(parentPath: [String]) -> [ChildRPCForwarder] {
-        directChildForwarders(
-            parentPath: parentPath,
-            from: Dictionary(uniqueKeysWithValues: registeredRPCEndpoints.map { key, endpoint in
-                (
-                    key,
-                    ChildRPCForwarder(
-                        endpoint: endpoint,
-                        authToken: registeredRPCAuthTokens[key]
-                    )
-                )
-            })
-        )
-    }
-
-    private func forwardParentContinuityToRegisteredDirectChildren(
-        parentPath: [String],
-        parentDirectory: String,
-        blockData: Data
-    ) async {
-        await forwardParentContinuityToDirectChildren(
-            parentDirectory: parentDirectory,
-            blockData: blockData,
-            forwarders: registeredDirectChildForwarders(parentPath: parentPath)
-        )
-    }
-
-    private func forwardParentContinuityToDirectChildren(
-        parentDirectory: String,
-        blockData: Data,
-        forwarders: [ChildRPCForwarder]
-    ) async {
-        guard !forwarders.isEmpty else { return }
-        let blockHex = blockData.map { String(format: "%02x", $0) }.joined()
-        await withTaskGroup(of: Void.self) { group in
-            for forwarder in forwarders {
-                group.addTask { [parentDirectory, blockHex, forwarder] in
-                    await Self.forwardParentContinuity(
-                        parentDirectory: parentDirectory,
-                        blockHex: blockHex,
-                        forwarder: forwarder
-                    )
-                }
-            }
-            await group.waitForAll()
-        }
     }
 
     private nonisolated func normalizeHex(_ value: String) -> String {
