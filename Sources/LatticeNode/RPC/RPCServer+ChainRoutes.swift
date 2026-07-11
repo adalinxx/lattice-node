@@ -602,9 +602,8 @@ extension RPCRoutes {
                 transactions: genesisTransactions,
                 timestamp: timestamp,
                 target: UInt256.max,
-                parentState: Reference(parentGenesisAnchor),
                 fetcher: parentNetwork.ivyFetcher
-            )
+            ).reanchoredGenesisParentState(Reference(parentGenesisAnchor))
         } catch {
             log.error("deployChain: buildGenesis failed: \(error)")
             return jsonError("Failed to build genesis block", status: .internalServerError)

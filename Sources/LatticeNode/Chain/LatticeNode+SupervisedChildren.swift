@@ -537,13 +537,13 @@ extension LatticeNode {
         // doesn't, the hex is wrong/incomplete; return nil rather than spawn a divergent child.
         var rebuiltCID: String? = nil
         var rebuiltBlock: Block? = nil
-        if let rebuilt = try? await BlockBuilder.buildGenesis(
+        if let base = try? await BlockBuilder.buildGenesis(
                spec: spec, transactions: genesisTxs,
                timestamp: genesisBlock.timestamp, target: genesisBlock.target,
-               // Thread the ORIGINAL genesis's parentState CID verbatim so the rebuild
-               // reproduces the anchored genesis CID (child parentState = carrier prevState).
-               parentState: genesisBlock.parentState,
                fetcher: parentNetwork.ivyFetcher),
+           // Thread the ORIGINAL genesis's parentState CID verbatim so the rebuild
+           // reproduces the anchored genesis CID (child parentState = carrier prevState).
+           case let rebuilt = base.reanchoredGenesisParentState(genesisBlock.parentState),
            let vol = try? VolumeImpl<Block>(node: rebuilt) {
             rebuiltCID = vol.rawCID
             rebuiltBlock = rebuilt  // fully-hydrated block for a multi-entry durable re-serve
