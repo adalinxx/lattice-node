@@ -89,17 +89,101 @@ public struct ChildSpec: Sendable, Equatable {
         return args
     }
 
-    /// Build the generic launch description for the supervisor. When the parent
-    /// provisioned the child's identity, deliver its private key via
-    /// `LATTICE_PRIVATE_KEY` — MERGED into the inherited environment (the supervisor
-    /// REPLACES process env when set, so we must carry PATH etc. through).
-    public func launch(nodeExecutable: URL) -> SupervisedLaunch {
-        var environment: [String: String]? = nil
-        if let provisionedPrivateKeyHex {
-            var merged = ProcessInfo.processInfo.environment
-            merged["LATTICE_PRIVATE_KEY"] = provisionedPrivateKeyHex
-            environment = merged
+    // MARK: - Child environment (process-per-chain isolation)
+
+    /// A supervised child is a separate OS process with its own chain identity.
+    /// Process-per-chain isolation means it must NOT inherit the parent's ambient
+    /// environment: deploy tokens, cloud credentials, and API keys that happen to
+    /// live in the parent's env are unrelated to running a child chain, and
+    /// copying the whole environment leaks them to every recursively-spawned
+    /// descendant. Instead the child environment is built from an explicit
+    /// ALLOWLIST — the loader/runtime/TLS variables the executable needs, plus the
+    /// node's own documented tuning knobs — with the child-specific identity key
+    /// injected separately. Anything not on the allowlist is dropped.
+
+    /// Loader/runtime/TLS variables copied from the parent IF present. These are
+    /// needed for the child executable to launch, find its dynamic libraries, and
+    /// establish TLS connections. Absent keys are skipped.
+    static let inheritedRuntimeKeys: [String] = [
+        "PATH", "HOME", "TMPDIR", "TERM", "LANG", "LC_ALL", "LC_CTYPE",
+        "DYLD_LIBRARY_PATH", "DYLD_FRAMEWORK_PATH", "LD_LIBRARY_PATH",
+        "SSL_CERT_FILE", "SSL_CERT_DIR",
+    ]
+
+    /// Node tuning/operational knobs the child intentionally inherits. Every key
+    /// here is read via `ProcessInfo.processInfo.environment` somewhere in
+    /// LatticeNode (supervisor limits, logging, retention/pinning/eviction, and
+    /// the `NodeTuning.fromEnvironment` sync/gossip/mempool knobs). These are
+    /// configuration, not secrets — with the one deliberate exception of
+    /// `LATTICE_KEY_PASSWORD`, inherited so the child can unlock its provisioned
+    /// identity key. Be inclusive of documented knobs, but never blanket-copy.
+    static let inheritedTuningKeys: [String] = [
+        // Supervisor limits
+        "LATTICE_SUPERVISE_RECONCILE_SECONDS",
+        "LATTICE_MAX_SUPERVISED_CHILDREN",
+        "LATTICE_MAX_SUPERVISE_DEPTH",
+        // Identity-key unlock (needed to decrypt the provisioned key)
+        "LATTICE_KEY_PASSWORD",
+        // Logging
+        "LOG_LEVEL",
+        // Retention / pinning / eviction
+        "RETENTION_DEPTH",
+        "PIN_ANNOUNCE_EXPIRY",
+        "REANNOUNCE_INTERVAL",
+        "EVICTION_INTERVAL",
+        "EVICT_GRACE_SECONDS",
+        // NodeTuning.fromEnvironment knobs
+        "SYNC_TIMEOUT_SECONDS",
+        "SYNC_CATCHUP_THRESHOLD",
+        "SYNC_SHALLOW_THRESHOLD",
+        "FETCH_DEADLINE_SECONDS",
+        "FETCH_POLL_MILLIS",
+        "TX_DEDUP_WINDOW_SECONDS",
+        "PIN_ANNOUNCE_DEDUP_WINDOW_SECONDS",
+        "MAX_RECENT_TX_CIDS",
+        "MAX_RECENT_PIN_ANNOUNCES",
+        "MAX_RECENT_PEER_BLOCKS",
+        "MAX_CONCURRENT_BLOCK_VALIDATIONS",
+        "MAX_PENDING_GOSSIP_TASKS",
+        "MAX_PENDING_CHAIN_ANNOUNCE_TASKS",
+        "MEMPOOL_GOSSIP_CAPACITY",
+        "MEMPOOL_GOSSIP_REFILL_PER_SEC",
+        "MEMPOOL_FULL_BAN_THRESHOLD",
+        "HARD_FAULT_BAN_THRESHOLD",
+        "EXTRACTOR_MAX_PENDING_TASKS",
+        "MEMPOOL_TX_EXPIRY_SECONDS",
+    ]
+
+    /// The environment a supervised child is launched with: an explicit allowlist
+    /// drawn from `parentEnvironment` (defaults to this process's environment),
+    /// plus the child-specific provisioned identity key when set. NEVER a copy of
+    /// the whole parent environment — see the allowlists above. Exposed as its own
+    /// method (rather than inlined into `launch()`) so the isolation guarantee is
+    /// unit-testable without spawning a process.
+    public func childEnvironment(
+        parentEnvironment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> [String: String] {
+        var environment: [String: String] = [:]
+        for key in Self.inheritedRuntimeKeys + Self.inheritedTuningKeys {
+            if let value = parentEnvironment[key] { environment[key] = value }
         }
-        return SupervisedLaunch(label: directory, executableURL: nodeExecutable, arguments: arguments(), environment: environment)
+        if let provisionedPrivateKeyHex {
+            environment["LATTICE_PRIVATE_KEY"] = provisionedPrivateKeyHex
+        }
+        return environment
+    }
+
+    /// Build the generic launch description for the supervisor. The child is
+    /// launched with an allowlisted environment (see `childEnvironment()`) rather
+    /// than a copy of the parent's, so unrelated parent secrets never leak into
+    /// supervised children. When the parent provisioned the child's identity, its
+    /// private key is delivered via `LATTICE_PRIVATE_KEY`.
+    public func launch(nodeExecutable: URL) -> SupervisedLaunch {
+        return SupervisedLaunch(
+            label: directory,
+            executableURL: nodeExecutable,
+            arguments: arguments(),
+            environment: childEnvironment()
+        )
     }
 }

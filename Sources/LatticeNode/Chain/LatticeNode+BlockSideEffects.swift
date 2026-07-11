@@ -791,15 +791,14 @@ extension LatticeNode {
             // direct child of the PoW root this single-hop proof IS the full path to
             // the root; grandchildren get their composed full path via the parent-
             // chain relay.
-            for item in verified {
-                await persistAcceptedBlockProof(directory: directory, height: block.height, blockHash: cid, proof: item.proof)
-            }
-            // F5-4: fold this block's verified inherited (parent-chain) work into the
-            // accumulator and re-run fork choice so its securing weight counts.
-            for item in verified {
-                guard await applyInheritedWeight(directory: directory, blockHash: cid, proof: item.proof, source: validationBaseSource) else {
-                    return
-                }
+            // F5-4: persist each securing proof and fold this block's verified inherited
+            // (parent-chain) work into the accumulator via the ONE shared finalization
+            // contract (finalizeAcceptedChildProofs). A durable finalization failure stops
+            // post-acceptance handling (no publish), matching sync (degrade) and mining (fail).
+            if case .storageFailed = await finalizeAcceptedChildProofs(
+                directory: directory, height: block.height, blockHash: cid,
+                proofs: verified.map(\.proof), source: validationBaseSource) {
+                return
             }
             if outcome == .accepted {
                 await publishAcceptedBlock(
