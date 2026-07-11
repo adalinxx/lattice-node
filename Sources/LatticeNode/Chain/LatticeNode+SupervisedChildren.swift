@@ -1,5 +1,6 @@
 import Foundation
 import Lattice
+import Ivy  // SpawnCertificate — issue a spawn-cert chain for each supervised child
 import cashew
 import VolumeBroker  // SerializedVolume for re-serving a resolved genesis on the parent
 import LatticeNodeRPCFuzzSupport  // GenesisHexCodec/GenesisHexEntry (shared genesis-hex codec)
@@ -291,6 +292,31 @@ extension LatticeNode {
         // own local SOURCE of the chain (other nodes follow IT) and needs no bootstrap
         // peer to find itself. So leave it empty in both cases.
         let childBootstrapPeer: String? = nil
+        // SPAWN-CERT ISSUANCE (query-as-sole-path-within-the-tree): provision the child's
+        // identity (a worked key meeting minPeerKeyBits) and issue a cert that EXTENDS our
+        // OWN spawn-cert chain with a link to that identity at the child's chainPath. The
+        // child presents this chain (via --spawn-cert-chain) so we — and every ancestor —
+        // classify it as a spawn-tree member and SERVE it consensus queries (inherited
+        // weight, parent-state continuity). Without a cert the child boots federated and
+        // every parent query is refused (mayServe fails on an empty scope). Fail-open: on
+        // any issuance error the child still boots, just federated (queries refused).
+        var childSpawnCertBase64: String? = nil
+        var childProvisionedPrivHex: String? = nil
+        if let issuerPriv = Data(hex: config.privateKey) {
+            let (childPub, childPriv) = grindWorkedIdentityKey(minBits: config.minPeerKeyBits)
+            if let cert = SpawnCertificate.issue(
+                   childPublicKey: childPub,
+                   chainPath: metadata.chainPath,
+                   issuerKeyPair: (publicKey: config.publicKey, privateKey: issuerPriv)),
+               let encoded = try? JSONEncoder().encode(spawnCertChain + [cert]) {
+                childSpawnCertBase64 = encoded.base64EncodedString()
+                childProvisionedPrivHex = childPriv.map { String(format: "%02x", $0) }.joined()
+            } else {
+                log.warn("supervised child '\(dir)': spawn-cert issuance failed; booting federated (parent consensus queries refused)")
+            }
+        } else {
+            log.warn("supervised child '\(dir)': issuer private key undecodable; child boots federated")
+        }
         let spec = ChildSpec(
             directory: dir, chainPath: metadata.chainPath,
             genesisHex: metadata.genesisHex,
@@ -300,7 +326,9 @@ extension LatticeNode {
             // Inherit the parent's payout address so the child claims its block reward too;
             // without it the child mines empty-reward templates (forfeiting the reward).
             dataDir: childDataDir, coinbaseAddress: config.coinbaseAddress,
-            inheritedArguments: childInheritedArguments
+            inheritedArguments: childInheritedArguments,
+            spawnCertChainBase64: childSpawnCertBase64,
+            provisionedPrivateKeyHex: childProvisionedPrivHex
         )
         do {
             _ = try await supervisor.spawn(spec.launch(nodeExecutable: ChildProcessSupervisor.selfExecutableURL()))
@@ -512,6 +540,9 @@ extension LatticeNode {
         if let rebuilt = try? await BlockBuilder.buildGenesis(
                spec: spec, transactions: genesisTxs,
                timestamp: genesisBlock.timestamp, target: genesisBlock.target,
+               // Thread the ORIGINAL genesis's parentState CID verbatim so the rebuild
+               // reproduces the anchored genesis CID (child parentState = carrier prevState).
+               parentState: genesisBlock.parentState,
                fetcher: parentNetwork.ivyFetcher),
            let vol = try? VolumeImpl<Block>(node: rebuilt) {
             rebuiltCID = vol.rawCID

@@ -58,6 +58,12 @@ const HEAVY_TESTS = new Set([
   'mempool-propagation', 'partition', 'pin-lifecycle', 'reorg-state-rollback',
   'orphaned-withdrawal-pending', 'deep-reorg', 'concurrent-mining',
     'parent-dependency', 'supply-conservation', 'tx-throughput',
+  // The longest-running, most CPU-sustained scenario in the suite (~35min of
+  // continuous multi-node mining). Omitting it from the heavy cap let it
+  // co-schedule with timing-sensitive tests and starve their block production
+  // (observed: it timed out toytoy-compound-swap's grandchild hop and
+  // child-sync-fallback). Counting it against HEAVY_CONCURRENCY fixes that.
+  'stability-multichain',
 ])
 const HEAVY_CONCURRENCY = Math.max(1, parseInt(process.env.SMOKE_HEAVY_CONCURRENCY ?? '2', 10))
 

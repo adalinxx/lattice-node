@@ -203,12 +203,6 @@ enum RPCRoutes {
             }
             return try await submitChildBlock(node: node, request: req)
         }
-        api.post("chain/parent-continuity") { req, _ in
-            if let denied = requireAdminAccess(request: req, auth: auth, endpoint: "chain/parent-continuity") {
-                return denied
-            }
-            return await parentContinuity(node: node, request: req)
-        }
         api.post("chain/candidate") { req, _ in
             if let denied = requireAdminAccess(request: req, auth: auth, endpoint: "chain/candidate") {
                 return denied

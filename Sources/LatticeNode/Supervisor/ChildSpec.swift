@@ -26,6 +26,16 @@ public struct ChildSpec: Sendable, Equatable {
     /// Config the child inherits from the parent (e.g. `--min-peer-key-bits`),
     /// already expressed as argv pairs.
     public let inheritedArguments: [String]
+    /// The child's spawn-cert chain (root→…→child), base64-encoded JSON, ISSUED by this
+    /// parent (its own chain extended with a cert for the provisioned child identity).
+    /// Passed as `--spawn-cert-chain` so the child presents it and ancestors can classify
+    /// it as a spawn-tree member and SERVE it consensus queries (inherited weight,
+    /// parent-state continuity). nil ⇒ the child boots federated.
+    public let spawnCertChainBase64: String?
+    /// The child's provisioned p2p private key (hex), delivered via `LATTICE_PRIVATE_KEY`
+    /// so the child's identity is the one this parent issued the cert for. nil ⇒ the child
+    /// self-generates (and cannot be certified, since the parent wouldn't know its key).
+    public let provisionedPrivateKeyHex: String?
 
     public init(
         directory: String,
@@ -37,7 +47,9 @@ public struct ChildSpec: Sendable, Equatable {
         rpcPort: UInt16,
         dataDir: String,
         coinbaseAddress: String? = nil,
-        inheritedArguments: [String] = []
+        inheritedArguments: [String] = [],
+        spawnCertChainBase64: String? = nil,
+        provisionedPrivateKeyHex: String? = nil
     ) {
         self.directory = directory
         self.chainPath = chainPath
@@ -49,6 +61,8 @@ public struct ChildSpec: Sendable, Equatable {
         self.dataDir = dataDir
         self.coinbaseAddress = coinbaseAddress
         self.inheritedArguments = inheritedArguments
+        self.spawnCertChainBase64 = spawnCertChainBase64
+        self.provisionedPrivateKeyHex = provisionedPrivateKeyHex
     }
 
     /// The argument vector (excluding argv[0]) for `lattice-node`. Leads with the
@@ -70,12 +84,22 @@ public struct ChildSpec: Sendable, Equatable {
         ]
         if let bootstrapPeer { args += ["--peer", bootstrapPeer] }
         if let coinbaseAddress { args += ["--coinbase-address", coinbaseAddress] }
+        if let spawnCertChainBase64 { args += ["--spawn-cert-chain", spawnCertChainBase64] }
         args += inheritedArguments
         return args
     }
 
-    /// Build the generic launch description for the supervisor.
+    /// Build the generic launch description for the supervisor. When the parent
+    /// provisioned the child's identity, deliver its private key via
+    /// `LATTICE_PRIVATE_KEY` — MERGED into the inherited environment (the supervisor
+    /// REPLACES process env when set, so we must carry PATH etc. through).
     public func launch(nodeExecutable: URL) -> SupervisedLaunch {
-        SupervisedLaunch(label: directory, executableURL: nodeExecutable, arguments: arguments())
+        var environment: [String: String]? = nil
+        if let provisionedPrivateKeyHex {
+            var merged = ProcessInfo.processInfo.environment
+            merged["LATTICE_PRIVATE_KEY"] = provisionedPrivateKeyHex
+            environment = merged
+        }
+        return SupervisedLaunch(label: directory, executableURL: nodeExecutable, arguments: arguments(), environment: environment)
     }
 }

@@ -224,6 +224,23 @@ extension LatticeNode {
         return height == 0
     }
 
+    /// PARENT-FIRST gate: whether THIS chain has caught up to the best tip any connected
+    /// peer has advertised (within `tolerance`). A supervising node must not spawn/follow a
+    /// CHILD until this (parent) chain is caught up — otherwise the child outruns the parent
+    /// and its continuity queries against the parent defer forever (the parent hasn't yet synced the
+    /// carriers the child's blocks anchor to). A perpetually-mining chain is never EXACTLY at
+    /// the tip, hence the tolerance. No advertised peer tip yet ⇒ we can't assert caught-up,
+    /// so treat as NOT caught up (keep waiting) rather than spawn a child prematurely.
+    func chainCaughtUpToBestKnownPeer(directory: String, tolerance: UInt64 = 2) async -> Bool {
+        guard let network = network(for: directory) else { return false }
+        let height = await chain(for: directory)?.getHighestBlockHeight() ?? 0
+        guard let tips = knownPeerTips[chainKey(forPath: network.chainPath)], !tips.isEmpty else {
+            return false
+        }
+        let bestPeerHeight = tips.values.map { $0.height }.max() ?? 0
+        return height + tolerance >= bestPeerHeight
+    }
+
     /// Ask every connected parent for this chain's same-chain peers and dial any
     /// returned endpoints on the chain-gossip network. Verify-not-trust: the dial
     /// authenticates the identity and consensus validates the chain, so a bogus

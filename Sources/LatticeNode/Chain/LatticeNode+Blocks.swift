@@ -467,6 +467,24 @@ extension LatticeNode {
                 }
                 return await failStorageDegraded(failureReason, directory: directory, chainPath: blockChainPath)
             }
+            // AVAILABILITY, NOT FRAUD. Lattice returns `.deferred` when it could not
+            // RESOLVE the data needed to DECIDE validity — the block content, or an
+            // ancestor/parent state a proof walks. The load-bearing case here: a child
+            // block carrying a withdrawal whose receipt lives in a `parentState` this
+            // node has not caught up to yet (the child sync outran the parent). `A`,
+            // which holds that parent state, validates and accepts the very same block.
+            // If we let `.deferred` fall through to `.rejected` we would emit a FALSE
+            // invalidity verdict on a valid block — two honest nodes disagreeing on
+            // validity, i.e. a consensus split. Validity is a deterministic function of
+            // the block + its committed ancestor state; the only reason to not-accept a
+            // block a peer accepted is that we lack the data to check it — which must
+            // resolve to "retry once it's available" (sync re-delivers / the parent is
+            // backfilled), never a rejection. `.deferredWhileSyncing` keeps it retriable
+            // with no peer penalty and is never memoized as a refusal.
+            if processingResult.isDeferred {
+                NodeLogger("blocks").info("\(directory): deferring block \(String(header.rawCID.prefix(16)))… height=\(blockForProcessing?.height ?? 0) — Lattice could not resolve validation data (parent/ancestor state not caught up); staying retriable")
+                return .deferredWhileSyncing
+            }
             if await chain.contains(blockHash: header.rawCID) {
                 if let block = blockForProcessing, let parentAnchor {
                     await persistVerifiedParentHeaderEdge(directory: directory, anchor: parentAnchor)

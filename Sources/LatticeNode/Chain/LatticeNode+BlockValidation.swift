@@ -110,30 +110,6 @@ extension LatticeNode {
         }
     }
 
-    /// Record a parent transition pushed directly from the parent process (a
-    /// minted block, embedding this child or not). The parent — which is the
-    /// authority on its own state transitions — delivers every block it mints to
-    /// its children so their continuity index stays current without depending on
-    /// best-effort gossip or an on-demand fetch race. The pushed block is verified
-    /// independently (CID + PoW by the caller); here we record the verified
-    /// `prevState→postState` edge for every local chain whose parent is the
-    /// pushed block's chain. This grants no child fork-choice weight — only the
-    /// continuity edge a child needs to anchor candidates as the parent advances.
-    func recordPushedParentContinuity(parentDirectory: String, parentBlock: Block, parentCID: String) async {
-        let anchor = ParentAnchor(
-            blockHash: parentCID,
-            parentHash: parentBlock.parent?.rawCID,
-            height: parentBlock.height,
-            prevStateCID: parentBlock.prevState.rawCID
-        )
-        let childDirectories = networks.values
-            .filter { $0.parentDirectory == parentDirectory }
-            .map(\.directory)
-        for childDirectory in childDirectories {
-            await persistVerifiedParentHeaderEdge(directory: childDirectory, anchor: anchor)
-            await persistVerifiedParentStateEdge(directory: childDirectory, parentBlock: parentBlock)
-        }
-    }
     func persistCommittingParentEdgeFromVerifiedProof(
         directory: String,
         proof: ChildBlockProof
@@ -267,40 +243,19 @@ extension LatticeNode {
         guard let parentChainBlock, tipBlock.height > 0 else {
             return tipBlock
         }
-
         let candidateParentStateRoot = parentChainBlock.prevState.rawCID
         let previousRoot = tipBlock.parentState.rawCID
         if await parentStateRootIsContinuous(
-            previousRoot: previousRoot,
-            currentRoot: candidateParentStateRoot,
-            directory: directory
+            previousRoot: previousRoot, currentRoot: candidateParentStateRoot, directory: directory
         ) {
             return tipBlock
         }
-
-        // Continuity isn't established yet from the edges the child already
-        // learned via parent gossip/extraction. That extraction is asynchronous
-        // and best-effort, so it can lag (or transiently gap) behind a fast
-        // parent — leaving the child unable to anchor a candidate to the parent's
-        // current carrier even though the carrier and its ancestry are perfectly
-        // verifiable. Establish continuity on demand: walk the carrier's parent
-        // ancestry through the parent-reaching fetcher, verifying each block's CID
-        // and PoW, recording the prevState→postState edges, until the path from
-        // this child's tip parentState to the carrier's prevState is complete.
-        // This is the proof-availability model (consensus-fork-choice.md): a child
-        // verifies parent transitions itself rather than waiting on push delivery.
         if let committingParentHash = parentChainBlock.parent?.rawCID,
            await backfillSyncedParentStatePath(
-               directory: directory,
-               previousRoot: previousRoot,
-               currentRoot: candidateParentStateRoot,
-               committingParentHash: committingParentHash,
-               fetcher: fetcher,
-               requireProofOfWork: true
-           ) {
+               directory: directory, previousRoot: previousRoot, currentRoot: candidateParentStateRoot,
+               committingParentHash: committingParentHash, fetcher: fetcher, requireProofOfWork: true) {
             return tipBlock
         }
-
         NodeLogger("candidate").warn("\(directory): no child candidate for parent prevState \(String(candidateParentStateRoot.prefix(16)))…; current child tip parentState \(String(previousRoot.prefix(16)))… is not continuous")
         return nil
     }

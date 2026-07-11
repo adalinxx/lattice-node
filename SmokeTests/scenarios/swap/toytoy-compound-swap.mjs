@@ -11,6 +11,7 @@
 
 import { allocPorts, smokeRoot } from 'lattice-node-sdk/env'
 import { LatticeNode, LatticeNetwork, LatticeMiner, sleep, genKeypair, waitFor } from 'lattice-node-sdk'
+import { scaledMs } from 'lattice-node-sdk/waitFor'
 
 const ROOT = smokeRoot('toytoy-compound')
 const [a, b, toyP, ttP] = await allocPorts(4, { seed: 71 })
@@ -86,8 +87,16 @@ const balAt = async (ep, addr) => (await fetch(`${ep}/balance/${addr}`).then((x)
 // receipt; on a LIVE tip the receipt may not be visible at first-submit time, so
 // resubmit (re-reading the nonce) until the withdrawn balance lands. Mirrors the
 // bounded-resubmit loop in grandchild-swap.mjs.
+//
+// The resubmit budget is a scaled DEADLINE, not a fixed iteration count: under suite
+// contention block production (and thus the receipt→parentState→withdrawal cadence)
+// runs ~1/N slower, so a fixed 120s loop false-fails a slow-but-correct run — the
+// deepest (grandchild) hop is the one that starves first. `scaledMs` stretches the
+// window with SMOKE_TIMEOUT_SCALE exactly like `waitFor`, so green runs are unaffected
+// and only a genuine stall still surfaces.
 const landWithdraw = async (submit, check, desc) => {
-  for (let i = 0; i < 40; i++) {
+  const deadline = Date.now() + scaledMs(120_000)
+  while (Date.now() < deadline) {
     if (await check()) return
     try { await submit() } catch { /* not yet valid — retry */ }
     await sleep(3000)

@@ -710,37 +710,6 @@ extension RPCRoutes {
         ))
     }
 
-    // POST /api/chain/parent-continuity { parentDirectory, blockHex }
-    // A parent process pushes every block it mints to its children — whether or
-    // not that block embeds a child — so each child records the parent's
-    // prevState→postState continuity edge synchronously, instead of relying on
-    // best-effort gossip (which the child can drop under a fast parent) plus an
-    // on-demand fetch race. The pushed block is verified independently here (CID
-    // re-derivation + PoW) before its transition is recorded; it never advances a
-    // child tip or grants child fork-choice weight.
-    static func parentContinuity(node: LatticeNode, request: Request) async -> Response {
-        let data = (try? await request.body.collect(upTo: 4_194_304)).map { Data(buffer: $0) } ?? Data()
-        struct Body: Decodable { let parentDirectory: String?; let blockHex: String? }
-        guard let body = try? jsonDecoder.decode(Body.self, from: data),
-              let parentDirectory = body.parentDirectory, !parentDirectory.isEmpty,
-              let blockHex = body.blockHex,
-              let blockData = Data(hex: blockHex),
-              let parentBlock = Block(data: blockData),
-              let parentCID = try? VolumeImpl<Block>(node: parentBlock).rawCID else {
-            return jsonError("Missing parentDirectory or blockHex", status: .badRequest)
-        }
-        let rootHash = parentBlock.proofOfWorkHash()
-        guard parentBlock.validateProofOfWork(nexusHash: rootHash) else {
-            return jsonError("Parent block PoW invalid", status: .badRequest)
-        }
-        await node.recordPushedParentContinuity(
-            parentDirectory: parentDirectory,
-            parentBlock: parentBlock,
-            parentCID: parentCID
-        )
-        return json(["accepted": true])
-    }
-
     // POST /api/chain/submit-work { workId, nonce, hash?, chainPath? }
     // The coordinator submits nonce results; the node resolves the nonce-0
     // candidate, seals it, validates the target, accepts/persists, and publishes.

@@ -2021,7 +2021,6 @@ final class SecurityTests: XCTestCase {
         "POST chain/template",
         "POST chain/submit-work",
         "POST chain/submit-child-block",
-        "POST chain/parent-continuity",
         "POST chain/candidate",
         "GET chain/candidate",
         "GET chain/auth-check",
