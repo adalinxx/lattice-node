@@ -68,8 +68,7 @@ external workers:
 swift run lattice-mining-coordinator \
   --node http://127.0.0.1:8080 \
   --worker-executable .build/debug/lattice-miner \
-  --workers 2 \
-  --batch-size 10000
+  --workers 2
 ```
 
 Use `--once` for one bounded coordinator batch. `lattice-miner` is not a

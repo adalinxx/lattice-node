@@ -49,8 +49,7 @@ back to the node.
 lattice-mining-coordinator \
   --node http://127.0.0.1:8080 \
   --worker-executable /usr/local/bin/lattice-miner \
-  --workers 4 \
-  --batch-size 10000
+  --workers 4
 ```
 
 If block production stalls:
@@ -83,7 +82,7 @@ The parent endpoint is an authority boundary, not merely a bootstrap hint. Back
 up the configured parent key and child process identity as operational secrets.
 
 For application testing, deploy a normal child with test-oriented parameters.
-Nexus retains its one pinned genesis and network mode.
+Nexus retains its one pinned genesis.
 
 ## Storage and backups
 

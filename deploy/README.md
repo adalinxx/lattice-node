@@ -1,8 +1,8 @@
 # Deployment
 
 The tracked deployment assets target the current one-process/one-chain daemon.
-Scripts for obsolete network modes, faucets, embedded trees, and workers that
-talk directly to nodes were removed because those modes do not exist in Lattice.
+Scripts for faucets, embedded trees, and workers that talk directly to nodes
+were removed because those roles do not exist in Lattice.
 
 ## Rules that every deployment must preserve
 
@@ -56,12 +56,12 @@ Example Nexus process:
 
 ```bash
 docker run --network host \
-  -v lattice-data:/var/lib/lattice \
-  ghcr.io/adalinxx/lattice-node:main \
+  -v lattice-data:/home/lattice/.lattice \
+  ghcr.io/adalinxx/lattice-node:2.0.0 \
   lattice-node \
   --chain-path Nexus \
-  --data-directory /var/lib/lattice/chains/Nexus \
-  --identity-key /var/lib/lattice/identity/nexus.key \
+  --data-directory /home/lattice/.lattice/chains/Nexus \
+  --identity-key /home/lattice/.lattice/identity/nexus.key \
   --listen-port 4001 \
   --fact-listen-port 4002 \
   --rpc-port 8080
@@ -72,33 +72,11 @@ loopback-only:
 
 ```bash
 docker run --network host \
-  ghcr.io/adalinxx/lattice-node:main \
+  ghcr.io/adalinxx/lattice-node:2.0.0 \
   lattice-mining-coordinator \
   --node http://127.0.0.1:8080 \
   --worker-executable /usr/local/bin/lattice-miner \
   --workers 2
-```
-
-## Fly.io
-
-[fly/fly.toml](fly/fly.toml) is a Nexus bootstrap-node example. It exposes only
-the overlay and hierarchy fact ports. The RPC listener remains loopback-only,
-so a colocated coordinator must run in the same Fly Machine or process group.
-
-[fly/bootstrap-fly.sh](fly/bootstrap-fly.sh) deploys the example and prints the
-process public keys needed for explicit `--peer` configuration.
-
-## Terraform
-
-The [terraform](terraform/) example creates Nexus bootstrap hosts on Hetzner.
-Cloud-init runs a node and colocated coordinator on the host network. There is
-no generated genesis timestamp or network-mode flag: every host verifies the
-same compiled Nexus genesis.
-
-```bash
-cd deploy/terraform
-terraform init
-terraform apply
 ```
 
 ## Child process

@@ -28,26 +28,40 @@ struct NodeNetworkPlaneConfigurations {
     let hierarchy: IvyConfig
 
     init(_ configuration: NodeConfiguration) throws {
-        overlay = IvyConfig(
-            signingKey: configuration.signingKey,
-            listenPort: configuration.listenPort,
-            bootstrapPeers: configuration.bootstrapPeers,
-            minPeerKeyBits: configuration.minPeerKeyBits,
-            mode: .overlay
+        try self.init(
+            overlay: IvyConfig(
+                signingKey: configuration.signingKey,
+                listenPort: configuration.listenPort,
+                bootstrapPeers: configuration.bootstrapPeers,
+                minPeerKeyBits: configuration.minPeerKeyBits,
+                mode: .overlay
+            ),
+            hierarchy: IvyConfig(
+                signingKey: configuration.signingKey,
+                listenPort: configuration.factListenPort,
+                bootstrapPeers: configuration.parentEndpoint.map { [$0.ivy] } ?? [],
+                maxConnections: IvyConfig.defaultMaxConnections,
+                maxConnectionsPerNetgroup: IvyConfig.defaultMaxConnections,
+                minPeerKeyBits: 0,
+                relayEnabled: false,
+                carriers: [],
+                mode: .privateNetwork
+            )
         )
-        hierarchy = IvyConfig(
-            signingKey: configuration.signingKey,
-            listenPort: configuration.factListenPort,
-            bootstrapPeers: configuration.parentEndpoint.map { [$0.ivy] } ?? [],
-            maxConnections: IvyConfig.defaultMaxConnections,
-            maxConnectionsPerNetgroup: IvyConfig.defaultMaxConnections,
-            minPeerKeyBits: 0,
-            relayEnabled: false,
-            carriers: [],
-            mode: .privateNetwork
-        )
+    }
+
+    init(overlay: IvyConfig, hierarchy: IvyConfig) throws {
+        guard overlay.mode == .overlay,
+              hierarchy.mode == .privateNetwork,
+              overlay.peerKey == hierarchy.peerKey else {
+            throw IvyModeError.invalidConfiguration(
+                "network runtime requires same-identity overlay and private hierarchy planes"
+            )
+        }
         try overlay.validate()
         try hierarchy.validate()
+        self.overlay = overlay
+        self.hierarchy = hierarchy
     }
 }
 
@@ -117,6 +131,7 @@ public actor NodeNetworkRuntime: IvyDelegate {
     private let hello: ChainHello
     private let parentFactGate: AuthenticatedParentFactGate?
 
+    private var lifecycleTail: Task<Void, Never>?
     private var process: ChainProcess?
     private var isRunning = false
     private var overlayPeers: [PeerKey: AuthenticatedPeer] = [:]
@@ -141,7 +156,21 @@ public actor NodeNetworkRuntime: IvyDelegate {
     private var nextRequestID: UInt64 = 0
 
     public init(configuration: NodeConfiguration) throws {
-        let planeConfigurations = try NodeNetworkPlaneConfigurations(configuration)
+        try self.init(
+            configuration: configuration,
+            planeConfigurations: NodeNetworkPlaneConfigurations(configuration)
+        )
+    }
+
+    init(
+        configuration: NodeConfiguration,
+        planeConfigurations: NodeNetworkPlaneConfigurations
+    ) throws {
+        guard planeConfigurations.overlay.peerKey.hex == configuration.processPublicKey else {
+            throw IvyModeError.invalidConfiguration(
+                "network runtime plane identity must match the process identity"
+            )
+        }
         let overlay = Ivy(config: planeConfigurations.overlay)
         let hierarchy = Ivy(config: planeConfigurations.hierarchy)
         self.configuration = configuration
@@ -165,6 +194,21 @@ public actor NodeNetworkRuntime: IvyDelegate {
     /// Installs both delegates and the recovered process's local content source
     /// before either listener becomes visible. The private plane starts first.
     public func start(process: ChainProcess) async throws {
+        try await enqueueStart(process: process).value
+    }
+
+    func enqueueStart(process: ChainProcess) -> Task<Void, any Error> {
+        let previous = lifecycleTail
+        let operation = Task { [weak self] in
+            await previous?.value
+            guard let self else { throw CancellationError() }
+            try await self.startNow(process: process)
+        }
+        lifecycleTail = Task { _ = try? await operation.value }
+        return operation
+    }
+
+    private func startNow(process: ChainProcess) async throws {
         guard !isRunning else { throw NodeNetworkRuntimeError.alreadyRunning }
         self.process = process
         await overlay.install(
@@ -190,12 +234,22 @@ public actor NodeNetworkRuntime: IvyDelegate {
     }
 
     public func stop() async {
+        let previous = lifecycleTail
+        let operation = Task { [weak self] in
+            await previous?.value
+            await self?.stopNow()
+        }
+        lifecycleTail = operation
+        await operation.value
+    }
+
+    private func stopNow() async {
         guard isRunning || process != nil else { return }
+        isRunning = false
         await Self.stopPlanes(
             stopOverlay: { await self.overlay.stop() },
             stopHierarchy: { await self.hierarchy.stop() }
         )
-        isRunning = false
         process = nil
         overlayPeers.removeAll()
         hierarchyPeers.removeAll()
