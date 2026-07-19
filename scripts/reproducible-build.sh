@@ -6,7 +6,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-PRODUCTS=(LatticeNode LatticeMiner)
+PRODUCTS=(lattice-node lattice-mining-coordinator lattice-miner)
 default_build_root="$PWD/.build-reproducible"
 if [[ "${REPRO_IN_CONTAINER:-0}" != "1" && "$(uname -s)" == "Darwin" && "$PWD" != /Users/* ]]; then
   # Docker Desktop does not always share /private/tmp mounts back to the host.
@@ -101,7 +101,7 @@ run_container_build() {
     "$SWIFT_IMAGE" bash -lc '
       set -euo pipefail
       apt-get update
-      apt-get install -y --no-install-recommends libjavascriptcoregtk-4.1-dev libsqlite3-dev
+      apt-get install -y --no-install-recommends libsqlite3-dev
       mkdir -p /workspace/lattice-node
       tar -xf - -C /workspace/lattice-node
       cd /workspace/lattice-node

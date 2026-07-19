@@ -1,0 +1,46 @@
+app = "lattice-bootstrap"
+primary_region = "iad"
+
+[build]
+  image = "ghcr.io/adalinxx/lattice-node:main"
+
+# RPC keeps its default loopback bind. Run an external mining coordinator in
+# the same Machine or process group when this node should produce blocks.
+[processes]
+  node = "lattice-node --chain-path Nexus --data-directory /data/chains/Nexus --identity-key /data/identity/nexus.key --listen-port 4001 --fact-listen-port 4002 --rpc-port 8080 --minimum-peer-key-bits 0"
+
+[[vm]]
+  memory = "512mb"
+  cpu_kind = "shared"
+  cpus = 1
+  processes = ["node"]
+
+[mounts]
+  source = "lattice_data"
+  destination = "/data"
+  initial_size = 1
+  auto_extend_size_threshold = 80
+  auto_extend_size_increment = "1GB"
+  auto_extend_size_limit = "10GB"
+
+[[services]]
+  internal_port = 4001
+  protocol = "tcp"
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ["node"]
+
+  [[services.ports]]
+    port = 4001
+
+[[services]]
+  internal_port = 4002
+  protocol = "tcp"
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ["node"]
+
+  [[services.ports]]
+    port = 4002
