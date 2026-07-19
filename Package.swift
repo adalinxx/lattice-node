@@ -1,8 +1,6 @@
 // swift-tools-version: 6.0
 import PackageDescription
 
-let architectureBranch = "agent/foundational-architecture-alignment"
-
 let package = Package(
     name: "LatticeNode",
     platforms: [
@@ -22,17 +20,26 @@ let package = Package(
         ),
     ],
     dependencies: [
-        // Coordinated architecture branches are the integration gate. Replace
-        // these with coherent release tags after the cross-repository suite is
-        // green; do not widen ranges across incompatible major versions.
-        .package(url: "https://github.com/adalinxx/Lattice.git", branch: architectureBranch),
+        .package(
+            url: "https://github.com/adalinxx/Lattice.git",
+            exact: "18.0.1"
+        ),
         .package(
             url: "https://github.com/adalinxx/cashew.git",
             exact: "4.0.1"
         ),
-        .package(url: "https://github.com/adalinxx/Ivy.git", branch: architectureBranch),
-        .package(url: "https://github.com/adalinxx/Tally.git", branch: architectureBranch),
-        .package(url: "https://github.com/adalinxx/VolumeBroker.git", branch: architectureBranch),
+        .package(
+            url: "https://github.com/adalinxx/Ivy.git",
+            exact: "8.0.0"
+        ),
+        .package(
+            url: "https://github.com/adalinxx/Tally.git",
+            exact: "3.0.1"
+        ),
+        .package(
+            url: "https://github.com/adalinxx/VolumeBroker.git",
+            exact: "4.0.0"
+        ),
         .package(url: "https://github.com/hummingbird-project/hummingbird.git", from: "2.0.0"),
         .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.3.0"),
         .package(url: "https://github.com/apple/swift-crypto.git", from: "3.0.0"),

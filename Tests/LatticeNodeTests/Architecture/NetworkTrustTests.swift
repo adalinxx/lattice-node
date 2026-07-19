@@ -12,6 +12,12 @@ private enum NetworkTestError: Error {
     case failedStart
 }
 
+private enum NetworkRuntimeStartOutcome: Equatable, Sendable {
+    case started
+    case failed(NodeNetworkRuntimeError)
+    case unexpected(String)
+}
+
 private actor NetworkEventRecorder {
     private var values: [String] = []
     func append(_ value: String) { values.append(value) }
@@ -992,6 +998,104 @@ final class NetworkTrustTests: XCTestCase {
         XCTAssertEqual(failureEvents, [
             "start-hierarchy", "start-overlay", "stop-overlay", "stop-hierarchy",
         ])
+    }
+
+    func testRealNetworkRuntimeStartsStopsAndRestartsBothPlanes() async throws {
+        let storage = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "lattice-network-runtime-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        addTeardownBlock { try? FileManager.default.removeItem(at: storage) }
+        let configuration = try NodeConfiguration(
+            chainPath: ["Nexus"],
+            minimumRootWork: UInt256(1),
+            storagePath: storage,
+            privateKeyHex: String(repeating: "5b", count: 32)
+        )
+        let planes = try NodeNetworkPlaneConfigurations(
+            overlay: IvyConfig(
+                signingKey: configuration.signingKey,
+                listenPort: 0,
+                stunServers: [],
+                mode: .overlay
+            ),
+            hierarchy: IvyConfig(
+                signingKey: configuration.signingKey,
+                listenPort: 0,
+                stunServers: [],
+                maxConnections: IvyConfig.defaultMaxConnections,
+                maxConnectionsPerNetgroup: IvyConfig.defaultMaxConnections,
+                relayEnabled: false,
+                carriers: [],
+                mode: .privateNetwork
+            )
+        )
+        let runtime = try NodeNetworkRuntime(
+            configuration: configuration,
+            planeConfigurations: planes
+        )
+        let process = try await ChainProcess.open(
+            configuration: configuration,
+            remoteSource: runtime.remoteContentSource
+        )
+
+        do {
+            do {
+                try await runtime.canonicalTipDidChange()
+                XCTFail("a stopped runtime must reject canonical-tip changes")
+            } catch {
+                XCTAssertEqual(error as? NodeNetworkRuntimeError, .notRunning)
+            }
+
+            var startOutcomes: [NetworkRuntimeStartOutcome] = []
+            await withTaskGroup(of: NetworkRuntimeStartOutcome.self) { group in
+                for _ in 0..<2 {
+                    group.addTask {
+                        do {
+                            try await runtime.start(process: process)
+                            return .started
+                        } catch let error as NodeNetworkRuntimeError {
+                            return .failed(error)
+                        } catch {
+                            return .unexpected(String(describing: error))
+                        }
+                    }
+                }
+                for await outcome in group { startOutcomes.append(outcome) }
+            }
+            XCTAssertEqual(startOutcomes.filter { $0 == .started }.count, 1)
+            XCTAssertEqual(
+                startOutcomes.filter { $0 == .failed(.alreadyRunning) }.count,
+                1
+            )
+            try await runtime.canonicalTipDidChange()
+
+            await runtime.stop()
+            do {
+                try await runtime.canonicalTipDidChange()
+                XCTFail("a stopped runtime must reject canonical-tip changes")
+            } catch {
+                XCTAssertEqual(error as? NodeNetworkRuntimeError, .notRunning)
+            }
+            await runtime.stop()
+
+            try await runtime.start(process: process)
+            try await runtime.canonicalTipDidChange()
+            await runtime.stop()
+
+            let starting = await runtime.enqueueStart(process: process)
+            await runtime.stop()
+            try await starting.value
+            do {
+                try await runtime.canonicalTipDidChange()
+                XCTFail("stop queued during start must leave the runtime stopped")
+            } catch {
+                XCTAssertEqual(error as? NodeNetworkRuntimeError, .notRunning)
+            }
+        } catch {
+            await runtime.stop()
+            throw error
+        }
     }
 
     private func envelope(parentPath: [String]) throws -> ChildValidationPackageEnvelope {

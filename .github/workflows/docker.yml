@@ -7,10 +7,6 @@ on:
     tags: ['v*', '[0-9]*']
   pull_request:
     branches: [main]
-  workflow_run:
-    workflows: ['Build & Test']
-    types: [completed]
-    branches: [main]
 
 env:
   REGISTRY: ghcr.io
@@ -18,7 +14,6 @@ env:
 
 jobs:
   docker:
-    if: github.event_name != 'workflow_run'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -59,73 +54,3 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-
-  deploy:
-    # Only deploy after the Build & Test workflow succeeds on a main push.
-    if: >-
-      github.event_name == 'workflow_run' &&
-      github.event.workflow_run.event == 'push' &&
-      github.event.workflow_run.head_branch == 'main' &&
-      github.event.workflow_run.conclusion == 'success'
-    runs-on: ubuntu-latest
-    timeout-minutes: 50
-    environment: production
-    permissions:
-      contents: read
-      packages: read
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.workflow_run.head_sha }}
-
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      # The `docker` job is skipped on workflow_run, so this commit's image is built
-      # by the push-triggered Docker job, which runs INDEPENDENTLY of Build & Test
-      # (our trigger). Build & Test can finish first, before the image is pushed —
-      # so we POLL for the commit-pinned image rather than failing on the first miss
-      # (that race would permanently skip the deploy, since nothing re-fires when the
-      # Docker build later pushes). If the image never appears within the window (the
-      # Docker build failed), the loop times out and the job fails — we still never
-      # deploy a stale `:main`. The deploy is pinned to this exact commit's image.
-      - name: Resolve and verify commit-pinned image
-        id: image
-        run: |
-          SHORT_SHA=$(echo "${{ github.event.workflow_run.head_sha }}" | cut -c1-7)
-          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${SHORT_SHA}"
-          echo "Waiting for the push-triggered Docker build to publish $IMAGE ..."
-          # The Docker build runs independently and is allowed up to 30 min
-          # (its job timeout-minutes). Build & Test (our trigger) can finish almost
-          # immediately, so from here the image may not appear for the FULL Docker
-          # window. Poll well past that (40 min) so an image published at minute
-          # 26-30 is still picked up — the previous ~25 min window left a false-fail
-          # gap. The Docker job cannot outlive its own 30 min timeout, so 40 min
-          # always covers it plus queue/setup slack. Only a genuinely failed/never-
-          # published build times out here, which correctly fails (no stale :main).
-          deadline=$((SECONDS + 2400))   # 40 min > Docker job's 30 min timeout + slack
-          until docker buildx imagetools inspect "$IMAGE" > /dev/null 2>&1; do
-            if [ "$SECONDS" -ge "$deadline" ]; then
-              echo "::error::Commit image $IMAGE not found after waiting; the Docker build likely failed. Not deploying a stale :main."
-              exit 1
-            fi
-            echo "  not available yet; retrying in 15s..."
-            sleep 15
-          done
-          echo "  found $IMAGE"
-          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
-
-      - uses: superfly/flyctl-actions/setup-flyctl@master
-
-      - name: Deploy to Fly.io bootstrap nodes
-        run: |
-          for app in lattice-bootstrap-iad lattice-bootstrap-ams lattice-bootstrap-sjc; do
-            echo "Deploying to $app..."
-            flyctl deploy --app "$app" --image "${{ steps.image.outputs.image }}" --config deploy/fly/fly.toml --yes
-          done
-        env:
-          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}

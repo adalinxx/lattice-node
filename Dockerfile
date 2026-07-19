@@ -31,7 +31,8 @@ COPY --from=builder /build/.build/release/lattice-miner /usr/local/bin/lattice-m
 COPY deploy/entrypoint.sh /usr/local/bin/lattice-entrypoint
 RUN chmod +x /usr/local/bin/lattice-entrypoint
 
-RUN useradd -m -s /bin/bash lattice
+RUN useradd -m -s /bin/bash lattice \
+    && install -d -o lattice -g lattice /home/lattice/.lattice
 USER lattice
 
 VOLUME /home/lattice/.lattice
