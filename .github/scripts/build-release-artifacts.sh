@@ -23,12 +23,12 @@ rm -rf "$bundle_dir" "$archive" "$checksum" "$sbom" "$manifest"
 mkdir -p "$bundle_dir/bin" "$out_dir"
 
 if [[ "${SKIP_SWIFT_BUILD:-0}" != "1" ]]; then
-    for product in LatticeNode LatticeMiner; do
+    for product in lattice-node lattice-mining-coordinator lattice-miner; do
         swift build -c release --product "$product"
     done
 fi
 
-for product in LatticeNode LatticeMiner; do
+for product in lattice-node lattice-mining-coordinator lattice-miner; do
     binary=".build/release/${product}"
     if [[ ! -x "$binary" ]]; then
         echo "missing release binary: $binary" >&2
@@ -42,8 +42,9 @@ cat > "$bundle_dir/README.md" <<EOF
 
 This archive contains the release builds for:
 
-- LatticeNode
-- LatticeMiner
+- lattice-node
+- lattice-mining-coordinator
+- lattice-miner
 
 Verify the archive checksum with:
 
@@ -89,7 +90,7 @@ jq -n \
       downloadLocation: "https://github.com/adalinxx/lattice-node",
       filesAnalyzed: false,
       versionInfo: $version,
-      supplier: "Organization: The Lattice Authors"
+      supplier: "Person: adalinxx"
     }
   ] + ($resolved[0].pins | map({
     name: .identity,

@@ -2,7 +2,7 @@ name: Release Artifacts
 
 on:
   push:
-    tags: ['v*']
+    tags: ['v*', '[0-9]*']
   workflow_dispatch:
     inputs:
       version:
@@ -33,7 +33,7 @@ jobs:
 
       - name: Install Linux dependencies
         run: |
-          apt-get update && apt-get install -y --no-install-recommends libjavascriptcoregtk-4.1-dev libsqlite3-dev jq
+          apt-get update && apt-get install -y --no-install-recommends libsqlite3-dev jq
 
       - name: Build release artifacts
         id: build

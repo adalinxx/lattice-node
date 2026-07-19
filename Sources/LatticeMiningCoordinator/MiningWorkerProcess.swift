@@ -28,7 +28,6 @@ struct MiningWorkerProcessResult: Decodable {
     let workId: String
     let status: String
     let nonce: UInt64?
-    let hash: String?
     let rangeStart: UInt64
     let rangeCount: UInt64
 }
@@ -60,24 +59,12 @@ public struct MiningWorkerProcessClient: Sendable {
             "--target", work.targetHex,
             "--start-nonce", String(range.startNonce),
             "--count", String(range.count),
-        ] + (work.prefixHex.isEmpty ? [] : ["--prefix-hex", work.prefixHex])
+        ]
 
         let stdout = Pipe()
         let stderr = Pipe()
         process.standardOutput = stdout
         process.standardError = stderr
-        // Close both ends of both pipes on every exit path (success, not-found,
-        // cancellation, error). swift-corelibs-foundation does not reliably close
-        // a Pipe's fds on FileHandle deinit, so without this each spawn leaks pipe
-        // fds; at ~1 worker/sec the coordinator exhausts RLIMIT_NOFILE and the
-        // next spawn fails with EBADF ("Bad file descriptor"). The reads below run
-        // before this defer fires.
-        defer {
-            try? stdout.fileHandleForReading.close()
-            try? stdout.fileHandleForWriting.close()
-            try? stderr.fileHandleForReading.close()
-            try? stderr.fileHandleForWriting.close()
-        }
 
         try await handle.run()
 
@@ -100,8 +87,7 @@ public struct MiningWorkerProcessClient: Sendable {
         return MiningWorkerResult(
             workerId: workerId,
             workId: result.workId,
-            nonce: nonce,
-            hash: result.hash
+            nonce: nonce
         )
     }
 }

@@ -1,8 +1,8 @@
 # Release Verification
 
-Lattice Node release archives are published with three operator-verifiable artifacts:
+Lattice Node release archives are published with four operator-verifiable artifacts:
 
-- `*.tar.gz`: release binaries for `LatticeNode`, `LatticeMiningCoordinatorTool`, and `LatticeMiner`.
+- `*.tar.gz`: release binaries for `lattice-node`, `lattice-mining-coordinator`, and `lattice-miner`.
 - `*.tar.gz.sha256`: SHA-256 checksum for the archive.
 - `*.spdx.json`: SBOM generated from `Package.resolved`.
 - `*.artifacts.json`: manifest binding the archive path/name, checksum path, digest, and SBOM path produced by CI.
