@@ -45,6 +45,7 @@ jobs:
 
       - name: Build release artifacts from canonical source path
         id: build
+        shell: bash
         env:
           RELEASE_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || github.event.inputs.version || github.sha }}
           RELEASE_PLATFORM: linux-amd64
@@ -61,6 +62,7 @@ jobs:
             .github/scripts/build-release-artifacts.sh
 
       - name: Run archived-node multichain E2E
+        shell: bash
         env:
           ARCHIVE_PATH: ${{ steps.build.outputs.archive_path }}
         run: |
