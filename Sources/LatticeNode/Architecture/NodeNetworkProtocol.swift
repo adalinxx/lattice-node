@@ -1,0 +1,881 @@
+import Foundation
+import Ivy
+import Lattice
+import UInt256
+import cashew
+
+enum NodeNetworkTopic {
+    enum Plane { case overlay, hierarchy }
+
+    static let overlayHello = "lattice.overlay.hello.v1"
+    static let blockAnnouncement = "lattice.overlay.block.v1"
+    static let transactionAvailable = "lattice.overlay.transaction.available.v1"
+    static let transactionInventoryRequest =
+        "lattice.overlay.transaction.inventory.request.v1"
+    static let transactionInventoryResponse =
+        "lattice.overlay.transaction.inventory.response.v1"
+    static let predecessorRequest = "lattice.overlay.predecessor.v1"
+    static let acceptedLeavesRequest = "lattice.overlay.accepted-leaves.request.v1"
+    static let acceptedLeavesResponse = "lattice.overlay.accepted-leaves.response.v1"
+    static let portableAttachmentAvailable =
+        "lattice.overlay.portable-attachment.available.v1"
+    static let portableAttachmentIndexRequest =
+        "lattice.overlay.portable-attachment.index.request.v1"
+    static let portableAttachmentIndexResponse =
+        "lattice.overlay.portable-attachment.index.response.v1"
+    static let hierarchyHello = "lattice.hierarchy.hello.v1"
+    static let childEvidenceAvailable = "lattice.hierarchy.evidence.available.v1"
+    static let childEvidenceIndexRequest = "lattice.hierarchy.evidence.index.request.v1"
+    static let childEvidenceIndexResponse = "lattice.hierarchy.evidence.index.response.v1"
+    static let childCandidateRequest = "lattice.hierarchy.child-candidate.request.v1"
+    static let childCandidateResponse = "lattice.hierarchy.child-candidate.response.v1"
+    static let securingWorkPush = "lattice.hierarchy.securing-work.push.v1"
+    static let inheritedWorkPush = securingWorkPush
+
+    static func plane(for topic: String) -> Plane? {
+        switch topic {
+        case overlayHello, blockAnnouncement, transactionAvailable,
+             transactionInventoryRequest, transactionInventoryResponse,
+             predecessorRequest,
+             acceptedLeavesRequest, acceptedLeavesResponse,
+             portableAttachmentAvailable,
+             portableAttachmentIndexRequest,
+             portableAttachmentIndexResponse: .overlay
+        case hierarchyHello, childEvidenceAvailable,
+             childEvidenceIndexRequest, childEvidenceIndexResponse,
+             childCandidateRequest, childCandidateResponse,
+             securingWorkPush: .hierarchy
+        default: nil
+        }
+    }
+}
+
+enum NodeNetworkWireError: Error, Equatable, Sendable {
+    case oversized
+    case malformed
+    case nonCanonical
+}
+
+private let _maximumNodeMessageSize = Int(IvyConfig.protocolMaxFrameSize) - 256
+
+protocol NodeJSONMessage: Codable {
+    func validate() throws
+}
+
+extension NodeJSONMessage {
+    func encoded() throws -> Data {
+        try validate()
+        let data = try _canonicalJSONEncode(self)
+        guard data.count <= _maximumNodeMessageSize else {
+            throw NodeNetworkWireError.oversized
+        }
+        return data
+    }
+
+    static func decoded(_ data: Data) throws -> Self {
+        guard data.count <= _maximumNodeMessageSize else {
+            throw NodeNetworkWireError.oversized
+        }
+        guard let value = try? JSONDecoder().decode(Self.self, from: data) else {
+            throw NodeNetworkWireError.malformed
+        }
+        try value.validate()
+        guard try value.encoded() == data else {
+            throw NodeNetworkWireError.nonCanonical
+        }
+        return value
+    }
+}
+
+struct BlockAnnouncementMessage: NodeJSONMessage, Equatable, Sendable {
+    let blockCID: String
+
+    func validate() throws {
+        guard _isBoundedWireAtom(blockCID) else {
+            throw NodeNetworkWireError.malformed
+        }
+    }
+}
+
+/// Announces one complete transaction Volume. The exact authenticated
+/// advertiser is the first retrieval target; validity still comes from
+/// content addressing and Lattice preflight.
+struct TransactionAvailableMessage: NodeJSONMessage, Equatable, Sendable {
+    let volumeRootCID: String
+
+    func validate() throws {
+        guard _isBoundedWireAtom(volumeRootCID) else {
+            throw NodeNetworkWireError.malformed
+        }
+    }
+}
+
+struct TransactionInventoryRequestMessage: NodeJSONMessage, Equatable, Sendable {
+    let requestID: UInt64
+    let afterRootCID: String?
+
+    func validate() throws {
+        guard requestID != 0,
+              afterRootCID.map({ _isBoundedWireAtom($0) }) ?? true else {
+            throw NodeNetworkWireError.malformed
+        }
+    }
+}
+
+struct TransactionInventoryResponseMessage: NodeJSONMessage, Equatable, Sendable {
+    static let maximumRoots = 64
+
+    let requestID: UInt64
+    let afterRootCID: String?
+    let volumeRootCIDs: [String]
+    let hasMore: Bool
+
+    func validate() throws {
+        guard requestID != 0,
+              afterRootCID.map({ _isBoundedWireAtom($0) }) ?? true,
+              volumeRootCIDs.count <= Self.maximumRoots,
+              volumeRootCIDs == Array(Set(volumeRootCIDs)).sorted(),
+              volumeRootCIDs.allSatisfy({ _isBoundedWireAtom($0) }),
+              volumeRootCIDs.allSatisfy({ cid in
+                  afterRootCID.map({ cid > $0 }) ?? true
+              }),
+              !hasMore || volumeRootCIDs.count == Self.maximumRoots else {
+            throw NodeNetworkWireError.malformed
+        }
+    }
+}
+
+struct PredecessorRequestMessage: NodeJSONMessage, Equatable, Sendable {
+    let predecessorCID: String
+
+    func validate() throws {
+        guard _isBoundedWireAtom(predecessorCID) else {
+            throw NodeNetworkWireError.malformed
+        }
+    }
+}
+
+/// A paginated inventory of accepted-forest leaves. Every retained accepted
+/// block is an ancestor of one leaf, so ordinary predecessor pulls reconstruct
+/// the complete graph without trusting remote aggregate state.
+struct AcceptedLeavesRequestMessage: NodeJSONMessage, Equatable, Sendable {
+    let requestID: UInt64
+    let afterCID: String?
+    /// The first page fixes a durable admission sequence; following pages use
+    /// it so a changing forest cannot move a branch behind the CID cursor.
+    let snapshotSequence: Int64?
+
+    init(
+        requestID: UInt64,
+        afterCID: String?,
+        snapshotSequence: Int64? = nil
+    ) {
+        self.requestID = requestID
+        self.afterCID = afterCID
+        self.snapshotSequence = snapshotSequence
+    }
+
+    func validate() throws {
+        guard requestID != 0,
+              snapshotSequence.map({ $0 >= 0 }) ?? true,
+              afterCID.map({ _isBoundedWireAtom($0) }) ?? true else {
+            throw NodeNetworkWireError.malformed
+        }
+    }
+}
+
+struct AcceptedLeavesResponseMessage: NodeJSONMessage, Equatable, Sendable {
+    /// One inventory page is deliberately small enough to fit the receiver's
+    /// per-peer low-priority admission budget.
+    static let maximumLeaves = 64
+
+    let requestID: UInt64
+    let afterCID: String?
+    let snapshotSequence: Int64
+    let blockCIDs: [String]
+    let hasMore: Bool
+
+    init(
+        requestID: UInt64,
+        afterCID: String?,
+        snapshotSequence: Int64,
+        blockCIDs: [String],
+        hasMore: Bool
+    ) {
+        self.requestID = requestID
+        self.afterCID = afterCID
+        self.snapshotSequence = snapshotSequence
+        self.blockCIDs = blockCIDs
+        self.hasMore = hasMore
+    }
+
+    func validate() throws {
+        guard requestID != 0,
+              snapshotSequence >= 0,
+              afterCID.map({ _isBoundedWireAtom($0) }) ?? true,
+              blockCIDs.count <= Self.maximumLeaves,
+              blockCIDs == Array(Set(blockCIDs)).sorted(),
+              blockCIDs.allSatisfy({ _isBoundedWireAtom($0) }),
+              blockCIDs.allSatisfy({ cid in afterCID.map({ cid > $0 }) ?? true }),
+              !hasMore || blockCIDs.count == Self.maximumLeaves else {
+            throw NodeNetworkWireError.malformed
+        }
+    }
+}
+
+/// One physical outer-root attachment for a root-independent direct child
+/// edge. The edge CID addresses the canonical direct-edge object; `rootCID`
+/// identifies the upstream proof context; `attachmentCID` is its CAS manifest.
+struct PortableAttachmentSummary: Codable, Equatable, Hashable, Sendable {
+    let edgeCID: String
+    let rootCID: String
+    let attachmentCID: String
+
+    fileprivate var isValid: Bool {
+        _isCanonicalWireCID(edgeCID)
+            && _isCanonicalWireCID(rootCID)
+            && _isCanonicalWireCID(attachmentCID)
+    }
+}
+
+struct PortableAttachmentAvailableMessage: NodeJSONMessage, Equatable, Sendable {
+    let edgeCID: String
+    let rootCID: String
+    let attachmentCID: String
+
+    func validate() throws {
+        guard PortableAttachmentSummary(
+            edgeCID: edgeCID,
+            rootCID: rootCID,
+            attachmentCID: attachmentCID
+        ).isValid else {
+            throw NodeNetworkWireError.malformed
+        }
+    }
+}
+
+struct PortableAttachmentIndexRequestMessage: NodeJSONMessage, Equatable, Sendable {
+    let requestID: UInt64
+    let after: PortableAttachmentSummary?
+
+    func validate() throws {
+        guard requestID != 0, after?.isValid ?? true else {
+            throw NodeNetworkWireError.malformed
+        }
+    }
+}
+
+struct PortableAttachmentIndexResponseMessage: NodeJSONMessage, Equatable, Sendable {
+    static let maximumEntries = 1
+
+    let requestID: UInt64
+    let after: PortableAttachmentSummary?
+    let entries: [PortableAttachmentSummary]
+    let hasMore: Bool
+
+    func validate() throws {
+        let sorted = entries.sorted {
+            ($0.edgeCID, $0.rootCID) < ($1.edgeCID, $1.rootCID)
+        }
+        guard requestID != 0,
+              after?.isValid ?? true,
+              entries.count <= Self.maximumEntries,
+              entries == sorted,
+              Set(entries).count == entries.count,
+              entries.allSatisfy({ entry in
+                  entry.isValid && (after.map({ cursor in
+                      (entry.edgeCID, entry.rootCID)
+                          > (cursor.edgeCID, cursor.rootCID)
+                  }) ?? true)
+              }),
+              !hasMore || !entries.isEmpty else {
+            throw NodeNetworkWireError.malformed
+        }
+    }
+}
+
+private func _isCanonicalWireCID(_ value: String) -> Bool {
+    _isBoundedWireAtom(value) && CIDIdentity.isCanonical(value)
+}
+
+struct ChildEvidenceAvailableMessage: NodeJSONMessage, Equatable, Sendable {
+    let childPath: [String]
+    let childCID: String
+    let rootCID: String
+    let attachmentCID: String
+
+    func validate() throws {
+        guard _isAbsoluteChainPath(childPath), childPath.count > 1,
+              _isCanonicalWireCID(childCID),
+              _isCanonicalWireCID(rootCID),
+              _isCanonicalWireCID(attachmentCID) else {
+            throw NodeNetworkWireError.malformed
+        }
+    }
+}
+
+struct ChildEvidenceIndexRequestMessage: NodeJSONMessage, Equatable, Sendable {
+    let requestID: UInt64
+    let childPath: [String]
+    let after: IssuedChildEvidenceSummary?
+
+    func validate() throws {
+        guard requestID != 0,
+              _isAbsoluteChainPath(childPath), childPath.count > 1,
+              after.map({
+                  _isCanonicalWireCID($0.childCID)
+                    && _isCanonicalWireCID($0.rootCID)
+                    && _isCanonicalWireCID($0.attachmentCID)
+              }) ?? true else {
+            throw NodeNetworkWireError.malformed
+        }
+    }
+}
+
+struct ChildEvidenceIndexResponseMessage: NodeJSONMessage, Equatable, Sendable {
+    static let maximumEntries = 64
+
+    let requestID: UInt64
+    let childPath: [String]
+    let after: IssuedChildEvidenceSummary?
+    let entries: [IssuedChildEvidenceSummary]
+    let hasMore: Bool
+
+    func validate() throws {
+        let sorted = entries.sorted {
+            ($0.childCID, $0.rootCID) < ($1.childCID, $1.rootCID)
+        }
+        guard requestID != 0,
+              _isAbsoluteChainPath(childPath), childPath.count > 1,
+              entries.count <= Self.maximumEntries,
+              entries == sorted,
+              Set(entries.map { $0.childCID + "\0" + $0.rootCID }).count
+                == entries.count,
+              entries.allSatisfy({ entry in
+                  _isCanonicalWireCID(entry.childCID)
+                    && _isCanonicalWireCID(entry.rootCID)
+                    && _isCanonicalWireCID(entry.attachmentCID)
+                    && after.map({ cursor in
+                        (entry.childCID, entry.rootCID)
+                            > (cursor.childCID, cursor.rootCID)
+                    }) ?? true
+              }),
+              !hasMore || !entries.isEmpty else {
+            throw NodeNetworkWireError.malformed
+        }
+    }
+}
+
+/// One provisional parent carrier context sent only to its immediate child.
+struct ChildCandidateRequestMessage: Sendable {
+    static let maximumBudgetMilliseconds: UInt32 = 60_000
+    static let maximumRewards = 256
+    static let maximumRewardBytes = ChainServiceLimits.maximumPayloadBytes
+    static let maximumEncodedBytes = _maximumNodeMessageSize
+
+    let requestID: UInt64
+    let budgetMilliseconds: UInt32
+    let mode: MiningMode
+    let childPath: [String]
+    let parentCID: String
+    let parentData: Data
+    let rewards: [MiningReward]
+
+    init(
+        requestID: UInt64,
+        budgetMilliseconds: UInt32,
+        mode: MiningMode = .normal,
+        childPath: [String],
+        parentCID: String,
+        parentData: Data,
+        rewards: [MiningReward]
+    ) {
+        self.requestID = requestID
+        self.budgetMilliseconds = budgetMilliseconds
+        self.mode = mode
+        self.childPath = childPath
+        self.parentCID = parentCID
+        self.parentData = parentData
+        self.rewards = rewards
+    }
+
+    func encoded() throws -> Data {
+        guard requestID != 0,
+              (1...Self.maximumBudgetMilliseconds).contains(budgetMilliseconds),
+              _isAbsoluteChainPath(childPath), childPath.count > 1,
+              childPath.count <= Int(UInt16.max),
+              _isBoundedWireAtom(parentCID),
+              parentData.count <= Int(UInt32.max),
+              _contentBoundBlock(cid: parentCID, data: parentData) != nil,
+              rewards.count <= Self.maximumRewards else {
+            throw NodeNetworkWireError.malformed
+        }
+        let pathBytes = childPath.map { Data($0.utf8) }
+        let parentBytes = Data(parentCID.utf8)
+        let rewardBytes = try _encodeMiningRewards(
+            rewards,
+            under: childPath
+        )
+        guard rewardBytes.count <= Self.maximumRewardBytes,
+              rewardBytes.count <= Int(UInt32.max) else {
+            throw NodeNetworkWireError.malformed
+        }
+        let size = 13 + 2 + pathBytes.reduce(0) { $0 + 2 + $1.count }
+            + 2 + parentBytes.count + 4 + rewardBytes.count
+            + 4 + parentData.count
+        guard size <= Self.maximumEncodedBytes else {
+            throw NodeNetworkWireError.oversized
+        }
+        var data = Data(capacity: size)
+        data.appendUInt64(requestID)
+        data.appendUInt32(budgetMilliseconds)
+        data.append(mode == .normal ? 0 : 1)
+        data.appendUInt16(UInt16(pathBytes.count))
+        for component in pathBytes {
+            data.appendUInt16(UInt16(component.count))
+            data.append(component)
+        }
+        data.appendUInt16(UInt16(parentBytes.count))
+        data.append(parentBytes)
+        data.appendUInt32(UInt32(rewardBytes.count))
+        data.append(rewardBytes)
+        data.appendUInt32(UInt32(parentData.count))
+        data.append(parentData)
+        return data
+    }
+
+    static func decoded(_ data: Data) throws -> Self {
+        guard data.count <= Self.maximumEncodedBytes else {
+            throw NodeNetworkWireError.oversized
+        }
+        var position = data.startIndex
+        guard let requestID = data.readUInt64(at: &position), requestID != 0,
+              let budgetMilliseconds = data.readUInt32(at: &position),
+              position < data.endIndex else {
+            throw NodeNetworkWireError.malformed
+        }
+        let mode: MiningMode
+        switch data[position] {
+        case 0: mode = .normal
+        case 1: mode = .deployment
+        default: throw NodeNetworkWireError.malformed
+        }
+        position = data.index(after: position)
+        guard
+              let pathCount = data.readUInt16(at: &position), pathCount > 1 else {
+            throw NodeNetworkWireError.malformed
+        }
+        var childPath: [String] = []
+        childPath.reserveCapacity(Int(pathCount))
+        for _ in 0..<pathCount {
+            guard let length = data.readUInt16(at: &position), length > 0,
+                  data.distance(from: position, to: data.endIndex) >= Int(length) else {
+                throw NodeNetworkWireError.malformed
+            }
+            let end = data.index(position, offsetBy: Int(length))
+            guard let component = String(
+                data: data[position..<end],
+                encoding: .utf8
+            ) else {
+                throw NodeNetworkWireError.malformed
+            }
+            childPath.append(component)
+            position = end
+        }
+        guard let parentLength = data.readUInt16(at: &position), parentLength > 0,
+              data.distance(from: position, to: data.endIndex) >= Int(parentLength) else {
+            throw NodeNetworkWireError.malformed
+        }
+        let parentEnd = data.index(position, offsetBy: Int(parentLength))
+        guard let parentCID = String(
+            data: data[position..<parentEnd],
+            encoding: .utf8
+        ) else {
+            throw NodeNetworkWireError.malformed
+        }
+        position = parentEnd
+        guard let rewardLength = data.readUInt32(at: &position),
+              rewardLength <= Self.maximumRewardBytes,
+              data.distance(from: position, to: data.endIndex)
+                > Int(rewardLength) + 4 else {
+            throw NodeNetworkWireError.malformed
+        }
+        let rewardEnd = data.index(position, offsetBy: Int(rewardLength))
+        guard let rewards = try? _decodeMiningRewards(
+            Data(data[position..<rewardEnd]),
+            under: childPath
+        ) else {
+            throw NodeNetworkWireError.malformed
+        }
+        position = rewardEnd
+        guard let blockLength = data.readUInt32(at: &position), blockLength > 0,
+              data.distance(from: position, to: data.endIndex) == Int(blockLength) else {
+            throw NodeNetworkWireError.malformed
+        }
+        let message = Self(
+            requestID: requestID,
+            budgetMilliseconds: budgetMilliseconds,
+            mode: mode,
+            childPath: childPath,
+            parentCID: parentCID,
+            parentData: Data(data[position...]),
+            rewards: rewards
+        )
+        guard try message.encoded() == data else {
+            throw NodeNetworkWireError.nonCanonical
+        }
+        return message
+    }
+}
+
+/// A contextual unmined child template returned to the exact requesting parent.
+/// It is ephemeral mining input, never parent-owned child-chain state.
+struct ChildCandidateResponseMessage: Sendable {
+    let requestID: UInt64
+    let childPath: [String]
+    let parentCID: String
+    let childCID: String
+    let searchTarget: UInt256
+    let deploymentTarget: UInt256?
+    let blockData: Data
+    let acquisitionEntries: [String: Data]
+
+    init(
+        requestID: UInt64,
+        childPath: [String],
+        parentCID: String,
+        childCID: String,
+        searchTarget: UInt256,
+        deploymentTarget: UInt256? = nil,
+        blockData: Data,
+        acquisitionEntries: [String: Data]
+    ) {
+        self.requestID = requestID
+        self.childPath = childPath
+        self.parentCID = parentCID
+        self.childCID = childCID
+        self.searchTarget = searchTarget
+        self.deploymentTarget = deploymentTarget
+        self.blockData = blockData
+        self.acquisitionEntries = acquisitionEntries
+    }
+
+    func encoded() throws -> Data {
+        guard requestID != 0,
+              _isAbsoluteChainPath(childPath), childPath.count > 1,
+              childPath.count <= Int(UInt16.max),
+              _isBoundedWireAtom(parentCID), _isBoundedWireAtom(childCID),
+              searchTarget > .zero,
+              blockData.count <= Int(UInt32.max),
+              _contentBoundBlock(cid: childCID, data: blockData) != nil,
+              deploymentTarget.map({
+                  $0 > .zero && searchTarget <= $0
+              }) ?? true,
+              let package = try? ChildAcquisitionPackage(
+                  entries: acquisitionEntries,
+                  childCID: childCID,
+                  childData: blockData,
+                  maximumBytes: ChildAcquisitionPackage.maximumBytes
+              ) else {
+            throw NodeNetworkWireError.malformed
+        }
+        let pathBytes = childPath.map { Data($0.utf8) }
+        let parentBytes = Data(parentCID.utf8)
+        let childBytes = Data(childCID.utf8)
+        let targetBytes = Data(searchTarget.toHexString().utf8)
+        let deploymentBytes = deploymentTarget.map {
+            Data($0.toHexString().utf8)
+        }
+        let extraEntries = acquisitionEntries
+            .filter { $0.key != childCID }
+            .sorted { $0.key < $1.key }
+        guard targetBytes.count == 64 else { throw NodeNetworkWireError.malformed }
+        var size = 8 + 2 + pathBytes.reduce(0) { $0 + 2 + $1.count }
+        size += 2 + parentBytes.count + 2 + childBytes.count
+        size += targetBytes.count + 1 + (deploymentBytes?.count ?? 0)
+        size += 4 + blockData.count + 2
+        size += package.framedByteCount - (6 + childBytes.count + blockData.count)
+        guard extraEntries.count <= Int(UInt16.max),
+              size <= _maximumNodeMessageSize else {
+            throw NodeNetworkWireError.oversized
+        }
+        var data = Data(capacity: size)
+        data.appendUInt64(requestID)
+        data.appendUInt16(UInt16(pathBytes.count))
+        for component in pathBytes {
+            data.appendUInt16(UInt16(component.count))
+            data.append(component)
+        }
+        data.appendUInt16(UInt16(parentBytes.count))
+        data.append(parentBytes)
+        data.appendUInt16(UInt16(childBytes.count))
+        data.append(childBytes)
+        data.append(targetBytes)
+        data.append(deploymentBytes == nil ? 0 : 1)
+        if let deploymentBytes { data.append(deploymentBytes) }
+        data.appendUInt32(UInt32(blockData.count))
+        data.append(blockData)
+        data.appendUInt16(UInt16(extraEntries.count))
+        for (cid, entry) in extraEntries {
+            let cidBytes = Data(cid.utf8)
+            data.appendUInt16(UInt16(cidBytes.count))
+            data.append(cidBytes)
+            data.appendUInt32(UInt32(entry.count))
+            data.append(entry)
+        }
+        return data
+    }
+
+    static func decoded(_ data: Data) throws -> Self {
+        guard data.count <= _maximumNodeMessageSize else {
+            throw NodeNetworkWireError.oversized
+        }
+        var position = data.startIndex
+        guard let requestID = data.readUInt64(at: &position), requestID != 0,
+              let childPath = data.readChainPath(at: &position),
+              let parentCID = data.readString(at: &position),
+              let childCID = data.readString(at: &position),
+              data.distance(from: position, to: data.endIndex) >= 64 else {
+            throw NodeNetworkWireError.malformed
+        }
+        let targetEnd = data.index(position, offsetBy: 64)
+        guard let targetHex = String(
+                data: data[position..<targetEnd],
+                encoding: .utf8
+              ), let searchTarget = UInt256.fromHexString(targetHex) else {
+            throw NodeNetworkWireError.malformed
+        }
+        position = targetEnd
+        guard position < data.endIndex else {
+            throw NodeNetworkWireError.malformed
+        }
+        let hasDeploymentTarget = data[position]
+        position = data.index(after: position)
+        let deploymentTarget: UInt256?
+        switch hasDeploymentTarget {
+        case 0:
+            deploymentTarget = nil
+        case 1:
+            guard data.distance(from: position, to: data.endIndex) >= 64 else {
+                throw NodeNetworkWireError.malformed
+            }
+            let end = data.index(position, offsetBy: 64)
+            guard let hex = String(data: data[position..<end], encoding: .utf8),
+                  let target = UInt256.fromHexString(hex) else {
+                throw NodeNetworkWireError.malformed
+            }
+            deploymentTarget = target
+            position = end
+        default:
+            throw NodeNetworkWireError.malformed
+        }
+        guard let blockLength = data.readUInt32(at: &position), blockLength > 0,
+              data.distance(from: position, to: data.endIndex) > Int(blockLength) else {
+            throw NodeNetworkWireError.malformed
+        }
+        let blockEnd = data.index(position, offsetBy: Int(blockLength))
+        let blockData = Data(data[position..<blockEnd])
+        position = blockEnd
+        guard let entryCount = data.readUInt16(at: &position) else {
+            throw NodeNetworkWireError.malformed
+        }
+        var acquisitionEntries = [childCID: blockData]
+        acquisitionEntries.reserveCapacity(Int(entryCount) + 1)
+        for _ in 0..<entryCount {
+            guard let cid = data.readString(at: &position), cid != childCID,
+                  _isBoundedWireAtom(cid),
+                  let entry = data.readUInt32Bytes(at: &position),
+                  !entry.isEmpty,
+                  acquisitionEntries[cid] == nil else {
+                throw NodeNetworkWireError.malformed
+            }
+            acquisitionEntries[cid] = entry
+        }
+        guard position == data.endIndex else {
+            throw NodeNetworkWireError.malformed
+        }
+        let message = Self(
+            requestID: requestID,
+            childPath: childPath,
+            parentCID: parentCID,
+            childCID: childCID,
+            searchTarget: searchTarget,
+            deploymentTarget: deploymentTarget,
+            blockData: blockData,
+            acquisitionEntries: acquisitionEntries
+        )
+        guard try message.encoded() == data else {
+            throw NodeNetworkWireError.nonCanonical
+        }
+        return message
+    }
+}
+
+/// A child-independent fragment of the configured parent's securing-work
+/// graph. The exact hierarchy session already binds its destination, so the
+/// payload deliberately carries no child path. An empty delta is the ordered
+/// completion marker for its revision.
+struct InheritedWorkPushMessage: NodeJSONMessage, Equatable, Sendable {
+    static let maximumFacts = 256
+    static let maximumEncodedBytes = _maximumNodeMessageSize
+
+    let snapshot: InheritedWorkSnapshot
+
+    func validate() throws {
+        let factCount = snapshot.blockCIDs.reduce(0) {
+            $0 + snapshot.sourceWork(forBlock: $1).grindIDs.count
+        }
+        guard snapshot.revision > 0,
+              factCount <= Self.maximumFacts,
+              snapshot.hasUniqueGrindLocations,
+              snapshot.blockCIDs.allSatisfy({ blockCID in
+                  _isCanonicalWireCID(blockCID)
+                    && !snapshot.sourceWork(forBlock: blockCID).isEmpty
+                    && snapshot.sourceWork(forBlock: blockCID).grindIDs.allSatisfy {
+                        _isCanonicalWireCID($0)
+                            && snapshot.sourceWork(forBlock: blockCID)
+                                .work(forGrind: $0).map { $0 > .zero } == true
+                    }
+              }) else {
+            throw NodeNetworkWireError.malformed
+        }
+    }
+}
+
+private func _encodeMiningRewards(
+    _ rewards: [MiningReward],
+    under childPath: [String]
+) throws -> Data {
+    guard rewards.count <= ChildCandidateRequestMessage.maximumRewards,
+          rewards.count <= Int(UInt16.max) else {
+        throw NodeNetworkWireError.oversized
+    }
+    var seen: Set<String> = []
+    for reward in rewards {
+        let pathKey = reward.chainPath.joined(separator: "/")
+        guard _isAbsoluteChainPath(reward.chainPath),
+              reward.chainPath.count >= childPath.count,
+              Array(reward.chainPath.prefix(childPath.count)) == childPath,
+              seen.insert(pathKey).inserted,
+              let body = reward.transaction.body.node,
+              body.chainPath == reward.chainPath,
+              (try? ContentBoundTransaction(
+                transaction: reward.transaction
+              )) != nil else {
+            throw NodeNetworkWireError.malformed
+        }
+    }
+    let data = try _canonicalJSONEncode(rewards)
+    guard data.count <= ChildCandidateRequestMessage.maximumRewardBytes else {
+        throw NodeNetworkWireError.oversized
+    }
+    return data
+}
+
+private func _decodeMiningRewards(
+    _ data: Data,
+    under childPath: [String]
+) throws -> [MiningReward] {
+    guard data.count <= ChildCandidateRequestMessage.maximumRewardBytes else {
+        throw NodeNetworkWireError.oversized
+    }
+    guard let rewards = try? JSONDecoder().decode(
+            [MiningReward].self,
+            from: data
+          ),
+          rewards.count <= ChildCandidateRequestMessage.maximumRewards,
+          try _encodeMiningRewards(rewards, under: childPath) == data else {
+        throw NodeNetworkWireError.malformed
+    }
+    return rewards
+}
+
+private extension Data {
+    mutating func appendUInt16(_ value: UInt16) {
+        append(UInt8(value & 0xff))
+        append(UInt8(value >> 8))
+    }
+
+    mutating func appendUInt64(_ value: UInt64) {
+        for shift in stride(from: 0, to: 64, by: 8) {
+            append(UInt8((value >> UInt64(shift)) & 0xff))
+        }
+    }
+
+    mutating func appendUInt32(_ value: UInt32) {
+        for shift in stride(from: 0, to: 32, by: 8) {
+            append(UInt8((value >> UInt32(shift)) & 0xff))
+        }
+    }
+
+    func readUInt16(at position: inout Index) -> UInt16? {
+        guard distance(from: position, to: endIndex) >= 2 else { return nil }
+        let value = UInt16(self[position])
+            | (UInt16(self[index(after: position)]) << 8)
+        position = index(position, offsetBy: 2)
+        return value
+    }
+
+    func readUInt64(at position: inout Index) -> UInt64? {
+        guard distance(from: position, to: endIndex) >= 8 else { return nil }
+        var value: UInt64 = 0
+        for shift in stride(from: 0, to: 64, by: 8) {
+            value |= UInt64(self[position]) << UInt64(shift)
+            position = index(after: position)
+        }
+        return value
+    }
+
+    func readUInt32(at position: inout Index) -> UInt32? {
+        guard distance(from: position, to: endIndex) >= 4 else { return nil }
+        var value: UInt32 = 0
+        for shift in stride(from: 0, to: 32, by: 8) {
+            value |= UInt32(self[position]) << UInt32(shift)
+            position = index(after: position)
+        }
+        return value
+    }
+
+    func readString(at position: inout Index) -> String? {
+        guard let length = readUInt16(at: &position), length > 0,
+              distance(from: position, to: endIndex) >= Int(length) else {
+            return nil
+        }
+        let end = index(position, offsetBy: Int(length))
+        guard let value = String(data: self[position..<end], encoding: .utf8) else {
+            return nil
+        }
+        position = end
+        return value
+    }
+
+    func readUInt32Bytes(at position: inout Index) -> Data? {
+        guard let length = readUInt32(at: &position),
+              distance(from: position, to: endIndex) >= Int(length) else {
+            return nil
+        }
+        let end = index(position, offsetBy: Int(length))
+        let bytes = Data(self[position..<end])
+        position = end
+        return bytes
+    }
+
+    func readChainPath(at position: inout Index) -> [String]? {
+        guard let count = readUInt16(at: &position), count > 1 else { return nil }
+        var path: [String] = []
+        path.reserveCapacity(Int(count))
+        for _ in 0..<count {
+            guard let component = readString(at: &position) else { return nil }
+            path.append(component)
+        }
+        return path
+    }
+}
+
+func _contentBoundBlock(cid: String, data: Data) -> Block? {
+    guard let block = Block(data: data), block.toData() == data,
+          let header = try? BlockHeader(node: block), header.rawCID == cid else {
+        return nil
+    }
+    return block
+}
