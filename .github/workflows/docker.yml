@@ -49,8 +49,50 @@ jobs:
         with:
           context: .
           platforms: linux/amd64
+          load: ${{ github.event_name != 'push' }}
           push: ${{ github.event_name == 'push' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Mine, restart, and recover the container
+        env:
+          IMAGE_TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          set -euo pipefail
+          image="$(printf '%s\n' "$IMAGE_TAGS" | head -n 1)"
+          volume="lattice-smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          cleanup() {
+            docker rm -f lattice-node-smoke >/dev/null 2>&1 || true
+            docker volume rm "$volume" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+          docker volume create "$volume" >/dev/null
+          start() {
+            docker run -d --name lattice-node-smoke \
+              -v "$volume:/home/lattice/.lattice" "$image" >/dev/null
+          }
+          await_height() {
+            expected="$1"
+            for _ in $(seq 1 100); do
+              if docker exec lattice-node-smoke curl --fail --silent \
+                http://127.0.0.1:8080/health | grep -q "\"height\":$expected"; then
+                return
+              fi
+              sleep 0.1
+            done
+            docker logs lattice-node-smoke
+            return 1
+          }
+          start
+          await_height 0
+          docker exec lattice-node-smoke lattice-mining-coordinator \
+            --node http://127.0.0.1:8080 \
+            --worker-executable /usr/local/bin/lattice-miner \
+            --workers 1 --once --batch-size 1 >/dev/null
+          await_height 1
+          docker rm -f lattice-node-smoke >/dev/null
+          start
+          await_height 1
+          docker exec lattice-node-smoke lattice-proof-verifier --help >/dev/null

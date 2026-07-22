@@ -198,11 +198,18 @@ without copying state validity out of Lattice. The pool applies
 bounded replacement, expiry, and low-value eviction, and revalidates after every
 canonical change. Transactions confirmed on the new chain leave the pool;
 ordinary transactions from removed blocks are reinserted when still valid.
+Successfully revalidated transactions from disconnected canonical history are
+durable, bounded reorg candidates: their bytes already belong to accepted block
+Volumes. On restart, a non-equal service checkpoint replays the net fork delta
+to the current canonical tip. An unprojected transient branch that returns to
+the checkpoint is not replayed; peer-origin transactions seen only on that
+branch require rebroadcast. Unconfirmed peer gossip remains volatile.
 Locally submitted transaction roots survive restart and are revalidated before
 becoming visible again. Live pool roots use process-owner VolumeBroker pin
 deltas and are unpinned on removal; startup clears that owner before restoring
-only durable local submissions. Peer transactions are therefore serveable while
-pooled but never become restart authority.
+explicitly durable rows: local submissions and successfully projected reorg
+candidates. Ordinary unconfirmed peer gossip is serveable while pooled but
+never becomes restart authority.
 
 ## External mining
 
@@ -238,6 +245,9 @@ The unauthenticated adapter is loopback-only:
 ```text
 GET  /health
 GET  /v1/status
+GET  /v1/blocks/:cid
+GET  /v1/transactions/:cid
+GET  /v1/accounts/:address/proof
 POST /v1/transactions
 POST /v1/mining/templates
 POST /v1/mining/work

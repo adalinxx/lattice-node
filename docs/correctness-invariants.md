@@ -50,4 +50,9 @@ reference and survive restart. Every live pool root also has one process-owner
 VolumeBroker pin, updated by pool mutation deltas and removed with the pool
 entry. Startup clears that owner before restoring only the durable local roots,
 so peer submissions remain serveable while pooled but never become recovery
-authority.
+authority. A valid transaction removed from consensus-admitted canonical
+history is the one exception: once Lattice revalidates and persists it in the
+bounded pool, its durable root and service-projection checkpoint make recovery
+idempotent across crashes. Startup replays the net fork delta from that
+checkpoint to the recovered tip. A peer-origin transaction seen only on an
+unprojected transient branch remains volatile and requires rebroadcast.

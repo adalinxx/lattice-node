@@ -158,12 +158,29 @@ struct LatticeNodeCommand: AsyncParsableCommand {
         print("  nexus:   \(configuration.nexusGenesisCID)")
         print("  rpc:     http://\(rpcBind):\(rpcPort)")
 
+        let maintenance = Task {
+            await runPeriodicMaintenance(every: .seconds(60)) {
+                do {
+                    _ = try await process.evictUnretainedVolumes()
+                } catch is CancellationError {
+                    return
+                } catch {
+                    FileHandle.standardError.write(Data(
+                        "volume maintenance failed: \(error)\n".utf8
+                    ))
+                }
+            }
+        }
         do {
             try await app.runService()
         } catch {
+            maintenance.cancel()
+            await maintenance.value
             await network.stop()
             throw error
         }
+        maintenance.cancel()
+        await maintenance.value
         await network.stop()
     }
 
@@ -183,6 +200,21 @@ struct LatticeNodeCommand: AsyncParsableCommand {
         }
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         return url
+    }
+}
+
+func runPeriodicMaintenance(
+    every interval: Duration,
+    operation: @escaping @Sendable () async -> Void
+) async {
+    while !Task.isCancelled {
+        do {
+            try await Task.sleep(for: interval)
+        } catch {
+            return
+        }
+        guard !Task.isCancelled else { return }
+        await operation()
     }
 }
 
@@ -256,14 +288,37 @@ func makeApplication(
     service: ChainService,
     host: String,
     port: Int
-) -> Application<RouterResponder<BasicRequestContext>> {
-    let router = Router()
+) -> Application<RouterResponder<LatticeRequestContext>> {
+    let router = Router(context: LatticeRequestContext.self)
 
     router.get("health") { request, context in
-        try json(await service.status(), request: request, context: context)
+        let status = await service.status()
+        var response = try json(status, request: request, context: context)
+        if !status.mempoolAvailable {
+            response.status = .serviceUnavailable
+        }
+        return response
     }
     router.get("v1/status") { request, context in
         try json(await service.status(), request: request, context: context)
+    }
+    router.get("v1/blocks/:cid") { request, context in
+        let cid = try context.parameters.require("cid")
+        return try await serviceCall(request: request, context: context) {
+            try await service.acceptedBlock(cid)
+        }
+    }
+    router.get("v1/transactions/:cid") { request, context in
+        let cid = try context.parameters.require("cid")
+        return try await serviceCall(request: request, context: context) {
+            try await service.transaction(cid)
+        }
+    }
+    router.get("v1/accounts/:address/proof") { request, context in
+        let address = try context.parameters.require("address")
+        return try await serviceCall(request: request, context: context) {
+            try await service.accountProof(address: address)
+        }
     }
     router.post("v1/transactions") { request, context in
         let input: SubmitTransactionRequest = try await decode(request, context: context)
@@ -296,12 +351,24 @@ func makeApplication(
     )
 }
 
+struct LatticeRequestContext: RequestContext {
+    var coreContext: CoreRequestContextStorage
+
+    init(source: Source) {
+        coreContext = .init(source: source)
+    }
+
+    var maxUploadSize: Int { ChainServiceLimits.maximumPayloadBytes }
+}
+
 private func decode<Value: Decodable, Context: RequestContext>(
     _ request: Request,
     context: Context
 ) async throws -> Value {
     do {
         return try await request.decode(as: Value.self, context: context)
+    } catch let error as any HTTPResponseError {
+        throw error
     } catch {
         throw HTTPError(.badRequest)
     }
@@ -318,6 +385,8 @@ private func serviceCall<Value: Encodable, Context: RequestContext>(
             request: request,
             context: context
         )
+    } catch ChainServiceError.resourceNotFound {
+        throw HTTPError(.notFound)
     } catch ChainServiceError.childIntentLimitReached {
         throw HTTPError(.tooManyRequests)
     } catch ChainServiceError.noDeploymentAvailable {

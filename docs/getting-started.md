@@ -79,6 +79,23 @@ target, start nonce, and count.
 request JSON (`{"rewards":[...]}`). Omit it for no rewards; the coordinator has
 no identity or private-key flag.
 
+## Verify an account proof
+
+Request the proof from the chain process that owns the account state, then pass
+the returned `LightClientProof` to the verifier:
+
+```bash
+curl -o account-proof.json \
+  http://127.0.0.1:8080/v1/accounts/<address>/proof
+lattice-proof-verifier --file account-proof.json
+```
+
+The verifier prints `valid <block-CID>` and exits 0 for a valid self-contained
+witness. Verify that CID's ancestry and fork choice before trusting the account
+value. The verifier
+exits 2 for a well-formed but invalid proof and 1 when the input cannot be read
+or decoded.
+
 ## Start a child process
 
 All chain paths are absolute and Nexus-inclusive. Start a child with its full

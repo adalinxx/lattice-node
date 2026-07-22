@@ -987,6 +987,79 @@ final class ChainProcessTests: XCTestCase {
         )
     }
 
+    func testProjectionHistoryPermutationsReplayAndReopenIdentically()
+        async throws {
+        enum Event: CaseIterable {
+            case acceptChild
+            case attachSecondRoot
+            case inheritWork
+        }
+
+        let orders: [[Event]] = [
+            [.acceptChild, .attachSecondRoot, .inheritWork],
+            [.acceptChild, .inheritWork, .attachSecondRoot],
+            [.attachSecondRoot, .acceptChild, .inheritWork],
+            [.attachSecondRoot, .inheritWork, .acceptChild],
+            [.inheritWork, .acceptChild, .attachSecondRoot],
+            [.inheritWork, .attachSecondRoot, .acceptChild],
+        ]
+
+        for order in orders {
+            let fixture = try await directProjectionArrivalFixture()
+            var process: ChainProcess? = try await ChainProcess.open(
+                configuration: fixture.configuration
+            )
+            try await admitProjectionIncumbent(fixture, to: process!)
+
+            func apply(_ event: Event, to process: ChainProcess) async throws {
+                switch event {
+                case .acceptChild:
+                    _ = try await process.admit(
+                        fixture.competingHeader,
+                        authenticatedChildPackage: fixture.acceptingPackage
+                    )
+                case .attachSecondRoot:
+                    _ = try await process.admit(
+                        fixture.competingHeader,
+                        authenticatedChildPackage: fixture.targetMissPackage
+                    )
+                case .inheritWork:
+                    _ = try await process.applyInheritedWorkSnapshot(
+                        fixture.parentWork(
+                            revision: 1,
+                            includeAcceptingCarrier: true
+                        ),
+                        from: fixture.parentAuthority.value
+                    )
+                }
+            }
+
+            for event in order {
+                try await apply(event, to: process!)
+                process = nil
+                process = try await ChainProcess.open(
+                    configuration: fixture.configuration
+                )
+            }
+            for event in Event.allCases {
+                try await apply(event, to: process!)
+            }
+
+            let status = await process!.status()
+            let snapshot = await process!.parentSecuringWorkSnapshot()
+            let exported = try XCTUnwrap(snapshot)
+            XCTAssertEqual(status.tipCID, fixture.competingHeader.rawCID)
+            XCTAssertTrue(
+                exported.sourceWork(forBlock: fixture.competingHeader.rawCID)
+                    .grindIDs.isSuperset(of: [
+                        fixture.acceptingGrind,
+                        fixture.lateGrind,
+                    ]),
+                "order: \(order)"
+            )
+        }
+    }
+
     func testAcceptedChildOrphanRecoversIncomingEvidenceForPackageLessRetry()
         async throws {
         let fixture = try await childBootstrapFixture()
