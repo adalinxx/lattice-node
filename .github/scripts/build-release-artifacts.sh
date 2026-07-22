@@ -37,13 +37,14 @@ else
         RELEASE_ARTIFACT_ROOT="$PWD/.build" \
         scripts/build-release-binaries.sh
 fi
-for product in lattice-node lattice-mining-coordinator lattice-miner; do
+for product in lattice-node lattice-mining-coordinator lattice-miner lattice-proof-verifier; do
     cp "$PWD/.build/release-binaries/$product" "$bundle_dir/bin/$product"
 done
 .github/scripts/smoke-lattice-node.sh \
     "$bundle_dir/bin/lattice-node" \
     "$bundle_dir/bin/lattice-mining-coordinator" \
-    "$bundle_dir/bin/lattice-miner"
+    "$bundle_dir/bin/lattice-miner" \
+    "$bundle_dir/bin/lattice-proof-verifier"
 
 cat > "$bundle_dir/README.md" <<EOF
 # Lattice Node ${version} (${platform})
@@ -53,6 +54,7 @@ This archive contains the release builds for:
 - lattice-node
 - lattice-mining-coordinator
 - lattice-miner
+- lattice-proof-verifier
 
 Linux executables statically include the Swift runtime and require the host's
 glibc and SQLite runtime libraries.

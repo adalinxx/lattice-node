@@ -29,6 +29,12 @@ it.
 curl --fail http://127.0.0.1:8080/health
 ```
 
+If that probe fails, read the diagnostic body from the status route:
+
+```bash
+curl http://127.0.0.1:8080/v1/status
+```
+
 Important fields:
 
 - `phase`: `active`, `awaitingGenesis` for an unbootstrapped child, or
@@ -40,6 +46,10 @@ Important fields:
 - `tipCID` and `height`: null only while a child awaits genesis.
 - `revision` and `parentWorkRevision`: local consensus and completed
   immediate-parent work watermarks, useful for causal monitoring.
+- `mempoolAvailable`: false when service projection failed closed; consensus
+  reads remain available, but restart the node before transaction ingress or
+  template construction can resume. `/health` returns HTTP 503 so container
+  health checks detect this state; `/v1/status` remains readable.
 - `mempoolCount`, `mempoolBytes`, and `pendingChildIntents`: bounded service
   pressure indicators.
 

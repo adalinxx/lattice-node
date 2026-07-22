@@ -9,6 +9,7 @@ import Darwin
 import Glibc
 #endif
 import Lattice
+import LatticeLightClient
 import LatticeMinerCore
 import LatticeNode
 import Ivy
@@ -211,6 +212,176 @@ final class ParentChildE2ETests: XCTestCase {
         passed = true
     }
 
+    func testPublicPolicyChildDeploysAndEnforcesWasmWithoutLosingLiveness()
+        async throws {
+        let workspace = try E2EWorkspace()
+        let cluster = E2ECluster()
+        var passed = false
+        defer {
+            cluster.forceTerminateAll()
+            if passed {
+                try? workspace.remove()
+            } else {
+                print("lattice-node E2E artifacts retained at \(workspace.url.path)")
+            }
+        }
+
+        let binary = try E2EBinary.latticeNode()
+        let parentIdentity = try workspace.makeIdentity(named: "policy-parent")
+        let childIdentity = try workspace.makeIdentity(named: "policy-child")
+        let parentKey = try PeerKey(parentIdentity.publicKey)
+        let ports = try E2EPorts.allocate(count: 6)
+        let parent = E2ENode(
+            binary: binary,
+            configuration: E2ENode.Configuration(
+                name: "policy-parent",
+                chainPath: "Nexus",
+                storage: workspace.url.appendingPathComponent("policy-parent"),
+                identity: parentIdentity,
+                overlayPort: ports[0],
+                factPort: ports[1],
+                rpcPort: ports[2]
+            ),
+            logDirectory: workspace.logs
+        )
+        let child = E2ENode(
+            binary: binary,
+            configuration: E2ENode.Configuration(
+                name: "policy-child",
+                chainPath: "Nexus/Policy",
+                storage: workspace.url.appendingPathComponent("policy-child"),
+                identity: childIdentity,
+                overlayPort: ports[3],
+                factPort: ports[4],
+                rpcPort: ports[5],
+                parent: .init(publicKey: parentKey.hex, factPort: ports[1])
+            ),
+            logDirectory: workspace.logs
+        )
+        cluster.add(parent)
+        cluster.add(child)
+        try parent.start()
+        try child.start()
+        _ = try await parent.waitForStatus { $0.phase == .active }
+        _ = try await child.waitForStatus { $0.phase == .awaitingGenesis }
+
+        let module = WasmPolicyModule(bytes: try XCTUnwrap(Data(
+            base64Encoded: "AGFzbQEAAAABDAJgAX8Bf2ACf38BfwMDAgABBQMBAAEGBwF/AUGACAsHUwQGbWVtb3J5AgANbGF0dGljZV9hbGxvYwAAHGxhdHRpY2VfdmFsaWRhdGVfdHJhbnNhY3Rpb24AARdsYXR0aWNlX3ZhbGlkYXRlX2FjdGlvbgABCnICEQEBfyMAIQEjACAAaiQAIAELXgECfyABQQ9JBEBBAA8LAkADQCACIAFBD2tLDQFBACEDAkADQCADQQ9GBEBBAQ8LIAAgAmogA2otAABBECADai0AAEcNASADQQFqIQMMAAsLIAJBAWohAgwACwtBAAsLFQEAQRALD3BvbGljeS1zZW50aW5lbA=="
+        )))
+        let moduleCID = try WasmPolicyModuleHeader(node: module).rawCID
+        XCTAssertEqual(
+            moduleCID,
+            "bafyreif6fnqbpy6xnnigwmx3fpb7vx3sygjlqx65lnu4onqgww4ba3y7zy"
+        )
+        let intent: ChildDeployIntentResponse = try await parent.post(
+            "/v1/children/intents",
+            body: ChildDeployIntentRequest(
+                directory: "Policy",
+                spec: ChainSpec(
+                    maxNumberOfTransactionsPerBlock: 100,
+                    maxStateGrowth: 100_000,
+                    premine: 0,
+                    targetBlockTime: 1_000,
+                    initialReward: 10,
+                    halvingInterval: 100,
+                    wasmPolicies: [WasmPolicyRef(
+                        moduleCID: moduleCID,
+                        scope: .action
+                    )]
+                ),
+                genesisTransactions: [],
+                policyModules: [module],
+                target: .max,
+                timestamp: 1
+            )
+        )
+        try await parent.stop()
+        try parent.start()
+        _ = try await parent.waitForStatus {
+            $0.phase == .active && $0.pendingChildIntents == 1
+        }
+        try await submitGenesisAnchor(
+            on: parent,
+            intent: intent,
+            chainPath: ["Nexus"]
+        )
+        let deployment = try await mine(parent, mode: .deployment)
+        XCTAssertTrue(deployment.accepted)
+        _ = try await child.waitForStatus {
+            $0.phase == .active && $0.tipCID == intent.genesisCID
+        }
+
+        let signer = CryptoUtils.generateKeyPair()
+        let firstAllowed = try signedTransaction(
+            key: signer,
+            chainPath: ["Nexus", "Policy"],
+            actions: [Action(
+                key: "policy-sentinel/first",
+                oldValue: nil,
+                newValue: "accepted"
+            )],
+            nonce: 0
+        )
+        let _: SubmitTransactionResponse = try await child.post(
+            "/v1/transactions",
+            body: SubmitTransactionRequest(transaction: firstAllowed)
+        )
+        _ = try await child.waitForStatus { $0.mempoolCount == 1 }
+        let firstWork = try await mine(parent)
+        XCTAssertTrue(firstWork.accepted)
+        let firstAccepted = try await child.waitForStatus {
+            $0.height == 1 && $0.mempoolCount == 0
+        }
+
+        let rejected = try signedTransaction(
+            key: signer,
+            chainPath: ["Nexus", "Policy"],
+            actions: [Action(
+                key: "forbidden",
+                oldValue: nil,
+                newValue: "rejected"
+            )],
+            nonce: 1
+        )
+        do {
+            let _: SubmitTransactionResponse = try await child.post(
+                "/v1/transactions",
+                body: SubmitTransactionRequest(transaction: rejected)
+            )
+            XCTFail("policy-rejected transaction was accepted")
+        } catch let error as E2EHTTPError {
+            XCTAssertEqual(error.status, 400)
+        }
+        let afterRejection = try await child.waitForStatus { _ in true }
+        XCTAssertEqual(afterRejection.tipCID, firstAccepted.tipCID)
+        XCTAssertEqual(afterRejection.height, firstAccepted.height)
+        XCTAssertEqual(afterRejection.mempoolCount, 0)
+
+        let secondAllowed = try signedTransaction(
+            key: signer,
+            chainPath: ["Nexus", "Policy"],
+            actions: [Action(
+                key: "policy-sentinel/second",
+                oldValue: nil,
+                newValue: "accepted"
+            )],
+            nonce: 1
+        )
+        let _: SubmitTransactionResponse = try await child.post(
+            "/v1/transactions",
+            body: SubmitTransactionRequest(transaction: secondAllowed)
+        )
+        _ = try await child.waitForStatus { $0.mempoolCount == 1 }
+        let secondWork = try await mine(parent)
+        XCTAssertTrue(secondWork.accepted)
+        _ = try await child.waitForStatus {
+            $0.height == 2 && $0.mempoolCount == 0
+        }
+
+        try await cluster.stopAll()
+        passed = true
+    }
+
     func testPortableContinuityWaitsForLiveParentWorkBeforeConsensus() async throws {
         let workspace = try E2EWorkspace()
         let cluster = E2ECluster()
@@ -238,7 +409,12 @@ final class ParentChildE2ETests: XCTestCase {
             named: "portable-late",
             seed: 3
         )
-        let ports = try E2EPorts.allocate(count: 9)
+        let impostorIdentity = try workspace.makeIdentity(
+            named: "portable-impostor",
+            seed: 4
+        )
+        let ports = try E2EPorts.allocate(count: 12)
+        let parentPeer = try overlayPeer(identity: parentIdentity, port: ports[0])
         let parent = E2ENode(
             binary: binary,
             configuration: E2ENode.Configuration(
@@ -284,9 +460,39 @@ final class ParentChildE2ETests: XCTestCase {
             ),
             logDirectory: workspace.logs
         )
+        let impostor = E2ENode(
+            binary: binary,
+            configuration: E2ENode.Configuration(
+                name: "portable-impostor",
+                chainPath: "Nexus",
+                storage: workspace.url.appendingPathComponent("portable-impostor"),
+                identity: impostorIdentity,
+                overlayPort: ports[9],
+                factPort: ports[10],
+                rpcPort: ports[11],
+                overlayPeers: [parentPeer]
+            ),
+            logDirectory: workspace.logs
+        )
+        let wrongParent = E2ENode(
+            binary: binary,
+            configuration: E2ENode.Configuration(
+                name: "portable-wrong-parent",
+                chainPath: "Nexus",
+                storage: workspace.url.appendingPathComponent("portable-impostor"),
+                identity: impostorIdentity,
+                overlayPort: ports[9],
+                factPort: ports[1],
+                rpcPort: ports[11]
+            ),
+            logDirectory: workspace.logs
+        )
         cluster.add(parent)
         cluster.add(source)
         cluster.add(late)
+        cluster.add(impostor)
+        cluster.add(wrongParent)
+        XCTAssertNotEqual(parentKey.hex, wrongParent.processPublicKey)
 
         try parent.start()
         try source.start()
@@ -329,44 +535,73 @@ final class ParentChildE2ETests: XCTestCase {
         }
         let expectedTip = try XCTUnwrap(sourceTip)
 
+        // Give the later wrong-key parent the exact accepted Nexus history.
+        // Its persisted facts are therefore sufficient; only its process
+        // identity differs from the authority pinned by child genesis.
+        try impostor.start()
+        let parentTip = try await parent.waitForStatus { $0.height ?? 0 > 0 }
+        _ = try await waitForTip(impostor, try XCTUnwrap(parentTip.tipCID))
+        try await impostor.stop()
+
         // Historical parent-signed attachments remain portable across the
         // same-chain overlay, but neither an existing child nor a late joiner
-        // may treat them as a current view of parent state.
+        // may treat them as a current view of parent state. A live process on
+        // the configured fact port is insufficient when its identity is not
+        // the parent authority pinned by child genesis.
         try await parent.stop()
+        try wrongParent.start()
+        _ = try await wrongParent.waitForStatus { $0.phase == .active }
         try await source.stop()
         try source.start()
         let staleSource = try await source.waitForStatus {
             $0.phase == .awaitingParent && $0.tipCID == expectedTip.tipCID
         }
         XCTAssertEqual(staleSource.height, expectedTip.height)
-        do {
-            let _: MiningTemplateResponse = try await source.post(
-                "/v1/mining/templates",
-                body: MiningTemplateRequest(mode: .normal)
-            )
-            XCTFail("child issued mining work without current parent state")
-        } catch let error as E2EHTTPError {
-            XCTAssertEqual(error.status, 503)
-        }
 
         try late.start()
         let staleLate = try await late.waitForStatus(timeout: .seconds(20)) {
             $0.phase == .awaitingParent && $0.tipCID == expectedTip.tipCID
         }
         XCTAssertEqual(staleLate.height, expectedTip.height)
-        do {
-            let _: MiningTemplateResponse = try await late.post(
-                "/v1/mining/templates",
-                body: MiningTemplateRequest(mode: .normal)
-            )
-            XCTFail("late child issued mining work without current parent state")
-        } catch let error as E2EHTTPError {
-            XCTAssertEqual(error.status, 503)
+
+        // The deterministic hierarchy-role and parent-fact gate tests prove
+        // the identity rejection itself. This bounded shipped-process check
+        // adds operational evidence that neither child activates while a
+        // synchronized wrong-key process occupies the exact parent port.
+        let wrongParentWork = try await mine(wrongParent)
+        XCTAssertTrue(wrongParentWork.accepted)
+        let observationDeadline = ContinuousClock.now + .seconds(3)
+        while ContinuousClock.now < observationDeadline {
+            for (node, baseline) in [(source, staleSource), (late, staleLate)] {
+                let stillStale = try await node.waitForStatus(
+                    timeout: .seconds(1)
+                ) { _ in true }
+                XCTAssertEqual(stillStale.phase, .awaitingParent)
+                XCTAssertEqual(stillStale.tipCID, expectedTip.tipCID)
+                XCTAssertEqual(stillStale.height, expectedTip.height)
+                XCTAssertEqual(
+                    stillStale.parentWorkRevision,
+                    baseline.parentWorkRevision
+                )
+            }
+            try await Task.sleep(for: .milliseconds(100))
+        }
+        for node in [source, late] {
+            do {
+                let _: MiningTemplateResponse = try await node.post(
+                    "/v1/mining/templates",
+                    body: MiningTemplateRequest(mode: .normal)
+                )
+                XCTFail("child issued mining work without its configured parent")
+            } catch let error as E2EHTTPError {
+                XCTAssertEqual(error.status, 503)
+            }
         }
 
         // The configured parent completes a fresh inherited-work snapshot.
         // Only that live completion makes the already verified tip
         // operational on both same-chain peers.
+        try await wrongParent.stop()
         try parent.start()
         _ = try await parent.waitForStatus { $0.phase == .active }
         _ = try await source.waitForStatus(timeout: .seconds(20)) {
@@ -580,9 +815,16 @@ final class ParentChildE2ETests: XCTestCase {
         let receiptsTransaction = try legacySignedTransaction(
             chainPath: ["Nexus", "Payments", "Receipts"]
         )
-        let _: SubmitTransactionResponse = try await receipts.post(
+        let submittedReceipts: SubmitTransactionResponse = try await receipts.post(
             "/v1/transactions",
             body: SubmitTransactionRequest(transaction: receiptsTransaction)
+        )
+        let receiptsTransactionVolume = try VolumeImpl<Transaction>(
+            node: receiptsTransaction
+        )
+        XCTAssertEqual(
+            submittedReceipts.transactionCID,
+            receiptsTransactionVolume.rawCID
         )
         let queuedReceipts = try await receipts.waitForStatus { $0.mempoolCount == 1 }
         XCTAssertEqual(queuedReceipts.mempoolCount, 1)
@@ -616,6 +858,27 @@ final class ParentChildE2ETests: XCTestCase {
         let finalReceipts = try XCTUnwrap(progressedReceipts)
         XCTAssertNotEqual(finalPayments.tipCID, paymentsTip)
         XCTAssertNotEqual(finalReceipts.tipCID, receiptsIntent.genesisCID)
+        let expectedReceiptsTransactions = try MerkleDictionaryImpl<
+            VolumeImpl<Transaction>
+        >().inserting(key: "0", value: receiptsTransactionVolume)
+        let expectedTransactionsCID = try HeaderImpl(
+            node: expectedReceiptsTransactions
+        ).rawCID
+        var cursor = try XCTUnwrap(finalReceipts.tipCID)
+        var inclusionCount = 0
+        for _ in 0..<(try XCTUnwrap(finalReceipts.height)) {
+            if cursor == receiptsIntent.genesisCID { break }
+            let block = try JSONDecoder().decode(
+                Block.self,
+                from: try await receipts.get("/v1/blocks/\(cursor)")
+            )
+            if block.transactions.rawCID == expectedTransactionsCID {
+                inclusionCount += 1
+            }
+            cursor = try XCTUnwrap(block.parent?.rawCID)
+        }
+        XCTAssertEqual(cursor, receiptsIntent.genesisCID)
+        XCTAssertEqual(inclusionCount, 1)
 
         try await cluster.stopAll()
         passed = true
@@ -941,17 +1204,34 @@ final class ParentChildE2ETests: XCTestCase {
         // template commits to them without expanding their private bytes. The
         // configured targets give this round an observable black-box result:
         // the shared hash misses Payments but is accepted by Receipts.
+        let paymentsTipBlock = try JSONDecoder().decode(
+            Block.self,
+            from: try await payments.get("/v1/blocks/\(paymentsTip)")
+        )
+        let receiptsTip = try XCTUnwrap(receiptsBeforeCarrier.tipCID)
+        let receiptsTipBlock = try JSONDecoder().decode(
+            Block.self,
+            from: try await receipts.get("/v1/blocks/\(receiptsTip)")
+        )
+        let paymentsCandidateTarget = paymentsTipBlock.nextTarget
+        let receiptsCandidateTarget = receiptsTipBlock.nextTarget
         let selectedTemplate: MiningTemplateResponse = try await nexus.post(
             "/v1/mining/templates",
             body: MiningTemplateRequest()
         )
+        let hitCeiling = min(
+            selectedTemplate.block.target,
+            receiptsCandidateTarget,
+            selectedTemplate.searchTarget
+        )
+        XCTAssertLessThan(paymentsCandidateTarget, hitCeiling)
         let carrierMidstate = ProofOfWork.midstate(for: selectedTemplate.block)
         var carrierNonce: UInt64 = 0
         var rootHash = ProofOfWork.hash(
             midstate: carrierMidstate,
             nonce: carrierNonce
         )
-        while rootHash <= hardTarget {
+        while rootHash <= paymentsCandidateTarget || rootHash > hitCeiling {
             carrierNonce += 1
             rootHash = ProofOfWork.hash(
                 midstate: carrierMidstate,
@@ -959,8 +1239,8 @@ final class ParentChildE2ETests: XCTestCase {
             )
         }
         XCTAssertEqual(selectedTemplate.searchTarget, .max)
-        XCTAssertLessThan(hardTarget, .max)
-        XCTAssertGreaterThan(rootHash, hardTarget)
+        XCTAssertGreaterThan(rootHash, paymentsCandidateTarget)
+        XCTAssertLessThanOrEqual(rootHash, hitCeiling)
 
         // Search the exact public template through the shipped worker, then
         // submit that worker's nonce through the public node RPC.
@@ -985,6 +1265,410 @@ final class ParentChildE2ETests: XCTestCase {
         }
         XCTAssertEqual(unchangedPayments.tipCID, paymentsTip)
         XCTAssertEqual(unchangedPayments.height, paymentsHeight)
+
+        try await cluster.stopAll()
+        passed = true
+    }
+
+    func testSamePathTransactionRelaysAndSurvivesSubmittingReplicaRestart() async throws {
+        let workspace = try E2EWorkspace()
+        let cluster = E2ECluster()
+        var passed = false
+        defer {
+            cluster.forceTerminateAll()
+            if passed {
+                try? workspace.remove()
+            } else {
+                print("lattice-node E2E artifacts retained at \(workspace.url.path)")
+            }
+        }
+
+        let binary = try E2EBinary.latticeNode()
+        let nexusIdentity = try workspace.makeIdentity(named: "relay-nexus")
+        let aIdentity = try workspace.makeIdentity(named: "relay-a")
+        let bIdentity = try workspace.makeIdentity(named: "relay-b")
+        let nexusKey = try PeerKey(nexusIdentity.publicKey)
+        let ports = try E2EPorts.allocate(count: 9)
+        let nexus = nexusNode(
+            binary: binary,
+            workspace: workspace,
+            name: "relay-nexus",
+            identity: nexusIdentity,
+            overlayPort: ports[0],
+            factPort: ports[1],
+            rpcPort: ports[2]
+        )
+        let a = childNode(
+            binary: binary,
+            workspace: workspace,
+            name: "relay-a",
+            directory: "Payments",
+            identity: aIdentity,
+            parentPublicKey: nexusKey.hex,
+            parentFactPort: ports[1],
+            overlayPort: ports[3],
+            factPort: ports[4],
+            rpcPort: ports[5]
+        )
+        let b = childNode(
+            binary: binary,
+            workspace: workspace,
+            name: "relay-b",
+            directory: "Payments",
+            identity: bIdentity,
+            parentPublicKey: nexusKey.hex,
+            parentFactPort: ports[1],
+            overlayPort: ports[6],
+            factPort: ports[7],
+            rpcPort: ports[8]
+        )
+        a.setOverlayPeers([try overlayPeer(identity: bIdentity, port: ports[6])])
+        b.setOverlayPeers([try overlayPeer(identity: aIdentity, port: ports[3])])
+        cluster.add(nexus)
+        cluster.add(a)
+        cluster.add(b)
+
+        try nexus.start()
+        try a.start()
+        try b.start()
+        _ = try await waitForNexus(nexus)
+        let intent = try await childIntent(
+            on: nexus,
+            directory: "Payments",
+            timestamp: 1
+        )
+        try await submitGenesisAnchor(
+            on: nexus,
+            intent: intent,
+            chainPath: ["Nexus"]
+        )
+        let deployment = try await mine(nexus, mode: .deployment)
+        XCTAssertTrue(deployment.accepted)
+        let aGenesis = try await a.waitForStatus {
+            $0.phase == .active && $0.tipCID == intent.genesisCID
+        }
+        _ = try await b.waitForStatus {
+            $0.phase == .active && $0.tipCID == intent.genesisCID
+        }
+
+        let transaction = try legacySignedTransaction(
+            chainPath: ["Nexus", "Payments"],
+            keySeed: 90
+        )
+        let submitted: SubmitTransactionResponse = try await a.post(
+            "/v1/transactions",
+            body: SubmitTransactionRequest(transaction: transaction)
+        )
+        XCTAssertEqual(submitted.mempoolCount, 1)
+        _ = try await b.waitForStatus { $0.mempoolCount == 1 }
+
+        // B is now the only live child candidate source. The transaction can
+        // reach consensus without the process that originally accepted it.
+        try await a.stop()
+        var progressedB: ChainServiceStatusResponse?
+        for _ in 0..<5 {
+            let work = try await mine(nexus)
+            XCTAssertTrue(work.accepted)
+            if let status = try? await b.waitForStatus(
+                timeout: .seconds(2),
+                where: {
+                    $0.mempoolCount == 0
+                        && ($0.height ?? 0) > (aGenesis.height ?? 0)
+                }
+            ) {
+                progressedB = status
+                break
+            }
+        }
+        let included = try XCTUnwrap(progressedB)
+
+        // A restores its durable local transaction, learns B's accepted block,
+        // and removes the now-included transaction during reconciliation.
+        try a.start()
+        let convergedA = try await a.waitForStatus(timeout: .seconds(20)) {
+            $0.phase == .active
+                && $0.tipCID == included.tipCID
+                && $0.height == included.height
+                && $0.mempoolCount == 0
+        }
+        XCTAssertEqual(convergedA.tipCID, included.tipCID)
+
+        try await cluster.stopAll()
+        passed = true
+    }
+
+    func testMalformedOverlayPeerCannotBlockHonestTransactionProgress() async throws {
+        let workspace = try E2EWorkspace()
+        let cluster = E2ECluster()
+        var passed = false
+        defer {
+            cluster.forceTerminateAll()
+            if passed {
+                try? workspace.remove()
+            } else {
+                print("lattice-node E2E artifacts retained at \(workspace.url.path)")
+            }
+        }
+
+        let binary = try E2EBinary.latticeNode()
+        let aIdentity = try workspace.makeIdentity(named: "hostile-target")
+        let bIdentity = try workspace.makeIdentity(named: "honest-peer")
+        let ports = try E2EPorts.allocate(count: 7)
+        let aPeer = try overlayPeer(identity: aIdentity, port: ports[0])
+        let bPeer = try overlayPeer(identity: bIdentity, port: ports[3])
+        let a = nexusNode(
+            binary: binary,
+            workspace: workspace,
+            name: "hostile-target",
+            identity: aIdentity,
+            overlayPort: ports[0],
+            factPort: ports[1],
+            rpcPort: ports[2]
+        )
+        let b = nexusNode(
+            binary: binary,
+            workspace: workspace,
+            name: "honest-peer",
+            identity: bIdentity,
+            overlayPort: ports[3],
+            factPort: ports[4],
+            rpcPort: ports[5]
+        )
+        a.setOverlayPeers([bPeer])
+        b.setOverlayPeers([aPeer])
+        cluster.add(a)
+        cluster.add(b)
+
+        try a.start()
+        try b.start()
+        _ = try await waitForNexus(a)
+        _ = try await waitForNexus(b)
+        let hostile = try E2EOverlayObserver(
+            port: ports[6],
+            bootstrapPeer: aPeer,
+            hello: ChainHello(
+                nexusGenesisCID: NexusGenesis.expectedBlockHash,
+                chainPath: ["Nexus"],
+                minimumRootWorkHex: String(repeating: "0", count: 63) + "1"
+            )
+        )
+        addTeardownBlock { await hostile.stop() }
+        try await hostile.start()
+        try await hostile.waitForConnection(to: aPeer.publicKey)
+
+        // The schema is otherwise plausible, but trailing whitespace makes the
+        // recognized node message noncanonical. A must isolate it to this peer.
+        let hostileSend = await hostile.send(
+            topic: "lattice.overlay.transaction.available.v1",
+            payload: Data("{\"volumeRootCID\":\"unavailable\"} ".utf8)
+        )
+        guard case .enqueued = hostileSend else {
+            return XCTFail("hostile message did not reach the authenticated session")
+        }
+        // A later canonical request on the same ordered Ivy session must be
+        // answered. This is the causal marker that the malformed frame was
+        // delivered and ignored without poisoning the authenticated session.
+        let inventoryRequest = try canonicalJSON(InventoryRequest(
+            requestID: 7,
+            afterRootCID: nil
+        ))
+        let markerSend = await hostile.send(
+            topic: "lattice.overlay.transaction.inventory.request.v1",
+            payload: inventoryRequest
+        )
+        guard case .enqueued = markerSend else {
+            return XCTFail("causal marker was not queued on the hostile session")
+        }
+        try await hostile.waitForMessage(
+            topic: "lattice.overlay.transaction.inventory.response.v1"
+        )
+
+        let submitted: SubmitTransactionResponse = try await b.post(
+            "/v1/transactions",
+            body: SubmitTransactionRequest(transaction: try legacySignedTransaction(
+                chainPath: ["Nexus"],
+                keySeed: 93
+            ))
+        )
+        XCTAssertEqual(submitted.mempoolCount, 1)
+        _ = try await a.waitForStatus { $0.mempoolCount == 1 }
+
+        let mined = try await mineBlock(a)
+        XCTAssertTrue(mined.response.accepted)
+        _ = try await a.waitForStatus {
+            $0.tipCID == mined.blockCID && $0.mempoolCount == 0
+        }
+        _ = try await b.waitForStatus {
+            $0.tipCID == mined.blockCID && $0.mempoolCount == 0
+        }
+
+        await hostile.stop()
+        try await cluster.stopAll()
+        passed = true
+    }
+
+    func testParentOutageRevokesNestedReadinessButKeepsTransactionIngress()
+        async throws
+    {
+        let workspace = try E2EWorkspace()
+        let cluster = E2ECluster()
+        var passed = false
+        defer {
+            cluster.forceTerminateAll()
+            if passed {
+                try? workspace.remove()
+            } else {
+                print("lattice-node E2E artifacts retained at \(workspace.url.path)")
+            }
+        }
+
+        let binary = try E2EBinary.latticeNode()
+        let nexusIdentity = try workspace.makeIdentity(named: "cascade-nexus")
+        let middleIdentity = try workspace.makeIdentity(named: "cascade-middle")
+        let leafIdentity = try workspace.makeIdentity(named: "cascade-leaf")
+        let nexusKey = try PeerKey(nexusIdentity.publicKey)
+        let middleKey = try PeerKey(middleIdentity.publicKey)
+        let ports = try E2EPorts.allocate(count: 9)
+        let nexus = nexusNode(
+            binary: binary,
+            workspace: workspace,
+            name: "cascade-nexus",
+            identity: nexusIdentity,
+            overlayPort: ports[0],
+            factPort: ports[1],
+            rpcPort: ports[2]
+        )
+        let middle = childNode(
+            binary: binary,
+            workspace: workspace,
+            name: "cascade-middle",
+            directory: "Payments",
+            identity: middleIdentity,
+            parentPublicKey: nexusKey.hex,
+            parentFactPort: ports[1],
+            overlayPort: ports[3],
+            factPort: ports[4],
+            rpcPort: ports[5]
+        )
+        let leaf = E2ENode(
+            binary: binary,
+            configuration: E2ENode.Configuration(
+                name: "cascade-leaf",
+                chainPath: "Nexus/Payments/Receipts",
+                storage: workspace.url.appendingPathComponent("cascade-leaf"),
+                identity: leafIdentity,
+                overlayPort: ports[6],
+                factPort: ports[7],
+                rpcPort: ports[8],
+                parent: .init(publicKey: middleKey.hex, factPort: ports[4])
+            ),
+            logDirectory: workspace.logs
+        )
+        cluster.add(nexus)
+        cluster.add(middle)
+        cluster.add(leaf)
+
+        try nexus.start()
+        try middle.start()
+        _ = try await waitForNexus(nexus)
+        let middleIntent = try await childIntent(
+            on: nexus,
+            directory: "Payments",
+            timestamp: 1
+        )
+        try await submitGenesisAnchor(
+            on: nexus,
+            intent: middleIntent,
+            chainPath: ["Nexus"]
+        )
+        let middleDeployment = try await mine(nexus, mode: .deployment)
+        XCTAssertTrue(middleDeployment.accepted)
+        _ = try await middle.waitForStatus {
+            $0.phase == .active && $0.tipCID == middleIntent.genesisCID
+        }
+
+        let leafIntent = try await childIntent(
+            on: middle,
+            directory: "Receipts",
+            timestamp: 2
+        )
+        try await submitGenesisAnchor(
+            on: middle,
+            intent: leafIntent,
+            chainPath: ["Nexus", "Payments"]
+        )
+        let leafDeployment = try await mine(nexus, mode: .deployment)
+        XCTAssertTrue(leafDeployment.accepted)
+        try leaf.start()
+        let readyMiddle = try await middle.waitForStatus {
+            $0.phase == .active
+                && $0.tipCID != middleIntent.genesisCID
+                && ($0.height ?? 0) > 0
+        }
+        let readyLeaf = try await leaf.waitForStatus {
+            $0.phase == .active && $0.tipCID == leafIntent.genesisCID
+        }
+
+        // Only the root process stops. The live descendants retain verified
+        // history and RPC availability but lose actionable consensus in order.
+        try await nexus.stop()
+        let staleMiddle = try await middle.waitForStatus {
+            $0.phase == .awaitingParent && $0.tipCID == readyMiddle.tipCID
+        }
+        let staleLeaf = try await leaf.waitForStatus {
+            $0.phase == .awaitingParent && $0.tipCID == readyLeaf.tipCID
+        }
+        XCTAssertEqual(staleMiddle.height, readyMiddle.height)
+        XCTAssertEqual(staleLeaf.height, readyLeaf.height)
+
+        let middleSubmission: SubmitTransactionResponse = try await middle.post(
+            "/v1/transactions",
+            body: SubmitTransactionRequest(transaction: try legacySignedTransaction(
+                chainPath: ["Nexus", "Payments"],
+                keySeed: 91
+            ))
+        )
+        let leafSubmission: SubmitTransactionResponse = try await leaf.post(
+            "/v1/transactions",
+            body: SubmitTransactionRequest(transaction: try legacySignedTransaction(
+                chainPath: ["Nexus", "Payments", "Receipts"],
+                keySeed: 92
+            ))
+        )
+        XCTAssertEqual(middleSubmission.mempoolCount, 1)
+        XCTAssertEqual(leafSubmission.mempoolCount, 1)
+
+        for node in [middle, leaf] {
+            do {
+                let _: MiningTemplateResponse = try await node.post(
+                    "/v1/mining/templates",
+                    body: MiningTemplateRequest(mode: .normal)
+                )
+                XCTFail("descendant issued a template without live root authority")
+            } catch let error as E2EHTTPError {
+                XCTAssertEqual(error.status, 503)
+            }
+            do {
+                let _: SubmitWorkResponse = try await node.post(
+                    "/v1/mining/work",
+                    body: SubmitWorkRequest(workID: "unavailable", nonce: 0)
+                )
+                XCTFail("descendant accepted work without live root authority")
+            } catch let error as E2EHTTPError {
+                XCTAssertEqual(error.status, 503)
+            }
+        }
+
+        try nexus.start()
+        _ = try await nexus.waitForStatus { $0.phase == .active }
+        let recoveredMiddle = try await middle.waitForStatus(timeout: .seconds(20)) {
+            $0.phase == .active && $0.mempoolCount == 1
+        }
+        let recoveredLeaf = try await leaf.waitForStatus(timeout: .seconds(20)) {
+            $0.phase == .active && $0.mempoolCount == 1
+        }
+        XCTAssertEqual(recoveredMiddle.tipCID, staleMiddle.tipCID)
+        XCTAssertEqual(recoveredLeaf.tipCID, staleLeaf.tipCID)
 
         try await cluster.stopAll()
         passed = true
@@ -2195,8 +2879,28 @@ final class ParentChildE2ETests: XCTestCase {
         XCTAssertEqual(reverseArrival.tipCID, winnerCID)
         await liveObserver.stop()
 
-        // Once both sources are gone, C and D must recover the selected
-        // canonical projection from disk without any bootstrap source.
+        // D's inbound synchronization above proves reverse arrival, but does
+        // not require D to become an advertiser to that source. Reconnect the
+        // original winning replica directly to the loser to exercise the
+        // losing node's canonical-delta/mempool reconciliation.
+        winner.setOverlayPeers([loserPeer])
+        try winner.start()
+        _ = try await waitForTip(winner, winnerCID)
+        _ = try await loser.waitForStatus {
+            $0.tipCID == winnerCID && $0.mempoolCount == 1
+        }
+        try await winner.stop()
+
+        // Once every source is gone, each process must recover the selected
+        // projection from disk. A transaction revalidated from disconnected
+        // canonical history is a bounded durable reorg candidate, so the
+        // losing node restores it without either branch source.
+        try await loser.stop()
+        loser.setOverlayPeers([])
+        try loser.start()
+        _ = try await loser.waitForStatus {
+            $0.tipCID == winnerCID && $0.mempoolCount == 1
+        }
         try await loser.stop()
         c.forceTerminate()
         d.forceTerminate()
@@ -2206,6 +2910,170 @@ final class ParentChildE2ETests: XCTestCase {
         try d.start()
         _ = try await waitForTip(c, winnerCID)
         _ = try await waitForTip(d, winnerCID)
+
+        try await cluster.stopAll()
+        passed = true
+    }
+
+    func testSeededNexusReplicasReconcileAcrossRestartAndLateJoin() async throws {
+        let seedText = ProcessInfo.processInfo.environment["LATTICE_E2E_SEED"]
+            ?? "1592614637"
+        let seed = try XCTUnwrap(
+            UInt64(seedText),
+            "LATTICE_E2E_SEED must be an unsigned integer"
+        )
+        print("LATTICE_E2E_SEED=\(seed)")
+        let roundText = ProcessInfo.processInfo.environment["LATTICE_E2E_ROUNDS"]
+            ?? "8"
+        let roundCount = try XCTUnwrap(
+            Int(roundText).flatMap { (1...155).contains($0) ? $0 : nil },
+            "LATTICE_E2E_ROUNDS must be between 1 and 155"
+        )
+        print("LATTICE_E2E_ROUNDS=\(roundCount)")
+
+        let workspace = try E2EWorkspace()
+        let cluster = E2ECluster()
+        var passed = false
+        defer {
+            cluster.forceTerminateAll()
+            if passed {
+                try? workspace.remove()
+            } else {
+                print("lattice-node E2E artifacts retained at \(workspace.url.path)")
+            }
+        }
+
+        let binary = try E2EBinary.latticeNode()
+        let identities = try [
+            workspace.makeIdentity(named: "seeded-a"),
+            workspace.makeIdentity(named: "seeded-b"),
+            workspace.makeIdentity(named: "seeded-late"),
+        ]
+        let ports = try E2EPorts.allocate(count: 9)
+        let peers = try [
+            overlayPeer(identity: identities[0], port: ports[0]),
+            overlayPeer(identity: identities[1], port: ports[3]),
+        ]
+        let replicas = (0..<3).map { index in
+            nexusNode(
+                binary: binary,
+                workspace: workspace,
+                name: ["seeded-a", "seeded-b", "seeded-late"][index],
+                identity: identities[index],
+                overlayPort: ports[index * 3],
+                factPort: ports[index * 3 + 1],
+                rpcPort: ports[index * 3 + 2]
+            )
+        }
+        replicas[0].setOverlayPeers([peers[1]])
+        replicas[1].setOverlayPeers([peers[0]])
+        replicas[2].setOverlayPeers(peers)
+        cluster.add(replicas[0])
+        cluster.add(replicas[1])
+        cluster.add(replicas[2])
+
+        try replicas[0].start()
+        try replicas[1].start()
+        _ = try await waitForNexus(replicas[0])
+        _ = try await waitForNexus(replicas[1])
+
+        var generator = E2ESeededGenerator(seed: seed)
+        let lateJoinRound = roundCount == 1
+            ? 0
+            : 1 + generator.next(upperBound: roundCount - 1)
+        var started = [0, 1]
+        var expectedTip = NexusGenesis.expectedBlockHash
+        var expectedHeight: UInt64 = 0
+
+        for round in 0..<roundCount {
+            if round == lateJoinRound {
+                try replicas[2].start()
+                started.append(2)
+                _ = try await replicas[2].waitForStatus {
+                    $0.tipCID == expectedTip
+                        && $0.height == expectedHeight
+                        && $0.mempoolCount == 0
+                }
+            }
+
+            let submitter = started[generator.next(upperBound: started.count)]
+            let transaction = try legacySignedTransaction(
+                chainPath: ["Nexus"],
+                keySeed: UInt8(round + 101)
+            )
+            let transactionCID = try VolumeImpl<Transaction>(
+                node: transaction
+            ).rawCID
+            let submitted: SubmitTransactionResponse = try await replicas[submitter].post(
+                "/v1/transactions",
+                body: SubmitTransactionRequest(transaction: transaction)
+            )
+            XCTAssertEqual(submitted.transactionCID, transactionCID)
+            XCTAssertEqual(submitted.mempoolCount, 1)
+            for index in started {
+                _ = try await replicas[index].waitForStatus { $0.mempoolCount == 1 }
+            }
+
+            // Rotate every failure mode in every seed; the seed chooses the
+            // affected replica and the producer, not whether an edge is seen.
+            let failure = (round + Int(seed & 3)) % 4
+            let failed = failure == 0
+                ? nil
+                : started[generator.next(upperBound: started.count)]
+            if let failed {
+                switch failure {
+                case 1:
+                    try await replicas[failed].stop()
+                case 2:
+                    replicas[failed].forceTerminate()
+                default:
+                    try replicas[failed].suspend()
+                }
+            }
+            let responsive = started.filter { $0 != failed }
+            let producer = responsive[generator.next(upperBound: responsive.count)]
+            let failedLabel = failed.map(String.init) ?? "none"
+            print(
+                "seeded round=\(round) submitter=\(submitter) "
+                    + "failure=\(failure) failed=\(failedLabel) "
+                    + "producer=\(producer)"
+            )
+
+            let block = try await mineBlock(replicas[producer])
+            XCTAssertTrue(block.response.accepted)
+            XCTAssertEqual(block.template.block.parent?.rawCID, expectedTip)
+            let transactionVolume = try VolumeImpl<Transaction>(node: transaction)
+            let expectedTransactions = try MerkleDictionaryImpl<VolumeImpl<Transaction>>()
+                .inserting(key: "0", value: transactionVolume)
+            XCTAssertEqual(
+                block.template.block.transactions.rawCID,
+                try HeaderImpl(node: expectedTransactions).rawCID
+            )
+            expectedTip = block.blockCID
+            expectedHeight += 1
+            for index in responsive {
+                _ = try await replicas[index].waitForStatus {
+                    $0.tipCID == expectedTip
+                        && $0.height == expectedHeight
+                        && $0.mempoolCount == 0
+                }
+            }
+
+            if let failed {
+                if failure == 3 {
+                    try replicas[failed].resume()
+                } else {
+                    try replicas[failed].start()
+                }
+            }
+            for index in started {
+                _ = try await replicas[index].waitForStatus {
+                    $0.tipCID == expectedTip
+                        && $0.height == expectedHeight
+                        && $0.mempoolCount == 0
+                }
+            }
+        }
 
         try await cluster.stopAll()
         passed = true
@@ -2369,8 +3237,10 @@ final class ParentChildE2ETests: XCTestCase {
         let binary = try E2EBinary.latticeNode()
         let parentIdentity = try workspace.makeIdentity(named: "nexus")
         let childIdentity = try workspace.makeIdentity(named: "market")
+        let lateIdentity = try workspace.makeIdentity(named: "market-late")
         let parentPeerKey = try PeerKey(parentIdentity.publicKey)
-        let ports = try E2EPorts.allocate(count: 6)
+        let ports = try E2EPorts.allocate(count: 9)
+        let childPeer = try overlayPeer(identity: childIdentity, port: ports[3])
         let parent = E2ENode(
             binary: binary,
             configuration: E2ENode.Configuration(
@@ -2398,8 +3268,27 @@ final class ParentChildE2ETests: XCTestCase {
             ),
             logDirectory: workspace.logs
         )
+        let late = E2ENode(
+            binary: binary,
+            configuration: E2ENode.Configuration(
+                name: "market-late",
+                chainPath: "Nexus/Market",
+                storage: workspace.url.appendingPathComponent(
+                    "market-late",
+                    isDirectory: true
+                ),
+                identity: lateIdentity,
+                overlayPort: ports[6],
+                factPort: ports[7],
+                rpcPort: ports[8],
+                overlayPeers: [childPeer],
+                parent: .init(publicKey: parentPeerKey.hex, factPort: ports[1])
+            ),
+            logDirectory: workspace.logs
+        )
         cluster.add(parent)
         cluster.add(child)
+        cluster.add(late)
 
         try parent.start()
         try child.start()
@@ -2642,8 +3531,91 @@ final class ParentChildE2ETests: XCTestCase {
                 && $0.height == delayed.height.map { $0 + 1 }
         }
 
+        let beforeReplayData = try await child.get(
+            "/v1/accounts/\(buyerAddress)/proof"
+        )
+        let beforeReplay = try JSONDecoder().decode(
+            LightClientProof.self,
+            from: beforeReplayData
+        )
+        let beforeReplayBlockCID = await LightClientProtocol.verify(beforeReplay)
+        XCTAssertEqual(
+            beforeReplayBlockCID,
+            withdrawn.tipCID
+        )
+        XCTAssertEqual(beforeReplay.balance, depositA - 3)
+
+        // A fresh same-path replica must acquire the withdrawal's complete
+        // cross-chain state through production protocols, then remain able to
+        // serve as the only live child process.
+        try late.start()
+        _ = try await late.waitForStatus {
+            $0.phase == .active
+                && $0.tipCID == withdrawn.tipCID
+                && $0.height == withdrawn.height
+        }
+        let lateProofData = try await late.get(
+            "/v1/accounts/\(buyerAddress)/proof"
+        )
+        let lateProof = try JSONDecoder().decode(
+            LightClientProof.self,
+            from: lateProofData
+        )
+        let lateProofBlockCID = await LightClientProtocol.verify(lateProof)
+        XCTAssertEqual(
+            lateProofBlockCID,
+            withdrawn.tipCID
+        )
+        XCTAssertEqual(lateProof.balance, beforeReplay.balance)
+        XCTAssertEqual(lateProof.nonce, beforeReplay.nonce)
+        try await child.stop()
+
+        // This is a true replay: the first withdrawal is already canonical,
+        // so the deposit's permanent spent marker must reject a fresh-nonce
+        // claim submitted through the newly joined replica.
+        let spentDepositReplay = try signedTransaction(
+            key: buyer,
+            chainPath: childPath,
+            accountActions: [AccountAction(
+                owner: buyerAddress,
+                delta: Int64(depositA - 1)
+            )],
+            withdrawalActions: [WithdrawalAction(
+                withdrawer: buyerAddress,
+                nonce: nonceA,
+                demander: sellerAddress,
+                amountDemanded: demandA,
+                amountWithdrawn: depositA
+            )],
+            fee: 1,
+            nonce: 1
+        )
+        let _: SubmitTransactionResponse = try await late.post(
+            "/v1/transactions",
+            body: SubmitTransactionRequest(transaction: spentDepositReplay)
+        )
+        let replayWork = try await mine(parent)
+        XCTAssertTrue(replayWork.accepted)
+        let replayRejected = try await late.waitForStatus {
+            $0.height == withdrawn.height.map { $0 + 1 }
+        }
+        let afterReplayData = try await late.get(
+            "/v1/accounts/\(buyerAddress)/proof"
+        )
+        let afterReplay = try JSONDecoder().decode(
+            LightClientProof.self,
+            from: afterReplayData
+        )
+        let afterReplayBlockCID = await LightClientProtocol.verify(afterReplay)
+        XCTAssertEqual(
+            afterReplayBlockCID,
+            replayRejected.tipCID
+        )
+        XCTAssertEqual(afterReplay.balance, beforeReplay.balance)
+        XCTAssertEqual(afterReplay.nonce, beforeReplay.nonce)
+
         // Spending the one-unit witness output proves the exact fee-ranked
-        // claim committed, rather than the competing replay of the same deposit.
+        // claim committed, rather than the same-nonce competing claim.
         let witnessSpend = try signedTransaction(
             key: witness,
             chainPath: childPath,
@@ -2653,7 +3625,7 @@ final class ParentChildE2ETests: XCTestCase {
             ],
             nonce: 0
         )
-        let _: SubmitTransactionResponse = try await child.post(
+        let _: SubmitTransactionResponse = try await late.post(
             "/v1/transactions",
             body: SubmitTransactionRequest(transaction: witnessSpend)
         )
@@ -2677,20 +3649,51 @@ final class ParentChildE2ETests: XCTestCase {
         XCTAssertTrue(spendWork.accepted)
         XCTAssertEqual(spendWork.publishedChildProofs.map(\.directory), ["Market"])
         _ = try await parent.waitForStatus { $0.mempoolCount == 0 }
-        let spent = try await child.waitForStatus {
-            $0.mempoolCount == 2
-                && $0.height == withdrawn.height.map { $0 + 1 }
+        let spent = try await late.waitForStatus {
+            $0.height == replayRejected.height.map { $0 + 1 }
         }
+        let lateSinkData = try await late.get(
+            "/v1/accounts/\(sinkAddress)/proof"
+        )
+        let lateSink = try JSONDecoder().decode(
+            LightClientProof.self,
+            from: lateSinkData
+        )
+        let lateSinkBlockCID = await LightClientProtocol.verify(lateSink)
+        XCTAssertEqual(
+            lateSinkBlockCID,
+            spent.tipCID
+        )
+        XCTAssertEqual(lateSink.balance, 1)
 
         // Persistent contextual junk neither becomes valid nor suppresses the
         // next empty child block.
         let livenessWork = try await mine(parent)
         XCTAssertTrue(livenessWork.accepted)
         XCTAssertEqual(livenessWork.publishedChildProofs.map(\.directory), ["Market"])
-        _ = try await child.waitForStatus {
-            $0.mempoolCount == 2
-                && $0.height == spent.height.map { $0 + 1 }
+        let finalChild = try await late.waitForStatus {
+            $0.height == spent.height.map { $0 + 1 }
         }
+
+        try child.start()
+        _ = try await child.waitForStatus {
+            $0.phase == .active
+                && $0.tipCID == finalChild.tipCID
+                && $0.height == finalChild.height
+        }
+        let recoveredSinkData = try await child.get(
+            "/v1/accounts/\(sinkAddress)/proof"
+        )
+        let recoveredSink = try JSONDecoder().decode(
+            LightClientProof.self,
+            from: recoveredSinkData
+        )
+        let recoveredSinkBlockCID = await LightClientProtocol.verify(recoveredSink)
+        XCTAssertEqual(
+            recoveredSinkBlockCID,
+            finalChild.tipCID
+        )
+        XCTAssertEqual(recoveredSink.balance, lateSink.balance)
 
         try await cluster.stopAll()
         passed = true
@@ -3136,6 +4139,310 @@ final class ParentChildE2ETests: XCTestCase {
         passed = true
     }
 
+    func testAbruptCrashReopensDurableMempoolAndAcceptedTip() async throws {
+        let workspace = try E2EWorkspace()
+        let cluster = E2ECluster()
+        var passed = false
+        defer {
+            cluster.forceTerminateAll()
+            if passed {
+                try? workspace.remove()
+            } else {
+                print("lattice-node E2E artifacts retained at \(workspace.url.path)")
+            }
+        }
+
+        let binary = try E2EBinary.latticeNode()
+        let identity = try workspace.makeIdentity(named: "nexus")
+        let ports = try E2EPorts.allocate(count: 3)
+        let node = nexusNode(
+            binary: binary,
+            workspace: workspace,
+            name: "nexus",
+            identity: identity,
+            overlayPort: ports[0],
+            factPort: ports[1],
+            rpcPort: ports[2]
+        )
+        cluster.add(node)
+
+        try node.start()
+        _ = try await waitForNexus(node)
+        let transaction = try legacySignedTransaction(chainPath: ["Nexus"])
+        let _: SubmitTransactionResponse = try await node.post(
+            "/v1/transactions",
+            body: SubmitTransactionRequest(transaction: transaction)
+        )
+        _ = try await node.waitForStatus { $0.mempoolCount == 1 }
+
+        node.forceTerminate()
+        try node.start()
+        _ = try await node.waitForStatus {
+            $0.phase == .active
+                && $0.tipCID == NexusGenesis.expectedBlockHash
+                && $0.mempoolCount == 1
+        }
+
+        let mined = try await mineBlock(node)
+        XCTAssertTrue(mined.response.accepted)
+        _ = try await node.waitForStatus {
+            $0.tipCID == mined.blockCID && $0.mempoolCount == 0
+        }
+
+        node.forceTerminate()
+        try node.start()
+        let recovered = try await waitForTip(node, mined.blockCID)
+        XCTAssertEqual(recovered.height, 1)
+        XCTAssertEqual(recovered.mempoolCount, 0)
+
+        try await cluster.stopAll()
+        passed = true
+    }
+
+    func testAcceptedReadsAndProofVerifierSurviveNodeRestart() async throws {
+        let workspace = try E2EWorkspace()
+        let cluster = E2ECluster()
+        var passed = false
+        defer {
+            cluster.forceTerminateAll()
+            if passed {
+                try? workspace.remove()
+            } else {
+                print("lattice-node E2E artifacts retained at \(workspace.url.path)")
+            }
+        }
+
+        let nodeBinary = try E2EBinary.latticeNode()
+        let coordinator = try E2EBinary.latticeMiningCoordinator()
+        let miner = try E2EBinary.latticeMiner()
+        let verifier = try E2EBinary.latticeProofVerifier()
+        let identity = try workspace.makeIdentity(named: "read-proof")
+        let ports = try E2EPorts.allocate(count: 3)
+        let node = nexusNode(
+            binary: nodeBinary,
+            workspace: workspace,
+            name: "read-proof",
+            identity: identity,
+            overlayPort: ports[0],
+            factPort: ports[1],
+            rpcPort: ports[2]
+        )
+        cluster.add(node)
+
+        try node.start()
+        _ = try await waitForNexus(node)
+
+        let sender = CryptoUtils.generateKeyPair()
+        let recipient = CryptoUtils.generateKeyPair()
+        let senderAddress = CryptoUtils.createAddress(from: sender.publicKey)
+        let recipientAddress = CryptoUtils.createAddress(from: recipient.publicKey)
+        let funding = try signedTransaction(
+            key: sender,
+            chainPath: ["Nexus"],
+            accountActions: [AccountAction(owner: senderAddress, delta: 100)],
+            nonce: 0
+        )
+        let funded = try await mineWithCoordinator(
+            node,
+            coordinator: coordinator,
+            miner: miner,
+            rewards: [MiningReward(chainPath: ["Nexus"], transaction: funding)]
+        )
+        XCTAssertTrue(funded.accepted)
+        _ = try await node.waitForStatus { $0.height == 1 }
+
+        let transaction = try signedTransaction(
+            key: sender,
+            chainPath: ["Nexus"],
+            accountActions: [
+                AccountAction(owner: senderAddress, delta: -40),
+                AccountAction(owner: recipientAddress, delta: 40),
+            ],
+            nonce: 1
+        )
+        let submitted: SubmitTransactionResponse = try await node.post(
+            "/v1/transactions",
+            body: SubmitTransactionRequest(transaction: transaction)
+        )
+        _ = try await node.waitForStatus { $0.mempoolCount == 1 }
+        let mined = try await mineWithCoordinator(
+            node,
+            coordinator: coordinator,
+            miner: miner
+        )
+        XCTAssertTrue(mined.accepted)
+        let blockCID = try XCTUnwrap(mined.tipCID)
+        _ = try await node.waitForStatus {
+            $0.tipCID == blockCID && $0.height == 2 && $0.mempoolCount == 0
+        }
+
+        func assertPublicReads() async throws {
+            let blockData = try await node.get("/v1/blocks/\(blockCID)")
+            let block = try JSONDecoder().decode(Block.self, from: blockData)
+            XCTAssertEqual(try BlockHeader(node: block).rawCID, blockCID)
+
+            let transactionData = try await node.get(
+                "/v1/transactions/\(submitted.transactionCID)"
+            )
+            let content = try JSONDecoder().decode(
+                ContentBoundTransaction.self,
+                from: transactionData
+            )
+            XCTAssertEqual(
+                try VolumeImpl<Transaction>(node: content.transaction()).rawCID,
+                submitted.transactionCID
+            )
+
+            let proofData = try await node.get(
+                "/v1/accounts/\(senderAddress)/proof"
+            )
+            let proof = try JSONDecoder().decode(LightClientProof.self, from: proofData)
+            XCTAssertEqual(proof.balance, 60)
+            XCTAssertEqual(proof.nonce, 1)
+            XCTAssertEqual(try BlockHeader(node: proof.block).rawCID, blockCID)
+            let verification = try await runProofVerifier(verifier, proof: proofData)
+            XCTAssertEqual(verification, "valid \(blockCID)")
+        }
+
+        try await assertPublicReads()
+        try await node.stop()
+        try node.start()
+        _ = try await waitForTip(node, blockCID)
+        try await assertPublicReads()
+
+        try await cluster.stopAll()
+        passed = true
+    }
+
+    func testStoppedStoreBackupRestoresAndMismatchedHalfFailsClosed() async throws {
+        let workspace = try E2EWorkspace()
+        let cluster = E2ECluster()
+        var passed = false
+        defer {
+            cluster.forceTerminateAll()
+            if passed {
+                try? workspace.remove()
+            } else {
+                print("lattice-node E2E artifacts retained at \(workspace.url.path)")
+            }
+        }
+
+        let binary = try E2EBinary.latticeNode()
+        let originalIdentity = try workspace.makeIdentity(named: "original")
+        let ports = try E2EPorts.allocate(count: 9)
+        let originalStorage = workspace.url.appendingPathComponent(
+            "original",
+            isDirectory: true
+        )
+        let backupStorage = workspace.url.appendingPathComponent(
+            "backup",
+            isDirectory: true
+        )
+        let restoredStorage = workspace.url.appendingPathComponent(
+            "restored",
+            isDirectory: true
+        )
+        let mismatchedStorage = workspace.url.appendingPathComponent(
+            "mismatched",
+            isDirectory: true
+        )
+        let original = nexusNode(
+            binary: binary,
+            workspace: workspace,
+            name: "original",
+            identity: originalIdentity,
+            overlayPort: ports[0],
+            factPort: ports[1],
+            rpcPort: ports[2]
+        )
+        cluster.add(original)
+
+        try original.start()
+        _ = try await waitForNexus(original)
+        let backedUp = try await mineBlock(original)
+        XCTAssertTrue(backedUp.response.accepted)
+        try await original.stop()
+        try FileManager.default.copyItem(at: originalStorage, to: backupStorage)
+
+        try original.start()
+        _ = try await waitForTip(original, backedUp.blockCID)
+        let advanced = try await mineBlock(original)
+        XCTAssertTrue(advanced.response.accepted)
+        XCTAssertEqual(advanced.template.block.parent?.rawCID, backedUp.blockCID)
+        try await original.stop()
+
+        try FileManager.default.copyItem(at: backupStorage, to: restoredStorage)
+        try FileManager.default.createDirectory(
+            at: mismatchedStorage,
+            withIntermediateDirectories: true
+        )
+        for name in ["state.db", "state.db-shm", "state.db-wal"] {
+            let source = originalStorage.appendingPathComponent(name)
+            if FileManager.default.fileExists(atPath: source.path) {
+                try FileManager.default.copyItem(
+                    at: source,
+                    to: mismatchedStorage.appendingPathComponent(name)
+                )
+            }
+        }
+        for name in ["volumes.db", "volumes.db-shm", "volumes.db-wal"] {
+            let source = backupStorage.appendingPathComponent(name)
+            if FileManager.default.fileExists(atPath: source.path) {
+                try FileManager.default.copyItem(
+                    at: source,
+                    to: mismatchedStorage.appendingPathComponent(name)
+                )
+            }
+        }
+
+        let mismatched = E2ENode(
+            binary: binary,
+            configuration: E2ENode.Configuration(
+                name: "mismatched",
+                chainPath: "Nexus",
+                storage: mismatchedStorage,
+                identity: originalIdentity,
+                overlayPort: ports[6],
+                factPort: ports[7],
+                rpcPort: ports[8]
+            ),
+            logDirectory: workspace.logs
+        )
+        cluster.add(mismatched)
+        try mismatched.start()
+        let mismatchStatus = try await mismatched.waitForExit()
+        XCTAssertNotEqual(mismatchStatus, 0)
+        XCTAssertTrue(try mismatched.latestStandardError().contains(
+            "missingMaterializedVolume"
+        ))
+
+        let restored = E2ENode(
+            binary: binary,
+            configuration: E2ENode.Configuration(
+                name: "restored",
+                chainPath: "Nexus",
+                storage: restoredStorage,
+                identity: originalIdentity,
+                overlayPort: ports[3],
+                factPort: ports[4],
+                rpcPort: ports[5]
+            ),
+            logDirectory: workspace.logs
+        )
+        cluster.add(restored)
+        try restored.start()
+        let recovered = try await waitForTip(restored, backedUp.blockCID)
+        XCTAssertEqual(recovered.height, 1)
+        let continued = try await mineBlock(restored)
+        XCTAssertTrue(continued.response.accepted)
+        XCTAssertEqual(continued.template.block.parent?.rawCID, backedUp.blockCID)
+        let continuedStatus = try await waitForTip(restored, continued.blockCID)
+        XCTAssertEqual(continuedStatus.height, 2)
+
+        try await cluster.stopAll()
+        passed = true
+    }
+
     private func nexusNode(
         binary: URL,
         workspace: E2EWorkspace,
@@ -3259,7 +4566,8 @@ final class ParentChildE2ETests: XCTestCase {
     private func mineWithCoordinator(
         _ parent: E2ENode,
         coordinator: URL,
-        miner: URL
+        miner: URL,
+        rewards: [MiningReward] = []
     ) async throws -> E2ECoordinatorResult {
         let process = Process()
         let output = Pipe()
@@ -3272,6 +4580,22 @@ final class ParentChildE2ETests: XCTestCase {
             "--once",
             "--batch-size", "1",
         ]
+        var rewardsFile: URL?
+        if !rewards.isEmpty {
+            let file = FileManager.default.temporaryDirectory.appendingPathComponent(
+                "lattice-e2e-rewards-\(UUID().uuidString).json"
+            )
+            try JSONEncoder().encode(
+                MiningTemplateRequest(rewards: rewards)
+            ).write(to: file, options: .atomic)
+            process.arguments! += ["--rewards-file", file.path]
+            rewardsFile = file
+        }
+        defer {
+            if let rewardsFile {
+                try? FileManager.default.removeItem(at: rewardsFile)
+            }
+        }
         process.standardOutput = output
         process.standardError = errors
         try process.run()
@@ -3371,6 +4695,45 @@ final class ParentChildE2ETests: XCTestCase {
             "/v1/mining/work",
             body: SubmitWorkRequest(workID: template.workID, nonce: nonce)
         )
+    }
+
+    private func runProofVerifier(
+        _ verifier: URL,
+        proof: Data
+    ) async throws -> String {
+        let process = Process()
+        let input = Pipe()
+        let output = Pipe()
+        let errors = Pipe()
+        process.executableURL = verifier
+        process.standardInput = input
+        process.standardOutput = output
+        process.standardError = errors
+        try process.run()
+        try input.fileHandleForWriting.write(contentsOf: proof)
+        try input.fileHandleForWriting.close()
+
+        let clock = ContinuousClock()
+        let deadline = clock.now + .seconds(10)
+        while process.isRunning && clock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(50))
+        }
+        guard !process.isRunning else {
+            process.terminate()
+            process.waitUntilExit()
+            throw E2EHTTPError(status: 0, body: "proof verifier timed out")
+        }
+        process.waitUntilExit()
+        let stdout = output.fileHandleForReading.readDataToEndOfFile()
+        let stderr = errors.fileHandleForReading.readDataToEndOfFile()
+        guard process.terminationStatus == 0 else {
+            throw E2EHTTPError(
+                status: Int(process.terminationStatus),
+                body: "proof verifier failed: \(String(decoding: stderr, as: UTF8.self))"
+            )
+        }
+        return String(decoding: stdout, as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private func childIntent(
@@ -3482,6 +4845,7 @@ final class ParentChildE2ETests: XCTestCase {
         key: (privateKey: String, publicKey: String),
         chainPath: [String],
         accountActions: [AccountAction] = [],
+        actions: [Action] = [],
         depositActions: [DepositAction] = [],
         genesisActions: [GenesisAction] = [],
         receiptActions: [ReceiptAction] = [],
@@ -3493,6 +4857,7 @@ final class ParentChildE2ETests: XCTestCase {
             keys: [key],
             chainPath: chainPath,
             accountActions: accountActions,
+            actions: actions,
             depositActions: depositActions,
             genesisActions: genesisActions,
             receiptActions: receiptActions,
@@ -3506,6 +4871,7 @@ final class ParentChildE2ETests: XCTestCase {
         keys: [(privateKey: String, publicKey: String)],
         chainPath: [String],
         accountActions: [AccountAction] = [],
+        actions: [Action] = [],
         depositActions: [DepositAction] = [],
         genesisActions: [GenesisAction] = [],
         receiptActions: [ReceiptAction] = [],
@@ -3515,7 +4881,7 @@ final class ParentChildE2ETests: XCTestCase {
     ) throws -> Transaction {
         let body = TransactionBody(
             accountActions: accountActions,
-            actions: [],
+            actions: actions,
             depositActions: depositActions,
             genesisActions: genesisActions,
             receiptActions: receiptActions,
@@ -3595,6 +4961,19 @@ private struct E2EWorkerResult: Decodable {
     let nonce: UInt64?
 }
 
+private struct E2ESeededGenerator {
+    private var state: UInt64
+
+    init(seed: UInt64) {
+        state = seed
+    }
+
+    mutating func next(upperBound: Int) -> Int {
+        state = state &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
+        return Int(state % UInt64(upperBound))
+    }
+}
+
 private extension Ivy {
     func installObserver(delegate: IvyDelegate) {
         self.delegate = delegate
@@ -3615,8 +4994,10 @@ private actor E2EOverlayObserver: IvyDelegate {
     private let hello: Data
     private let port: UInt16
     private let expectedPeerKey: String
+    private var connectedPeer: AuthenticatedPeer?
     private var connectionCounts: [String: Int] = [:]
     private var announcementCounts: [String: Int] = [:]
+    private var messageCounts: [String: Int] = [:]
 
     init(port: UInt16, bootstrapPeer: E2ENode.OverlayPeer, hello: ChainHello) throws {
         self.port = port
@@ -3686,8 +5067,26 @@ private actor E2EOverlayObserver: IvyDelegate {
         )
     }
 
+    func waitForMessage(
+        topic: String,
+        after count: Int = 0,
+        timeout: Duration = .seconds(10)
+    ) async throws {
+        let clock = ContinuousClock()
+        let deadline = clock.now + timeout
+        while clock.now < deadline {
+            if messageCounts[topic, default: 0] > count { return }
+            try? await Task.sleep(for: .milliseconds(50))
+        }
+        throw E2EHTTPError(
+            status: 0,
+            body: "timed out waiting for observer message on \(topic)"
+        )
+    }
+
     func ivy(_ ivy: Ivy, didConnect peer: AuthenticatedPeer) async {
         if peer.key.hex == expectedPeerKey {
+            connectedPeer = peer
             connectionCounts[peer.key.hex, default: 0] += 1
         }
         _ = await ivy.sendMessage(
@@ -3709,6 +5108,9 @@ private actor E2EOverlayObserver: IvyDelegate {
             }
             return
         }
+        if peer.key.hex == expectedPeerKey {
+            messageCounts[message.topic, default: 0] += 1
+        }
         guard message.topic == Self.blockAnnouncementTopic,
               peer.key.hex == expectedPeerKey,
               let announcement = try? JSONDecoder().decode(
@@ -3727,6 +5129,26 @@ private actor E2EOverlayObserver: IvyDelegate {
     func announcementCount(of blockCID: String) -> Int {
         announcementCounts[blockCID, default: 0]
     }
+
+    func send(topic: String, payload: Data) async -> SendMessageResult {
+        guard let connectedPeer else { return .notConnected }
+        return await ivy.sendMessage(
+            to: connectedPeer,
+            topic: topic,
+            payload: payload
+        )
+    }
+}
+
+private struct InventoryRequest: Encodable {
+    let requestID: UInt64
+    let afterRootCID: String?
+}
+
+private func canonicalJSON<T: Encodable>(_ value: T) throws -> Data {
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+    return try encoder.encode(value)
 }
 
 private struct E2EHTTPError: Error, LocalizedError {
@@ -3880,6 +5302,38 @@ private final class E2ENode {
         try? E2EPorts.reserve(reservedPorts)
     }
 
+    func waitForExit(timeout: Duration = .seconds(10)) async throws -> Int32 {
+        guard let process else {
+            throw E2EHTTPError(status: 0, body: "node is not running")
+        }
+        let clock = ContinuousClock()
+        let deadline = clock.now + timeout
+        while process.isRunning && clock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(50))
+        }
+        guard !process.isRunning else {
+            throw E2EHTTPError(
+                status: 0,
+                body: "node did not exit: \(configuration.name)"
+            )
+        }
+        process.waitUntilExit()
+        let status = process.terminationStatus
+        self.process = nil
+        closeLogs()
+        try E2EPorts.reserve(reservedPorts)
+        return status
+    }
+
+    func latestStandardError() throws -> String {
+        try String(
+            contentsOf: logDirectory.appendingPathComponent(
+                "\(configuration.name)-\(launchCount).stderr.log"
+            ),
+            encoding: .utf8
+        )
+    }
+
     func suspend() throws {
         guard let process, process.isRunning else {
             throw E2EHTTPError(
@@ -3923,15 +5377,29 @@ private final class E2ENode {
         var lastError: Error?
         var lastStatus: ChainServiceStatusResponse?
         while clock.now < deadline {
+            let requestRemaining = clock.now.duration(to: deadline).components
+            let requestTimeout = max(
+                0.001,
+                min(
+                    Self.requestTimeout,
+                    TimeInterval(requestRemaining.seconds)
+                        + TimeInterval(requestRemaining.attoseconds) / 1e18
+                )
+            )
             do {
-                let status = try await status()
+                let status = try await status(timeout: requestTimeout)
                 lastStatus = status
                 if predicate(status) { return status }
             } catch {
                 lastError = error
                 if let process, !process.isRunning { break }
             }
-            try? await Task.sleep(for: .milliseconds(100))
+            let sleepRemaining = clock.now.duration(to: deadline)
+            if sleepRemaining > .zero {
+                try? await Task.sleep(
+                    for: min(sleepRemaining, .milliseconds(100))
+                )
+            }
         }
         let observed = lastStatus.map {
             "phase=\($0.phase.rawValue), tip=\($0.tipCID ?? "nil"), height=\($0.height.map(String.init) ?? "nil"), mempool=\($0.mempoolCount)"
@@ -3961,14 +5429,22 @@ private final class E2ENode {
         return try await send(request, timeout: timeout)
     }
 
+    func get(_ path: String) async throws -> Data {
+        var request = URLRequest(url: baseURL.appending(path: path))
+        request.httpMethod = "GET"
+        return try await sendData(request)
+    }
+
     var rpcURL: URL {
         baseURL
     }
 
-    private func status() async throws -> ChainServiceStatusResponse {
+    private func status(
+        timeout: TimeInterval? = nil
+    ) async throws -> ChainServiceStatusResponse {
         var request = URLRequest(url: baseURL.appending(path: "/v1/status"))
         request.httpMethod = "GET"
-        return try await send(request)
+        return try await send(request, timeout: timeout)
     }
 
     private var baseURL: URL {
@@ -3987,6 +5463,14 @@ private final class E2ENode {
         _ request: URLRequest,
         timeout: TimeInterval? = nil
     ) async throws -> Response {
+        let data = try await sendData(request, timeout: timeout)
+        return try JSONDecoder().decode(Response.self, from: data)
+    }
+
+    private func sendData(
+        _ request: URLRequest,
+        timeout: TimeInterval? = nil
+    ) async throws -> Data {
         var request = request
         request.timeoutInterval = timeout ?? Self.requestTimeout
         let (data, response) = try await URLSession.shared.data(for: request)
@@ -3995,10 +5479,11 @@ private final class E2ENode {
             let status = (response as? HTTPURLResponse)?.statusCode ?? 0
             throw E2EHTTPError(
                 status: status,
-                body: String(decoding: data, as: UTF8.self)
+                body: "\(request.httpMethod ?? "HTTP") \(request.url?.path ?? "request"): "
+                    + String(decoding: data, as: UTF8.self)
             )
         }
-        return try JSONDecoder().decode(Response.self, from: data)
+        return data
     }
 
     private func launchArguments() -> [String] {
@@ -4126,6 +5611,13 @@ private enum E2EBinary {
         try executable(environment: "E2E_MINER_BIN", product: "lattice-miner")
     }
 
+    static func latticeProofVerifier() throws -> URL {
+        try executable(
+            environment: "E2E_PROOF_VERIFIER_BIN",
+            product: "lattice-proof-verifier"
+        )
+    }
+
     private static func executable(
         environment variable: String,
         product: String
@@ -4154,7 +5646,14 @@ private enum E2EBinary {
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .deletingLastPathComponent()
-        let binary = repository.appendingPathComponent(".build/debug/\(product)")
+        #if DEBUG
+        let configuration = "debug"
+        #else
+        let configuration = "release"
+        #endif
+        let binary = repository.appendingPathComponent(
+            ".build/\(configuration)/\(product)"
+        )
         guard FileManager.default.isExecutableFile(atPath: binary.path) else {
             throw E2EHTTPError(
                 status: 0,

@@ -86,4 +86,5 @@ fi
 export LATTICE_TSAN_STRESS=1
 export TSAN_OPTIONS="${TSAN_OPTIONS:-halt_on_error=1:exitcode=66:history_size=7}"
 
-swift test --sanitize thread --filter NetworkTrustTests
+swift test --sanitize thread --filter \
+    'NetworkTrustTests|ChainProcessTests|ChainServiceTests|MiningAndTransactionPoolTests|LatticeMiningCoordinatorTests'
