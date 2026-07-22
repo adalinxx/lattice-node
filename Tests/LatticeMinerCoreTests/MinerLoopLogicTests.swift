@@ -113,4 +113,53 @@ final class MinerLoopLogicTests: XCTestCase {
         XCTAssertEqual(sealed.postState.rawCID, block.postState.rawCID)
         XCTAssertNotEqual(sealed.proofOfWorkHash(), block.proofOfWorkHash())
     }
+
+    func testMinerHashExactlyMatchesLatticeConsensus() async throws {
+        let fetcher = InMemoryContentSource([:])
+        let block = try await BlockBuilder.buildGenesis(
+            spec: testSpec(),
+            timestamp: 1,
+            target: UInt256.max,
+            fetcher: fetcher
+        )
+        let midstate = ProofOfWork.midstate(for: block)
+
+        for nonce in [UInt64(0), 1, 42, .max] {
+            XCTAssertEqual(
+                ProofOfWork.hash(midstate: midstate, nonce: nonce),
+                ProofOfWork.withNonce(block, nonce: nonce).proofOfWorkHash()
+            )
+        }
+    }
+
+    func testProofOfWorkSearchBatchWrapsAcrossUInt64Maximum() async throws {
+        let fetcher = InMemoryContentSource([:])
+        for timestamp in 1...64 {
+            let block = try await BlockBuilder.buildGenesis(
+                spec: testSpec(),
+                timestamp: Int64(timestamp),
+                target: UInt256.max,
+                fetcher: fetcher
+            )
+            let midstate = ProofOfWork.midstate(for: block)
+            let beforeWrap = ProofOfWork.hash(
+                midstate: midstate,
+                nonce: UInt64.max
+            )
+            let afterWrap = ProofOfWork.hash(midstate: midstate, nonce: 0)
+            guard beforeWrap > afterWrap else { continue }
+
+            XCTAssertEqual(
+                ProofOfWork.searchBatch(
+                    midstate: midstate,
+                    target: afterWrap,
+                    startNonce: UInt64.max,
+                    count: 2
+                ),
+                0
+            )
+            return
+        }
+        XCTFail("could not construct a wrap-crossing nonce test vector")
+    }
 }

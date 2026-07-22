@@ -44,6 +44,9 @@ struct LatticeMiningCoordinatorTool: AsyncParsableCommand {
     @Flag(name: .long, help: "Disable the best-effort freshness probe for this run.")
     var noStaleProbe = false
 
+    @Flag(name: .long, help: "Mine one pending child deployment subtree instead of normal work.")
+    var deployment = false
+
     func run() async throws {
         guard let apiBaseURL = URL(string: node) else {
             throw ValidationError("Invalid --node URL: \(node)")
@@ -53,7 +56,10 @@ struct LatticeMiningCoordinatorTool: AsyncParsableCommand {
             ?? (workerExecutable == nil ? 10_000 : 2_000_000_000)
         let client = HTTPMiningCoordinatorNodeClient(
             apiBaseURL: apiBaseURL,
-            templateRequestBody: try Self.loadTemplateRequest(path: rewardsFile)
+            templateRequestBody: try Self.loadTemplateRequest(
+                path: rewardsFile,
+                deployment: deployment
+            )
         )
 
         let coordinatorWorkers = try makeWorkers(count: workerCount)
@@ -85,7 +91,7 @@ struct LatticeMiningCoordinatorTool: AsyncParsableCommand {
             try failClosedIfNeeded(result)
             switch result {
             case .backoff, .nodeFailed:
-                try? await Task.sleep(for: .milliseconds(250))
+                try? await Task.sleep(nanoseconds: 250_000_000)
             case .noSolution(let workId):
                 print("No nonce in batch work=\(String(workId.prefix(16)))...")
             case .workerFailed(let workId, let workerId, let error):
@@ -98,7 +104,7 @@ struct LatticeMiningCoordinatorTool: AsyncParsableCommand {
                     "disposition=\(submission.disposition) accepted=\(submission.accepted)"
                 )
                 if !submission.accepted {
-                    try? await Task.sleep(for: .milliseconds(250))
+                    try? await Task.sleep(nanoseconds: 250_000_000)
                 }
             }
         }
@@ -162,7 +168,10 @@ struct LatticeMiningCoordinatorTool: AsyncParsableCommand {
         }
     }
 
-    private static func loadTemplateRequest(path: String?) throws -> Data {
+    private static func loadTemplateRequest(
+        path: String?,
+        deployment: Bool
+    ) throws -> Data {
         let data: Data
         if let path {
             data = try Data(contentsOf: URL(fileURLWithPath: path))
@@ -170,12 +179,14 @@ struct LatticeMiningCoordinatorTool: AsyncParsableCommand {
             data = Data(#"{"rewards":[]}"#.utf8)
         }
         guard data.count <= 1 << 20,
-              let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              var object = try JSONSerialization.jsonObject(with: data)
+                as? [String: Any],
               object["rewards"] is [Any] else {
             throw ValidationError(
                 "--rewards-file must be a JSON {\"rewards\":[...]} request no larger than 1 MiB"
             )
         }
-        return data
+        if deployment { object["mode"] = "deployment" }
+        return try JSONSerialization.data(withJSONObject: object)
     }
 }

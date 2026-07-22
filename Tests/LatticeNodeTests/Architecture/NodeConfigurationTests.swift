@@ -19,6 +19,12 @@ final class NodeConfigurationTests: XCTestCase {
         ]))
         XCTAssertNotNil(ChainAddress(["Nexus", "line\nbreak"]))
         XCTAssertNil(ChainAddress(["Nexus", "has/slash"]))
+        XCTAssertNil(ChainAddress(["Payments"]))
+        XCTAssertThrowsError(try ChainHello(
+            nexusGenesisCID: NexusGenesis.expectedBlockHash,
+            chainPath: ["Payments"],
+            minimumRootWorkHex: String(repeating: "0", count: 63) + "1"
+        ).encode())
     }
 
     func testConfigurationRejectsPathWhoseCanonicalHandshakeIsOversized() throws {
@@ -58,6 +64,30 @@ final class NodeConfigurationTests: XCTestCase {
         )) { error in
             XCTAssertEqual(error as? NodeConfigurationError, .invalidPorts)
         }
+    }
+
+    func testSigningKeyRecreatesConfiguredIdentity() throws {
+        let configuration = try NodeConfiguration(
+            chainPath: ["Nexus"],
+            minimumRootWork: UInt256(1),
+            storagePath: URL(fileURLWithPath: "/tmp/lattice-node-test"),
+            privateKeyHex: String(repeating: "01", count: 32)
+        )
+        let message = Data("lattice".utf8)
+        let first = configuration.signingKey
+        let second = configuration.signingKey
+
+        XCTAssertEqual(first.rawRepresentation, second.rawRepresentation)
+        XCTAssertEqual(
+            try PeerKey(rawRepresentation: first.publicKey.rawRepresentation).hex,
+            configuration.processPublicKey
+        )
+        XCTAssertTrue(
+            second.publicKey.isValidSignature(
+                try first.signature(for: message),
+                for: message
+            )
+        )
     }
 
     func testChildRequiresDialableAuthenticatedParent() throws {

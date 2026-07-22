@@ -152,7 +152,7 @@ public actor MiningCoordinator {
     private let workers: [MiningCoordinatorWorker]
     private let totalBatchSize: UInt64
     private let staleProbeEnabled: Bool
-    private let retryBackoffDelay: Duration
+    private let retryBackoffNanoseconds: UInt64
     private let maxSubmitRetries: Int
     private var nextNonceOffset: UInt64
     private var nonceWorkId: String?
@@ -173,7 +173,7 @@ public actor MiningCoordinator {
         self.totalBatchSize = max(totalBatchSize, 1)
         self.nextNonceOffset = nonceOffset
         self.staleProbeEnabled = staleProbeEnabled
-        self.retryBackoffDelay = retryBackoffDelay
+        self.retryBackoffNanoseconds = Self.nanoseconds(retryBackoffDelay)
         self.maxSubmitRetries = max(maxSubmitRetries, 0)
     }
 
@@ -206,18 +206,15 @@ public actor MiningCoordinator {
         while !Task.isCancelled {
             let result = await runBatch()
             guard !Task.isCancelled else { break }
-            if case .backoff = result {
+            switch result {
+            case .backoff, .nodeFailed:
                 do {
-                    try await Task.sleep(for: retryBackoffDelay)
+                    try await Task.sleep(nanoseconds: retryBackoffNanoseconds)
                 } catch {
                     break
                 }
-            } else if case .nodeFailed = result {
-                do {
-                    try await Task.sleep(for: retryBackoffDelay)
-                } catch {
-                    break
-                }
+            default:
+                break
             }
         }
     }
@@ -354,7 +351,7 @@ public actor MiningCoordinator {
                 }
                 metricsState.retryBackoffCount += 1
                 do {
-                    try await Task.sleep(for: retryBackoffDelay)
+                    try await Task.sleep(nanoseconds: retryBackoffNanoseconds)
                 } catch {
                     // Cancellation: abandon without a duplicate POST.
                     return .submitted(
@@ -388,6 +385,17 @@ public actor MiningCoordinator {
         case .nonHTTPResponse, .invalidSubmissionResponse:
             return false
         }
+    }
+
+    private static func nanoseconds(_ duration: Duration) -> UInt64 {
+        let components = duration.components
+        guard components.seconds >= 0, components.attoseconds >= 0 else { return 0 }
+        let seconds = UInt64(components.seconds)
+        let nanoseconds = UInt64(components.attoseconds / 1_000_000_000)
+        let (scaled, overflow) = seconds.multipliedReportingOverflow(by: 1_000_000_000)
+        if overflow { return UInt64.max }
+        let (total, additionOverflow) = scaled.addingReportingOverflow(nanoseconds)
+        return additionOverflow ? UInt64.max : total
     }
 
     private func assignRanges(workerCount: Int) -> [NonceSearchRange] {
@@ -503,6 +511,11 @@ public final class HTTPMiningCoordinatorNodeClient: MiningCoordinatorNodeClient 
         }
         if http.statusCode == 401 || http.statusCode == 403 {
             throw MiningCoordinatorNodeClientError.unauthorized(statusCode: http.statusCode)
+        }
+        guard http.statusCode < 500 else {
+            throw MiningCoordinatorNodeClientError.invalidSubmissionResponse(
+                statusCode: http.statusCode
+            )
         }
         struct Response: Decodable {
             let accepted: Bool

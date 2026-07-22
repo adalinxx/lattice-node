@@ -9,29 +9,42 @@ enum NodeNetworkTopic {
 
     static let overlayHello = "lattice.overlay.hello.v1"
     static let blockAnnouncement = "lattice.overlay.block.v1"
+    static let transactionAvailable = "lattice.overlay.transaction.available.v1"
+    static let transactionInventoryRequest =
+        "lattice.overlay.transaction.inventory.request.v1"
+    static let transactionInventoryResponse =
+        "lattice.overlay.transaction.inventory.response.v1"
     static let predecessorRequest = "lattice.overlay.predecessor.v1"
+    static let acceptedLeavesRequest = "lattice.overlay.accepted-leaves.request.v1"
+    static let acceptedLeavesResponse = "lattice.overlay.accepted-leaves.response.v1"
+    static let portableAttachmentAvailable =
+        "lattice.overlay.portable-attachment.available.v1"
+    static let portableAttachmentIndexRequest =
+        "lattice.overlay.portable-attachment.index.request.v1"
+    static let portableAttachmentIndexResponse =
+        "lattice.overlay.portable-attachment.index.response.v1"
     static let hierarchyHello = "lattice.hierarchy.hello.v1"
-    static let childEvidenceRequest = "lattice.hierarchy.evidence.request.v1"
-    static let childEvidenceResponse = "lattice.hierarchy.evidence.response.v1"
     static let childEvidenceAvailable = "lattice.hierarchy.evidence.available.v1"
     static let childEvidenceIndexRequest = "lattice.hierarchy.evidence.index.request.v1"
     static let childEvidenceIndexResponse = "lattice.hierarchy.evidence.index.response.v1"
-    static let childProofRootsRequest = "lattice.hierarchy.proof-roots.request.v1"
-    static let childProofRootsResponse = "lattice.hierarchy.proof-roots.response.v1"
     static let childCandidateRequest = "lattice.hierarchy.child-candidate.request.v1"
     static let childCandidateResponse = "lattice.hierarchy.child-candidate.response.v1"
-    static let coverageRequest = "lattice.hierarchy.coverage.v1"
-    static let inheritedWorkResponse = "lattice.hierarchy.inherited-work.v1"
+    static let securingWorkPush = "lattice.hierarchy.securing-work.push.v1"
+    static let inheritedWorkPush = securingWorkPush
 
     static func plane(for topic: String) -> Plane? {
         switch topic {
-        case overlayHello, blockAnnouncement, predecessorRequest: .overlay
-        case hierarchyHello, childEvidenceRequest, childEvidenceResponse,
-             childEvidenceAvailable,
+        case overlayHello, blockAnnouncement, transactionAvailable,
+             transactionInventoryRequest, transactionInventoryResponse,
+             predecessorRequest,
+             acceptedLeavesRequest, acceptedLeavesResponse,
+             portableAttachmentAvailable,
+             portableAttachmentIndexRequest,
+             portableAttachmentIndexResponse: .overlay
+        case hierarchyHello, childEvidenceAvailable,
              childEvidenceIndexRequest, childEvidenceIndexResponse,
-             childProofRootsRequest, childProofRootsResponse,
              childCandidateRequest, childCandidateResponse,
-             coverageRequest, inheritedWorkResponse: .hierarchy
+             securingWorkPush: .hierarchy
         default: nil
         }
     }
@@ -84,6 +97,54 @@ struct BlockAnnouncementMessage: NodeJSONMessage, Equatable, Sendable {
     }
 }
 
+/// Announces one complete transaction Volume. The exact authenticated
+/// advertiser is the first retrieval target; validity still comes from
+/// content addressing and Lattice preflight.
+struct TransactionAvailableMessage: NodeJSONMessage, Equatable, Sendable {
+    let volumeRootCID: String
+
+    func validate() throws {
+        guard _isBoundedWireAtom(volumeRootCID) else {
+            throw NodeNetworkWireError.malformed
+        }
+    }
+}
+
+struct TransactionInventoryRequestMessage: NodeJSONMessage, Equatable, Sendable {
+    let requestID: UInt64
+    let afterRootCID: String?
+
+    func validate() throws {
+        guard requestID != 0,
+              afterRootCID.map({ _isBoundedWireAtom($0) }) ?? true else {
+            throw NodeNetworkWireError.malformed
+        }
+    }
+}
+
+struct TransactionInventoryResponseMessage: NodeJSONMessage, Equatable, Sendable {
+    static let maximumRoots = 64
+
+    let requestID: UInt64
+    let afterRootCID: String?
+    let volumeRootCIDs: [String]
+    let hasMore: Bool
+
+    func validate() throws {
+        guard requestID != 0,
+              afterRootCID.map({ _isBoundedWireAtom($0) }) ?? true,
+              volumeRootCIDs.count <= Self.maximumRoots,
+              volumeRootCIDs == Array(Set(volumeRootCIDs)).sorted(),
+              volumeRootCIDs.allSatisfy({ _isBoundedWireAtom($0) }),
+              volumeRootCIDs.allSatisfy({ cid in
+                  afterRootCID.map({ cid > $0 }) ?? true
+              }),
+              !hasMore || volumeRootCIDs.count == Self.maximumRoots else {
+            throw NodeNetworkWireError.malformed
+        }
+    }
+}
+
 struct PredecessorRequestMessage: NodeJSONMessage, Equatable, Sendable {
     let predecessorCID: String
 
@@ -94,249 +155,160 @@ struct PredecessorRequestMessage: NodeJSONMessage, Equatable, Sendable {
     }
 }
 
-enum ChildEvidenceRequestKind: String, Codable, Sendable {
-    case proof
-    case parentCarrier
-    case parentGenesis
-}
-
-struct ChildEvidenceRequestMessage: NodeJSONMessage, Equatable, Sendable {
+/// A paginated inventory of accepted-forest leaves. Every retained accepted
+/// block is an ancestor of one leaf, so ordinary predecessor pulls reconstruct
+/// the complete graph without trusting remote aggregate state.
+struct AcceptedLeavesRequestMessage: NodeJSONMessage, Equatable, Sendable {
     let requestID: UInt64
-    let childPath: [String]
-    let childCID: String
-    let kind: ChildEvidenceRequestKind
-    let proofRootCID: String?
-    let carrierCID: String?
-    let rootCID: String?
-    let directory: String?
-    let childGenesisCID: String?
+    let afterCID: String?
+    /// The first page fixes a durable admission sequence; following pages use
+    /// it so a changing forest cannot move a branch behind the CID cursor.
+    let snapshotSequence: Int64?
 
-    init?(
+    init(
         requestID: UInt64,
-        requirement: CrossChainEvidenceRequirement,
-        expectedChildPath: [String],
-        expectedChildCID: String,
-        proofRootCID: String?
+        afterCID: String?,
+        snapshotSequence: Int64? = nil
     ) {
         self.requestID = requestID
-        childPath = expectedChildPath
-        childCID = expectedChildCID
-        self.proofRootCID = proofRootCID
-        switch requirement {
-        case .childProof(let path, let cid):
-            guard path == expectedChildPath, cid == expectedChildCID else { return nil }
-            kind = .proof
-            carrierCID = nil
-            rootCID = nil
-            directory = nil
-            childGenesisCID = nil
-        case .parentCarrier(let parentPath, let carrier, let root):
-            guard parentPath == Array(expectedChildPath.dropLast()) else { return nil }
-            kind = .parentCarrier
-            carrierCID = carrier
-            rootCID = root
-            directory = nil
-            childGenesisCID = nil
-        case .parentGenesis(let parentPath, let childDirectory, let genesisCID):
-            guard parentPath == Array(expectedChildPath.dropLast()),
-                  childDirectory == expectedChildPath.last else { return nil }
-            kind = .parentGenesis
-            carrierCID = nil
-            rootCID = nil
-            directory = childDirectory
-            childGenesisCID = genesisCID
-        }
-        guard (try? validate()) != nil else { return nil }
+        self.afterCID = afterCID
+        self.snapshotSequence = snapshotSequence
     }
 
     func validate() throws {
         guard requestID != 0,
-              _isAbsoluteChainPath(childPath),
-              childPath.count > 1,
-              _isBoundedWireAtom(childCID) else {
+              snapshotSequence.map({ $0 >= 0 }) ?? true,
+              afterCID.map({ _isBoundedWireAtom($0) }) ?? true else {
             throw NodeNetworkWireError.malformed
         }
-        let valid: Bool
-        switch kind {
-        case .proof:
-            valid = (proofRootCID.map({ _isBoundedWireAtom($0) }) ?? true)
-                && carrierCID == nil && rootCID == nil
-                && directory == nil && childGenesisCID == nil
-        case .parentCarrier:
-            valid = proofRootCID.map({ _isBoundedWireAtom($0) }) == true
-                && rootCID == proofRootCID
-                && carrierCID.map({ _isBoundedWireAtom($0) }) == true
-                && rootCID.map({ _isBoundedWireAtom($0) }) == true
-                && directory == nil && childGenesisCID == nil
-        case .parentGenesis:
-            valid = proofRootCID.map({ _isBoundedWireAtom($0) }) == true
-                && carrierCID == nil && rootCID == nil
-                && directory == childPath.last
-                && directory.map({ !$0.isEmpty && $0.utf8.count <= Int(UInt16.max) }) == true
-                && childGenesisCID.map({ _isBoundedWireAtom($0) }) == true
-        }
-        guard valid else { throw NodeNetworkWireError.malformed }
     }
 }
 
-struct ChildEvidenceResponseMessage: Sendable {
-    static let maximumAcquisitionEntries = Int(UInt16.max)
+struct AcceptedLeavesResponseMessage: NodeJSONMessage, Equatable, Sendable {
+    /// One inventory page is deliberately small enough to fit the receiver's
+    /// per-peer low-priority admission budget.
+    static let maximumLeaves = 64
 
     let requestID: UInt64
-    let childCID: String
-    let candidateData: Data?
-    let acquisitionEntries: [String: Data]
-    let envelope: ChildValidationPackageEnvelope
+    let afterCID: String?
+    let snapshotSequence: Int64
+    let blockCIDs: [String]
+    let hasMore: Bool
 
     init(
         requestID: UInt64,
-        childCID: String,
-        candidateData: Data? = nil,
-        acquisitionEntries: [String: Data] = [:],
-        envelope: ChildValidationPackageEnvelope
+        afterCID: String?,
+        snapshotSequence: Int64,
+        blockCIDs: [String],
+        hasMore: Bool
     ) {
         self.requestID = requestID
-        self.childCID = childCID
-        self.candidateData = candidateData
-        self.acquisitionEntries = acquisitionEntries
-        self.envelope = envelope
+        self.afterCID = afterCID
+        self.snapshotSequence = snapshotSequence
+        self.blockCIDs = blockCIDs
+        self.hasMore = hasMore
     }
 
-    func encoded() throws -> Data {
-        guard requestID != 0, _isBoundedWireAtom(childCID),
-              candidateData.map({ !$0.isEmpty }) ?? true,
-              acquisitionEntries.count <= Self.maximumAcquisitionEntries,
-              acquisitionEntries[childCID].map({ entry in
-                  candidateData.map({ $0 == entry }) ?? true
-              }) ?? true else {
+    func validate() throws {
+        guard requestID != 0,
+              snapshotSequence >= 0,
+              afterCID.map({ _isBoundedWireAtom($0) }) ?? true,
+              blockCIDs.count <= Self.maximumLeaves,
+              blockCIDs == Array(Set(blockCIDs)).sorted(),
+              blockCIDs.allSatisfy({ _isBoundedWireAtom($0) }),
+              blockCIDs.allSatisfy({ cid in afterCID.map({ cid > $0 }) ?? true }),
+              !hasMore || blockCIDs.count == Self.maximumLeaves else {
             throw NodeNetworkWireError.malformed
         }
-        let childBytes = Data(childCID.utf8)
-        let candidateBytes = candidateData ?? Data()
-        let envelopeBytes = try envelope.encode()
-        let sortedEntries = acquisitionEntries.sorted { $0.key < $1.key }
-        var framedEntryBytes = 0
-        for (cid, entry) in sortedEntries {
-            guard _isBoundedWireAtom(cid),
-                  !entry.isEmpty,
-                  entry.count <= Int(UInt32.max) else {
-                throw NodeNetworkWireError.malformed
-            }
-            framedEntryBytes += 6 + cid.utf8.count + entry.count
-        }
-        guard childBytes.count <= Int(UInt16.max),
-              candidateBytes.count <= Int(UInt32.max),
-              framedEntryBytes <= ChildAcquisitionPackage.maximumBytes,
-              16 + childBytes.count + candidateBytes.count
-                + framedEntryBytes + envelopeBytes.count
-                <= _maximumNodeMessageSize else {
-            throw NodeNetworkWireError.oversized
-        }
-        var data = Data(
-            capacity: 16 + childBytes.count + candidateBytes.count
-                + framedEntryBytes + envelopeBytes.count
-        )
-        data.appendUInt64(requestID)
-        data.appendUInt16(UInt16(childBytes.count))
-        data.append(childBytes)
-        data.appendUInt32(UInt32(candidateBytes.count))
-        data.append(candidateBytes)
-        data.appendUInt16(UInt16(sortedEntries.count))
-        for (cid, entry) in sortedEntries {
-            let cidBytes = Data(cid.utf8)
-            data.appendUInt16(UInt16(cidBytes.count))
-            data.append(cidBytes)
-            data.appendUInt32(UInt32(entry.count))
-            data.append(entry)
-        }
-        data.append(envelopeBytes)
-        return data
     }
+}
 
-    static func decoded(_ data: Data) throws -> Self {
-        guard data.count <= _maximumNodeMessageSize else {
-            throw NodeNetworkWireError.oversized
-        }
-        var position = data.startIndex
-        guard let requestID = data.readUInt64(at: &position), requestID != 0,
-              let childLength = data.readUInt16(at: &position),
-              data.distance(from: position, to: data.endIndex) > Int(childLength) else {
-            throw NodeNetworkWireError.malformed
-        }
-        let childEnd = data.index(position, offsetBy: Int(childLength))
-        guard let childCID = String(data: data[position..<childEnd], encoding: .utf8),
-              _isBoundedWireAtom(childCID) else {
-            throw NodeNetworkWireError.malformed
-        }
-        position = childEnd
-        guard let candidateLength = data.readUInt32(at: &position),
-              data.distance(from: position, to: data.endIndex)
-                > Int(candidateLength) else {
-            throw NodeNetworkWireError.malformed
-        }
-        let candidateEnd = data.index(position, offsetBy: Int(candidateLength))
-        let candidateData = candidateLength == 0
-            ? nil
-            : Data(data[position..<candidateEnd])
-        position = candidateEnd
-        guard let entryCount = data.readUInt16(at: &position),
-              Int(entryCount) <= Self.maximumAcquisitionEntries else {
-            throw NodeNetworkWireError.malformed
-        }
-        var acquisitionEntries: [String: Data] = [:]
-        acquisitionEntries.reserveCapacity(Int(entryCount))
-        for _ in 0..<entryCount {
-            guard let cid = data.readString(at: &position),
-                  _isBoundedWireAtom(cid),
-                  let entry = data.readUInt32Bytes(at: &position),
-                  !entry.isEmpty,
-                  acquisitionEntries[cid] == nil else {
-                throw NodeNetworkWireError.malformed
-            }
-            acquisitionEntries[cid] = entry
-        }
-        guard position < data.endIndex else {
-            throw NodeNetworkWireError.malformed
-        }
-        let envelope = try ChildValidationPackageEnvelope.decode(Data(data[position...]))
-        let message = Self(
-            requestID: requestID,
-            childCID: childCID,
-            candidateData: candidateData,
-            acquisitionEntries: acquisitionEntries,
-            envelope: envelope
-        )
-        guard try message.encoded() == data else {
-            throw NodeNetworkWireError.nonCanonical
-        }
-        return message
-    }
+/// One physical outer-root attachment for a root-independent direct child
+/// edge. The edge CID addresses the canonical direct-edge object; `rootCID`
+/// identifies the upstream proof context; `attachmentCID` is its CAS manifest.
+struct PortableAttachmentSummary: Codable, Equatable, Hashable, Sendable {
+    let edgeCID: String
+    let rootCID: String
+    let attachmentCID: String
 
-    static func maximumAcquisitionBytes(
-        childCID: String,
-        candidateByteCount: Int = 0,
-        envelopeByteCount: Int
-    ) -> Int {
-        min(
-            ChildAcquisitionPackage.maximumBytes,
-            max(
-                0,
-                _maximumNodeMessageSize - 16 - childCID.utf8.count
-                    - candidateByteCount - envelopeByteCount
-            )
-        )
+    fileprivate var isValid: Bool {
+        _isCanonicalWireCID(edgeCID)
+            && _isCanonicalWireCID(rootCID)
+            && _isCanonicalWireCID(attachmentCID)
     }
+}
+
+struct PortableAttachmentAvailableMessage: NodeJSONMessage, Equatable, Sendable {
+    let edgeCID: String
+    let rootCID: String
+    let attachmentCID: String
+
+    func validate() throws {
+        guard PortableAttachmentSummary(
+            edgeCID: edgeCID,
+            rootCID: rootCID,
+            attachmentCID: attachmentCID
+        ).isValid else {
+            throw NodeNetworkWireError.malformed
+        }
+    }
+}
+
+struct PortableAttachmentIndexRequestMessage: NodeJSONMessage, Equatable, Sendable {
+    let requestID: UInt64
+    let after: PortableAttachmentSummary?
+
+    func validate() throws {
+        guard requestID != 0, after?.isValid ?? true else {
+            throw NodeNetworkWireError.malformed
+        }
+    }
+}
+
+struct PortableAttachmentIndexResponseMessage: NodeJSONMessage, Equatable, Sendable {
+    static let maximumEntries = 1
+
+    let requestID: UInt64
+    let after: PortableAttachmentSummary?
+    let entries: [PortableAttachmentSummary]
+    let hasMore: Bool
+
+    func validate() throws {
+        let sorted = entries.sorted {
+            ($0.edgeCID, $0.rootCID) < ($1.edgeCID, $1.rootCID)
+        }
+        guard requestID != 0,
+              after?.isValid ?? true,
+              entries.count <= Self.maximumEntries,
+              entries == sorted,
+              Set(entries).count == entries.count,
+              entries.allSatisfy({ entry in
+                  entry.isValid && (after.map({ cursor in
+                      (entry.edgeCID, entry.rootCID)
+                          > (cursor.edgeCID, cursor.rootCID)
+                  }) ?? true)
+              }),
+              !hasMore || !entries.isEmpty else {
+            throw NodeNetworkWireError.malformed
+        }
+    }
+}
+
+private func _isCanonicalWireCID(_ value: String) -> Bool {
+    _isBoundedWireAtom(value) && CIDIdentity.isCanonical(value)
 }
 
 struct ChildEvidenceAvailableMessage: NodeJSONMessage, Equatable, Sendable {
     let childPath: [String]
     let childCID: String
     let rootCID: String
+    let attachmentCID: String
 
     func validate() throws {
         guard _isAbsoluteChainPath(childPath), childPath.count > 1,
-              _isBoundedWireAtom(childCID),
-              _isBoundedWireAtom(rootCID) else {
+              _isCanonicalWireCID(childCID),
+              _isCanonicalWireCID(rootCID),
+              _isCanonicalWireCID(attachmentCID) else {
             throw NodeNetworkWireError.malformed
         }
     }
@@ -351,8 +323,9 @@ struct ChildEvidenceIndexRequestMessage: NodeJSONMessage, Equatable, Sendable {
         guard requestID != 0,
               _isAbsoluteChainPath(childPath), childPath.count > 1,
               after.map({
-                  _isBoundedWireAtom($0.childCID)
-                    && _isBoundedWireAtom($0.rootCID)
+                  _isCanonicalWireCID($0.childCID)
+                    && _isCanonicalWireCID($0.rootCID)
+                    && _isCanonicalWireCID($0.attachmentCID)
               }) ?? true else {
             throw NodeNetworkWireError.malformed
         }
@@ -376,59 +349,18 @@ struct ChildEvidenceIndexResponseMessage: NodeJSONMessage, Equatable, Sendable {
               _isAbsoluteChainPath(childPath), childPath.count > 1,
               entries.count <= Self.maximumEntries,
               entries == sorted,
-              Set(entries).count == entries.count,
+              Set(entries.map { $0.childCID + "\0" + $0.rootCID }).count
+                == entries.count,
               entries.allSatisfy({ entry in
-                  _isBoundedWireAtom(entry.childCID)
-                    && _isBoundedWireAtom(entry.rootCID)
+                  _isCanonicalWireCID(entry.childCID)
+                    && _isCanonicalWireCID(entry.rootCID)
+                    && _isCanonicalWireCID(entry.attachmentCID)
                     && after.map({ cursor in
                         (entry.childCID, entry.rootCID)
                             > (cursor.childCID, cursor.rootCID)
                     }) ?? true
               }),
               !hasMore || !entries.isEmpty else {
-            throw NodeNetworkWireError.malformed
-        }
-    }
-}
-
-struct ChildProofRootsRequestMessage: NodeJSONMessage, Equatable, Sendable {
-    let requestID: UInt64
-    let childPath: [String]
-    let childCID: String
-    let afterRootCID: String?
-
-    func validate() throws {
-        guard requestID != 0,
-              _isAbsoluteChainPath(childPath), childPath.count > 1,
-              _isBoundedWireAtom(childCID),
-              afterRootCID.map({ _isBoundedWireAtom($0) }) ?? true else {
-            throw NodeNetworkWireError.malformed
-        }
-    }
-}
-
-struct ChildProofRootsResponseMessage: NodeJSONMessage, Equatable, Sendable {
-    static let maximumRoots = 256
-
-    let requestID: UInt64
-    let childPath: [String]
-    let childCID: String
-    let afterRootCID: String?
-    let rootCIDs: [String]
-    let hasMore: Bool
-
-    func validate() throws {
-        guard requestID != 0,
-              _isAbsoluteChainPath(childPath), childPath.count > 1,
-              _isBoundedWireAtom(childCID),
-              afterRootCID.map({ _isBoundedWireAtom($0) }) ?? true,
-              rootCIDs.count <= Self.maximumRoots,
-              rootCIDs == Array(Set(rootCIDs)).sorted(),
-              rootCIDs.allSatisfy({ _isBoundedWireAtom($0) }),
-              rootCIDs.allSatisfy({ root in
-                  afterRootCID.map({ root > $0 }) ?? true
-              }),
-              !hasMore || !rootCIDs.isEmpty else {
             throw NodeNetworkWireError.malformed
         }
     }
@@ -443,10 +375,29 @@ struct ChildCandidateRequestMessage: Sendable {
 
     let requestID: UInt64
     let budgetMilliseconds: UInt32
+    let mode: MiningMode
     let childPath: [String]
     let parentCID: String
     let parentData: Data
     let rewards: [MiningReward]
+
+    init(
+        requestID: UInt64,
+        budgetMilliseconds: UInt32,
+        mode: MiningMode = .normal,
+        childPath: [String],
+        parentCID: String,
+        parentData: Data,
+        rewards: [MiningReward]
+    ) {
+        self.requestID = requestID
+        self.budgetMilliseconds = budgetMilliseconds
+        self.mode = mode
+        self.childPath = childPath
+        self.parentCID = parentCID
+        self.parentData = parentData
+        self.rewards = rewards
+    }
 
     func encoded() throws -> Data {
         guard requestID != 0,
@@ -469,7 +420,7 @@ struct ChildCandidateRequestMessage: Sendable {
               rewardBytes.count <= Int(UInt32.max) else {
             throw NodeNetworkWireError.malformed
         }
-        let size = 12 + 2 + pathBytes.reduce(0) { $0 + 2 + $1.count }
+        let size = 13 + 2 + pathBytes.reduce(0) { $0 + 2 + $1.count }
             + 2 + parentBytes.count + 4 + rewardBytes.count
             + 4 + parentData.count
         guard size <= Self.maximumEncodedBytes else {
@@ -478,6 +429,7 @@ struct ChildCandidateRequestMessage: Sendable {
         var data = Data(capacity: size)
         data.appendUInt64(requestID)
         data.appendUInt32(budgetMilliseconds)
+        data.append(mode == .normal ? 0 : 1)
         data.appendUInt16(UInt16(pathBytes.count))
         for component in pathBytes {
             data.appendUInt16(UInt16(component.count))
@@ -499,6 +451,17 @@ struct ChildCandidateRequestMessage: Sendable {
         var position = data.startIndex
         guard let requestID = data.readUInt64(at: &position), requestID != 0,
               let budgetMilliseconds = data.readUInt32(at: &position),
+              position < data.endIndex else {
+            throw NodeNetworkWireError.malformed
+        }
+        let mode: MiningMode
+        switch data[position] {
+        case 0: mode = .normal
+        case 1: mode = .deployment
+        default: throw NodeNetworkWireError.malformed
+        }
+        position = data.index(after: position)
+        guard
               let pathCount = data.readUInt16(at: &position), pathCount > 1 else {
             throw NodeNetworkWireError.malformed
         }
@@ -552,6 +515,7 @@ struct ChildCandidateRequestMessage: Sendable {
         let message = Self(
             requestID: requestID,
             budgetMilliseconds: budgetMilliseconds,
+            mode: mode,
             childPath: childPath,
             parentCID: parentCID,
             parentData: Data(data[position...]),
@@ -572,8 +536,29 @@ struct ChildCandidateResponseMessage: Sendable {
     let parentCID: String
     let childCID: String
     let searchTarget: UInt256
+    let deploymentTarget: UInt256?
     let blockData: Data
     let acquisitionEntries: [String: Data]
+
+    init(
+        requestID: UInt64,
+        childPath: [String],
+        parentCID: String,
+        childCID: String,
+        searchTarget: UInt256,
+        deploymentTarget: UInt256? = nil,
+        blockData: Data,
+        acquisitionEntries: [String: Data]
+    ) {
+        self.requestID = requestID
+        self.childPath = childPath
+        self.parentCID = parentCID
+        self.childCID = childCID
+        self.searchTarget = searchTarget
+        self.deploymentTarget = deploymentTarget
+        self.blockData = blockData
+        self.acquisitionEntries = acquisitionEntries
+    }
 
     func encoded() throws -> Data {
         guard requestID != 0,
@@ -582,8 +567,10 @@ struct ChildCandidateResponseMessage: Sendable {
               _isBoundedWireAtom(parentCID), _isBoundedWireAtom(childCID),
               searchTarget > .zero,
               blockData.count <= Int(UInt32.max),
-              let block = _contentBoundBlock(cid: childCID, data: blockData),
-              searchTarget >= block.target,
+              _contentBoundBlock(cid: childCID, data: blockData) != nil,
+              deploymentTarget.map({
+                  $0 > .zero && searchTarget <= $0
+              }) ?? true,
               let package = try? ChildAcquisitionPackage(
                   entries: acquisitionEntries,
                   childCID: childCID,
@@ -596,13 +583,17 @@ struct ChildCandidateResponseMessage: Sendable {
         let parentBytes = Data(parentCID.utf8)
         let childBytes = Data(childCID.utf8)
         let targetBytes = Data(searchTarget.toHexString().utf8)
+        let deploymentBytes = deploymentTarget.map {
+            Data($0.toHexString().utf8)
+        }
         let extraEntries = acquisitionEntries
             .filter { $0.key != childCID }
             .sorted { $0.key < $1.key }
         guard targetBytes.count == 64 else { throw NodeNetworkWireError.malformed }
         let size = 8 + 2 + pathBytes.reduce(0) { $0 + 2 + $1.count }
             + 2 + parentBytes.count + 2 + childBytes.count
-            + targetBytes.count + 4 + blockData.count + 2
+            + targetBytes.count + 1 + (deploymentBytes?.count ?? 0)
+            + 4 + blockData.count + 2
             + package.framedByteCount - (6 + childBytes.count + blockData.count)
         guard extraEntries.count <= Int(UInt16.max),
               size <= _maximumNodeMessageSize else {
@@ -620,6 +611,8 @@ struct ChildCandidateResponseMessage: Sendable {
         data.appendUInt16(UInt16(childBytes.count))
         data.append(childBytes)
         data.append(targetBytes)
+        data.append(deploymentBytes == nil ? 0 : 1)
+        if let deploymentBytes { data.append(deploymentBytes) }
         data.appendUInt32(UInt32(blockData.count))
         data.append(blockData)
         data.appendUInt16(UInt16(extraEntries.count))
@@ -653,6 +646,29 @@ struct ChildCandidateResponseMessage: Sendable {
             throw NodeNetworkWireError.malformed
         }
         position = targetEnd
+        guard position < data.endIndex else {
+            throw NodeNetworkWireError.malformed
+        }
+        let hasDeploymentTarget = data[position]
+        position = data.index(after: position)
+        let deploymentTarget: UInt256?
+        switch hasDeploymentTarget {
+        case 0:
+            deploymentTarget = nil
+        case 1:
+            guard data.distance(from: position, to: data.endIndex) >= 64 else {
+                throw NodeNetworkWireError.malformed
+            }
+            let end = data.index(position, offsetBy: 64)
+            guard let hex = String(data: data[position..<end], encoding: .utf8),
+                  let target = UInt256.fromHexString(hex) else {
+                throw NodeNetworkWireError.malformed
+            }
+            deploymentTarget = target
+            position = end
+        default:
+            throw NodeNetworkWireError.malformed
+        }
         guard let blockLength = data.readUInt32(at: &position), blockLength > 0,
               data.distance(from: position, to: data.endIndex) > Int(blockLength) else {
             throw NodeNetworkWireError.malformed
@@ -684,6 +700,7 @@ struct ChildCandidateResponseMessage: Sendable {
             parentCID: parentCID,
             childCID: childCID,
             searchTarget: searchTarget,
+            deploymentTarget: deploymentTarget,
             blockData: blockData,
             acquisitionEntries: acquisitionEntries
         )
@@ -694,62 +711,32 @@ struct ChildCandidateResponseMessage: Sendable {
     }
 }
 
-struct ParentCoverageEntry: Codable, Equatable, Sendable {
-    let childBlockCID: String
-    let parentCarrierCIDs: [String]
-}
+/// A child-independent fragment of the configured parent's securing-work
+/// graph. The exact hierarchy session already binds its destination, so the
+/// payload deliberately carries no child path. An empty delta is the ordered
+/// completion marker for its revision.
+struct InheritedWorkPushMessage: NodeJSONMessage, Equatable, Sendable {
+    static let maximumFacts = 256
+    static let maximumEncodedBytes = _maximumNodeMessageSize
 
-struct CoverageRequestMessage: NodeJSONMessage, Equatable, Sendable {
-    static let maximumBindings = 4_096
-
-    let requestID: UInt64
-    let childPath: [String]
-    let entries: [ParentCoverageEntry]
-
-    init(requestID: UInt64, childPath: [String], coverage: [String: Set<String>]) {
-        self.requestID = requestID
-        self.childPath = childPath
-        entries = coverage.map { childCID, parentCIDs in
-            ParentCoverageEntry(
-                childBlockCID: childCID,
-                parentCarrierCIDs: parentCIDs.sorted()
-            )
-        }.sorted { $0.childBlockCID < $1.childBlockCID }
-    }
-
-    var coverage: [String: Set<String>] {
-        Dictionary(uniqueKeysWithValues: entries.map {
-            ($0.childBlockCID, Set($0.parentCarrierCIDs))
-        })
-    }
-
-    func validate() throws {
-        let bindingCount = entries.reduce(0) { $0 + $1.parentCarrierCIDs.count }
-        guard requestID != 0,
-              _isAbsoluteChainPath(childPath), childPath.count > 1,
-              entries.count <= Self.maximumBindings,
-              bindingCount <= Self.maximumBindings,
-              entries == entries.sorted(by: { $0.childBlockCID < $1.childBlockCID }),
-              Set(entries.map(\.childBlockCID)).count == entries.count,
-              entries.allSatisfy({ entry in
-                  _isBoundedWireAtom(entry.childBlockCID)
-                      && !entry.parentCarrierCIDs.isEmpty
-                      && entry.parentCarrierCIDs == Array(Set(entry.parentCarrierCIDs)).sorted()
-                      && entry.parentCarrierCIDs.allSatisfy({ _isBoundedWireAtom($0) })
-              }) else {
-            throw NodeNetworkWireError.malformed
-        }
-    }
-}
-
-struct InheritedWorkResponseMessage: NodeJSONMessage, Equatable, Sendable {
-    let requestID: UInt64
-    let childPath: [String]
     let snapshot: InheritedWorkSnapshot
 
     func validate() throws {
-        guard requestID != 0,
-              _isAbsoluteChainPath(childPath), childPath.count > 1 else {
+        let factCount = snapshot.blockCIDs.reduce(0) {
+            $0 + snapshot.sourceWork(forBlock: $1).grindIDs.count
+        }
+        guard snapshot.revision > 0,
+              factCount <= Self.maximumFacts,
+              snapshot.hasUniqueGrindLocations,
+              snapshot.blockCIDs.allSatisfy({ blockCID in
+                  _isCanonicalWireCID(blockCID)
+                    && !snapshot.sourceWork(forBlock: blockCID).isEmpty
+                    && snapshot.sourceWork(forBlock: blockCID).grindIDs.allSatisfy {
+                        _isCanonicalWireCID($0)
+                            && snapshot.sourceWork(forBlock: blockCID)
+                                .work(forGrind: $0).map { $0 > .zero } == true
+                    }
+              }) else {
             throw NodeNetworkWireError.malformed
         }
     }

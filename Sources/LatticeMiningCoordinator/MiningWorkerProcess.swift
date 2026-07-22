@@ -99,7 +99,7 @@ private final class MiningWorkerSubprocess: @unchecked Sendable {
     /// (e.g. dash `sh -c`) don't reliably propagate SIGTERM to their children,
     /// and on swift-corelibs-foundation a bare `terminate()` does not promptly
     /// reap such a child, so we force-kill after a short grace period.
-    private static let terminationGrace: Duration = .milliseconds(200)
+    private static let terminationGraceNanoseconds: UInt64 = 200_000_000
 
     private let lock = NSLock()
     private var continuation: CheckedContinuation<Void, Never>?
@@ -168,7 +168,9 @@ private final class MiningWorkerSubprocess: @unchecked Sendable {
         // immediately.
         let pid = process.processIdentifier
         Task.detached { [weak self] in
-            try? await Task.sleep(for: MiningWorkerSubprocess.terminationGrace)
+            try? await Task.sleep(
+                nanoseconds: MiningWorkerSubprocess.terminationGraceNanoseconds
+            )
             guard let self else { return }
             let finished = self.withLock { self.didFinish }
             if !finished, self.process.isRunning {

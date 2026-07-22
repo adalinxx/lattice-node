@@ -62,7 +62,8 @@ swift run lattice-node \
 The child starts in `awaitingGenesis`. Create a child intent on the parent,
 submit the separately signed parent `GenesisAction` transaction, and mine the
 parent block that commits it. The authenticated hierarchy plane then delivers
-the genesis proof and activates the child. Genesis is returned as a normal
+the genesis proof. The child becomes active only after that same live parent
+finishes its current inherited-work export. Genesis is returned as a normal
 content-addressed block; there is no opaque serialized bootstrap channel.
 
 ## Mining
@@ -80,6 +81,10 @@ swift run lattice-mining-coordinator \
 `lattice-miner` is deliberately a small worker. It receives one immutable
 block/range assignment, searches nonces, and reports the result. It never owns
 chain state, wallet keys, child topology, proofs, or publication.
+
+Normal templates exclude every transaction containing a `GenesisAction`.
+Run the coordinator with `--deployment` to mine one fully backed pending child
+deployment subtree; repeated deployment rounds rotate across eligible work.
 
 ## HTTP API
 
@@ -99,8 +104,9 @@ See [docs/rpc-api.md](docs/rpc-api.md) for request and response shapes.
 
 ## Nexus genesis
 
-Nexus has one deterministic, unsigned genesis exception. Its sole transaction
-credits the premine and is valid only at the exact pinned genesis CID:
+Nexus starts from one deterministic local bootstrap block. Its sole unsigned
+transaction credits the premine; the node recomputes the block CID locally and
+requires the exact configured value:
 
 `bafyreiayw4z5qz4lt2sljf2enzn7uol3qa6bebadav7qwnqz7agxkiuwhq`
 

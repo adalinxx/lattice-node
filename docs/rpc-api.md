@@ -48,6 +48,8 @@ Both routes return the same chain-process status:
   "nexusGenesisCID": "bafyreiayw4z5qz4lt2sljf2enzn7uol3qa6bebadav7qwnqz7agxkiuwhq",
   "tipCID": "<cid>",
   "height": 42,
+  "revision": 57,
+  "parentWorkRevision": null,
   "mempoolCount": 3,
   "mempoolBytes": 2048,
   "pendingChildIntents": 0
@@ -56,6 +58,13 @@ Both routes return the same chain-process status:
 
 A child reports `phase: "awaitingGenesis"`, with null tip and height, until it
 receives its authenticated genesis link from its immediate parent.
+After bootstrap, a child reports `phase: "awaitingParent"` whenever its live
+configured parent session has not completed the current inherited-work export.
+Its retained tip may still be shown, but it is not operational consensus.
+
+`revision` is the local consensus mutation watermark. `parentWorkRevision` is
+the last inherited-work watermark durably completed from the configured parent;
+it is null on Nexus or before the first parent pass.
 
 ## Transactions
 
@@ -82,8 +91,9 @@ Response:
 }
 ```
 
-The unsigned premine is not a general RPC exception. It is accepted only while
-constructing the exact pinned Nexus genesis block.
+The premine is never accepted through RPC. It exists only in the locally
+constructed Nexus bootstrap block whose recomputed CID matches the configured
+trust anchor.
 
 ## Mining
 
@@ -99,6 +109,7 @@ assembled.
 
 ```json
 {
+  "mode": "normal",
   "rewards": [
     {
       "chainPath": ["Nexus"],
@@ -111,16 +122,24 @@ assembled.
 }
 ```
 
-`rewards` may be empty. Each reward is an externally signed transaction for
-one absolute chain path; process identity is never converted into wallet
-identity.
+`mode` is optional and defaults to `normal`. Normal work excludes all
+`GenesisAction` transactions. `deployment` selects one pending deployment whose
+complete anchor set has matching child intent content, rotating across eligible
+work. Child intents bind one parent state: siblings intended for the same carrier
+belong in one transaction containing all of their `GenesisAction`s. `rewards`
+may be empty. Each reward is an externally signed transaction
+for one absolute chain path; process identity is never converted into wallet
+identity. The coordinator exposes the same choice as `--deployment`.
+When no complete deployment subtree is currently available, the endpoint
+returns `409` so the coordinator backs off instead of mining ordinary work.
 
 Response fields:
 
 - `workID`: CID of the nonce-zero candidate.
 - `block`: the complete candidate block.
-- `searchTarget`: easiest accepted target among the assembled hierarchy,
-  bounded by the configured minimum Nexus-root work.
+- `searchTarget`: the effective threshold the miner must hit. It is bounded by
+  the configured minimum Nexus-root work and, for deployment work, by the
+  hardest pending deployment target in the selected recursive subtree.
 - `chainPath`: always `["Nexus"]` on this route.
 - `expiresInMilliseconds`: template lifetime.
 
@@ -176,6 +195,8 @@ delivers the authenticated genesis link.
 
 - Malformed or invalid requests return `400 Bad Request`.
 - Requests that require an active child before genesis return `409 Conflict`.
+- Consensus-producing requests on a bootstrapped child in `awaitingParent`
+  return `503 Service Unavailable`.
 - A full transaction pool or child-intent capacity returns `429 Too Many
   Requests`.
 - A temporarily unavailable transaction policy returns `503 Service

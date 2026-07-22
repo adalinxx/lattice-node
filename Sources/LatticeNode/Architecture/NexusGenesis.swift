@@ -2,7 +2,7 @@ import Lattice
 import UInt256
 import cashew
 
-/// The one deterministic unsigned transaction allowed by Nexus bootstrap.
+/// The deterministic local bootstrap definition for Nexus.
 public enum NexusGenesis {
     public static let ownerPublicKeyHex =
         "ed01fe416588df6e7fa5213c0d3e430f504bb5203172120c86b874826b55f53bdb7d"
@@ -24,7 +24,7 @@ public enum NexusGenesis {
         target: UInt256.max
     )
 
-    /// Consensus identity of the new unsigned Nexus genesis.
+    /// Canonical identity of the Nexus bootstrap block.
     public static let expectedBlockHash =
         "bafyreiayw4z5qz4lt2sljf2enzn7uol3qa6bebadav7qwnqz7agxkiuwhq"
 

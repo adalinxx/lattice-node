@@ -100,7 +100,7 @@ It initially reports `awaitingGenesis`. On the parent:
 2. Construct and sign a parent transaction with the returned genesis CID in a
    matching `GenesisAction`.
 3. `POST /v1/transactions` with that parent transaction.
-4. Mine the parent carrier.
+4. Mine the parent carrier with `lattice-mining-coordinator --deployment`.
 
 The hierarchy plane delivers the resulting authenticated genesis link to the
 child. The child does not accept opaque genesis bytes on its command line.

@@ -76,6 +76,13 @@ jobs:
       - name: Run tests
         run: swift test
 
+      - name: Run optimized multichain E2E
+        env:
+          E2E_NODE_BIN: ${{ github.workspace }}/.build/release/lattice-node
+          E2E_COORDINATOR_BIN: ${{ github.workspace }}/.build/release/lattice-mining-coordinator
+          E2E_MINER_BIN: ${{ github.workspace }}/.build/release/lattice-miner
+        run: swift test --skip-build --filter LatticeNodeE2ETests
+
       - name: Verify executables run
         run: |
           swift run lattice-node --help
@@ -101,6 +108,13 @@ jobs:
 
       - name: Run tests
         run: swift test
+
+      - name: Run optimized multichain E2E
+        env:
+          E2E_NODE_BIN: ${{ github.workspace }}/.build/release/lattice-node
+          E2E_COORDINATOR_BIN: ${{ github.workspace }}/.build/release/lattice-mining-coordinator
+          E2E_MINER_BIN: ${{ github.workspace }}/.build/release/lattice-miner
+        run: swift test --skip-build --filter LatticeNodeE2ETests
 
       - name: Run tests with code coverage
         run: swift test --enable-code-coverage

@@ -76,6 +76,103 @@ final class MiningTemplateBookTests: XCTestCase {
         }
     }
 
+    func testTemplateRecursivelyPropagatesNestedSearchTarget() async throws {
+        let hard = try await chainFixture(target: UInt256(4))
+        let easy = try await chainFixture(target: .max)
+        let middleBook = MiningTemplateBook(
+            chainPath: ["Nexus", "Middle"],
+            minimumRootWork: UInt256(1)
+        )
+        let middle = try await middleBook.build(
+            previous: hard.genesis,
+            transactions: [],
+            children: [DirectChildCandidate(
+                directory: "Leaf",
+                block: easy.genesis,
+                searchTarget: easy.genesis.target,
+                acquisitionEntries: [:]
+            )],
+            timestamp: 1,
+            fetcher: hard.store
+        )
+        XCTAssertEqual(middle.block.target, UInt256(4))
+        XCTAssertEqual(middle.searchTarget, UInt256.max)
+
+        let rootBook = MiningTemplateBook(
+            chainPath: ["Nexus"],
+            minimumRootWork: UInt256(1)
+        )
+        let root = try await rootBook.build(
+            previous: hard.genesis,
+            transactions: [],
+            children: [DirectChildCandidate(
+                directory: "Middle",
+                block: middle.block,
+                searchTarget: middle.searchTarget,
+                acquisitionEntries: [:]
+            )],
+            timestamp: 2,
+            fetcher: hard.store
+        )
+
+        XCTAssertEqual(root.block.target, UInt256(4))
+        XCTAssertEqual(root.searchTarget, UInt256.max)
+    }
+
+    func testPendingGenesisRequiresOneParentAndChildTargetHit() async throws {
+        let parent = try await chainFixture(target: UInt256(4))
+        let child = try await chainFixture(target: UInt256(8))
+        let book = MiningTemplateBook(
+            chainPath: ["Nexus"],
+            minimumRootWork: UInt256(1)
+        )
+        let template = try await book.build(
+            previous: parent.genesis,
+            transactions: [],
+            children: [DirectChildCandidate(
+                directory: "Payments",
+                block: child.genesis,
+                searchTarget: .max,
+                deploymentTarget: child.genesis.target,
+                requiresParentTargetHit: true,
+                acquisitionEntries: [:]
+            )],
+            timestamp: 1,
+            fetcher: parent.store
+        )
+
+        XCTAssertEqual(template.searchTarget, UInt256(4))
+        XCTAssertEqual(template.deploymentTarget, UInt256(4))
+    }
+
+    func testAncestorPreservesDeploymentBarrierWithoutRequiringItsOwnHit()
+        async throws
+    {
+        let parent = try await chainFixture(target: UInt256(4))
+        let middle = try await chainFixture(target: UInt256(8))
+        let book = MiningTemplateBook(
+            chainPath: ["Nexus"],
+            minimumRootWork: UInt256(1)
+        )
+        let template = try await book.build(
+            previous: parent.genesis,
+            transactions: [],
+            children: [DirectChildCandidate(
+                directory: "Middle",
+                block: middle.genesis,
+                searchTarget: .max,
+                deploymentTarget: UInt256(8),
+                acquisitionEntries: [:]
+            )],
+            timestamp: 1,
+            fetcher: parent.store
+        )
+
+        XCTAssertEqual(template.block.target, UInt256(4))
+        XCTAssertEqual(template.searchTarget, UInt256(8))
+        XCTAssertEqual(template.deploymentTarget, UInt256(8))
+    }
+
     func testStateInvalidTransactionDoesNotSuppressWork() async throws {
         let fixture = try await chainFixture()
         let recipient = CryptoUtils.createAddress(
@@ -116,6 +213,66 @@ final class MiningTemplateBookTests: XCTestCase {
         }
 
         XCTAssertEqual(included, [valid.body.rawCID])
+    }
+
+    func testTransactionLimitRefillsAfterHigherFeeStateInvalidEntry()
+        async throws
+    {
+        let fixture = try await chainFixture()
+        let recipient = CryptoUtils.createAddress(
+            from: CryptoUtils.generateKeyPair().publicKey
+        )
+        let invalid = try signedTransaction(
+            key: fixture.key,
+            accountActions: [
+                AccountAction(owner: fixture.owner, delta: -2_000),
+                AccountAction(owner: recipient, delta: 1_900),
+            ],
+            fee: 100,
+            nonce: 2
+        )
+        let valid = try signedTransaction(
+            key: fixture.key,
+            accountActions: [
+                AccountAction(owner: fixture.owner, delta: -2),
+                AccountAction(owner: recipient, delta: 1),
+            ],
+            fee: 1,
+            nonce: 1
+        )
+        let pool = TransactionPool()
+        let spec = try XCTUnwrap(fixture.genesis.spec.node)
+        _ = try await pool.submit(
+            valid,
+            spec: spec,
+            fetcher: fixture.store
+        )
+        _ = try await pool.submit(
+            invalid,
+            spec: spec,
+            fetcher: fixture.store
+        )
+        let ordered = await pool.transactions(limit: .max)
+        XCTAssertEqual(ordered.first?.body.rawCID, invalid.body.rawCID)
+
+        let template = try await MiningTemplateBook(
+            chainPath: ["Nexus"],
+            minimumRootWork: UInt256(1)
+        ).build(
+            previous: fixture.genesis,
+            transactions: ordered,
+            children: [],
+            timestamp: 1,
+            transactionLimit: 1,
+            fetcher: fixture.store
+        )
+        let included = try XCTUnwrap(template.block.transactions.node)
+            .allKeysAndValues().values
+        XCTAssertEqual(included.count, 1)
+        XCTAssertEqual(
+            included.first?.rawCID,
+            try VolumeImpl<Transaction>(node: valid).rawCID
+        )
     }
 
     func testStateFetchFailureIsNotMisclassifiedAsStaleTransaction() async throws {
@@ -267,6 +424,7 @@ final class MiningTemplateBookTests: XCTestCase {
             workID: first.workID,
             block: first.block,
             searchTarget: first.searchTarget,
+            deploymentTarget: first.deploymentTarget,
             chainPath: first.chainPath,
             expiresAt: ContinuousClock.now + .milliseconds(250),
             childCandidates: first.childCandidates
@@ -276,6 +434,7 @@ final class MiningTemplateBookTests: XCTestCase {
             workID: conflicting.workID,
             block: conflicting.block,
             searchTarget: conflicting.searchTarget,
+            deploymentTarget: conflicting.deploymentTarget,
             chainPath: conflicting.chainPath,
             expiresAt: ContinuousClock.now + .seconds(30),
             childCandidates: conflicting.childCandidates
@@ -291,6 +450,7 @@ final class MiningTemplateBookTests: XCTestCase {
             workID: first.workID,
             block: first.block,
             searchTarget: first.searchTarget,
+            deploymentTarget: first.deploymentTarget,
             chainPath: first.chainPath,
             expiresAt: ContinuousClock.now - .seconds(1),
             childCandidates: first.childCandidates
@@ -299,6 +459,7 @@ final class MiningTemplateBookTests: XCTestCase {
             workID: conflicting.workID,
             block: conflicting.block,
             searchTarget: conflicting.searchTarget,
+            deploymentTarget: conflicting.deploymentTarget,
             chainPath: conflicting.chainPath,
             expiresAt: ContinuousClock.now + .seconds(30),
             childCandidates: conflicting.childCandidates
@@ -345,6 +506,8 @@ final class MiningTemplateBookTests: XCTestCase {
             target: target,
             fetcher: store
         )
+        try await VolumeImpl<Transaction>(node: premine).store(storer: store)
+        try await LatticeState.emptyHeader.storeRecursively(storer: store)
         try await BlockHeader(node: result.block).storeBlock(storer: store)
         try await result.block.postState.storeRecursively(storer: store)
         return (result.block, store, key, owner)
@@ -352,7 +515,42 @@ final class MiningTemplateBookTests: XCTestCase {
 }
 
 final class TransactionPoolArchitectureTests: XCTestCase {
-    func testCheapTrustBoundaryChecksRunBeforeCryptography() async throws {
+    func testHistoricalBodyCIDInputSignatureIsAcceptedAtNodeIngress() async throws {
+        let store = MiningTestStore()
+        let key = CryptoUtils.generateKeyPair()
+        let body = transactionBody(
+            key: key,
+            accountActions: [AccountAction(
+                owner: CryptoUtils.createAddress(from: key.publicKey),
+                delta: -1
+            )],
+            fee: 1,
+            nonce: 0,
+            chainPath: ["Nexus"]
+        )
+        let header = try HeaderImpl(node: body)
+        let signature = try XCTUnwrap(CryptoUtils.sign(
+            message: header.rawCID,
+            privateKeyHex: key.privateKey
+        ))
+        let transaction = Transaction(
+            signatures: [key.publicKey: signature],
+            body: header
+        )
+        let pool = TransactionPool()
+
+        let cid = try await pool.submit(
+            transaction,
+            spec: testSpec(),
+            fetcher: store
+        ).transactionCID
+
+        XCTAssertEqual(cid, try VolumeImpl<Transaction>(node: transaction).rawCID)
+        let count = await pool.count
+        XCTAssertEqual(count, 1)
+    }
+
+    func testPoolEnforcesResourcesButLeavesConsensusToLattice() async throws {
         let store = MiningTestStore()
         let key = CryptoUtils.generateKeyPair()
         let wrongPathBody = transactionBody(
@@ -371,17 +569,11 @@ final class TransactionPoolArchitectureTests: XCTestCase {
         )
         let pool = TransactionPool(maxSignatures: 1)
 
-        await XCTAssertThrowsErrorAsync(
-            try await pool.submit(
-                wrongPath,
-                chainPath: ["Nexus"],
-                spec: testSpec(),
-                fetcher: store,
-                storer: store
-            )
-        ) { error in
-            XCTAssertEqual(error as? TransactionPoolError, .wrongChainPath)
-        }
+        _ = try await pool.submit(
+            wrongPath,
+            spec: testSpec(),
+            fetcher: store
+        )
 
         let tooManySignatures = Transaction(
             signatures: ["a": "x", "b": "y"],
@@ -390,10 +582,8 @@ final class TransactionPoolArchitectureTests: XCTestCase {
         await XCTAssertThrowsErrorAsync(
             try await pool.submit(
                 tooManySignatures,
-                chainPath: ["Nexus"],
                 spec: testSpec(),
-                fetcher: store,
-                storer: store
+                fetcher: store
             )
         ) { error in
             XCTAssertEqual(error as? TransactionPoolError, .tooLarge)
@@ -407,10 +597,8 @@ final class TransactionPoolArchitectureTests: XCTestCase {
         await XCTAssertThrowsErrorAsync(
             try await pool.submit(
                 oversizedSignature,
-                chainPath: ["Nexus"],
                 spec: testSpec(),
-                fetcher: UnavailableMiningFetcher(),
-                storer: store
+                fetcher: UnavailableMiningFetcher()
             )
         ) { error in
             XCTAssertEqual(error as? TransactionPoolError, .tooLarge)
@@ -421,16 +609,14 @@ final class TransactionPoolArchitectureTests: XCTestCase {
         await XCTAssertThrowsErrorAsync(
             try await pool.submit(
                 Transaction(signatures: [:], body: detached),
-                chainPath: ["Nexus"],
                 spec: smallSpec,
-                fetcher: store,
-                storer: store
+                fetcher: store
             )
         ) { error in
             XCTAssertEqual(error as? TransactionPoolError, .tooLarge)
         }
         let count = await pool.count
-        XCTAssertEqual(count, 0)
+        XCTAssertEqual(count, 1)
     }
 
     func testFeeRateOrderingUsesExactFullWidthProducts() async throws {
@@ -463,21 +649,339 @@ final class TransactionPoolArchitectureTests: XCTestCase {
 
         _ = try await pool.submit(
             medium,
-            chainPath: ["Nexus"],
             spec: testSpec(),
-            fetcher: store,
-            storer: store
+            fetcher: store
         )
         _ = try await pool.submit(
             high,
-            chainPath: ["Nexus"],
             spec: testSpec(),
-            fetcher: store,
-            storer: store
+            fetcher: store
         )
 
         let ordered = await pool.transactions(limit: 2).map(\.body.rawCID)
         XCTAssertEqual(ordered, [high.body.rawCID, medium.body.rawCID])
+    }
+
+    func testFutureNonceBecomesEligibleBehindReadyPredecessor()
+        async throws
+    {
+        let store = MiningTestStore()
+        let pool = TransactionPool()
+        let key = CryptoUtils.generateKeyPair()
+        let owner = CryptoUtils.createAddress(from: key.publicKey)
+        let recipient = CryptoUtils.createAddress(
+            from: CryptoUtils.generateKeyPair().publicKey
+        )
+        let current = try signedTransaction(
+            key: key,
+            accountActions: [
+                AccountAction(owner: owner, delta: -2),
+                AccountAction(owner: recipient, delta: 1),
+            ],
+            fee: 1,
+            nonce: 0
+        )
+        let future = try signedTransaction(
+            key: key,
+            accountActions: [
+                AccountAction(owner: owner, delta: -2),
+                AccountAction(owner: recipient, delta: 1),
+            ],
+            fee: 1,
+            nonce: 1
+        )
+
+        _ = try await pool.submit(
+            current,
+            spec: testSpec(),
+            fetcher: store
+        )
+        _ = try await pool.submit(
+            future,
+            spec: testSpec(),
+            fetcher: store,
+            disposition: .future
+        )
+        let initiallyReady = await pool.transactions(limit: .max)
+            .map(\.body.node?.nonce)
+        XCTAssertEqual(initiallyReady, [0, 1])
+
+        let removed = await pool.revalidate { transaction in
+            switch transaction.body.node?.nonce {
+            case 0: return .invalid
+            case 1: return .ready
+            default: return .future
+            }
+        }
+
+        XCTAssertEqual(removed.removed.count, 1)
+        let finallyReady = await pool.transactions(limit: .max)
+            .map(\.body.node?.nonce)
+        XCTAssertEqual(finallyReady, [1])
+
+        await pool.rollback(removed)
+        let restored = await pool.transactions(limit: .max)
+            .map(\.body.node?.nonce)
+        XCTAssertEqual(restored, [0, 1])
+    }
+
+    func testDependencyFrontierPrefersFeesWithoutBreakingMultiSignerOrder()
+        async throws
+    {
+        let store = MiningTestStore()
+        let pool = TransactionPool()
+        let firstKey = CryptoUtils.generateKeyPair()
+        let secondKey = CryptoUtils.generateKeyPair()
+        let first = try signedTransaction(
+            key: firstKey,
+            accountActions: [],
+            fee: 1,
+            nonce: 0
+        )
+        let second = try signedTransaction(
+            key: secondKey,
+            accountActions: [],
+            fee: 10,
+            nonce: 0
+        )
+        let joint = try signedTransaction(
+            keys: [firstKey, secondKey],
+            accountActions: [],
+            fee: 100,
+            nonce: 1
+        )
+        for (transaction, disposition) in [
+            (first, TransactionPoolDisposition.ready),
+            (second, .ready),
+            (joint, .future),
+        ] {
+            _ = try await pool.submit(
+                transaction,
+                spec: testSpec(),
+                fetcher: store,
+                disposition: disposition
+            )
+        }
+
+        let selected = await pool.transactions(limit: .max)
+        let roots = try selected.map { try VolumeImpl<Transaction>(node: $0).rawCID }
+        XCTAssertEqual(
+            roots,
+            try [second, first, joint].map {
+                try VolumeImpl<Transaction>(node: $0).rawCID
+            }
+        )
+    }
+
+    func testSameSignerAndNonceRequiresStrictlyBetterReplacement() async throws {
+        let store = MiningTestStore()
+        let pool = TransactionPool()
+        let key = CryptoUtils.generateKeyPair()
+        let owner = CryptoUtils.createAddress(from: key.publicKey)
+        let recipient = CryptoUtils.createAddress(
+            from: CryptoUtils.generateKeyPair().publicKey
+        )
+        let low = try signedTransaction(
+            key: key,
+            accountActions: [
+                AccountAction(owner: owner, delta: -2),
+                AccountAction(owner: recipient, delta: 1),
+            ],
+            fee: 1,
+            nonce: 0
+        )
+        let high = try signedTransaction(
+            key: key,
+            accountActions: [
+                AccountAction(owner: owner, delta: -3),
+                AccountAction(owner: recipient, delta: 1),
+            ],
+            fee: 2,
+            nonce: 0
+        )
+
+        _ = try await pool.submit(
+            low,
+            spec: testSpec(),
+            fetcher: store
+        )
+        let replacement = try await pool.submit(
+            high,
+            spec: testSpec(),
+            fetcher: store
+        )
+        XCTAssertEqual(replacement.replaced.map(\.cid), [
+            try VolumeImpl<Transaction>(node: low).rawCID,
+        ])
+        await XCTAssertThrowsErrorAsync(
+            try await pool.submit(
+                low,
+                spec: testSpec(),
+                fetcher: store
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? TransactionPoolError,
+                .replacementUnderpriced
+            )
+        }
+
+        let count = await pool.count
+        let selected = await pool.transactions(limit: 1).first
+        XCTAssertEqual(count, 1)
+        XCTAssertEqual(selected?.body.rawCID, high.body.rawCID)
+    }
+
+    func testPartialSignerOverlapAtSameNonceIsRejected() async throws {
+        let store = MiningTestStore()
+        let pool = TransactionPool()
+        let firstKey = CryptoUtils.generateKeyPair()
+        let sharedKey = CryptoUtils.generateKeyPair()
+        let thirdKey = CryptoUtils.generateKeyPair()
+        let recipient = CryptoUtils.createAddress(
+            from: CryptoUtils.generateKeyPair().publicKey
+        )
+        let first = try signedTransaction(
+            keys: [firstKey, sharedKey],
+            accountActions: [
+                AccountAction(
+                    owner: CryptoUtils.createAddress(from: firstKey.publicKey),
+                    delta: -1
+                ),
+                AccountAction(
+                    owner: CryptoUtils.createAddress(from: sharedKey.publicKey),
+                    delta: -1
+                ),
+                AccountAction(owner: recipient, delta: 1),
+            ],
+            fee: 1,
+            nonce: 0
+        )
+        let overlap = try signedTransaction(
+            keys: [sharedKey, thirdKey],
+            accountActions: [
+                AccountAction(
+                    owner: CryptoUtils.createAddress(from: sharedKey.publicKey),
+                    delta: -1
+                ),
+                AccountAction(
+                    owner: CryptoUtils.createAddress(from: thirdKey.publicKey),
+                    delta: -2
+                ),
+                AccountAction(owner: recipient, delta: 1),
+            ],
+            fee: 2,
+            nonce: 0
+        )
+
+        _ = try await pool.submit(
+            first,
+            spec: testSpec(),
+            fetcher: store
+        )
+        await XCTAssertThrowsErrorAsync(
+            try await pool.submit(
+                overlap,
+                spec: testSpec(),
+                fetcher: store
+            )
+        ) { error in
+            XCTAssertEqual(error as? TransactionPoolError, .conflictingNonce)
+        }
+
+        let count = await pool.count
+        XCTAssertEqual(count, 1)
+    }
+
+    func testHigherFeeRateEvictsLowestValueEntryAtCapacity() async throws {
+        let store = MiningTestStore()
+        let pool = TransactionPool(maxCount: 1)
+        let firstKey = CryptoUtils.generateKeyPair()
+        let secondKey = CryptoUtils.generateKeyPair()
+        let recipient = CryptoUtils.createAddress(
+            from: CryptoUtils.generateKeyPair().publicKey
+        )
+        let low = try signedTransaction(
+            key: firstKey,
+            accountActions: [
+                AccountAction(
+                    owner: CryptoUtils.createAddress(from: firstKey.publicKey),
+                    delta: -2
+                ),
+                AccountAction(owner: recipient, delta: 1),
+            ],
+            fee: 1,
+            nonce: 0
+        )
+        let high = try signedTransaction(
+            key: secondKey,
+            accountActions: [
+                AccountAction(
+                    owner: CryptoUtils.createAddress(from: secondKey.publicKey),
+                    delta: -3
+                ),
+                AccountAction(owner: recipient, delta: 1),
+            ],
+            fee: 2,
+            nonce: 0
+        )
+
+        _ = try await pool.submit(
+            low,
+            spec: testSpec(),
+            fetcher: store
+        )
+        let mutation = try await pool.submit(
+            high,
+            spec: testSpec(),
+            fetcher: store
+        )
+        XCTAssertEqual(mutation.evicted.map(\.cid), [
+            try VolumeImpl<Transaction>(node: low).rawCID,
+        ])
+
+        let count = await pool.count
+        let selected = await pool.transactions(limit: 1).first
+        XCTAssertEqual(count, 1)
+        XCTAssertEqual(selected?.body.rawCID, high.body.rawCID)
+
+        await pool.rollback(mutation)
+        let restored = await pool.transactions(limit: 1).first
+        XCTAssertEqual(restored?.body.rawCID, low.body.rawCID)
+    }
+
+    func testExpiredTransactionsArePruned() async throws {
+        let store = MiningTestStore()
+        let pool = TransactionPool(entryLifetime: 10)
+        let key = CryptoUtils.generateKeyPair()
+        let owner = CryptoUtils.createAddress(from: key.publicKey)
+        let transaction = try signedTransaction(
+            key: key,
+            accountActions: [AccountAction(owner: owner, delta: -1)],
+            fee: 1,
+            nonce: 0
+        )
+        let addedAt = Date()
+
+        _ = try await pool.submit(
+            transaction,
+            spec: testSpec(),
+            fetcher: store,
+            addedAt: addedAt
+        )
+
+        let countBeforeExplicitExpiration = await pool.snapshot().count
+        XCTAssertEqual(countBeforeExplicitExpiration, 1)
+        let expiration = await pool.expire(
+            at: addedAt.addingTimeInterval(10)
+        )
+        let snapshot = await pool.snapshot()
+        let byteCount = await pool.byteCount
+        XCTAssertEqual(expiration.expired.map(\.cid), [
+            try VolumeImpl<Transaction>(node: transaction).rawCID,
+        ])
+        XCTAssertTrue(snapshot.isEmpty)
+        XCTAssertEqual(byteCount, 0)
     }
 
     private func storedSize(of transaction: Transaction) -> Int {
@@ -504,19 +1008,43 @@ private func signedTransaction(
     nonce: UInt64,
     chainPath: [String] = ["Nexus"]
 ) throws -> Transaction {
-    let body = transactionBody(
-        key: key,
+    try signedTransaction(
+        keys: [key],
         accountActions: accountActions,
         fee: fee,
         nonce: nonce,
         chainPath: chainPath
     )
+}
+
+private func signedTransaction(
+    keys: [(privateKey: String, publicKey: String)],
+    accountActions: [AccountAction],
+    fee: UInt64,
+    nonce: UInt64,
+    chainPath: [String] = ["Nexus"]
+) throws -> Transaction {
+    let body = TransactionBody(
+        accountActions: accountActions,
+        actions: [],
+        depositActions: [],
+        genesisActions: [],
+        receiptActions: [],
+        withdrawalActions: [],
+        signers: keys.map { CryptoUtils.createAddress(from: $0.publicKey) },
+        fee: fee,
+        nonce: nonce,
+        chainPath: chainPath
+    )
     let header = try HeaderImpl(node: body)
-    let signature = try XCTUnwrap(TransactionSigning.sign(
-        bodyHeader: header,
-        privateKeyHex: key.privateKey
-    ))
-    return Transaction(signatures: [key.publicKey: signature], body: header)
+    var signatures: [String: String] = [:]
+    for key in keys {
+        signatures[key.publicKey] = try XCTUnwrap(TransactionSigning.sign(
+            bodyHeader: header,
+            privateKeyHex: key.privateKey
+        ))
+    }
+    return Transaction(signatures: signatures, body: header)
 }
 
 private func transactionBody(

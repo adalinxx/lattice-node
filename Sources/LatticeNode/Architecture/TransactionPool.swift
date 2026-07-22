@@ -4,13 +4,39 @@ import cashew
 
 public enum TransactionPoolError: Error, Equatable {
     case unresolved
-    case invalidSignature
-    case wrongChainPath
-    case invalidShape
-    case invalidPolicy
-    case policyUnavailable
     case tooLarge
     case full
+    case invalidState
+    case conflictingNonce
+    case replacementUnderpriced
+}
+
+public enum TransactionPoolDisposition: Sendable, Equatable {
+    case ready
+    case future
+    case unavailable
+    case invalid
+}
+
+public struct TransactionPoolItem: Sendable {
+    public let cid: String
+    public let transaction: Transaction
+    public let disposition: TransactionPoolDisposition
+    public let addedAt: Date
+}
+
+public struct TransactionPoolMutation: Sendable {
+    public let transactionCID: String?
+    public let inserted: TransactionPoolItem?
+    public let replaced: [TransactionPoolItem]
+    public let evicted: [TransactionPoolItem]
+    public let expired: [TransactionPoolItem]
+    public let removed: [TransactionPoolItem]
+    public let reclassified: [TransactionPoolItem]
+
+    fileprivate var allRemoved: [TransactionPoolItem] {
+        replaced + evicted + expired + removed
+    }
 }
 
 public actor TransactionPool {
@@ -21,33 +47,56 @@ public actor TransactionPool {
         let transaction: Transaction
         let fee: UInt64
         let size: Int
+        let conflictKey: ConflictKey
+        var disposition: TransactionPoolDisposition
+        let addedAt: Date
+    }
+
+    private struct ConflictKey: Hashable, Sendable {
+        let signers: [String]
+        let nonce: UInt64
+    }
+
+    private struct SignerNonce: Hashable, Sendable {
+        let signer: String
+        let nonce: UInt64
     }
 
     private let maxCount: Int
     private let maxBytes: Int
     private let maxSignatures: Int
+    private let entryLifetime: TimeInterval
     private var entries: [String: Entry] = [:]
+    private var signerNonces: [SignerNonce: String] = [:]
     private var totalBytes = 0
 
     public init(
         maxCount: Int = 10_000,
         maxBytes: Int = 64 * 1024 * 1024,
-        maxSignatures: Int = 64
+        maxSignatures: Int = 64,
+        entryLifetime: TimeInterval = 3 * 60 * 60
     ) {
-        precondition(maxCount > 0 && maxBytes > 0 && maxSignatures > 0)
+        precondition(
+            maxCount > 0 && maxBytes > 0 && maxSignatures > 0
+                && entryLifetime > 0
+        )
         self.maxCount = maxCount
         self.maxBytes = maxBytes
         self.maxSignatures = maxSignatures
+        self.entryLifetime = entryLifetime
     }
 
     @discardableResult
     public func submit(
         _ transaction: Transaction,
-        chainPath: [String],
         spec: ChainSpec,
         fetcher: any Fetcher,
-        storer: any Storer
-    ) async throws -> String {
+        disposition: TransactionPoolDisposition = .ready,
+        addedAt: Date = Date()
+    ) async throws -> TransactionPoolMutation {
+        guard disposition != .invalid else {
+            throw TransactionPoolError.invalidState
+        }
         guard transaction.signatures.count <= maxSignatures,
               transaction.signatures.allSatisfy({ key, signature in
                   key.utf8.count <= Self.maximumSignatureFieldBytes
@@ -73,38 +122,10 @@ public actor TransactionPool {
         let bodyHeader = try await transaction.body.resolve(fetcher: fetcher)
         guard let body = bodyHeader.node else { throw TransactionPoolError.unresolved }
         let resolved = Transaction(signatures: transaction.signatures, body: bodyHeader)
-        guard body.chainPath == chainPath else { throw TransactionPoolError.wrongChainPath }
-        guard body.signers.count <= maxSignatures,
-              body.accountActionsAreValid(),
-              body.depositActionsAreValid(),
-              body.genesisActionsAreValid(),
-              body.receiptActionsAreValid(),
-              body.withdrawalActionsAreValid(),
-              body.actions.allSatisfy({ $0.verify() }),
-              body.valueConservation().conserved else {
-            throw TransactionPoolError.invalidShape
-        }
-        guard resolved.signaturesAreValid(), resolved.signaturesMatchSigners() else {
-            throw TransactionPoolError.invalidSignature
-        }
-        if chainPath.count == 1,
-           (!body.depositActions.isEmpty || !body.withdrawalActions.isEmpty) {
-            throw TransactionPoolError.invalidShape
-        }
-        do {
-            guard try await TransactionBody.batchVerifyPolicies(
-                bodies: [body],
-                spec: spec,
-                chainPath: chainPath,
-                fetcher: fetcher
-            ) else {
-                throw TransactionPoolError.invalidPolicy
-            }
-        } catch let error as WasmPolicyError {
-            if case .missingModule = error {
-                throw TransactionPoolError.policyUnavailable
-            }
-            throw TransactionPoolError.invalidPolicy
+        // Lattice preflight owns state and consensus validity. The pool only
+        // enforces bounded local-resource policy and indexes replacement keys.
+        guard body.signers.count <= maxSignatures else {
+            throw TransactionPoolError.tooLarge
         }
 
         guard let bodyData = body.toData() else {
@@ -118,45 +139,353 @@ public actor TransactionPool {
         }
         let header = try VolumeImpl<Transaction>(node: resolved)
         let cid = header.rawCID
-        if entries[cid] != nil { return cid }
-        guard entries.count < maxCount,
-              storedSize <= maxBytes - totalBytes else {
-            throw TransactionPoolError.full
+        if entries[cid] != nil {
+            return TransactionPoolMutation(
+                transactionCID: cid,
+                inserted: nil,
+                replaced: [],
+                evicted: [],
+                expired: [],
+                removed: [],
+                reclassified: []
+            )
         }
-        try await header.storeRecursively(storer: storer)
-        entries[cid] = Entry(
+        guard storedSize <= maxBytes else {
+            throw TransactionPoolError.tooLarge
+        }
+        let conflictKey = ConflictKey(
+            signers: Array(Set(body.signers)).sorted(),
+            nonce: body.nonce
+        )
+        let entry = Entry(
             cid: cid,
             transaction: resolved,
             fee: body.fee,
-            size: storedSize
+            size: storedSize,
+            conflictKey: conflictKey,
+            disposition: disposition,
+            addedAt: addedAt
         )
-        totalBytes += storedSize
-        return cid
+
+        let overlappingCIDs = Set(conflictKey.signers.compactMap {
+            signerNonces[SignerNonce(signer: $0, nonce: conflictKey.nonce)]
+        })
+        let replacedCID: String?
+        if overlappingCIDs.isEmpty {
+            replacedCID = nil
+        } else if overlappingCIDs.count == 1,
+                  let overlap = overlappingCIDs.first,
+                  entries[overlap]?.conflictKey == conflictKey {
+            replacedCID = overlap
+        } else {
+            throw TransactionPoolError.conflictingNonce
+        }
+        if let replacedCID, let replaced = entries[replacedCID] {
+            guard entry.fee > replaced.fee,
+                  feeRateComparison(
+                    entry.fee,
+                    entry.size,
+                    replaced.fee,
+                    replaced.size
+                  ) > 0 else {
+                throw TransactionPoolError.replacementUnderpriced
+            }
+        }
+
+        var prospectiveCount = entries.count - (replacedCID == nil ? 0 : 1)
+        var prospectiveBytes = totalBytes
+            - (replacedCID.flatMap { entries[$0]?.size } ?? 0)
+        var evictions: [String] = []
+        let candidates = entries.values
+            .filter { $0.cid != replacedCID }
+            .sorted {
+                feeRateComparison($0.fee, $0.size, $1.fee, $1.size) < 0
+            }
+        for candidate in candidates
+        where prospectiveCount >= maxCount
+            || storedSize > maxBytes - prospectiveBytes {
+            guard feeRateComparison(
+                entry.fee,
+                entry.size,
+                candidate.fee,
+                candidate.size
+            ) > 0 else {
+                throw TransactionPoolError.full
+            }
+            evictions.append(candidate.cid)
+            prospectiveCount -= 1
+            prospectiveBytes -= candidate.size
+        }
+        guard prospectiveCount < maxCount,
+              storedSize <= maxBytes - prospectiveBytes else {
+            throw TransactionPoolError.full
+        }
+
+        let replaced = replacedCID.flatMap { entries[$0].map(item) }
+        let evicted = evictions.compactMap { entries[$0].map(item) }
+        if let replacedCID { _ = remove(replacedCID) }
+        for cid in evictions { _ = remove(cid) }
+        insert(entry)
+        return TransactionPoolMutation(
+            transactionCID: cid,
+            inserted: item(entry),
+            replaced: replaced.map { [$0] } ?? [],
+            evicted: evicted,
+            expired: [],
+            removed: [],
+            reclassified: []
+        )
     }
 
     public func transactions(limit: Int) -> [Transaction] {
-        entries.values.sorted {
-            let ordering = compareProducts(
-                $0.fee,
-                UInt64($1.size),
-                $1.fee,
-                UInt64($0.size)
-            )
-            if ordering != 0 { return ordering > 0 }
-            return $0.cid < $1.cid
-        }.prefix(max(0, limit)).map(\.transaction)
+        orderedTransactions(
+            limit: limit,
+            includesUnavailable: false,
+            includesFuture: true
+        )
     }
 
-    public func remove(_ cids: some Sequence<String>) {
-        for cid in cids {
-            if let removed = entries.removeValue(forKey: cid) {
-                totalBytes -= removed.size
+    /// Candidate parent state can make a child withdrawal executable. Future
+    /// nonces stay excluded; unavailable entries get authoritative contextual
+    /// preflight before template selection.
+    public func contextualTransactions(
+        limit: Int
+    ) -> [Transaction] {
+        orderedTransactions(
+            limit: limit,
+            includesUnavailable: true,
+            includesFuture: true
+        )
+    }
+
+    private func orderedTransactions(
+        limit: Int,
+        includesUnavailable: Bool,
+        includesFuture: Bool
+    ) -> [Transaction] {
+        let maximum = max(0, limit)
+        guard maximum > 0 else { return [] }
+        var remaining = entries.values.filter {
+            $0.disposition == .ready
+                || (includesFuture && $0.disposition == .future)
+                || (includesUnavailable && $0.disposition == .unavailable)
+        }
+        var nextNonce: [String: UInt64] = [:]
+        var selected: [Entry] = []
+        while selected.count < maximum {
+            let eligible = remaining.filter { entry in
+                if entry.disposition == .ready { return true }
+                guard entry.disposition == .future,
+                      !entry.conflictKey.signers.isEmpty else { return false }
+                return entry.conflictKey.signers.allSatisfy {
+                    nextNonce[$0] == entry.conflictKey.nonce
+                }
             }
+            guard let best = eligible.sorted(by: higherFeePriority).first else {
+                break
+            }
+            selected.append(best)
+            remaining.removeAll { $0.cid == best.cid }
+            if best.conflictKey.nonce < UInt64.max {
+                for signer in best.conflictKey.signers {
+                    nextNonce[signer] = best.conflictKey.nonce + 1
+                }
+            }
+        }
+        if includesUnavailable, selected.count < maximum {
+            // Parent context may turn unavailable entries into a dependency
+            // frontier. Preserve nonce order for Lattice's contextual preflight
+            // and sequential BlockBuilder validation.
+            selected += remaining.sorted {
+                if $0.conflictKey.nonce != $1.conflictKey.nonce {
+                    return $0.conflictKey.nonce < $1.conflictKey.nonce
+                }
+                return higherFeePriority($0, $1)
+            }.prefix(maximum - selected.count)
+        }
+        return selected.map(\.transaction)
+    }
+
+    private func higherFeePriority(_ lhs: Entry, _ rhs: Entry) -> Bool {
+        let ordering = compareProducts(
+            lhs.fee,
+            UInt64(rhs.size),
+            rhs.fee,
+            UInt64(lhs.size)
+        )
+        if ordering != 0 { return ordering > 0 }
+        return lhs.cid < rhs.cid
+    }
+
+    public func snapshot() -> [TransactionPoolItem] {
+        entries.values.sorted { $0.cid < $1.cid }.map(item)
+    }
+
+    /// Reclassifies the pool against a canonical tip. The classifier is supplied
+    /// by the Lattice-owning layer so the pool never copies consensus rules.
+    @discardableResult
+    public func revalidate(
+        _ classify: @Sendable (Transaction) async throws
+            -> TransactionPoolDisposition
+    ) async rethrows -> TransactionPoolMutation {
+        let snapshot = entries.values.sorted { $0.cid < $1.cid }
+        var dispositions: [String: TransactionPoolDisposition] = [:]
+        for entry in snapshot {
+            dispositions[entry.cid] = try await classify(entry.transaction)
+        }
+
+        var removed: [TransactionPoolItem] = []
+        var reclassified: [TransactionPoolItem] = []
+        for (cid, disposition) in dispositions {
+            guard entries[cid] != nil else { continue }
+            if disposition == .invalid {
+                if let entry = remove(cid) { removed.append(item(entry)) }
+            } else {
+                if entries[cid]!.disposition != disposition {
+                    reclassified.append(item(entries[cid]!))
+                }
+                entries[cid]!.disposition = disposition
+            }
+        }
+        return TransactionPoolMutation(
+            transactionCID: nil,
+            inserted: nil,
+            replaced: [],
+            evicted: [],
+            expired: [],
+            removed: removed.sorted { $0.cid < $1.cid },
+            reclassified: reclassified.sorted { $0.cid < $1.cid }
+        )
+    }
+
+    @discardableResult
+    public func remove(_ cids: some Sequence<String>) -> TransactionPoolMutation {
+        let removed = cids.compactMap { remove($0).map(item) }
+        return TransactionPoolMutation(
+            transactionCID: nil,
+            inserted: nil,
+            replaced: [],
+            evicted: [],
+            expired: [],
+            removed: removed,
+            reclassified: []
+        )
+    }
+
+    @discardableResult
+    public func clear() -> TransactionPoolMutation {
+        let removed = entries.values.map(item)
+        entries.removeAll()
+        signerNonces.removeAll()
+        totalBytes = 0
+        return TransactionPoolMutation(
+            transactionCID: nil,
+            inserted: nil,
+            replaced: [],
+            evicted: [],
+            expired: [],
+            removed: removed,
+            reclassified: []
+        )
+    }
+
+    @discardableResult
+    public func expire(at now: Date = Date()) -> TransactionPoolMutation {
+        let cutoff = now.addingTimeInterval(-entryLifetime)
+        let expired = entries.values
+            .filter { $0.addedAt <= cutoff }
+            .sorted { $0.cid < $1.cid }
+            .compactMap { remove($0.cid).map(item) }
+        return TransactionPoolMutation(
+            transactionCID: nil,
+            inserted: nil,
+            replaced: [],
+            evicted: [],
+            expired: expired,
+            removed: [],
+            reclassified: []
+        )
+    }
+
+    public func rollback(_ mutation: TransactionPoolMutation) {
+        if let inserted = mutation.inserted { _ = remove(inserted.cid) }
+        for removed in mutation.allRemoved {
+            guard let body = removed.transaction.body.node,
+                  let envelope = removed.transaction.toData(),
+                  let bodyData = body.toData() else {
+                preconditionFailure("pooled transaction lost resolved content")
+            }
+            insert(Entry(
+                cid: removed.cid,
+                transaction: removed.transaction,
+                fee: body.fee,
+                size: envelope.count + bodyData.count,
+                conflictKey: ConflictKey(
+                    signers: Array(Set(body.signers)).sorted(),
+                    nonce: body.nonce
+                ),
+                disposition: removed.disposition,
+                addedAt: removed.addedAt
+            ))
+        }
+        for previous in mutation.reclassified where entries[previous.cid] != nil {
+            entries[previous.cid]!.disposition = previous.disposition
         }
     }
 
-    public var count: Int { entries.count }
-    public var byteCount: Int { totalBytes }
+    public var count: Int {
+        entries.count
+    }
+
+    public var byteCount: Int {
+        return totalBytes
+    }
+
+    private func item(_ entry: Entry) -> TransactionPoolItem {
+        TransactionPoolItem(
+            cid: entry.cid,
+            transaction: entry.transaction,
+            disposition: entry.disposition,
+            addedAt: entry.addedAt
+        )
+    }
+
+    private func insert(_ entry: Entry) {
+        precondition(entries[entry.cid] == nil)
+        entries[entry.cid] = entry
+        for signer in entry.conflictKey.signers {
+            signerNonces[SignerNonce(
+                signer: signer,
+                nonce: entry.conflictKey.nonce
+            )] = entry.cid
+        }
+        totalBytes += entry.size
+    }
+
+    @discardableResult
+    private func remove(_ cid: String) -> Entry? {
+        guard let removed = entries.removeValue(forKey: cid) else { return nil }
+        for signer in removed.conflictKey.signers {
+            let key = SignerNonce(signer: signer, nonce: removed.conflictKey.nonce)
+            if signerNonces[key] == cid { signerNonces.removeValue(forKey: key) }
+        }
+        totalBytes -= removed.size
+        return removed
+    }
+}
+
+private func feeRateComparison(
+    _ lhsFee: UInt64,
+    _ lhsSize: Int,
+    _ rhsFee: UInt64,
+    _ rhsSize: Int
+) -> Int {
+    compareProducts(
+        lhsFee,
+        UInt64(rhsSize),
+        rhsFee,
+        UInt64(lhsSize)
+    )
 }
 
 private func compareProducts(
