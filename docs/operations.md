@@ -31,11 +31,15 @@ curl --fail http://127.0.0.1:8080/health
 
 Important fields:
 
-- `phase`: `active` or, for an unbootstrapped child, `awaitingGenesis`.
+- `phase`: `active`, `awaitingGenesis` for an unbootstrapped child, or
+  `awaitingParent` when a bootstrapped child does not have a complete
+  inherited-work view from its live configured parent session.
 - `chainPath`: the complete path owned by this process.
 - `nexusGenesisCID`: must be
   `bafyreiayw4z5qz4lt2sljf2enzn7uol3qa6bebadav7qwnqz7agxkiuwhq`.
 - `tipCID` and `height`: null only while a child awaits genesis.
+- `revision` and `parentWorkRevision`: local consensus and completed
+  immediate-parent work watermarks, useful for causal monitoring.
 - `mempoolCount`, `mempoolBytes`, and `pendingChildIntents`: bounded service
   pressure indicators.
 
@@ -80,6 +84,12 @@ lattice-node \
 
 The parent endpoint is an authority boundary, not merely a bootstrap hint. Back
 up the configured parent key and child process identity as operational secrets.
+A same-chain peer may restore verifiable parent continuity while this endpoint
+is unavailable, but it cannot make the child `active`: only the configured
+parent's ordered inherited-work completion on the current authenticated session
+does that. Losing the session returns the child to `awaitingParent`; mining,
+work submission, child deployment, canonical publication, and inherited-work
+export to descendants remain unavailable until it reconnects.
 
 For application testing, deploy a normal child with test-oriented parameters.
 Nexus retains its one pinned genesis.
@@ -147,6 +157,8 @@ matched backup pair or wipe the entire process directory and resync.
 - Verify `--parent` names the immediate parent's process key and fact port.
 - Confirm the parent intent was followed by a separately signed parent
   `GenesisAction` transaction.
+- Confirm the coordinator was run with `--deployment`; normal templates never
+  include genesis actions.
 - Confirm a parent carrier containing the matching child genesis was accepted.
 - Check hierarchy-plane connectivity; an overlay peer cannot substitute for the
   configured parent fact link.

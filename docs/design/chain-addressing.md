@@ -75,8 +75,9 @@ nexus/Payments
 - Durable retention scopes combine the pinned Nexus genesis CID with the full
   path, preventing leaf-name collisions.
 
-## Nexus special case
+## Nexus root bootstrap
 
-Nexus is special only at the root boundary: it has no parent and constructs the
-one pinned unsigned genesis. The path representation is not special-cased;
-Nexus is simply the valid one-component absolute path `["Nexus"]`.
+Nexus has no parent, so an empty store constructs the one pinned unsigned
+genesis locally before configured root bootstrap. It is never accepted from a
+peer. The path representation is not special-cased; Nexus is simply the valid
+one-component absolute path `["Nexus"]`.

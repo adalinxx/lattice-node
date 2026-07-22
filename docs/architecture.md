@@ -48,7 +48,7 @@ LatticeNodeDaemon
   ├─ NodeConfiguration     immutable path, keys, ports, work floor
   ├─ ChainProcess          consensus admission and durable recovery
   ├─ ChainService          transactions, intents, templates, work results
-  ├─ NodeStore             state.db: facts, indexes, projections, recovery
+  ├─ NodeStore             state.db: semantic facts, indexes, root references
   ├─ DiskBroker            volumes.db: materialized CAS volumes
   ├─ Ivy overlay           same-chain peers and content
   ├─ Ivy hierarchy plane   authenticated direct parent/child facts
@@ -59,17 +59,57 @@ LatticeNodeDaemon
 code may prepare data, but canonical state changes only through process
 admission and its staged durable batch.
 
+Production ingress is intentionally one-way:
+
+```text
+Ivy acquisition and root attribution
+  -> ChainService ingress
+  -> ChainProcess validation and durable commit
+  -> ChainService reconciliation and publication
+```
+
+The runtime never mutates consensus state directly. Network preflight remains
+outside the service operation gate, while a commit reserves the service's small
+reconciliation fence before process mutation order is released. That prevents a
+new template, mempool operation, or child intent from observing a canonical
+commit before its service projection catches up, without allowing a slow peer
+to stall mining or RPC. Miner/RPC/reconciliation reads are local-only; remote
+content acquisition is explicit and root-scoped to network admission or a
+targeted retry.
+
+Ivy applies bounded transport admission before awaiting the runtime's inbound
+delegate, so peer work is backpressured at the transport boundary. On the
+private hierarchy plane, only the exact configured immediate parent bypasses
+the receiver's local Tally admission; all normal hierarchy and overlay traffic
+remains reputation-gated, and the bypass grants no consensus authority.
+Its optional public-address discovery runs after listener readiness and never
+delays local RPC availability.
+
 ## Two network planes
 
 The planes are deliberately separate:
 
 1. The public overlay admits peers that claim the same Nexus genesis, absolute
-   chain path, and minimum root-work floor. It carries block announcements and
-   content-addressed retrieval.
+   chain path, and minimum root-work floor. It carries block and transaction
+   Volume inventories plus content-addressed retrieval.
 2. The private hierarchy plane has no relay role. It carries direct-child
-   candidate requests, child proofs, parent coverage, and genesis links. A
+   candidate requests, parent-issued proofs, generic parent work, and genesis links. A
    configured parent key gates parent facts; a claimed path alone grants no
-   authority.
+   authority. Exact-CID exchange is explicitly enabled on this plane, but only
+   a connection that completed its own compatible hierarchy hello may use it.
+
+Hierarchy CAS reads are bounded, exact selections rather than database access:
+there is no enumeration or mutation API, the bytes are non-secret availability,
+and the receiver independently checks CIDs and Lattice evidence. A replacement
+connection must send a fresh hello even when it authenticates with the same
+key.
+
+While a parent requests contextual child candidates, it leases the nonce-zero
+provisional carrier as an ephemeral CAS root. Only a request rooted at that
+exact CID can receive it; durable descendants in the same selection still come
+from the process store. The lease is reference-counted across overlapping
+requests, fenced by runtime generation, and discarded after the bounded round.
+The provisional carrier is never written to durable consensus content.
 
 A parent may request candidates only from authenticated direct children. Slow
 or absent children are omitted within a bounded deadline, so one child cannot
@@ -86,26 +126,58 @@ stall Nexus template creation.
 4. External mining commits that transaction and child block in a parent
    carrier.
 5. The parent durably prepares and publishes the direct-child proof. The child
-   verifies the authenticated link, bootstraps, and becomes `active`.
+   verifies the authenticated link and bootstraps into `awaitingParent`.
+6. The same live authenticated parent streams its complete current inherited
+   work and an ordered completion marker. Only then does the child become
+   `active` and make its fork choice operational.
 
 There is no opaque genesis byte channel. The content-addressed genesis block,
 its CID, and the parent proof are the bootstrap material.
 
 The process that directly parents an edge retains that edge's exact bounded
-validation package before returning a contextual candidate. It replays durable
-authorized-genesis availability when the child reconnects. An ancestor does not
-become an implicit archive for packages below its direct children.
+validation package before returning a contextual candidate. Admission stages a
+newly authorized child's proof route in the same transaction as its genesis
+link, because that child cannot authenticate before the authorization exists.
+The parent replays durable authorized-genesis availability when the child
+reconnects. An ancestor does not become an implicit archive for packages below
+its direct children.
 
-## Nexus genesis exception
+Parent and child retain the same direct-edge evidence Volume, but acquire it at
+different moments. The parent retains the edge it issued; the child retains the
+edge it validated and may relay signed root attachments to same-chain peers.
+The child never returns topology to its parent. Parent work remains generic and
+child-specific projection remains entirely inside the child process.
 
-Nexus is the one bootstrap exception because it has no parent. On an empty
-Nexus store, `ChainProcess.open` constructs the deterministic unsigned genesis
-and requires its CID to equal:
+An evidence Volume is rooted by a canonical manifest containing the envelope
+and the exact sorted acquisition-member CIDs. The acquisition bytes are direct
+Volume members under their original CIDs—not a JSON archive inside another CAS
+blob—so VolumeBroker deduplicates them with validation content and exact-peer
+retrieval can reject missing or extra membership.
+
+The permanent edge record is the reusable source for later outer-root
+attachments. The bounded prepared-proof store exists only to bridge a crash
+before first publication. Neither record is embedded as a backlink in a block.
+
+Evidence discovery is only an index or live availability summary containing
+`child CID + root CID + attachment Volume CID`. The receiver fetches that
+complete Volume from the exact announcing session and verifies it locally.
+There is no second evidence request, proof-root request, or partial evidence
+response protocol; every `(child, root)` attachment is already one independent
+inventory entry, including noncanonical and repeated-child roots.
+
+## Nexus bootstrap
+
+Nexus has no parent, so an empty Nexus store starts from a configured local
+trust anchor. `ChainProcess.open` constructs the deterministic genesis,
+recomputes its CID, and requires it to equal:
 
 `bafyreiayw4z5qz4lt2sljf2enzn7uol3qa6bebadav7qwnqz7agxkiuwhq`
 
-On recovery, the store metadata and height-zero fact must name that same CID.
-No other unsigned transaction or alternate Nexus genesis is accepted.
+Only then does it bootstrap the root locally. This is not a network-admission
+exception: the unsigned allowance is confined to configured local bootstrap,
+while transactions in normal blocks and child genesis remain signature-strict. On recovery, the
+store metadata and height-zero fact must name that same CID; no alternate Nexus
+genesis is accepted.
 
 ## External mining pipeline
 
@@ -129,6 +201,13 @@ The node owns chain truth and template validity. The coordinator owns work
 lifecycle and range allocation. Workers own only proof-of-work search over an
 immutable assignment.
 
+Normal work never includes a `GenesisAction`. Deployment work explicitly
+selects one transaction whose complete anchor set has matching locally retained
+child intents, or one deployment subtree supplied by a direct child. Its
+effective search target preserves the hardest deployment barrier recursively.
+Because every intent binds the carrier's entering parent state, sibling chains
+that must launch together are anchored atomically by one transaction.
+
 ## Durability and recovery
 
 Each process directory contains:
@@ -136,15 +215,18 @@ Each process directory contains:
 ```text
 <storage>/
   process.key   # default process identity, mode 0600
-  state.db      # protocol facts and canonical projection
+  state.db      # staged protocol facts, immutable indexes, recovery metadata
   volumes.db    # materialized content volumes
 ```
 
-Admission stages protocol facts and materializes volumes before retained roots
-advance. Startup audits the store, reconciles retained roots, verifies every
-referenced materialized volume, and reconstructs the chain from the canonical
-projection plus staged batches. Nexus additionally verifies the exact genesis
-CID.
+Admission publishes each complete Volume, merge-retains its root, and only then
+commits the protocol fact that references it. A failed fact commit may leave a
+safe retained orphan; live code never exact-replaces the retention set. Under
+the exclusive startup lock, the node materializes protocol constants, derives
+the exact root set from durable facts, verifies every referenced Volume,
+reconciles retention once, audits semantic indexes, and reconstructs the chain
+by replaying staged admission batches. Networking starts afterward. Nexus also
+verifies the exact genesis CID.
 
 Legacy databases and volume layouts are not migrated in place. Operators must
 remove the entire configured storage directory and resync; keeping only one of

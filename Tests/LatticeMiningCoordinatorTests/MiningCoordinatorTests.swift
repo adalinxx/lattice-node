@@ -455,6 +455,27 @@ final class MiningCoordinatorTests: XCTestCase {
         }
     }
 
+    func testHTTPSubmitTreatsJSONServerFailureAsRetryableTransportFailure() throws {
+        let response = try XCTUnwrap(HTTPURLResponse(
+            url: URL(string: "http://127.0.0.1/v1/mining/work")!,
+            statusCode: 503,
+            httpVersion: nil,
+            headerFields: nil
+        ))
+
+        XCTAssertThrowsError(
+            try HTTPMiningCoordinatorNodeClient.decodeSubmission(
+                data: Data(#"{"accepted":false,"disposition":"busy","tipCID":null}"#.utf8),
+                response: response
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? MiningCoordinatorNodeClientError,
+                .invalidSubmissionResponse(statusCode: 503)
+            )
+        }
+    }
+
     func testHTTPSubmitUsesCurrentWorkRouteAndPayload() async throws {
         StubTemplateURLProtocol.responder = { request in
             XCTAssertEqual(request.url?.path, "/api/v1/mining/work")

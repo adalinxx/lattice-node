@@ -48,10 +48,11 @@ final class NexusGenesisArchitectureTests: XCTestCase {
         )
     }
 
-    func testCanonicalNexusGenesisBootstrapsOnlyWithItsExactCIDPermit() async throws {
+    func testCanonicalNexusGenesisBootstrapsAsConfiguredRoot() async throws {
         let store = GenesisTestStore()
         let genesis = try await NexusGenesis.create(fetcher: store)
         let header = try BlockHeader(node: genesis.block)
+        XCTAssertTrue(try NexusGenesis.verifyGenesis(genesis))
         try await LatticeState.emptyHeader.storeRecursively(storer: store)
         try await header.storeBlock(fetcher: store, storer: store)
 
@@ -61,17 +62,16 @@ final class NexusGenesisArchitectureTests: XCTestCase {
         )
         XCTAssertFalse(strict.0)
 
-        let bootstrap = try await ChainLevel.bootstrap(
+        let bootstrap = try await ChainLevel.bootstrapConfiguredRoot(
             context: try ChainRuntimeContext(
                 path: ["Nexus"],
                 minimumRootWork: UInt256(1)
             ),
             genesisHeader: header,
-            expectedUnsignedGenesisCID: genesis.blockHash,
             fetcher: store,
             validationContentStorer: store,
             materializedVolumeStorer: store,
-            stage: { _ in }
+            staging: { _ in }
         )
         let tip = await bootstrap.level.chain.getMainChainTip()
         XCTAssertEqual(tip, genesis.blockHash)

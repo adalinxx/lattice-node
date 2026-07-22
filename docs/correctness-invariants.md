@@ -26,3 +26,28 @@ supplier. Authenticated parent evidence establishes parent facts; it never
 vouches for a child transition.
 
 Established by: `AdmissionDecisionTests`.
+
+## NODE-STORAGE-001 — peers and persistence exchange complete Volumes
+
+Peer-facing content requests name one complete Volume root. Entry-level CIDs
+are internal resolution details, and no Volume becomes locally visible until
+its exact membership and CID bytes validate.
+
+## NODE-STORAGE-002 — a durable fact never outruns its content
+
+Live publication orders complete Volume storage, merge retention, then the
+SQLite semantic reference. Exact retained-set reconciliation and garbage
+collection run only while publication is quiescent.
+
+## NODE-MEMPOOL-001 — the mempool is tip-relative, not consensus
+
+The mempool may retain, order, relay, replace, or retry transactions, but only
+Lattice validation against an explicit canonical state can make a transaction
+executable or include it in a block.
+
+Local submissions commit a complete transaction Volume before their SQLite
+reference and survive restart. Every live pool root also has one process-owner
+VolumeBroker pin, updated by pool mutation deltas and removed with the pool
+entry. Startup clears that owner before restoring only the durable local roots,
+so peer submissions remain serveable while pooled but never become recovery
+authority.

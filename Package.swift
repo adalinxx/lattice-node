@@ -22,7 +22,7 @@ let package = Package(
     dependencies: [
         .package(
             url: "https://github.com/adalinxx/Lattice.git",
-            exact: "18.0.1"
+            exact: "20.0.7"
         ),
         .package(
             url: "https://github.com/adalinxx/cashew.git",
@@ -30,7 +30,7 @@ let package = Package(
         ),
         .package(
             url: "https://github.com/adalinxx/Ivy.git",
-            exact: "8.0.0"
+            exact: "10.0.5"
         ),
         .package(
             url: "https://github.com/adalinxx/Tally.git",
@@ -38,7 +38,7 @@ let package = Package(
         ),
         .package(
             url: "https://github.com/adalinxx/VolumeBroker.git",
-            exact: "4.0.0"
+            exact: "4.0.3"
         ),
         .package(url: "https://github.com/hummingbird-project/hummingbird.git", from: "2.0.0"),
         .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.3.0"),
@@ -125,6 +125,20 @@ let package = Package(
                 .product(name: "HummingbirdTesting", package: "hummingbird"),
             ],
             path: "Tests/LatticeNodeTests/Architecture"),
+        .testTarget(
+            name: "LatticeNodeE2ETests",
+            dependencies: [
+                "LatticeNode",
+                "LatticeNodeDaemon",
+                "LatticeMinerCore",
+                "LatticeMiningCoordinatorTool",
+                "LatticeMiner",
+                .product(name: "Lattice", package: "lattice"),
+                .product(name: "Ivy", package: "Ivy"),
+                .product(name: "Crypto", package: "swift-crypto"),
+                .product(name: "cashew", package: "cashew"),
+            ],
+            path: "Tests/LatticeNodeE2ETests"),
         .testTarget(
             name: "LatticeMinerCoreTests",
             dependencies: [

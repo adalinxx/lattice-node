@@ -1,8 +1,8 @@
 # Consensus and fork-choice ownership
 
 Consensus is defined by Lattice, not by `lattice-node`. The canonical rules are
-the [protocol specification](https://github.com/adalinxx/Lattice/blob/18.0.1/docs/spec.md)
-and [work and fork-choice rationale](https://github.com/adalinxx/Lattice/blob/18.0.1/docs/consensus-fork-choice.md).
+the [protocol specification](https://github.com/adalinxx/Lattice/blob/20.0.6/docs/spec.md)
+and [work and fork-choice rationale](https://github.com/adalinxx/Lattice/blob/20.0.6/docs/consensus-fork-choice.md).
 
 The node owns only the operational boundary around those rules:
 
@@ -10,13 +10,16 @@ The node owns only the operational boundary around those rules:
 - acquire the exact sparse evidence Lattice requests;
 - persist accepted fact batches before exposing their effects;
 - retain and replay the same immutable facts after restart;
-- route monotonic, path-scoped inherited-work snapshots without inventing new
-  work quantities; and
+- persist the unique `grind -> parent block` relation and join it only through
+  child-owned exact `parent block -> child block` edges;
+- stream changed work facts by revision, using a full snapshot only for a new
+  or reconnected child session; and
 - project the one canonical chain delta returned by Lattice.
 
 Work observations are joined by grind identity before they are totaled.
-Accepted parent work may affect a child; changing only the parent's canonical
-pointer may not. Exact work ties use Lattice's deterministic segment-base CID
+Accepted parent work affects a child only at an exact committed edge; parent
+ancestry never invents one. Changing only the parent's canonical pointer may
+not change weight. Exact work ties use Lattice's deterministic segment-base CID
 rule, never arrival order or an incumbent preference.
 
 The node must not implement a second fork-choice metric, accept peer-supplied

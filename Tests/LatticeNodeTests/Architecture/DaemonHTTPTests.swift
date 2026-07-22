@@ -9,6 +9,56 @@ import cashew
 @testable import LatticeNodeDaemon
 
 final class DaemonHTTPTests: XCTestCase {
+    func testParentUnavailableIsServiceUnavailable() async throws {
+        let storage = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "lattice-http-parent-unavailable-\(UUID().uuidString)"
+        )
+        addTeardownBlock { try? FileManager.default.removeItem(at: storage) }
+        let process = try await ChainProcess.open(configuration: NodeConfiguration(
+            chainPath: ["Nexus"],
+            minimumRootWork: UInt256(1),
+            storagePath: storage,
+            privateKeyHex: String(repeating: "01", count: 32)
+        ))
+        let service = ChainService(
+            process: process,
+            childCandidateProvider: { _ in [] },
+            childProofPublisher: { _ in },
+            acceptedBlockPublisher: { _ in }
+        )
+        await service.setParentConsensusReady(false)
+        let app = makeApplication(service: service, host: "127.0.0.1", port: 8080)
+        let body = try JSONEncoder().encode(MiningTemplateRequest())
+
+        try await app.test(.router) { client in
+            try await client.execute(
+                uri: "/v1/mining/templates",
+                method: .post,
+                headers: [.contentType: "application/json"],
+                body: ByteBuffer(bytes: body)
+            ) { response in
+                XCTAssertEqual(response.status, .serviceUnavailable)
+            }
+        }
+    }
+
+    func testMiningTemplateRequestJSONDefaultsAndDeploymentMode() throws {
+        let legacy = try JSONDecoder().decode(
+            MiningTemplateRequest.self,
+            from: Data("{}".utf8)
+        )
+        XCTAssertTrue(legacy.rewards.isEmpty)
+        XCTAssertEqual(legacy.mode, .normal)
+
+        let deployment = MiningTemplateRequest(mode: .deployment)
+        let decoded = try JSONDecoder().decode(
+            MiningTemplateRequest.self,
+            from: JSONEncoder().encode(deployment)
+        )
+        XCTAssertTrue(decoded.rewards.isEmpty)
+        XCTAssertEqual(decoded.mode, .deployment)
+    }
+
     func testMiningTemplateAndWorkRoutesRoundTrip() async throws {
         let storage = FileManager.default.temporaryDirectory.appendingPathComponent(
             "lattice-http-mining-test-\(UUID().uuidString)"
@@ -25,7 +75,7 @@ final class DaemonHTTPTests: XCTestCase {
             process: process,
             childCandidateProvider: { _ in [] },
             childProofPublisher: { _ in },
-            acceptedBlockPublisher: { _, _ in }
+            acceptedBlockPublisher: { _ in }
         )
         let app = makeApplication(
             service: service,
@@ -71,6 +121,18 @@ final class DaemonHTTPTests: XCTestCase {
                 XCTAssertEqual(submitted.disposition, .canonicalized)
                 XCTAssertNotNil(submitted.tipCID)
             }
+
+            let deploymentRequest = try JSONEncoder().encode(
+                MiningTemplateRequest(mode: .deployment)
+            )
+            try await client.execute(
+                uri: "/v1/mining/templates",
+                method: .post,
+                headers: [.contentType: "application/json"],
+                body: ByteBuffer(bytes: deploymentRequest)
+            ) { response in
+                XCTAssertEqual(response.status, .conflict)
+            }
         }
     }
 
@@ -90,7 +152,7 @@ final class DaemonHTTPTests: XCTestCase {
             process: process,
             childCandidateProvider: { _ in [] },
             childProofPublisher: { _ in },
-            acceptedBlockPublisher: { _, _ in }
+            acceptedBlockPublisher: { _ in }
         )
         let app = makeApplication(
             service: service,

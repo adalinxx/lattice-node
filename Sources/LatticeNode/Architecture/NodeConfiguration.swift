@@ -82,7 +82,8 @@ public struct NodeConfiguration: Sendable {
     public let address: ChainAddress
     public let minimumRootWork: UInt256
     public let storagePath: URL
-    public let signingKey: Curve25519.Signing.PrivateKey
+    private let signingKeyBytes: [UInt8]
+    public let processPublicKey: String
     public let listenPort: UInt16
     public let factListenPort: UInt16
     public let rpcPort: UInt16
@@ -151,7 +152,10 @@ public struct NodeConfiguration: Sendable {
         self.address = address
         self.minimumRootWork = minimumRootWork
         self.storagePath = storagePath
-        self.signingKey = signingKey
+        self.signingKeyBytes = Array(bytes)
+        self.processPublicKey = try! PeerKey(
+            rawRepresentation: signingKey.publicKey.rawRepresentation
+        ).hex
         self.listenPort = listenPort
         self.factListenPort = factListenPort
         self.rpcPort = rpcPort
@@ -162,8 +166,8 @@ public struct NodeConfiguration: Sendable {
 
     public var chainPath: [String] { address.components }
     public var nexusGenesisCID: String { NexusGenesis.expectedBlockHash }
-    public var processPublicKey: String {
-        try! PeerKey(rawRepresentation: signingKey.publicKey.rawRepresentation).hex
+    public var signingKey: Curve25519.Signing.PrivateKey {
+        try! Curve25519.Signing.PrivateKey(rawRepresentation: signingKeyBytes)
     }
     public var runtimeContext: ChainRuntimeContext {
         get throws {

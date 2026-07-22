@@ -13,7 +13,9 @@ public enum ChainHelloError: Error, Equatable, Sendable {
 /// pinned parent link. Synchronization state is advertised separately because
 /// competing roots on one child path remain ordinary fork-choice candidates.
 public struct ChainHello: Codable, Equatable, Sendable {
-    public static let protocolVersion: UInt16 = 1
+    /// Version 2 makes an ordered empty inherited-work snapshot the live
+    /// parent's session-completion marker.
+    public static let protocolVersion: UInt16 = 2
     public static let maximumEncodedSize = 64 * 1024
 
     public let version: UInt16

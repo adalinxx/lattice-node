@@ -3,22 +3,51 @@ import Lattice
 import UInt256
 import cashew
 
+private enum MiningCandidateValidationError: Error {
+    case invalid
+}
+
 public struct DirectChildCandidate: Sendable {
     public let directory: String
     public let block: Block
-    /// Easiest target satisfied by this candidate or anything nested below it.
+    /// The easiest target accepted anywhere in this candidate's subtree.
+    /// This affects only miner scheduling; every chain validates its own hit.
     public let searchTarget: UInt256
+    /// Hardest pending deployment target in this subtree. Ancestors preserve
+    /// this scheduling barrier without requiring their own chain targets to hit.
+    public let deploymentTarget: UInt256?
+    /// Local-only marker: this direct child is being anchored by this block.
+    let requiresParentTargetHit: Bool
     let acquisitionEntries: [String: Data]
 
     public init(
         directory: String,
         block: Block,
         searchTarget: UInt256,
+        deploymentTarget: UInt256? = nil,
         acquisitionEntries: [String: Data]
     ) {
         self.directory = directory
         self.block = block
         self.searchTarget = searchTarget
+        self.deploymentTarget = deploymentTarget
+        requiresParentTargetHit = false
+        self.acquisitionEntries = acquisitionEntries
+    }
+
+    init(
+        directory: String,
+        block: Block,
+        searchTarget: UInt256,
+        deploymentTarget: UInt256,
+        requiresParentTargetHit: Bool,
+        acquisitionEntries: [String: Data]
+    ) {
+        self.directory = directory
+        self.block = block
+        self.searchTarget = searchTarget
+        self.deploymentTarget = deploymentTarget
+        self.requiresParentTargetHit = requiresParentTargetHit
         self.acquisitionEntries = acquisitionEntries
     }
 }
@@ -27,6 +56,7 @@ public struct MiningTemplate: Sendable {
     public let workID: String
     public let block: Block
     public let searchTarget: UInt256
+    public let deploymentTarget: UInt256?
     public let chainPath: [String]
     public let expiresAt: ContinuousClock.Instant
     let childCandidates: [DirectChildCandidate]
@@ -53,7 +83,7 @@ public enum MiningTemplateError: Error, Equatable {
     case unknownWork
     case expired
     case belowSetupFloor
-    case missesEveryTarget
+    case missesSearchTarget
 }
 
 /// Bounded work cache for external miners. It never searches a nonce.
@@ -86,6 +116,7 @@ public actor MiningTemplateBook {
         children: [DirectChildCandidate],
         parentCarrier: Block? = nil,
         timestamp: Int64,
+        transactionLimit: Int = .max,
         fetcher: any Fetcher
     ) async throws -> MiningTemplate {
         let template = try await assemble(
@@ -94,6 +125,7 @@ public actor MiningTemplateBook {
             children: children,
             parentCarrier: parentCarrier,
             timestamp: timestamp,
+            transactionLimit: transactionLimit,
             fetcher: fetcher
         )
         return issue(template)
@@ -123,6 +155,7 @@ public actor MiningTemplateBook {
         children: [DirectChildCandidate],
         parentCarrier: Block? = nil,
         timestamp: Int64,
+        transactionLimit: Int = .max,
         fetcher: any Fetcher
     ) async throws -> MiningTemplate {
         try await assemble(
@@ -131,6 +164,7 @@ public actor MiningTemplateBook {
             children: children,
             parentCarrier: parentCarrier,
             timestamp: timestamp,
+            transactionLimit: transactionLimit,
             fetcher: fetcher
         )
     }
@@ -141,8 +175,10 @@ public actor MiningTemplateBook {
         children: [DirectChildCandidate],
         parentCarrier: Block?,
         timestamp: Int64,
+        transactionLimit: Int,
         fetcher: any Fetcher
     ) async throws -> MiningTemplate {
+        precondition(transactionLimit >= 0)
         var childBlocks: [String: Block] = [:]
         for child in children {
             guard !child.directory.isEmpty, !child.directory.contains("/") else {
@@ -163,10 +199,18 @@ public actor MiningTemplateBook {
             children: childBlocks,
             parentCarrier: parentCarrier,
             timestamp: timestamp,
+            chainPath: chainPath,
             fetcher: fetcher
         )
         var chunks = transactions.isEmpty ? [] : [transactions[...]]
-        while let chunk = chunks.popLast() {
+        while selected.count < transactionLimit, let chunk = chunks.popLast() {
+            let remaining = transactionLimit - selected.count
+            if chunk.count > remaining {
+                let split = chunk.index(chunk.startIndex, offsetBy: remaining)
+                chunks.append(chunk[split...])
+                chunks.append(chunk[..<split])
+                continue
+            }
             do {
                 candidate = try await Self.makeCandidate(
                     previous: previous,
@@ -174,10 +218,14 @@ public actor MiningTemplateBook {
                     children: childBlocks,
                     parentCarrier: parentCarrier,
                     timestamp: timestamp,
+                    chainPath: chainPath,
                     fetcher: fetcher
                 )
                 selected.append(contentsOf: chunk)
-            } catch is StateErrors {
+            } catch let error
+                where error is StateErrors
+                    || error is ProofErrors
+                    || error is MiningCandidateValidationError {
                 guard chunk.count > 1 else { continue }
                 let midpoint = chunk.index(
                     chunk.startIndex,
@@ -188,17 +236,24 @@ public actor MiningTemplateBook {
             }
         }
         let workID = try BlockHeader(node: candidate).rawCID
-        let easiestAcceptedTarget = children.reduce(candidate.target) {
+        let acceptedTarget = children.reduce(candidate.target) {
             max($0, $1.searchTarget)
         }
+        var deploymentTarget = children.compactMap(\.deploymentTarget).min()
+        if deploymentTarget != nil,
+           children.contains(where: \.requiresParentTargetHit) {
+            deploymentTarget = min(candidate.target, deploymentTarget!)
+        }
         let searchTarget = min(
-            easiestAcceptedTarget,
+            acceptedTarget,
+            deploymentTarget ?? .max,
             UInt256.max / minimumRootWork
         )
         let template = MiningTemplate(
             workID: workID,
             block: candidate,
             searchTarget: searchTarget,
+            deploymentTarget: deploymentTarget,
             chainPath: chainPath,
             expiresAt: ContinuousClock.now + lifetime,
             childCandidates: children
@@ -212,9 +267,10 @@ public actor MiningTemplateBook {
         children: [String: Block],
         parentCarrier: Block?,
         timestamp: Int64,
+        chainPath: [String],
         fetcher: any Fetcher
     ) async throws -> Block {
-        try await BlockBuilder.buildBlock(
+        let candidate = try await BlockBuilder.buildBlock(
             previous: previous,
             transactions: transactions,
             children: children,
@@ -223,6 +279,16 @@ public actor MiningTemplateBook {
             nonce: 0,
             fetcher: fetcher
         )
+        if transactions.contains(where: {
+            $0.body.node?.withdrawalActions.isEmpty != true
+        }) {
+            let valid = try await candidate.validateWithdrawals(
+                fetcher: fetcher,
+                chainPath: chainPath
+            )
+            guard valid else { throw MiningCandidateValidationError.invalid }
+        }
+        return candidate
     }
 
     public func candidate(workID: String, nonce: UInt64) throws -> Block {
@@ -247,7 +313,7 @@ public actor MiningTemplateBook {
             throw MiningTemplateError.belowSetupFloor
         }
         guard rootHash <= template.searchTarget else {
-            throw MiningTemplateError.missesEveryTarget
+            throw MiningTemplateError.missesSearchTarget
         }
         return (candidate, template.childCandidates)
     }

@@ -49,6 +49,10 @@ Worker output is:
 Workers may also expose local progress counters, but those counters are not
 consensus inputs and are not submitted to the node.
 
+Workers derive the midstate from Lattice's canonical nonce-independent block
+preimage and append every candidate nonce as exactly eight big-endian bytes.
+The worker does not define a second proof-of-work encoding.
+
 ## Ownership Matrix
 
 | Responsibility | Owner |

@@ -72,11 +72,38 @@ public struct MiningReward: Codable, Sendable {
     }
 }
 
+public enum MiningMode: String, Codable, Sendable, Equatable {
+    case normal
+    case deployment
+}
+
 public struct MiningTemplateRequest: Codable, Sendable {
     public let rewards: [MiningReward]
+    public let mode: MiningMode
 
-    public init(rewards: [MiningReward] = []) {
+    public init(
+        rewards: [MiningReward] = [],
+        mode: MiningMode = .normal
+    ) {
         self.rewards = rewards
+        self.mode = mode
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case rewards
+        case mode
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        rewards = try container.decodeIfPresent(
+            [MiningReward].self,
+            forKey: .rewards
+        ) ?? []
+        mode = try container.decodeIfPresent(
+            MiningMode.self,
+            forKey: .mode
+        ) ?? .normal
     }
 }
 
@@ -160,10 +187,16 @@ public struct DirectChildProofPublication: Sendable {
 public struct ChildCandidateRequestContext: Sendable {
     public let parentCarrier: Block
     public let rewards: [MiningReward]
+    public let mode: MiningMode
 
-    public init(parentCarrier: Block, rewards: [MiningReward]) {
+    public init(
+        parentCarrier: Block,
+        rewards: [MiningReward],
+        mode: MiningMode = .normal
+    ) {
         self.parentCarrier = parentCarrier
         self.rewards = rewards
+        self.mode = mode
     }
 }
 
@@ -174,14 +207,14 @@ public typealias ChildCandidateProvider = @Sendable (
 public typealias ChildProofPublisher = @Sendable (
     DirectChildProofPublication
 ) async throws -> Void
-public typealias AcceptedBlockPublisher = @Sendable (
-    _ blockCID: String,
-    _ canonicalized: Bool
+public typealias AcceptedBlockPublisher = @Sendable (_ blockCID: String) async throws -> Void
+public typealias AcceptedTransactionPublisher = @Sendable (
+    _ volumeRootCID: String
 ) async throws -> Void
 
-public struct AdmissionEffects: Sendable {
-    public let parentGenesisLinks: [ParentGenesisLink]
-    public let publishedChildProofs: [DirectChildProofSummary]
+private struct AdmissionEffects: Sendable {
+    let parentGenesisLinks: [ParentGenesisLink]
+    let publishedChildProofs: [DirectChildProofSummary]
 }
 
 /// Creates an ordinary direct-child genesis bound to the current parent state.
@@ -252,6 +285,7 @@ public struct ChildDeployIntentResponse: Codable, Sendable {
 
 public enum ChainServicePhase: String, Codable, Sendable {
     case awaitingGenesis
+    case awaitingParent
     case active
 }
 
@@ -261,6 +295,8 @@ public struct ChainServiceStatusResponse: Codable, Sendable, Equatable {
     public let nexusGenesisCID: String
     public let tipCID: String?
     public let height: UInt64?
+    public let revision: UInt64?
+    public let parentWorkRevision: UInt64?
     public let mempoolCount: Int
     public let mempoolBytes: Int
     public let pendingChildIntents: Int
@@ -279,12 +315,14 @@ public enum ChainServiceError: Error, Equatable, Sendable {
     case childCandidateLimitReached
     case invalidParentCarrier
     case parentCarrierRequired
-    case unresolvedChildContent
     case unresolvedTransactionContent
     case templateContextChanged
     case invalidWorkID
     case timestampOverflow
     case templateTooLarge
+    case noDeploymentAvailable
+    case mempoolUnavailable
+    case parentUnavailable
 }
 
 /// Transport-independent operations for one path. A future HTTP layer only
@@ -296,17 +334,29 @@ public actor ChainService {
         let genesisCID: String
         let genesis: Block
         let parentStateCID: String
+        let parentWorkAuthorityKey: ParentWorkAuthorityKey
         let acquisitionEntries: [String: Data]
     }
 
     private struct Anchor: Hashable {
         let directory: String
         let genesisCID: String
+        let parentWorkAuthorityKey: ParentWorkAuthorityKey
     }
 
     private struct ValidatedRewardPlan {
         let current: Transaction?
         let descendants: [MiningReward]
+    }
+
+    private struct QueuedCanonicalCommit: Sendable {
+        let commit: ChainCommit
+        let receipt: CanonicalCommitReceipt
+    }
+
+    private enum OperationWaiter {
+        case caller(CheckedContinuation<Void, Never>)
+        case canonicalCommit
     }
 
     private static let maximumWorkIDBytes = 256
@@ -316,6 +366,13 @@ public actor ChainService {
     private static let maximumRewardPlanEntries = 256
     private static let maximumRewardPlanBytes =
         ChainServiceLimits.maximumPayloadBytes
+    private static let maximumChildIntents = 64
+    private static let maximumChildIntentBytes =
+        ChainServiceLimits.maximumPayloadBytes
+    private static let maximumChildCandidateBytes = 16 * 1024 * 1024
+    private static let templateLifetimeSeconds: Int64 = 30
+    private static let templateLifetimeMilliseconds: UInt64 = 30_000
+    private static let templateCapacity = 16
 
     private let process: ChainProcess
     private let pool: TransactionPool
@@ -323,84 +380,181 @@ public actor ChainService {
     private let childCandidateProvider: ChildCandidateProvider
     private let childProofPublisher: ChildProofPublisher
     private let acceptedBlockPublisher: AcceptedBlockPublisher
-    private let maximumChildIntents: Int
-    private let maximumChildIntentBytes: Int
+    private let acceptedTransactionPublisher: AcceptedTransactionPublisher
     private let maximumChildCandidates: Int
-    private let maximumChildCandidateBytes: Int
-    private let templateLifetimeMilliseconds: UInt64
-    private let templateCapacity: Int
     private var childIntents: [String: ChildIntent] = [:]
+    private var deploymentTransactionCursor = 0
+    private var deploymentChildCursor = 0
+    private var deploymentSourceCursor = 0
+    private var liveMempoolRoots = Set<String>()
+    private var mempoolUnavailable = false
+    private var canonicalCommitQueue: [QueuedCanonicalCommit] = []
+    private var canonicalCommitWorker: Task<Void, Never>?
+    private var canonicalCommitWorkerReserved = false
+    private var parentConsensusReady: Bool
 
     // This actor calls other actors and is therefore reentrant. Keep its pool,
     // template cache, and pending intents in one externally observable order.
     private var operationInFlight = false
-    private var operationWaiters: [CheckedContinuation<Void, Never>] = []
+    private var operationWaiters: [OperationWaiter] = []
 
     public init(
         process: ChainProcess,
         childCandidateProvider: @escaping ChildCandidateProvider,
         childProofPublisher: @escaping ChildProofPublisher,
         acceptedBlockPublisher: @escaping AcceptedBlockPublisher,
+        acceptedTransactionPublisher: @escaping AcceptedTransactionPublisher = { _ in },
         mempoolMaxCount: Int = 10_000,
-        mempoolMaxBytes: Int = 64 * 1024 * 1024,
-        maximumChildIntents: Int = 64,
-        maximumChildIntentBytes: Int = ChainServiceLimits.maximumPayloadBytes,
-        maximumChildCandidates: Int = 64,
-        maximumChildCandidateBytes: Int = 16 * 1024 * 1024,
-        templateLifetimeSeconds: UInt64 = 30,
-        templateCapacity: Int = 16
+        maximumChildCandidates: Int = 64
     ) {
-        precondition(
-            maximumChildIntents > 0
-                && maximumChildIntentBytes > 0
-                && maximumChildCandidates > 0
-                && maximumChildCandidateBytes > 0
-                && maximumChildIntentBytes
-                    <= ChainServiceLimits.maximumPayloadBytes
-                && templateLifetimeSeconds > 0
-                && templateCapacity > 0
-                && templateLifetimeSeconds <= UInt64(Int64.max / 1_000)
-        )
+        precondition(mempoolMaxCount > 0 && maximumChildCandidates > 0)
         self.process = process
         self.childCandidateProvider = childCandidateProvider
         self.childProofPublisher = childProofPublisher
         self.acceptedBlockPublisher = acceptedBlockPublisher
+        self.acceptedTransactionPublisher = acceptedTransactionPublisher
         self.pool = TransactionPool(
             maxCount: mempoolMaxCount,
-            maxBytes: mempoolMaxBytes
+            maxBytes: 64 * 1024 * 1024
         )
         self.templates = MiningTemplateBook(
             chainPath: process.configuration.chainPath,
             minimumRootWork: process.configuration.minimumRootWork,
-            lifetime: .seconds(Int64(templateLifetimeSeconds)),
-            capacity: templateCapacity
+            lifetime: .seconds(Self.templateLifetimeSeconds),
+            capacity: Self.templateCapacity
         )
-        self.maximumChildIntents = maximumChildIntents
-        self.maximumChildIntentBytes = maximumChildIntentBytes
         self.maximumChildCandidates = maximumChildCandidates
-        self.maximumChildCandidateBytes = maximumChildCandidateBytes
-        self.templateLifetimeMilliseconds = templateLifetimeSeconds * 1_000
-        self.templateCapacity = templateCapacity
+        self.parentConsensusReady = process.configuration.address.isNexus
+    }
+
+    /// A child may retain and exchange immutable facts while disconnected, but
+    /// only a complete sync from its live configured parent makes its current
+    /// fork choice actionable. Nexus alone starts ready because it has no
+    /// parent; every child waits for the network runtime's session fence.
+    public func setParentConsensusReady(_ ready: Bool) async {
+        await acquireOperation()
+        defer { releaseOperation() }
+        guard parentConsensusReady != ready else { return }
+        parentConsensusReady = ready
+        await templates.invalidateAll()
     }
 
     public func status() async -> ChainServiceStatusResponse {
         await acquireOperation()
         defer { releaseOperation() }
+        let mempoolAvailable = (try? await prepareMempoolLocked()) != nil
         let status = await process.status()
         if status.phase == .active,
            let tip = try? await process.canonicalTipBlock() {
             removeStaleChildIntents(parentStateCID: tip.postState.rawCID)
         }
+        let phase: ChainServicePhase = if status.phase != .active {
+            .awaitingGenesis
+        } else if parentConsensusReady {
+            .active
+        } else {
+            .awaitingParent
+        }
         return ChainServiceStatusResponse(
-            phase: status.phase == .active ? .active : .awaitingGenesis,
+            phase: phase,
             chainPath: status.chainPath,
             nexusGenesisCID: status.nexusGenesisCID,
             tipCID: status.tipCID,
             height: status.height,
-            mempoolCount: await pool.count,
-            mempoolBytes: await pool.byteCount,
+            revision: status.revision,
+            parentWorkRevision: status.parentWorkRevision,
+            mempoolCount: mempoolAvailable ? await pool.count : 0,
+            mempoolBytes: mempoolAvailable ? await pool.byteCount : 0,
             pendingChildIntents: childIntents.count
         )
+    }
+
+    /// Appends a canonical commit while ChainProcess still owns mutation order.
+    /// Reconciliation is deferred to this service's worker so callers can
+    /// release their operation gate before waiting.
+    func enqueueCanonicalCommit(
+        _ commit: ChainCommit
+    ) -> CanonicalCommitReceipt {
+        let receipt = CanonicalCommitReceipt()
+        canonicalCommitQueue.append(QueuedCanonicalCommit(
+            commit: commit,
+            receipt: receipt
+        ))
+        reserveCanonicalCommitWorker()
+        return receipt
+    }
+
+    /// Apply the immediate parent's monotone work facts and reconcile every
+    /// service-owned projection before the runtime announces a resulting
+    /// reorg. The runtime authenticates the route; this actor owns pool,
+    /// template, and child-intent consistency.
+    @discardableResult
+    public func applyInheritedWorkSnapshot(
+        _ snapshot: InheritedWorkSnapshot,
+        from parentAuthorityKey: String
+    ) async throws -> ChainCommit? {
+        await acquireOperation()
+        var ownsOperation = true
+        defer {
+            if ownsOperation { releaseOperation() }
+        }
+        let update = try await process.applyInheritedWorkSnapshot(
+            snapshot,
+            from: parentAuthorityKey,
+            canonicalCommitPublisher: { [self] commit in
+                await enqueueCanonicalCommit(commit)
+            }
+        )
+        guard let commit = update.commit,
+              commit.canonicalChanged,
+              let receipt = update.canonicalCommitReceipt else {
+            return update.commit
+        }
+
+        // The process reserved this receipt before it released its mutation
+        // order, so a ready network admission cannot overtake this reorg.
+        releaseOperation()
+        ownsOperation = false
+        await receipt.wait()
+        return commit
+    }
+
+    /// The only production ingress for a candidate acquired by the network.
+    /// The process reserves canonical reconciliation before it releases its
+    /// mutation order; this method then waits behind that reservation before
+    /// projecting service-owned state.
+    public func admitNetworkCandidate(
+        _ header: BlockHeader,
+        authenticatedChildPackage: AuthenticatedChildPackage?,
+        preparingChildDirectories: [String]
+    ) async throws -> NodeAdmissionOutcome {
+        let outcome = try await process.admit(
+            header,
+            authenticatedChildPackage: authenticatedChildPackage,
+            preparingChildDirectories: preparingChildDirectories,
+            allowsRemoteAcquisition: true,
+            canonicalCommitPublisher: { [self] commit in
+                await enqueueCanonicalCommit(commit)
+            }
+        )
+        guard let block = await locallyStoredBlock(header) else {
+            // A target-miss carrier is intentionally not local chain state,
+            // but its authenticated path can still carry an accepted direct
+            // child. Relay any proof the process durably composed for it.
+            if outcome.parentCarrierLink != nil {
+                await handleCarrierAdmission(
+                    header: header,
+                    outcome: outcome
+                )
+            }
+            return outcome
+        }
+        _ = await handleAdmission(
+            block: block,
+            header: header,
+            outcome: outcome
+        )
+        return outcome
     }
 
     public func submitTransaction(
@@ -412,21 +566,243 @@ public actor ChainService {
               payload.count <= ChainServiceLimits.maximumPayloadBytes else {
             throw ChainServiceError.requestTooLarge
         }
-        let previous = try await process.canonicalTipBlock()
-        removeStaleChildIntents(parentStateCID: previous.postState.rawCID)
-        let spec = try await chainSpec(for: previous)
-        let cid = try await pool.submit(
+        let admission = try await admitTransactionLocked(
             request.transaction,
-            chainPath: process.configuration.chainPath,
-            spec: spec,
-            fetcher: process,
-            storer: process
+            persistLocal: true
         )
+        try? await acceptedTransactionPublisher(admission.cid)
         return SubmitTransactionResponse(
-            transactionCID: cid,
+            transactionCID: admission.cid,
             mempoolCount: await pool.count,
             mempoolBytes: await pool.byteCount
         )
+    }
+
+    /// Same-chain peer ingress. The exact advertiser has already supplied and
+    /// content-address verified the complete Volume; only Lattice may classify
+    /// its state validity.
+    public func submitNetworkTransaction(
+        _ transaction: Transaction
+    ) async throws -> Bool {
+        await acquireOperation()
+        defer { releaseOperation() }
+        return try await admitTransactionLocked(
+            transaction,
+            persistLocal: false
+        ).inserted
+    }
+
+    public func transactionInventoryRoots() async -> [String] {
+        await acquireOperation()
+        defer { releaseOperation() }
+        guard (try? await prepareMempoolLocked()) != nil else { return [] }
+        return await pool.snapshot().map(\.cid).sorted()
+    }
+
+    /// Rebuilds only user-submitted durable entries before networking starts.
+    /// Peer-originated transactions intentionally remain volatile.
+    public func restoreLocalTransactions() async throws {
+        await acquireOperation()
+        defer { releaseOperation() }
+        let durable = try await process.localTransactions()
+        guard !durable.isEmpty else { return }
+        let tip = try await process.canonicalTipBlock()
+        let spec = try await chainSpec(for: tip)
+        for item in durable {
+            let disposition = Self.poolDisposition(
+                (try await process.preflightTransaction(item.transaction)).disposition
+            )
+            guard disposition != .invalid else {
+                try await process.removeLocalTransaction(item.transactionCID)
+                continue
+            }
+            _ = try? await pool.submit(
+                item.transaction,
+                spec: spec,
+                fetcher: process,
+                disposition: disposition,
+                addedAt: Date(timeIntervalSince1970: TimeInterval(item.addedAt))
+            )
+        }
+        try await prepareMempoolLocked()
+        let roots = Set(await pool.snapshot().map(\.cid))
+        try await pruneDurableLocalTransactionsLocked(keeping: roots)
+        try await syncLiveMempoolRootsLocked(roots)
+    }
+
+    private func admitTransactionLocked(
+        _ transaction: Transaction,
+        persistLocal: Bool
+    ) async throws -> (cid: String, inserted: Bool) {
+        try await prepareMempoolLocked()
+        let previous = try await process.canonicalTipBlock()
+        removeStaleChildIntents(parentStateCID: previous.postState.rawCID)
+        let spec = try await chainSpec(for: previous)
+        guard let envelope = transaction.toData(),
+              envelope.count <= spec.maxBlockSize,
+              transaction.body.node?.toData().map({
+                  $0.count <= spec.maxBlockSize
+              }) ?? true else {
+            throw TransactionPoolError.tooLarge
+        }
+        let preflight = try await process.preflightTransaction(
+            transaction
+        )
+        guard await process.status().tipCID == preflight.tipCID else {
+            throw ChainServiceError.templateContextChanged
+        }
+        let disposition = Self.poolDisposition(preflight.disposition)
+        guard disposition != .invalid else {
+            throw TransactionPoolError.invalidState
+        }
+        let expectedCID = try VolumeImpl<Transaction>(node: transaction).rawCID
+        let durableBefore = try await process.localTransactionTimestamps()
+        let mutation = try await pool.submit(
+            transaction,
+            spec: spec,
+            fetcher: process,
+            disposition: disposition
+        )
+        guard let cid = mutation.transactionCID, cid == expectedCID else {
+            await pool.rollback(mutation)
+            throw TransactionPoolError.unresolved
+        }
+        let wasKnown = mutation.inserted == nil
+        do {
+            let snapshot = await pool.snapshot()
+            if persistLocal,
+               durableBefore[cid] == nil,
+               let admitted = snapshot.first(where: { $0.cid == cid }) {
+                let storedCID = try await process.persistLocalTransaction(
+                    admitted.transaction,
+                    addedAt: Int64(admitted.addedAt.timeIntervalSince1970)
+                )
+                guard storedCID == cid else {
+                    throw TransactionPoolError.unresolved
+                }
+            } else if !wasKnown {
+                let storedCID = try await process.persistPeerTransaction(
+                    transaction
+                )
+                // `persistPeerTransaction` installed this owner pin while the
+                // process mutation gate was held; account for it before the
+                // ordinary delta sync so it is neither doubled nor leaked.
+                liveMempoolRoots.insert(storedCID)
+                guard storedCID == cid else {
+                    throw TransactionPoolError.unresolved
+                }
+            }
+            try await pruneDurableLocalTransactionsLocked(
+                keeping: Set(snapshot.map(\.cid))
+            )
+            try await syncLiveMempoolRootsLocked(Set(snapshot.map(\.cid)))
+            guard await process.status().tipCID == preflight.tipCID else {
+                throw ChainServiceError.templateContextChanged
+            }
+            return (cid, !wasKnown)
+        } catch {
+            await pool.rollback(mutation)
+            try await restoreLocalDurabilityLocked(
+                durableBefore,
+                mutation: mutation
+            )
+            try await syncLiveMempoolRootsLocked(
+                Set(await pool.snapshot().map(\.cid))
+            )
+            throw error
+        }
+    }
+
+    private func restoreLocalDurabilityLocked(
+        _ durableBefore: [String: Int64],
+        mutation: TransactionPoolMutation
+    ) async throws {
+        let changed = [mutation.inserted].compactMap { $0 }
+            + mutation.replaced + mutation.evicted
+            + mutation.expired + mutation.removed
+        var changedByCID = Dictionary(uniqueKeysWithValues: changed.map {
+            ($0.cid, $0.transaction)
+        })
+        if let transactionCID = mutation.transactionCID {
+            let current = await pool.snapshot().first {
+                $0.cid == transactionCID
+            }
+            changedByCID[transactionCID] = mutation.inserted?.transaction
+                ?? current?.transaction
+        }
+        let changedRoots = Set(changedByCID.keys)
+        let currentRoots = Set(
+            try await process.localTransactionTimestamps().keys
+        )
+        for cid in changedRoots where durableBefore[cid] == nil
+            && currentRoots.contains(cid) {
+            try await process.removeLocalTransaction(cid)
+        }
+        for cid in changedRoots where durableBefore[cid] != nil
+            && !currentRoots.contains(cid) {
+            guard let addedAt = durableBefore[cid],
+                  let transaction = changedByCID[cid] else { continue }
+            _ = try await process.persistLocalTransaction(
+                transaction,
+                addedAt: addedAt
+            )
+        }
+    }
+
+    private func pruneDurableLocalTransactionsLocked(
+        keeping roots: Set<String>
+    ) async throws {
+        for transactionCID in try await process.localTransactionTimestamps().keys
+        where !roots.contains(transactionCID) {
+            try await process.removeLocalTransaction(transactionCID)
+        }
+    }
+
+    private func prepareMempoolLocked() async throws {
+        if mempoolUnavailable {
+            do {
+                try await pruneDurableLocalTransactionsLocked(keeping: [])
+                try await syncLiveMempoolRootsLocked([])
+                mempoolUnavailable = false
+            } catch {
+                throw ChainServiceError.mempoolUnavailable
+            }
+        }
+        let expiration = await pool.expire()
+        guard !expiration.expired.isEmpty else { return }
+        let durableBefore: [String: Int64]
+        do {
+            durableBefore = try await process.localTransactionTimestamps()
+        } catch {
+            await pool.rollback(expiration)
+            throw error
+        }
+        do {
+            let roots = Set(await pool.snapshot().map(\.cid))
+            try await pruneDurableLocalTransactionsLocked(keeping: roots)
+            try await syncLiveMempoolRootsLocked(roots)
+        } catch {
+            await pool.rollback(expiration)
+            try await restoreLocalDurabilityLocked(
+                durableBefore,
+                mutation: expiration
+            )
+            try await syncLiveMempoolRootsLocked(
+                Set(await pool.snapshot().map(\.cid))
+            )
+            throw error
+        }
+    }
+
+    private func syncLiveMempoolRootsLocked(_ roots: Set<String>) async throws {
+        let added = roots.subtracting(liveMempoolRoots)
+        let removed = liveMempoolRoots.subtracting(roots)
+        guard !added.isEmpty || !removed.isEmpty else { return }
+        try await process.updateLiveMempoolRoots(
+            adding: added,
+            removing: removed
+        )
+        liveMempoolRoots = roots
     }
 
     public func createChildDeployIntent(
@@ -434,6 +810,7 @@ public actor ChainService {
     ) async throws -> ChildDeployIntentResponse {
         await acquireOperation()
         defer { releaseOperation() }
+        guard parentConsensusReady else { throw ChainServiceError.parentUnavailable }
         guard request.directory.utf8.count <= Self.maximumDirectoryBytes,
               let childAddress = ChainAddress(
                   process.configuration.chainPath + [request.directory]
@@ -441,17 +818,24 @@ public actor ChainService {
             throw ChainServiceError.invalidChildDirectory
         }
         guard let encoded = try? JSONEncoder().encode(request),
-              encoded.count <= maximumChildIntentBytes else {
+              encoded.count <= Self.maximumChildIntentBytes else {
             throw ChainServiceError.childIntentTooLarge
         }
+        guard let parentAuthority = ParentWorkAuthorityKey(
+            process.configuration.processPublicKey
+        ), request.spec.parentWorkAuthorityKey == nil
+                || request.spec.parentWorkAuthorityKey == parentAuthority else {
+            throw ChainServiceError.invalidChildGenesis
+        }
+        let childSpec = request.spec.withParentWorkAuthorityKey(parentAuthority)
         let parent = try await process.canonicalTipBlock()
         removeStaleChildIntents(parentStateCID: parent.postState.rawCID)
         guard childIntents[request.directory] != nil
-            || childIntents.count < maximumChildIntents else {
+            || childIntents.count < Self.maximumChildIntents else {
             throw ChainServiceError.childIntentLimitReached
         }
         let genesis = try await BlockBuilder.buildChildGenesis(
-            spec: request.spec,
+            spec: childSpec,
             parentState: parent.postState,
             transactions: request.genesisTransactions,
             timestamp: request.timestamp,
@@ -470,11 +854,7 @@ public actor ChainService {
         // `parentState` deliberately references the parent's existing state;
         // recursively claiming that graph as child-deploy content would invent
         // cross-volume ownership.
-        try await (header as any Header).store(storer: process)
-        try await (genesis.transactions as any Header).storeRecursively(
-            storer: process
-        )
-        try await (genesis.spec as any Header).storeRecursively(storer: process)
+        try await header.storeBlock(fetcher: process, storer: process)
         let acquisitionEntries = try await process.durableCandidateEntries(
             for: genesis
         )
@@ -484,6 +864,7 @@ public actor ChainService {
             genesisCID: header.rawCID,
             genesis: genesis,
             parentStateCID: parent.postState.rawCID,
+            parentWorkAuthorityKey: parentAuthority,
             acquisitionEntries: acquisitionEntries
         )
         childIntents[request.directory] = intent
@@ -502,17 +883,20 @@ public actor ChainService {
     ) async throws -> MiningTemplateResponse {
         await acquireOperation()
         defer { releaseOperation() }
+        guard parentConsensusReady else { throw ChainServiceError.parentUnavailable }
+        try await prepareMempoolLocked()
         guard process.configuration.address.isNexus else {
             throw ChainServiceError.parentCarrierRequired
         }
         let assembled = try await buildMiningTemplate(
             rewards: request.rewards,
+            mode: request.mode,
             parentCarrier: nil
         )
         let template = await templates.issue(assembled)
         return MiningTemplateResponse(
             template: template,
-            maximumLifetimeMilliseconds: templateLifetimeMilliseconds
+            maximumLifetimeMilliseconds: Self.templateLifetimeMilliseconds
         )
     }
 
@@ -520,38 +904,53 @@ public actor ChainService {
     /// supplies the provisional carrier whose `prevState` this block must bind.
     public func miningCandidate(
         parentCarrier: Block,
-        rewards: [MiningReward] = []
+        parentContentSource: any ContentSource,
+        rewards: [MiningReward] = [],
+        mode: MiningMode = .normal
     ) async throws -> DirectChildCandidate {
         await acquireOperation()
         defer { releaseOperation() }
+        guard parentConsensusReady else { throw ChainServiceError.parentUnavailable }
+        try await prepareMempoolLocked()
         guard !process.configuration.address.isNexus,
               (try? BlockHeader(node: parentCarrier)) != nil else {
             throw ChainServiceError.invalidParentCarrier
         }
+        let fetcher = CoalescingFetcher(CompositeContentSource([
+            FetcherContentSource(process),
+            parentContentSource,
+        ]))
         let template = try await buildMiningTemplate(
             rewards: rewards,
-            parentCarrier: parentCarrier
+            mode: mode,
+            parentCarrier: parentCarrier,
+            fetcher: fetcher
         )
         _ = try await process.prepareChildProofs(
             for: template.block,
             children: template.childCandidates,
-            capacity: templateCapacity
+            capacity: Self.templateCapacity
         )
         let acquisitionEntries = try await process.durableCandidateEntries(
-            for: template.block
+            for: template.block,
+            fetcher: fetcher
         )
         return DirectChildCandidate(
             directory: process.configuration.address.directory,
             block: template.block,
             searchTarget: template.searchTarget,
+            deploymentTarget: template.deploymentTarget,
             acquisitionEntries: acquisitionEntries
         )
     }
 
     private func buildMiningTemplate(
         rewards: [MiningReward],
-        parentCarrier: Block?
+        mode: MiningMode,
+        parentCarrier: Block?,
+        fetcher: (any Fetcher)? = nil
     ) async throws -> MiningTemplate {
+        let fetcher: any Fetcher = fetcher ?? process
         let previous = try await process.canonicalTipBlock()
         removeStaleChildIntents(parentStateCID: previous.postState.rawCID)
         let spec = try await chainSpec(for: previous)
@@ -564,17 +963,85 @@ public actor ChainService {
         let maximumTransactions = Int(clamping: spec.maxNumberOfTransactionsPerBlock)
         var poolLimit = max(0, maximumTransactions - (reward == nil ? 0 : 1))
         let timestamp = try nextTimestamp(after: previous.timestamp)
+        let pooled: [Transaction]
+        if let parentCarrier {
+            var contextual: [Transaction] = []
+            for transaction in await pool.contextualTransactions(limit: .max) {
+                let preflight = try await process.preflightTransaction(
+                    transaction,
+                    parentState: parentCarrier.prevState,
+                    fetcher: fetcher
+                )
+                if preflight.disposition == .ready
+                    || preflight.disposition == .future {
+                    contextual.append(transaction)
+                }
+            }
+            pooled = contextual
+        } else {
+            pooled = await pool.transactions(limit: .max)
+        }
+        try await syncLiveMempoolRootsLocked(
+            Set(await pool.snapshot().map(\.cid))
+        )
+        let deploymentIndices = pooled.indices.filter {
+            !anchors(in: [pooled[$0]]).isEmpty
+        }
+        let pendingDeploymentIndices = deploymentIndices.filter {
+            isPendingDeployment(
+                pooled[$0],
+                parentStateCID: previous.postState.rawCID
+            )
+        }
+        let deploymentIndexSet = Set(deploymentIndices)
+        var preferredDeploymentIndex: Int?
+        var deploymentCursorAdvance = 0
+        if mode == .deployment, poolLimit > 0 {
+            for offset in pendingDeploymentIndices.indices {
+                let position = (deploymentTransactionCursor &+ offset)
+                    % pendingDeploymentIndices.count
+                let index = pendingDeploymentIndices[position]
+                let candidateAnchors = anchors(in: [pooled[index]])
+                let probe = try await templates.preview(
+                    previous: previous,
+                    transactions: (reward.map { [$0] } ?? []) + [pooled[index]],
+                    children: [],
+                    parentCarrier: parentCarrier,
+                    timestamp: timestamp,
+                    transactionLimit: (reward == nil ? 0 : 1) + 1,
+                    fetcher: fetcher
+                )
+                let included = anchors(
+                    in: try await blockTransactions(in: probe.block)
+                )
+                guard candidateAnchors.isSubset(of: included) else { continue }
+                preferredDeploymentIndex = index
+                deploymentCursorAdvance = offset + 1
+                break
+            }
+        }
+        let childDeploymentCursor = deploymentChildCursor
+        var selectLocalDeployment = preferredDeploymentIndex != nil
+            && deploymentSourceCursor.isMultiple(of: 2)
 
         while true {
-            let pooled = await pool.transactions(limit: poolLimit)
-            let transactions = (reward.map { [$0] } ?? []) + pooled
+            let selectedDeploymentIndex = selectLocalDeployment && poolLimit > 0
+                ? preferredDeploymentIndex
+                : nil
+            let ordinary = pooled.indices.compactMap {
+                deploymentIndexSet.contains($0) ? nil : pooled[$0]
+            }
+            let transactions = (reward.map { [$0] } ?? [])
+                + (selectedDeploymentIndex.map { [pooled[$0]] } ?? [])
+                + ordinary
             let provisional = try await templates.preview(
                 previous: previous,
                 transactions: transactions,
                 children: [],
                 parentCarrier: parentCarrier,
                 timestamp: timestamp,
-                fetcher: process
+                transactionLimit: poolLimit + (reward == nil ? 0 : 1),
+                fetcher: fetcher
             )
             try requireReward(rewardPlan.current, in: provisional.block)
             if !blockFits(provisional.block, spec: spec) {
@@ -588,17 +1055,47 @@ public actor ChainService {
             let selectedTransactions = try await blockTransactions(
                 in: provisional.block
             )
+            let selectedAnchors = anchors(in: selectedTransactions)
+            let localDeploymentIncluded = selectedDeploymentIndex.map {
+                anchors(in: [pooled[$0]]).isSubset(of: selectedAnchors)
+            } ?? false
             let providedChildren = try await validatedProvidedChildren(
                 context: ChildCandidateRequestContext(
                     parentCarrier: provisional.block,
-                    rewards: rewardPlan.descendants
-                )
+                    rewards: rewardPlan.descendants,
+                    mode: mode == .deployment && !localDeploymentIncluded
+                        ? .deployment
+                        : .normal
+                ),
+                deploymentCursor: childDeploymentCursor
             )
+            let providedDeployment = providedChildren.contains {
+                $0.deploymentTarget != nil
+            }
+            if mode == .deployment,
+               !pendingDeploymentIndices.isEmpty,
+               !localDeploymentIncluded,
+               !providedDeployment,
+               poolLimit == 0 {
+                throw ChainServiceError.templateTooLarge
+            }
+            if mode == .deployment,
+               preferredDeploymentIndex != nil,
+               !selectLocalDeployment,
+               !providedDeployment {
+                selectLocalDeployment = true
+                continue
+            }
+            if mode == .deployment,
+               !localDeploymentIncluded,
+               !providedDeployment {
+                throw ChainServiceError.noDeploymentAvailable
+            }
             let children = try combineChildren(
                 providedChildren,
                 eligibleChildren(
                     parentStateCID: previous.postState.rawCID,
-                    anchors: anchors(in: selectedTransactions)
+                    anchors: selectedAnchors
                 )
             )
             let template = try await templates.preview(
@@ -607,7 +1104,7 @@ public actor ChainService {
                 children: children,
                 parentCarrier: parentCarrier,
                 timestamp: timestamp,
-                fetcher: process
+                fetcher: fetcher
             )
             try requireReward(rewardPlan.current, in: template.block)
             try requireSameTemplateContext(
@@ -616,6 +1113,15 @@ public actor ChainService {
             )
 
             if blockFits(template.block, spec: spec) {
+                if localDeploymentIncluded {
+                    deploymentTransactionCursor &+= deploymentCursorAdvance
+                }
+                if providedDeployment {
+                    deploymentChildCursor &+= 1
+                }
+                if mode == .deployment {
+                    deploymentSourceCursor &+= 1
+                }
                 return template
             }
             guard poolLimit > 0 else {
@@ -629,7 +1135,11 @@ public actor ChainService {
         _ request: SubmitWorkRequest
     ) async throws -> SubmitWorkResponse {
         await acquireOperation()
-        defer { releaseOperation() }
+        var ownsOperation = true
+        defer {
+            if ownsOperation { releaseOperation() }
+        }
+        guard parentConsensusReady else { throw ChainServiceError.parentUnavailable }
         guard process.configuration.address.isNexus else {
             throw ChainServiceError.parentCarrierRequired
         }
@@ -646,14 +1156,28 @@ public actor ChainService {
         _ = try await process.prepareChildProofs(
             for: candidate,
             children: submission.children,
-            capacity: templateCapacity
+            capacity: Self.templateCapacity
         )
-        let outcome = try await process.admit(header)
-        let effects = try await applyAdmissionEffects(
+        let outcome = try await process.admit(
+            header,
+            canonicalCommitPublisher: { [self] commit in
+                await enqueueCanonicalCommit(commit)
+            }
+        )
+        let effects = await applyAdmissionEffects(
             block: candidate,
             header: header,
             outcome: outcome
         )
+
+        // The process enqueued this commit while preserving its own mutation
+        // order. Release our gate before waiting because reconciliation must
+        // acquire the same gate to update the pool and templates.
+        if let receipt = outcome.canonicalCommitReceipt {
+            releaseOperation()
+            ownsOperation = false
+            await receipt.wait()
+        }
 
         let status = await process.status()
         let accepted: Bool
@@ -677,64 +1201,128 @@ public actor ChainService {
     /// candidate was admitted through gossip, sync, or the hierarchy plane.
     /// Consensus admission itself remains exclusively in `ChainProcess`.
     @discardableResult
-    public func handleAdmission(
+    private func handleAdmission(
         block: Block,
+        header: BlockHeader,
         outcome: NodeAdmissionOutcome
-    ) async throws -> AdmissionEffects {
+    ) async -> AdmissionEffects {
         await acquireOperation()
         defer { releaseOperation() }
-        return try await applyAdmissionEffects(
+        return await applyAdmissionEffects(
             block: block,
-            header: BlockHeader(node: block),
+            header: header,
             outcome: outcome
         )
+    }
+
+    private func handleCarrierAdmission(
+        header: BlockHeader,
+        outcome: NodeAdmissionOutcome
+    ) async {
+        await acquireOperation()
+        defer { releaseOperation() }
+        _ = await publishCarrierChildProofs(
+            header: header,
+            outcome: outcome
+        )
+    }
+
+    private func startCanonicalCommitWorker() {
+        guard canonicalCommitWorker == nil else { return }
+        canonicalCommitWorker = Task {
+            await drainCanonicalCommits()
+        }
+    }
+
+    private func reserveCanonicalCommitWorker() {
+        guard !canonicalCommitWorkerReserved else { return }
+        // Reserve the gate before the task starts so later callers cannot see
+        // advanced chain state before reconciliation.
+        canonicalCommitWorkerReserved = true
+        if operationInFlight {
+            operationWaiters.insert(.canonicalCommit, at: 0)
+        } else {
+            operationInFlight = true
+            startCanonicalCommitWorker()
+        }
+    }
+
+    private func drainCanonicalCommits() async {
+        precondition(canonicalCommitWorkerReserved)
+        while !canonicalCommitQueue.isEmpty {
+            let event = canonicalCommitQueue.removeFirst()
+            await reconcileCanonicalCommitOrResetLocked(event.commit)
+            await event.receipt.finish()
+        }
+        canonicalCommitWorker = nil
+        canonicalCommitWorkerReserved = false
+        releaseOperation()
+    }
+
+    private func reconcileCanonicalCommitOrResetLocked(
+        _ commit: ChainCommit
+    ) async {
+        do {
+            try await reconcileCanonicalCommitLocked(commit)
+        } catch {
+            _ = await pool.clear()
+            do {
+                try await pruneDurableLocalTransactionsLocked(keeping: [])
+                try await syncLiveMempoolRootsLocked([])
+                mempoolUnavailable = false
+            } catch {
+                mempoolUnavailable = true
+            }
+            await templates.invalidateAll()
+            childIntents.removeAll()
+        }
     }
 
     private func applyAdmissionEffects(
         block: Block,
         header: BlockHeader,
         outcome: NodeAdmissionOutcome
-    ) async throws -> AdmissionEffects {
-        var genesisLinks: [ParentGenesisLink] = []
-        let durableProofs: [DurableDirectChildProof]
-        if let link = outcome.parentCarrierLink {
-            durableProofs = (try? await process.durableDirectChildProofs(
-                carrierCID: header.rawCID,
-                rootCID: link.rootCID
-            )) ?? []
-        } else {
-            durableProofs = []
+    ) async -> AdmissionEffects {
+        // Visibility of accepted work is independent from optional child
+        // materialization. A missing child payload must not suppress the
+        // canonical announcement or inherited-work refresh.
+        switch outcome.decision {
+        case .canonicalized(let commit):
+            if outcome.canonicalCommitReceipt == nil {
+                await reconcileCanonicalCommitOrResetLocked(commit)
+            }
+            try? await acceptedBlockPublisher(header.rawCID)
+        case .acceptedSide:
+            try? await acceptedBlockPublisher(header.rawCID)
+        case .carrier where outcome.inheritedWorkChanged:
+            // The carrier itself may be a target miss. Reannounce the accepted
+            // tip so the runtime pushes the new generic work delta without
+            // advertising an unaccepted same-chain block.
+            if let tipCID = await process.status().tipCID {
+                try? await acceptedBlockPublisher(tipCID)
+            }
+        default:
+            break
         }
+
+        var genesisLinks: [ParentGenesisLink] = []
 
         switch outcome.decision {
         case .canonicalized, .acceptedSide, .duplicate:
-            let transactions = try await blockTransactions(in: block)
+            let transactions = (try? await blockTransactions(in: block)) ?? []
             let blockAnchors = anchors(in: transactions).sorted {
-                ($0.directory, $0.genesisCID) < ($1.directory, $1.genesisCID)
-            }
-            var includedChildren = Dictionary(
-                uniqueKeysWithValues: durableProofs.map {
-                    ($0.directory, $0.childBlock)
-                }
-            )
-            if !blockAnchors.allSatisfy({ includedChildren[$0.directory] != nil }) {
-                includedChildren.merge(
-                    try await children(in: block),
-                    uniquingKeysWith: { prepared, _ in prepared }
-                )
+                ($0.directory, $0.genesisCID, $0.parentWorkAuthorityKey.value)
+                    < ($1.directory, $1.genesisCID, $1.parentWorkAuthorityKey.value)
             }
             for anchor in blockAnchors {
-                guard let child = includedChildren[anchor.directory],
-                      anchor.genesisCID
-                        == (try? BlockHeader(node: child).rawCID) else { continue }
-                if case .success(let link) = try await process.genesisLink(
-                    parentBlockHeader: header,
+                if let link = try? await process.issuedParentGenesisLink(
                     directory: anchor.directory,
                     childGenesisCID: anchor.genesisCID
                 ) {
                     genesisLinks.append(link)
-                    if childIntents[anchor.directory]?.genesisCID
-                        == anchor.genesisCID {
+                    if childIntents[anchor.directory]?.genesisCID == anchor.genesisCID,
+                       childIntents[anchor.directory]?.parentWorkAuthorityKey
+                        == anchor.parentWorkAuthorityKey {
                         childIntents.removeValue(forKey: anchor.directory)
                     }
                 }
@@ -743,57 +1331,138 @@ public actor ChainService {
             break
         }
 
-        switch outcome.decision {
-        case .canonicalized:
-            let transactionCIDs = try await blockTransactions(in: block).compactMap {
-                try? VolumeImpl<Transaction>(node: $0).rawCID
-            }
-            await pool.remove(transactionCIDs)
-            await templates.invalidateAll()
-            removeStaleChildIntents(parentStateCID: block.postState.rawCID)
-            do {
-                try await acceptedBlockPublisher(header.rawCID, true)
-            } catch {
-                // Admission is already durable. Peers can recover through the
-                // normal announcement/pull path; publication cannot rewrite it.
-            }
-        case .acceptedSide:
-            do {
-                try await acceptedBlockPublisher(header.rawCID, false)
-            } catch {
-                // As above, a retryable push is not part of consensus admission.
-            }
-        default:
-            break
-        }
-
-        var publishedChildProofs: [DirectChildProofSummary] = []
-        if outcome.parentCarrierLink != nil {
-            for durable in durableProofs {
-                let publication = DirectChildProofPublication(
-                    directory: durable.directory,
-                    childCID: durable.childCID,
-                    childBlock: durable.childBlock,
-                    proof: durable.proof
-                )
-                do {
-                    try await childProofPublisher(publication)
-                    publishedChildProofs.append(DirectChildProofSummary(
-                        directory: publication.directory,
-                        childCID: publication.childCID
-                    ))
-                } catch {
-                    // Proofs and links are durable; hierarchy pull/reconnect can
-                    // retry a failed eager publication.
-                }
-            }
-        }
+        let publishedChildProofs = await publishCarrierChildProofs(
+            header: header,
+            outcome: outcome
+        )
         return AdmissionEffects(
             parentGenesisLinks: genesisLinks.sorted {
                 $0.directory < $1.directory
             },
             publishedChildProofs: publishedChildProofs
         )
+    }
+
+    private func publishCarrierChildProofs(
+        header: BlockHeader,
+        outcome: NodeAdmissionOutcome
+    ) async -> [DirectChildProofSummary] {
+        guard let link = outcome.parentCarrierLink else { return [] }
+        let durableProofs = (try? await process.durableDirectChildProofs(
+            carrierCID: header.rawCID,
+            rootCID: link.rootCID
+        )) ?? []
+        var published: [DirectChildProofSummary] = []
+        for durable in durableProofs {
+            let publication = DirectChildProofPublication(
+                directory: durable.directory,
+                childCID: durable.childCID,
+                childBlock: durable.childBlock,
+                proof: durable.proof
+            )
+            do {
+                try await childProofPublisher(publication)
+                published.append(DirectChildProofSummary(
+                    directory: publication.directory,
+                    childCID: publication.childCID
+                ))
+            } catch {
+                // Proofs and links are durable; hierarchy pull/reconnect can
+                // retry a failed eager publication.
+            }
+        }
+        return published
+    }
+
+    private func locallyStoredBlock(_ header: BlockHeader) async -> Block? {
+        guard let data = await process.content([header.rawCID])[header.rawCID]
+        else {
+            return nil
+        }
+        return _contentBoundBlock(cid: header.rawCID, data: data)
+    }
+
+    private func reconcileCanonicalCommitLocked(
+        _ commit: ChainCommit
+    ) async throws {
+        guard commit.canonicalChanged else { return }
+        try await prepareMempoolLocked()
+
+        let addedTransactions = try await transactions(
+            inBlocks: commit.mainChainBlocksAdded.keys.sorted()
+        )
+        let removedTransactions = try await transactions(
+            inBlocks: commit.mainChainBlocksRemoved.sorted()
+        )
+        let tip = try await process.canonicalTipBlock()
+        let spec = try await chainSpec(for: tip)
+
+        let addedCIDs = Set(addedTransactions.compactMap {
+            try? VolumeImpl<Transaction>(node: $0).rawCID
+        })
+        var removedByCID: [String: Transaction] = [:]
+        for transaction in removedTransactions {
+            guard let cid = try? VolumeImpl<Transaction>(node: transaction).rawCID,
+                  !addedCIDs.contains(cid) else {
+                continue
+            }
+            removedByCID[cid] = transaction
+        }
+
+        await pool.remove(addedCIDs)
+        for cid in removedByCID.keys.sorted() {
+            guard let transaction = removedByCID[cid] else { continue }
+            let disposition = Self.poolDisposition(
+                (try await process.preflightTransaction(transaction)).disposition
+            )
+            _ = try? await pool.submit(
+                transaction,
+                spec: spec,
+                fetcher: process,
+                disposition: disposition
+            )
+        }
+        let process = self.process
+        _ = try await pool.revalidate { transaction in
+            let result = try await process.preflightTransaction(transaction)
+            return Self.poolDisposition(result.disposition)
+        }
+        try await pruneDurableLocalTransactionsLocked(
+            keeping: Set(await pool.snapshot().map(\.cid))
+        )
+        try await syncLiveMempoolRootsLocked(
+            Set(await pool.snapshot().map(\.cid))
+        )
+        await templates.invalidateAll()
+        removeStaleChildIntents(parentStateCID: tip.postState.rawCID)
+    }
+
+    private nonisolated static func poolDisposition(
+        _ disposition: TransactionPreflightDisposition
+    ) -> TransactionPoolDisposition {
+        switch disposition {
+        case .ready: .ready
+        case .future: .future
+        case .unavailable: .unavailable
+        case .invalid: .invalid
+        }
+    }
+
+    private func transactions(inBlocks blockCIDs: [String]) async throws
+        -> [Transaction] {
+        var result: [Transaction] = []
+        for cid in blockCIDs {
+            let header = BlockHeader(
+                rawCID: cid,
+                node: nil,
+                encryptionInfo: nil
+            )
+            guard let block = try await header.resolve(fetcher: process).node else {
+                throw ChainServiceError.unresolvedTransactionContent
+            }
+            result += try await blockTransactions(in: block)
+        }
+        return result
     }
 
     private func chainSpec(for block: Block) async throws -> ChainSpec {
@@ -859,9 +1528,7 @@ public actor ChainService {
               ) else {
             throw ChainServiceError.invalidRewardTransaction
         }
-        try await VolumeImpl<Transaction>(node: resolved).storeRecursively(
-            storer: process
-        )
+        try await VolumeImpl<Transaction>(node: resolved).store(storer: process)
         return resolved
     }
 
@@ -935,19 +1602,23 @@ public actor ChainService {
             guard intent.parentStateCID == parentStateCID,
                   anchors.contains(Anchor(
                       directory: intent.directory,
-                      genesisCID: intent.genesisCID
+                      genesisCID: intent.genesisCID,
+                      parentWorkAuthorityKey: intent.parentWorkAuthorityKey
                   )) else { return nil }
             return DirectChildCandidate(
                 directory: intent.directory,
                 block: intent.genesis,
                 searchTarget: intent.genesis.target,
+                deploymentTarget: intent.genesis.target,
+                requiresParentTargetHit: true,
                 acquisitionEntries: intent.acquisitionEntries
             )
         }.sorted { $0.directory < $1.directory }
     }
 
     private func validatedProvidedChildren(
-        context: ChildCandidateRequestContext
+        context: ChildCandidateRequestContext,
+        deploymentCursor: Int
     ) async throws
         -> [DirectChildCandidate] {
         let candidates = try await childCandidateProvider(context)
@@ -962,20 +1633,40 @@ public actor ChainService {
                 childCID: childCID,
                 childData: childData,
                 maximumBytes: min(
-                    maximumChildCandidateBytes,
+                    Self.maximumChildCandidateBytes,
                     ChildAcquisitionPackage.maximumBytes
                 )
             ) else { continue }
             guard accepted.count < maximumChildCandidates,
                   candidate.directory.utf8.count <= Self.maximumDirectoryBytes,
+                  !directories.contains(candidate.directory),
                   ChainAddress(
                       process.configuration.chainPath + [candidate.directory]
                   ) != nil,
                   candidate.block.parentState.rawCID
                       == context.parentCarrier.prevState.rawCID,
-                  candidate.searchTarget >= candidate.block.target,
+                  candidate.searchTarget > .zero,
+                  context.mode == .deployment
+                    || candidate.deploymentTarget == nil,
+                  candidate.deploymentTarget.map({
+                      $0 > .zero && candidate.searchTarget <= $0
+                  }) ?? true else {
+                continue
+            }
+            let candidateFetcher = CoalescingFetcher(OverlayContentSource(
+                entries: package.entries,
+                fallback: FetcherContentSource(process)
+            ))
+            guard let acquisitionEntries = try? await process.durableCandidateEntries(
+                for: candidate.block,
+                fetcher: candidateFetcher,
+                maximumBytes: min(
+                    Self.maximumChildCandidateBytes,
+                    ChildAcquisitionPackage.maximumBytes
+                )
+            ),
                   package.framedByteCount
-                    <= maximumChildCandidateBytes - encodedBytes,
+                    <= Self.maximumChildCandidateBytes - encodedBytes,
                   directories.insert(candidate.directory).inserted else {
                 continue
             }
@@ -984,10 +1675,16 @@ public actor ChainService {
                 directory: candidate.directory,
                 block: candidate.block,
                 searchTarget: candidate.searchTarget,
-                acquisitionEntries: candidate.acquisitionEntries
+                deploymentTarget: candidate.deploymentTarget,
+                acquisitionEntries: acquisitionEntries
             ))
         }
-        return accepted
+        guard context.mode == .deployment else { return accepted }
+        let deployments = accepted.filter { $0.deploymentTarget != nil }
+        guard !deployments.isEmpty else { return accepted }
+        let selected = deployments[deploymentCursor % deployments.count]
+        return accepted.filter { $0.deploymentTarget == nil }
+            + [selected]
     }
 
     private func candidateOrder(
@@ -1070,9 +1767,28 @@ public actor ChainService {
     private func anchors(in transactions: [Transaction]) -> Set<Anchor> {
         Set(transactions.flatMap { transaction in
             transaction.body.node?.genesisActions.map {
-                Anchor(directory: $0.directory, genesisCID: $0.blockCID)
+                Anchor(
+                    directory: $0.directory,
+                    genesisCID: $0.blockCID,
+                    parentWorkAuthorityKey: $0.parentWorkAuthorityKey
+                )
             } ?? []
         })
+    }
+
+    private func isPendingDeployment(
+        _ transaction: Transaction,
+        parentStateCID: String
+    ) -> Bool {
+        let transactionAnchors = anchors(in: [transaction])
+        return !transactionAnchors.isEmpty && transactionAnchors.allSatisfy { anchor in
+            guard let intent = childIntents[anchor.directory] else {
+                return false
+            }
+            return intent.parentStateCID == parentStateCID
+                && intent.genesisCID == anchor.genesisCID
+                && intent.parentWorkAuthorityKey == anchor.parentWorkAuthorityKey
+        }
     }
 
     private func blockTransactions(in block: Block) async throws -> [Transaction] {
@@ -1082,10 +1798,17 @@ public actor ChainService {
         guard let dictionary = transactionsHeader.node else {
             throw ChainServiceError.unresolvedTransactionContent
         }
-        let entries = try dictionary.allKeysAndValues()
+        let entries = try await dictionary.boundedKeysAndValues(
+            limit: dictionary.count,
+            fetcher: process
+        )
+        guard entries.count == dictionary.count else {
+            throw ChainServiceError.unresolvedTransactionContent
+        }
+        let headers = Dictionary(uniqueKeysWithValues: entries)
         var transactions: [Transaction] = []
-        for index in 0..<entries.count {
-            guard let transactionHeader = entries[String(index)] else {
+        for index in 0..<headers.count {
+            guard let transactionHeader = headers[String(index)] else {
                 throw ChainServiceError.unresolvedTransactionContent
             }
             let resolved = try await transactionHeader.resolve(fetcher: process)
@@ -1095,22 +1818,6 @@ public actor ChainService {
             transactions.append(transaction)
         }
         return transactions
-    }
-
-    private func children(in block: Block) async throws -> [String: Block] {
-        let childrenHeader = try await block.children.resolve(fetcher: process)
-        guard let dictionary = childrenHeader.node else {
-            throw ChainServiceError.unresolvedChildContent
-        }
-        var children: [String: Block] = [:]
-        for (directory, childHeader) in try dictionary.allKeysAndValues() {
-            let resolved = try await childHeader.resolve(fetcher: process)
-            guard let child = resolved.node else {
-                throw ChainServiceError.unresolvedChildContent
-            }
-            children[directory] = child
-        }
-        return children
     }
 
     private func nextTimestamp(after previous: Int64) throws -> Int64 {
@@ -1126,7 +1833,9 @@ public actor ChainService {
             operationInFlight = true
             return
         }
-        await withCheckedContinuation { operationWaiters.append($0) }
+        await withCheckedContinuation {
+            operationWaiters.append(.caller($0))
+        }
     }
 
     private func releaseOperation() {
@@ -1134,7 +1843,12 @@ public actor ChainService {
             operationInFlight = false
             return
         }
-        operationWaiters.removeFirst().resume()
+        switch operationWaiters.removeFirst() {
+        case .caller(let waiter):
+            waiter.resume()
+        case .canonicalCommit:
+            startCanonicalCommitWorker()
+        }
     }
 }
 

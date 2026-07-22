@@ -85,33 +85,66 @@ struct LatticeNodeCommand: AsyncParsableCommand {
         )
         let service = ChainService(
             process: process,
-            childCandidateProvider: { context in
-                await network.directChildCandidates(context)
+            childCandidateProvider: { [weak network] context in
+                guard let network else { return [] }
+                return await network.directChildCandidates(context)
             },
-            childProofPublisher: { publication in
+            childProofPublisher: { [weak network] publication in
+                guard let network else { throw CancellationError() }
                 _ = try await network.publishChildProof(
                     publication.proof,
                     childDirectory: publication.directory,
                     child: publication.childBlock
                 )
             },
-            acceptedBlockPublisher: { blockCID, canonicalized in
-                try await network.publishAcceptedBlock(
-                    blockCID,
-                    canonicalized: canonicalized
-                )
+            acceptedBlockPublisher: { [weak network] blockCID in
+                guard let network else { throw CancellationError() }
+                try await network.publishAcceptedBlock(blockCID)
+            },
+            acceptedTransactionPublisher: { [weak network] rootCID in
+                guard let network else { throw CancellationError() }
+                try await network.publishTransaction(rootCID)
             }
         )
-        await network.installChildCandidateBuilder { [weak service] context in
-            guard let service else { return nil }
+        try await service.restoreLocalTransactions()
+        await network.installChildCandidateBuilder { [weak service, weak network] context in
+            guard let service, let network else { return nil }
             return try await service.miningCandidate(
                 parentCarrier: context.parentCarrier,
-                rewards: context.rewards
+                parentContentSource: network.hierarchyContentSource,
+                rewards: context.rewards,
+                mode: context.mode
             )
         }
-        await network.installAdmissionHandler { [weak service] block, outcome in
-            guard let service else { return }
-            _ = try await service.handleAdmission(block: block, outcome: outcome)
+        await network.installAdmissionHandler {
+            [weak service] header,
+            package,
+            directories in
+            guard let service else { throw CancellationError() }
+            return try await service.admitNetworkCandidate(
+                header,
+                authenticatedChildPackage: package,
+                preparingChildDirectories: directories
+            )
+        }
+        await network.installInheritedWorkHandler { [weak service] snapshot, key in
+            guard let service else { throw CancellationError() }
+            return try await service.applyInheritedWorkSnapshot(
+                snapshot,
+                from: key
+            )
+        }
+        await network.installParentReadinessHandler { [weak service] ready in
+            await service?.setParentConsensusReady(ready)
+        }
+        await network.installTransactionHandler {
+            [weak service] transaction in
+            guard let service else { throw CancellationError() }
+            return try await service.submitNetworkTransaction(transaction)
+        }
+        await network.installTransactionInventoryProvider { [weak service] in
+            guard let service else { return [] }
+            return await service.transactionInventoryRoots()
         }
         try await network.start(process: process)
         let app = makeApplication(
@@ -287,12 +320,15 @@ private func serviceCall<Value: Encodable, Context: RequestContext>(
         )
     } catch ChainServiceError.childIntentLimitReached {
         throw HTTPError(.tooManyRequests)
+    } catch ChainServiceError.noDeploymentAvailable {
+        throw HTTPError(.conflict)
+    } catch ChainServiceError.mempoolUnavailable,
+            ChainServiceError.parentUnavailable {
+        throw HTTPError(.serviceUnavailable)
     } catch is ChainServiceError {
         throw HTTPError(.badRequest)
     } catch TransactionPoolError.full {
         throw HTTPError(.tooManyRequests)
-    } catch TransactionPoolError.policyUnavailable {
-        throw HTTPError(.serviceUnavailable)
     } catch is TransactionPoolError {
         throw HTTPError(.badRequest)
     } catch is MiningTemplateError {
