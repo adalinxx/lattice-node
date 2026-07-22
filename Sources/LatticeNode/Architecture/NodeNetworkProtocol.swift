@@ -590,11 +590,11 @@ struct ChildCandidateResponseMessage: Sendable {
             .filter { $0.key != childCID }
             .sorted { $0.key < $1.key }
         guard targetBytes.count == 64 else { throw NodeNetworkWireError.malformed }
-        let size = 8 + 2 + pathBytes.reduce(0) { $0 + 2 + $1.count }
-            + 2 + parentBytes.count + 2 + childBytes.count
-            + targetBytes.count + 1 + (deploymentBytes?.count ?? 0)
-            + 4 + blockData.count + 2
-            + package.framedByteCount - (6 + childBytes.count + blockData.count)
+        var size = 8 + 2 + pathBytes.reduce(0) { $0 + 2 + $1.count }
+        size += 2 + parentBytes.count + 2 + childBytes.count
+        size += targetBytes.count + 1 + (deploymentBytes?.count ?? 0)
+        size += 4 + blockData.count + 2
+        size += package.framedByteCount - (6 + childBytes.count + blockData.count)
         guard extraEntries.count <= Int(UInt16.max),
               size <= _maximumNodeMessageSize else {
             throw NodeNetworkWireError.oversized
