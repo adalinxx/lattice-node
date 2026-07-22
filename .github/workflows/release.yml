@@ -73,6 +73,7 @@ jobs:
           E2E_NODE_BIN="$extract_root/$bundle_name/bin/lattice-node" \
             E2E_COORDINATOR_BIN="$extract_root/$bundle_name/bin/lattice-mining-coordinator" \
             E2E_MINER_BIN="$extract_root/$bundle_name/bin/lattice-miner" \
+            E2E_PROOF_VERIFIER_BIN="$extract_root/$bundle_name/bin/lattice-proof-verifier" \
             swift test --filter LatticeNodeE2ETests
 
       - name: Verify release artifact bindings
@@ -141,6 +142,7 @@ jobs:
           E2E_NODE_BIN="$extract_root/$bundle_name/bin/lattice-node" \
             E2E_COORDINATOR_BIN="$extract_root/$bundle_name/bin/lattice-mining-coordinator" \
             E2E_MINER_BIN="$extract_root/$bundle_name/bin/lattice-miner" \
+            E2E_PROOF_VERIFIER_BIN="$extract_root/$bundle_name/bin/lattice-proof-verifier" \
             swift test --filter LatticeNodeE2ETests
 
       - name: Verify release artifact bindings
@@ -176,10 +178,12 @@ jobs:
     container: ubuntu:24.04
     timeout-minutes: 10
     steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
       - name: Install runtime dependencies
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends ca-certificates gzip libc-bin libsqlite3-0 tar
+          apt-get install -y --no-install-recommends ca-certificates curl gzip jq libc-bin libsqlite3-0 tar
 
       - name: Download Linux release archive
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -203,6 +207,12 @@ jobs:
             fi
             "$binary" --help >/dev/null
           done
+          bundle="$extract_root/$(basename "${archive%.tar.gz}")"
+          .github/scripts/smoke-lattice-node.sh \
+            "$bundle/bin/lattice-node" \
+            "$bundle/bin/lattice-mining-coordinator" \
+            "$bundle/bin/lattice-miner" \
+            "$bundle/bin/lattice-proof-verifier"
 
   reproducible-build-linux:
     runs-on: ubuntu-latest

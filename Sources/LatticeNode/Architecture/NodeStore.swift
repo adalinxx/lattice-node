@@ -47,6 +47,14 @@ struct LocalMempoolTransactionRecord: Sendable, Equatable {
     let addedAt: Int64
 }
 
+struct ChildDeployIntentRecord: Sendable, Equatable {
+    let directory: String
+    let genesisCID: String
+    let parentStateCID: String
+    let parentWorkAuthorityKey: ParentWorkAuthorityKey
+    let volumeRoots: [String]
+}
+
 struct AcceptedLeafPage: Sendable, Equatable {
     let snapshotSequence: Int64
     let blockCIDs: [String]
@@ -190,9 +198,9 @@ enum IssuedChildProofScope: String, Sendable {
 
 /// Node-owned immutable facts and availability indexes for one absolute path.
 actor NodeStore {
-    /// Epoch 21 stores exact hierarchy edges and inherited work by grind.
+    /// Epoch 24 checkpoints the service projection after consensus commits.
     /// Existing stores must be rebuilt from the pinned genesis.
-    static let currentSchemaEpoch: Int64 = 21
+    static let currentSchemaEpoch: Int64 = 24
 
     private let database: NodeSQLite
     private let nexusGenesisCID: String
@@ -464,6 +472,121 @@ actor NodeStore {
         }
     }
 
+    func serviceProjectionTip() throws -> String? {
+        let rows = try database.query(
+            "SELECT service_projection_tip_cid FROM node_metadata WHERE singleton = 1"
+        )
+        guard rows.count == 1,
+              let value = rows[0]["service_projection_tip_cid"] else {
+            throw NodeStoreError.corrupt("missing service projection checkpoint")
+        }
+        switch value {
+        case .null:
+            return nil
+        case .text(let cid):
+            guard CIDIdentity.isCanonical(cid), try hasAcceptedBlock(cid) else {
+                throw NodeStoreError.corrupt(
+                    "malformed service projection checkpoint"
+                )
+            }
+            return cid
+        default:
+            throw NodeStoreError.corrupt("malformed service projection checkpoint")
+        }
+    }
+
+    func setServiceProjectionTip(_ blockCID: String) throws {
+        guard CIDIdentity.isCanonical(blockCID),
+              try hasAcceptedBlock(blockCID) else {
+            throw NodeStoreError.corrupt("invalid service projection checkpoint")
+        }
+        try database.execute(
+            "UPDATE node_metadata SET service_projection_tip_cid = ?1 WHERE singleton = 1",
+            params: [.text(blockCID)]
+        )
+    }
+
+    func persistChildDeployIntent(_ intent: ChildDeployIntentRecord) throws {
+        guard !intent.directory.isEmpty,
+              CIDIdentity.isCanonical(intent.genesisCID),
+              CIDIdentity.isCanonical(intent.parentStateCID),
+              intent.volumeRoots == Array(Set(intent.volumeRoots)).sorted(),
+              intent.volumeRoots.contains(intent.genesisCID),
+              intent.volumeRoots.allSatisfy(CIDIdentity.isCanonical) else {
+            throw NodeStoreError.invalidConfiguration(
+                "child deployment intent is malformed"
+            )
+        }
+        let volumeRoots = try Self.encode(intent.volumeRoots)
+        try database.execute("""
+            INSERT INTO child_deploy_intents (
+                directory, genesis_cid, parent_state_cid,
+                parent_work_authority_key, volume_roots
+            ) VALUES (?1, ?2, ?3, ?4, ?5)
+            ON CONFLICT(directory) DO UPDATE SET
+                genesis_cid = excluded.genesis_cid,
+                parent_state_cid = excluded.parent_state_cid,
+                parent_work_authority_key = excluded.parent_work_authority_key,
+                volume_roots = excluded.volume_roots
+            """, params: [
+                .text(intent.directory),
+                .text(intent.genesisCID),
+                .text(intent.parentStateCID),
+                .text(intent.parentWorkAuthorityKey.value),
+                .blob(volumeRoots),
+            ]
+        )
+    }
+
+    func removeChildDeployIntents(directories: [String]) throws {
+        try database.transaction {
+            for directory in Set(directories) where !directory.isEmpty {
+                try database.execute(
+                    "DELETE FROM child_deploy_intents WHERE directory = ?1",
+                    params: [.text(directory)]
+                )
+            }
+        }
+    }
+
+    func childDeployIntents() throws -> [ChildDeployIntentRecord] {
+        try database.query("""
+            SELECT directory, genesis_cid, parent_state_cid,
+                   parent_work_authority_key, volume_roots
+            FROM child_deploy_intents
+            ORDER BY directory
+            """).map { row in
+            guard let directory = row["directory"]?.textValue,
+                  !directory.isEmpty,
+                  let genesisCID = row["genesis_cid"]?.textValue,
+                  CIDIdentity.isCanonical(genesisCID),
+                  let parentStateCID = row["parent_state_cid"]?.textValue,
+                  CIDIdentity.isCanonical(parentStateCID),
+                  let rawAuthority = row["parent_work_authority_key"]?.textValue,
+                  let authority = ParentWorkAuthorityKey(rawAuthority),
+                  let rootsPayload = row["volume_roots"]?.blobValue else {
+                throw NodeStoreError.corrupt(
+                    "malformed child deployment intent"
+                )
+            }
+            let volumeRoots = try Self.decode([String].self, from: rootsPayload)
+            guard volumeRoots == Array(Set(volumeRoots)).sorted(),
+                  volumeRoots.contains(genesisCID),
+                  volumeRoots.allSatisfy(CIDIdentity.isCanonical) else {
+                throw NodeStoreError.corrupt(
+                    "malformed child deployment Volume manifest"
+                )
+            }
+            return ChildDeployIntentRecord(
+                directory: directory,
+                genesisCID: genesisCID,
+                parentStateCID: parentStateCID,
+                parentWorkAuthorityKey: authority,
+                volumeRoots: volumeRoots
+            )
+        }
+    }
+
     /// Stable pagination over the accepted forest's leaves. The first call
     /// captures the current admission sequence; later calls reuse it so newly
     /// admitted descendants cannot reshuffle an in-progress page walk.
@@ -568,6 +691,7 @@ actor NodeStore {
                 "accepted-block index does not match immutable batches"
             )
         }
+        _ = try serviceProjectionTip()
 
         var expectedParentFacts: [IssuedParentFactKey: Data] = [:]
         for row in try database.query(
@@ -2579,7 +2703,7 @@ actor NodeStore {
         let rows: [[String: NodeSQLiteValue]]
         do {
             rows = try database.query(
-                "SELECT schema_epoch, nexus_genesis_cid, chain_path, minimum_root_work, spawning_parent_key, issuing_authority_key FROM node_metadata WHERE singleton = 1"
+                "SELECT schema_epoch, nexus_genesis_cid, chain_path, minimum_root_work, spawning_parent_key, issuing_authority_key, service_projection_tip_cid FROM node_metadata WHERE singleton = 1"
             )
         } catch {
             throw NodeStoreError.wipeRequired("unreadable schema metadata")
@@ -2610,6 +2734,7 @@ actor NodeStore {
         "parent_work_source",
         "parent_work_facts",
         "local_mempool_transactions",
+        "child_deploy_intents",
         "prepared_child_proofs",
         "pending_child_proof_routes",
     ]
@@ -2632,11 +2757,12 @@ actor NodeStore {
                     chain_path BLOB NOT NULL,
                     minimum_root_work TEXT NOT NULL,
                     spawning_parent_key TEXT NOT NULL,
-                    issuing_authority_key TEXT NOT NULL
+                    issuing_authority_key TEXT NOT NULL,
+                    service_projection_tip_cid TEXT
                 )
                 """)
             try database.execute(
-                "INSERT INTO node_metadata (singleton, schema_epoch, nexus_genesis_cid, chain_path, minimum_root_work, spawning_parent_key, issuing_authority_key) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO node_metadata (singleton, schema_epoch, nexus_genesis_cid, chain_path, minimum_root_work, spawning_parent_key, issuing_authority_key, service_projection_tip_cid) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, NULL)",
                 params: [
                     .int(schemaEpoch),
                     .text(nexusGenesisCID),
@@ -2735,6 +2861,15 @@ actor NodeStore {
             CREATE TABLE IF NOT EXISTS local_mempool_transactions (
                 transaction_cid TEXT PRIMARY KEY,
                 added_at INTEGER NOT NULL CHECK (added_at >= 0)
+            ) WITHOUT ROWID
+            """)
+        try database.execute("""
+            CREATE TABLE IF NOT EXISTS child_deploy_intents (
+                directory TEXT PRIMARY KEY,
+                genesis_cid TEXT NOT NULL,
+                parent_state_cid TEXT NOT NULL,
+                parent_work_authority_key TEXT NOT NULL,
+                volume_roots BLOB NOT NULL
             ) WITHOUT ROWID
             """)
         try database.execute("""
@@ -2848,15 +2983,15 @@ actor NodeStore {
 
 /// Records the canonical Volume boundaries materialized during one admission.
 actor NodeAdmissionStorage: VolumeStorer {
-    private let storage: any VolumeStorer
+    private let storage: (any VolumeStorer)?
     private var roots = Set<String>()
 
-    init(storage: any VolumeStorer) {
+    init(storage: (any VolumeStorer)? = nil) {
         self.storage = storage
     }
 
     func store(volume: SerializedVolume) async throws {
-        try await storage.store(volume: volume)
+        try await storage?.store(volume: volume)
         roots.insert(volume.root)
     }
 

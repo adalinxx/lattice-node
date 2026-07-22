@@ -95,6 +95,9 @@ cannot select a second chain at runtime.
 |---|---|---|
 | `/health` | GET | Process and chain status |
 | `/v1/status` | GET | Same structured status response |
+| `/v1/blocks/{cid}` | GET | Read an accepted block |
+| `/v1/transactions/{cid}` | GET | Read a locally retained content-bound transaction |
+| `/v1/accounts/{address}/proof` | GET | Build a proof at the current canonical state |
 | `/v1/transactions` | POST | Submit a content-bound signed transaction |
 | `/v1/mining/templates` | POST | Create Nexus work and gather direct-child candidates |
 | `/v1/mining/work` | POST | Submit a nonce for issued work |

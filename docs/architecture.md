@@ -73,7 +73,9 @@ outside the service operation gate, while a commit reserves the service's small
 reconciliation fence before process mutation order is released. That prevents a
 new template, mempool operation, or child intent from observing a canonical
 commit before its service projection catches up, without allowing a slow peer
-to stall mining or RPC. Miner/RPC/reconciliation reads are local-only; remote
+to stall mining or RPC. The projected canonical tip is checkpointed only after
+that reconciliation is durable; startup replays the net endpoint fork delta if a
+crash lands between the two commits. Miner/RPC/reconciliation reads are local-only; remote
 content acquisition is explicit and root-scoped to network admission or a
 targeted retry.
 

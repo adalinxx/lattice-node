@@ -19,6 +19,16 @@ jobs:
         run: |
           apt-get update && apt-get install -y --no-install-recommends libsqlite3-dev ripgrep
 
+      - name: Verify architecture docs match the resolved Lattice release
+        run: |
+          lattice_version="$(awk '/"identity" : "lattice"/ { found=1 } found && /"version"/ { gsub(/[",]/, "", $3); print $3; exit }' Package.resolved)"
+          test -n "$lattice_version"
+          if stale="$(rg -n -o 'github.com/adalinxx/Lattice/blob/[0-9]+\.[0-9]+\.[0-9]+' docs README.md | grep -v "/blob/$lattice_version" || true)" && test -n "$stale"; then
+            echo "$stale"
+            echo "Lattice documentation links must match resolved version $lattice_version" >&2
+            exit 1
+          fi
+
       - name: Run strict concurrency gate
         run: .github/scripts/check-strict-concurrency.sh
 
@@ -81,6 +91,7 @@ jobs:
           E2E_NODE_BIN: ${{ github.workspace }}/.build/release/lattice-node
           E2E_COORDINATOR_BIN: ${{ github.workspace }}/.build/release/lattice-mining-coordinator
           E2E_MINER_BIN: ${{ github.workspace }}/.build/release/lattice-miner
+          E2E_PROOF_VERIFIER_BIN: ${{ github.workspace }}/.build/release/lattice-proof-verifier
         run: swift test --skip-build --filter LatticeNodeE2ETests
 
       - name: Verify executables run
@@ -88,6 +99,7 @@ jobs:
           swift run lattice-node --help
           swift run lattice-mining-coordinator --help
           swift run lattice-miner --help
+          swift run lattice-proof-verifier --help
 
   test-linux:
     runs-on: ubuntu-latest
@@ -114,6 +126,7 @@ jobs:
           E2E_NODE_BIN: ${{ github.workspace }}/.build/release/lattice-node
           E2E_COORDINATOR_BIN: ${{ github.workspace }}/.build/release/lattice-mining-coordinator
           E2E_MINER_BIN: ${{ github.workspace }}/.build/release/lattice-miner
+          E2E_PROOF_VERIFIER_BIN: ${{ github.workspace }}/.build/release/lattice-proof-verifier
         run: swift test --skip-build --filter LatticeNodeE2ETests
 
       - name: Run tests with code coverage
@@ -124,6 +137,7 @@ jobs:
           swift run lattice-node --help
           swift run lattice-mining-coordinator --help
           swift run lattice-miner --help
+          swift run lattice-proof-verifier --help
 
   thread-sanitizer:
     runs-on: macos-15
@@ -160,8 +174,10 @@ jobs:
       - name: Resolve dependencies
         run: swift package resolve
 
-      - name: Run hierarchy regressions under ASan + UBSan
-        run: swift test --sanitize address --sanitize undefined --filter NetworkTrustTests
+      - name: Run node state-machine regressions under ASan + UBSan
+        run: >-
+          swift test --sanitize address --sanitize undefined --filter
+          'NetworkTrustTests|ChainProcessTests|ChainServiceTests|MiningAndTransactionPoolTests|LatticeMiningCoordinatorTests'
 
   static-analysis:
     runs-on: macos-15

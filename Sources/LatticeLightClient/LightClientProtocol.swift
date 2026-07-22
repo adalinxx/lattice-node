@@ -2,25 +2,14 @@ import Foundation
 import Lattice
 import cashew
 
-// Module 10 (layer cleanup) — ownership decision: `LatticeLightClient` is a
-// BLESSED lower-layer client package, deliberately kept OUT of the daemon. It
-// depends only on Lattice + cashew + VolumeBroker (never LatticeNode), so a
-// light client / the `LatticeProofVerifier` executable can verify a state
-// witness without booting any node/RPC machinery. It is not folded into Lattice
-// because that would force the core consensus library to depend on VolumeBroker;
-// keeping it a first-class client target gives clients a stable import path
-// while leaving proof verification daemon-free. Do NOT move this into LatticeNode.
+// Kept below LatticeNode so clients can verify proofs without node, network, or
+// storage machinery.
 
 public struct LightClientProof: Codable, Sendable {
-    public let blockHash: String
-    public let blockHeight: UInt64
-    /// Header metadata for the block whose state root anchors this witness.
-    ///
-    /// This binds the duplicated top-level proof fields to one header object. A
-    /// light client still has to verify/trust the header chain separately before
-    /// treating the state root as canonical.
-    public let header: ChainHeader
-    public let stateRoot: String
+    /// The complete block lets verification recompute its CID and bind the
+    /// witnessed state root to content-addressed consensus data. A client still
+    /// verifies the block's ancestry and fork choice separately.
+    public let block: Block
     public let address: String
     public let balance: UInt64
     /// The STORED on-chain nonce: the value witnessed under `_nonce_<address>`
@@ -38,30 +27,21 @@ public struct LightClientProof: Codable, Sendable {
     /// LatticeState wrapper node, and (c) read the proven balance from the
     /// verified account leaf. Each entry's bytes are content-bound to its CID.
     public let witness: [WitnessNode]
-    public let timestamp: Int64
 
     public init(
-        blockHash: String,
-        blockHeight: UInt64,
-        header: ChainHeader,
-        stateRoot: String,
+        block: Block,
         address: String,
         balance: UInt64,
         nonce: UInt64,
         accountRoot: String,
-        witness: [WitnessNode],
-        timestamp: Int64
+        witness: [WitnessNode]
     ) {
-        self.blockHash = blockHash
-        self.blockHeight = blockHeight
-        self.header = header
-        self.stateRoot = stateRoot
+        self.block = block
         self.address = address
         self.balance = balance
         self.nonce = nonce
         self.accountRoot = accountRoot
         self.witness = witness
-        self.timestamp = timestamp
     }
 
     /// One content-addressed node of the pruned witness DAG. `data` is the
@@ -79,61 +59,7 @@ public struct LightClientProof: Codable, Sendable {
     }
 }
 
-public struct ChainHeader: Codable, Sendable {
-    public let hash: String
-    public let height: UInt64
-    public let previousHash: String?
-    public let stateRoot: String
-    public let target: String
-    public let timestamp: Int64
-    public let cumulativeWork: String
-
-    public init(
-        hash: String,
-        height: UInt64,
-        previousHash: String?,
-        stateRoot: String,
-        target: String,
-        timestamp: Int64,
-        cumulativeWork: String
-    ) {
-        self.hash = hash
-        self.height = height
-        self.previousHash = previousHash
-        self.stateRoot = stateRoot
-        self.target = target
-        self.timestamp = timestamp
-        self.cumulativeWork = cumulativeWork
-    }
-}
-
 public enum LightClientProtocol {
-    public static func buildAccountProof(
-        address: String,
-        balance: UInt64,
-        nonce: UInt64,
-        blockHash: String,
-        blockHeight: UInt64,
-        header: ChainHeader,
-        stateRoot: String,
-        timestamp: Int64,
-        accountRoot: String = "",
-        witness: [LightClientProof.WitnessNode] = []
-    ) async -> LightClientProof {
-        return LightClientProof(
-            blockHash: blockHash,
-            blockHeight: blockHeight,
-            header: header,
-            stateRoot: stateRoot,
-            address: address,
-            balance: balance,
-            nonce: nonce,
-            accountRoot: accountRoot,
-            witness: witness,
-            timestamp: timestamp
-        )
-    }
-
     /// Collect the pruned Merkle witness that proves `address`'s account leaf is
     /// committed under `stateRoot`. Returns the (accountRoot, witness-nodes) pair:
     ///
@@ -149,6 +75,7 @@ public enum LightClientProtocol {
         state: LatticeState,
         stateRoot: String,
         address: String,
+        balanceExists: Bool = true,
         nonceExists: Bool,
         fetcher: any Fetcher
     ) async throws -> (accountRoot: String, witness: [LightClientProof.WitnessNode]) {
@@ -158,14 +85,21 @@ public enum LightClientProtocol {
         // Without the insertion proof a zero-nonce proof is not verifiable —
         // `verify` could default missing data to 0 with no absence witness.
         let proofPaths: [[String]: SparseMerkleProof] = [
-            [address]: .existence,
+            [address]: balanceExists ? .existence : .insertion,
             [AccountStateHeader.nonceTrackingKey(address)]: nonceExists ? .existence : .insertion,
         ]
         let proof = try await state.accountState.proof(paths: proofPaths, fetcher: fetcher)
 
         let storer = _ProofCollectingStorer()
-        // The pruned account-path nodes (top node hashes to accountRoot).
-        try await proof.storeRecursively(storer: storer)
+        // Store the two proven paths, not every reference reachable from the
+        // sparse proof: unrelated siblings are intentionally unresolved.
+        try await proof.store(
+            paths: [
+                [address]: .targeted,
+                [AccountStateHeader.nonceTrackingKey(address)]: .targeted,
+            ],
+            storer: storer
+        )
         // The LatticeState wrapper node committed under stateRoot. Store only the
         // wrapper's own bytes (not its full sub-trees) so the witness stays pruned
         // while still binding accountRoot → stateRoot.
@@ -180,7 +114,7 @@ public enum LightClientProtocol {
     }
 
     /// Verify a balance proof end-to-end from its own witness, fail-closed:
-    ///  (0) confirm the claimed block metadata matches the embedded header,
+    ///  (0) recompute the complete block's CID and use its post-state root,
     ///  (a) recompute `accountRoot` from the witness's account-path nodes,
     ///  (b) confirm `accountRoot` is committed under `stateRoot` (the LatticeState
     ///      wrapper node stored under `stateRoot` references it as `accountState`),
@@ -189,16 +123,15 @@ public enum LightClientProtocol {
     ///
     /// The witness's CID→bytes map is attacker-supplied, so every node fetched is
     /// content-bound: bytes stored under a CID must hash back to it.
-    public static func verify(_ proof: LightClientProof) async -> Bool {
-        guard !proof.witness.isEmpty, !proof.stateRoot.isEmpty, !proof.accountRoot.isEmpty else {
-            return false
+    /// Returns the content-addressed block CID anchoring a valid state witness.
+    /// The caller must independently verify that block's ancestry and fork
+    /// choice; returning the CID makes that required comparison explicit.
+    public static func verify(_ proof: LightClientProof) async -> String? {
+        guard !proof.witness.isEmpty, !proof.accountRoot.isEmpty,
+              let blockCID = try? BlockHeader(node: proof.block).rawCID else {
+            return nil
         }
-        guard proof.header.hash == proof.blockHash,
-              proof.header.height == proof.blockHeight,
-              proof.header.stateRoot == proof.stateRoot,
-              proof.header.timestamp == proof.timestamp else {
-            return false
-        }
+        let stateRoot = proof.block.postState.rawCID
 
         // Verification runs over ONLY the proof's witness nodes, in a sealed
         // in-memory source. `InMemoryContentSource` has no tier chain — it cannot
@@ -207,19 +140,21 @@ public enum LightClientProtocol {
         var witnessMap: [String: Data] = [:]
         witnessMap.reserveCapacity(proof.witness.count)
         for node in proof.witness {
-            guard let data = node.rawData else { return false }
-            witnessMap[node.cid] = data
+            guard let data = node.rawData else { return nil }
+            guard witnessMap.updateValue(data, forKey: node.cid) == nil else {
+                return nil
+            }
         }
         let fetcher = InMemoryContentSource(witnessMap)
 
         // (b) The LatticeState wrapper committed under stateRoot must be present and
         // content-bound, and must reference the claimed accountRoot as accountState.
-        guard let stateData = try? await fetcher.fetch(rawCid: proof.stateRoot),
+        guard let stateData = try? await fetcher.fetch(rawCid: stateRoot),
               let stateNode = LatticeState(data: stateData),
               // known-valid local node; CID cannot fail
-              try! LatticeStateHeader(node: stateNode).rawCID == proof.stateRoot,
+              try! LatticeStateHeader(node: stateNode).rawCID == stateRoot,
               stateNode.accountState.rawCID == proof.accountRoot else {
-            return false
+            return nil
         }
 
         // (a)+(c) Resolve the account leaf (and the nonce key when claimed) from the
@@ -230,17 +165,17 @@ public enum LightClientProtocol {
         guard let accountNode = try? await accountHeader.resolve(
             paths: [[proof.address]: .targeted, [nonceKey]: .targeted], fetcher: fetcher
         ).node else {
-            return false
+            return nil
         }
         let balance: UInt64 = (try? accountNode.get(key: proof.address)) ?? 0
-        guard balance == proof.balance else { return false }
+        guard balance == proof.balance else { return nil }
         // A non-zero claimed nonce must be backed by the witnessed nonce leaf. A
         // zero claim is valid only when resolving the nonce path succeeds and no
         // nonce value is present; for absent keys, the witness carries an insertion
         // proof for that path.
         let witnessedNonce: UInt64 = (try? accountNode.get(key: nonceKey)) ?? 0
-        if proof.nonce != 0 { return witnessedNonce == proof.nonce }
-        return witnessedNonce == 0
+        guard witnessedNonce == proof.nonce else { return nil }
+        return blockCID
     }
 }
 

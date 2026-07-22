@@ -2,12 +2,94 @@ import Crypto
 import Foundation
 import Ivy
 import Lattice
+import LatticeLightClient
 import UInt256
+import VolumeBroker
 import XCTest
 import cashew
 @testable import LatticeNode
 
 final class ChainServiceTests: XCTestCase {
+    func testReadSurfaceUsesAcceptedFactsAndVerifiableCanonicalState() async throws {
+        let process = try await nexusProcess()
+        let service = makeService(process: process)
+        let genesis = try await process.canonicalTipBlock()
+        let genesisCID = try BlockHeader(node: genesis).rawCID
+
+        let accepted = try await service.acceptedBlock(genesisCID)
+        XCTAssertEqual(try BlockHeader(node: accepted).rawCID, genesisCID)
+        let genesisTransactions = try await accepted.transactions.resolve(
+            fetcher: process
+        )
+        let transactionDictionary = try XCTUnwrap(genesisTransactions.node)
+        let transactionEntries = try await transactionDictionary.boundedKeysAndValues(
+            limit: transactionDictionary.count,
+            fetcher: process
+        )
+        let premineCID = try XCTUnwrap(transactionEntries.first?.1.rawCID)
+        let premine = try await service.transaction(premineCID)
+        XCTAssertEqual(try VolumeImpl(node: premine.transaction()).rawCID, premineCID)
+
+        let loose = try await BlockBuilder.buildBlock(
+            previous: genesis,
+            transactions: [],
+            timestamp: genesis.timestamp + 1,
+            nonce: 0,
+            fetcher: process
+        )
+        let looseVolume = try VolumeImpl<Block>(node: loose)
+        try await looseVolume.store(storer: process)
+        await XCTAssertThrowsErrorAsync(
+            try await service.acceptedBlock(looseVolume.rawCID)
+        ) { error in
+            XCTAssertEqual(error as? ChainServiceError, .resourceNotFound)
+        }
+
+        let looseTransaction = try signedTransaction(
+            key: CryptoUtils.generateKeyPair(),
+            chainPath: ["Nexus"]
+        )
+        let looseTransactionVolume = try VolumeImpl<Transaction>(
+            node: looseTransaction
+        )
+        try await looseTransactionVolume.store(storer: process)
+        await XCTAssertThrowsErrorAsync(
+            try await service.transaction(looseTransactionVolume.rawCID)
+        ) { error in
+            XCTAssertEqual(error as? ChainServiceError, .resourceNotFound)
+        }
+
+        let transaction = try signedTransaction(
+            key: CryptoUtils.generateKeyPair(),
+            chainPath: ["Nexus"]
+        )
+        let submitted = try await service.submitTransaction(
+            SubmitTransactionRequest(transaction: transaction)
+        )
+        let returned = try await service.transaction(submitted.transactionCID)
+        XCTAssertEqual(
+            try returned.transaction().body.rawCID,
+            transaction.body.rawCID
+        )
+
+        let proof = try await service.accountProof(
+            address: NexusGenesis.ownerAddress
+        )
+        XCTAssertEqual(try BlockHeader(node: proof.block).rawCID, genesisCID)
+        XCTAssertEqual(proof.balance, NexusGenesis.spec.premineAmount())
+        let proofIsValid = await LightClientProtocol.verify(proof)
+        XCTAssertEqual(proofIsValid, genesisCID)
+
+        let absentAddress = CryptoUtils.createAddress(
+            from: CryptoUtils.generateKeyPair().publicKey
+        )
+        let absentProof = try await service.accountProof(address: absentAddress)
+        XCTAssertEqual(absentProof.balance, 0)
+        XCTAssertEqual(absentProof.nonce, 0)
+        let absentProofIsValid = await LightClientProtocol.verify(absentProof)
+        XCTAssertEqual(absentProofIsValid, genesisCID)
+    }
+
     func testParentReadinessGatesConsensusWorkButNotTransactions() async throws {
         let service = ChainService(
             process: try await nexusProcess(),
@@ -94,6 +176,7 @@ final class ChainServiceTests: XCTestCase {
                 halvingInterval: 100
             ),
             genesisTransactions: [transaction],
+            policyModules: [WasmPolicyModule(bytes: Data([0, 1, 2]))],
             target: UInt256.max,
             timestamp: 1
         )
@@ -106,6 +189,7 @@ final class ChainServiceTests: XCTestCase {
             decodedIntent.genesisTransactions.first?.body.rawCID,
             transaction.body.rawCID
         )
+        XCTAssertEqual(decodedIntent.policyModules.first?.bytes, Data([0, 1, 2]))
     }
 
     func testRequestPayloadCeilingIsInclusive() async throws {
@@ -542,6 +626,7 @@ final class ChainServiceTests: XCTestCase {
         // Removing the block re-admits its ordinary transaction; adding it
         // again must then remove it. A reversed queue would leave it pooled.
         let status = await service.status()
+        XCTAssertTrue(status.mempoolAvailable)
         XCTAssertEqual(status.mempoolCount, 0)
     }
 
@@ -729,9 +814,10 @@ final class ChainServiceTests: XCTestCase {
     }
 #endif
 
-    func testQueuedCommitFailureResetsVolatileStateAndReleasesWaiter()
+    func testProjectionFailureFailsStopWithoutDeletingDurableInputs()
         async throws {
-        let service = makeService(process: try await nexusProcess())
+        let process = try await nexusProcess()
+        let service = makeService(process: process)
         _ = try await service.submitTransaction(SubmitTransactionRequest(
             transaction: try signedTransaction(
                 key: CryptoUtils.generateKeyPair(),
@@ -745,6 +831,9 @@ final class ChainServiceTests: XCTestCase {
             timestamp: 1
         )
 
+        // Inject a malformed projection event at the component boundary. A
+        // production Lattice commit cannot name unavailable block content,
+        // but storage/content failures must preserve every recovery input.
         let receipt = await service.enqueueCanonicalCommit(ChainCommit(
             tipHash: "missing-block",
             mainChainBlocksAdded: ["missing-block": 0]
@@ -760,13 +849,17 @@ final class ChainServiceTests: XCTestCase {
         await receipt.wait()
 
         let status = await service.status()
+        XCTAssertFalse(status.mempoolAvailable)
         XCTAssertEqual(status.mempoolCount, 0)
-        XCTAssertEqual(status.pendingChildIntents, 0)
-        let template = try await laterTemplate.value
-        XCTAssertEqual(
-            try template.block.transactions.node?.allKeysAndValues().count,
-            0
-        )
+        XCTAssertEqual(status.pendingChildIntents, 1)
+        let durable = try await process.localTransactions()
+        XCTAssertEqual(durable.count, 1)
+        await XCTAssertThrowsErrorAsync(try await laterTemplate.value) { error in
+            XCTAssertEqual(
+                error as? ChainServiceError,
+                .mempoolUnavailable
+            )
+        }
         await XCTAssertThrowsErrorAsync(
             try await service.submitWork(SubmitWorkRequest(
                 workID: stale.workID,
@@ -908,6 +1001,390 @@ final class ChainServiceTests: XCTestCase {
         XCTAssertEqual(restored, [submitted.transactionCID])
     }
 
+    func testRestartReplaysProjectionAfterCheckpointWriteFailure() async throws {
+        let storage = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "lattice-service-projection-recovery-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        addTeardownBlock { try? FileManager.default.removeItem(at: storage) }
+        let configuration = try NodeConfiguration(
+            chainPath: ["Nexus"],
+            minimumRootWork: UInt256(1),
+            storagePath: storage,
+            privateKeyHex: String(repeating: "6e", count: 32)
+        )
+
+        var process: ChainProcess? = try await ChainProcess.open(
+            configuration: configuration
+        )
+        var service: ChainService? = makeService(process: process!)
+        let genesis = try await process!.canonicalTipBlock()
+        let transaction = try signedTransaction(
+            key: CryptoUtils.generateKeyPair(),
+            chainPath: ["Nexus"]
+        )
+        let inserted = try await service!.submitNetworkTransaction(transaction)
+        XCTAssertTrue(inserted)
+        let transactionCID = try VolumeImpl<Transaction>(node: transaction).rawCID
+        let losingTemplate = try await service!.miningTemplate(
+            MiningTemplateRequest()
+        )
+        let losing = try await service!.submitWork(SubmitWorkRequest(
+            workID: losingTemplate.workID,
+            nonce: 0
+        ))
+        XCTAssertTrue(losing.accepted)
+        let losingCID = try XCTUnwrap(losing.tipCID)
+        _ = try await simpleChildIntent(
+            service: service!,
+            directory: "RecoveryChild",
+            timestamp: 1
+        )
+        let unrelatedPeer = try signedTransaction(
+            key: CryptoUtils.generateKeyPair(),
+            chainPath: ["Nexus"]
+        )
+        let unrelatedInserted = try await service!
+            .submitNetworkTransaction(unrelatedPeer)
+        XCTAssertTrue(unrelatedInserted)
+        var recovery = try await process!.serviceProjectionRecoveryCommit()
+        XCTAssertNil(recovery)
+
+        let fork1 = try await BlockBuilder.buildBlock(
+            previous: genesis,
+            timestamp: genesis.timestamp + 1,
+            nonce: 1,
+            fetcher: process!
+        )
+        let fork1Admission = try await process!.admit(BlockHeader(node: fork1))
+        XCTAssertTrue(fork1Admission.decision.isAccepted)
+        let fork2 = try await BlockBuilder.buildBlock(
+            previous: fork1,
+            timestamp: fork1.timestamp + 1,
+            nonce: 2,
+            fetcher: process!
+        )
+        let fork2Header = try BlockHeader(node: fork2)
+        let fork2Admission = try await process!.admit(fork2Header)
+        XCTAssertTrue(fork2Admission.decision.isAccepted)
+        let status = await process!.status()
+        XCTAssertEqual(status.tipCID, fork2Header.rawCID)
+
+        // Abort only the final checkpoint write. Every earlier projection
+        // effect uses the real stores and completes before this trigger fires.
+        let database = try NodeSQLite(
+            path: configuration.storagePath
+                .appendingPathComponent("state.db").path
+        )
+        try database.execute("""
+            CREATE TRIGGER fail_service_projection_checkpoint
+            BEFORE UPDATE OF service_projection_tip_cid ON node_metadata
+            BEGIN
+                SELECT RAISE(ABORT, 'injected checkpoint failure');
+            END
+            """)
+        recovery = try await process!.serviceProjectionRecoveryCommit()
+        let missedCommit = try XCTUnwrap(recovery)
+        let receipt = await service!.enqueueCanonicalCommit(missedCommit)
+        await receipt.wait()
+
+        let degraded = await service!.status()
+        XCTAssertFalse(degraded.mempoolAvailable)
+        XCTAssertEqual(degraded.pendingChildIntents, 0)
+        let durableCIDs = try await process!.localTransactions()
+            .map(\.transactionCID)
+        XCTAssertEqual(durableCIDs, [transactionCID])
+        let checkpointRows = try database.query(
+            "SELECT service_projection_tip_cid FROM node_metadata WHERE singleton = 1"
+        )
+        XCTAssertEqual(
+            checkpointRows.first?["service_projection_tip_cid"]?.textValue,
+            losingCID
+        )
+        let pendingRecovery = try await process!
+            .serviceProjectionRecoveryCommit()
+        XCTAssertNotNil(pendingRecovery)
+        try database.execute("DROP TRIGGER fail_service_projection_checkpoint")
+
+        // A real reopen replays the same endpoint delta. The already-persisted
+        // reorg candidate remains exact, unrelated gossip stays volatile, and
+        // stale child-intent cleanup is idempotent.
+        service = nil
+        process = nil
+        process = try await ChainProcess.open(configuration: configuration)
+        service = makeService(process: process!)
+        try await service!.restoreLocalTransactions()
+        var roots = await service!.transactionInventoryRoots()
+        XCTAssertEqual(roots, [transactionCID])
+        let recoveredStatus = await service!.status()
+        XCTAssertEqual(recoveredStatus.pendingChildIntents, 0)
+
+        // The checkpoint is written last, so replay is idempotent and the
+        // resurrected transaction remains exact across another reopen.
+        service = nil
+        process = nil
+        process = try await ChainProcess.open(configuration: configuration)
+        service = makeService(process: process!)
+        try await service!.restoreLocalTransactions()
+        roots = await service!.transactionInventoryRoots()
+        XCTAssertEqual(roots, [transactionCID])
+        recovery = try await process!.serviceProjectionRecoveryCommit()
+        XCTAssertNil(recovery)
+    }
+
+    func testProjectionRecoverySupportsDistinctChildGenesisRoots() async throws {
+        let fixture = try await inheritedForkFixture()
+        try await fixture.service.restoreLocalTransactions()
+        var recovery = try await fixture.process
+            .serviceProjectionRecoveryCommit()
+        XCTAssertNil(recovery)
+
+        _ = try await fixture.process.applyInheritedWorkSnapshot(
+            InheritedWorkSnapshot(
+                revision: 1,
+                workByBlock: [
+                    fixture.siblingCarrierCID: WorkMeasure(
+                        try verifiedWorkContribution(
+                            id: fixture.siblingCarrierCID,
+                            work: 1_000
+                        )
+                    ),
+                ]
+            ),
+            from: fixture.parentAuthority.value
+        )
+        let admitted = try await fixture.process.admit(
+            fixture.siblingHeader,
+            authenticatedChildPackage: fixture.siblingPackage
+        )
+        XCTAssertTrue(admitted.decision.isAccepted)
+        let status = await fixture.process.status()
+        XCTAssertEqual(status.tipCID, fixture.siblingCID)
+
+        recovery = try await fixture.process.serviceProjectionRecoveryCommit()
+        let recovered = try XCTUnwrap(recovery)
+        XCTAssertEqual(recovered.tipHash, fixture.siblingCID)
+        XCTAssertEqual(recovered.mainChainBlocksAdded, [fixture.siblingCID: 0])
+        XCTAssertEqual(recovered.mainChainBlocksRemoved, [fixture.activeCID])
+
+        try await fixture.service.restoreLocalTransactions()
+        recovery = try await fixture.process.serviceProjectionRecoveryCommit()
+        XCTAssertNil(recovery)
+        try await fixture.service.restoreLocalTransactions()
+        recovery = try await fixture.process.serviceProjectionRecoveryCommit()
+        XCTAssertNil(recovery)
+    }
+
+    func testProjectionRecoveryTreatsUnprojectedRoundTripAsVolatile()
+        async throws {
+        let context = try await {
+            let fixture = try await inheritedForkFixture()
+            try await fixture.service.restoreLocalTransactions()
+            let local = try signedTransaction(
+                key: CryptoUtils.generateKeyPair(),
+                chainPath: ["Nexus", "Payments"]
+            )
+            let submitted = try await fixture.service.submitTransaction(
+                SubmitTransactionRequest(transaction: local)
+            )
+
+            _ = try await fixture.process.applyInheritedWorkSnapshot(
+                InheritedWorkSnapshot(
+                    revision: 1,
+                    workByBlock: [
+                        fixture.siblingCarrierCID: WorkMeasure(
+                            try verifiedWorkContribution(
+                                id: fixture.siblingCarrierCID,
+                                work: 1_000
+                            )
+                        ),
+                    ]
+                ),
+                from: fixture.parentAuthority.value
+            )
+            let sibling = try await fixture.process.admit(
+                fixture.siblingHeader,
+                authenticatedChildPackage: fixture.siblingPackage
+            )
+            XCTAssertTrue(sibling.decision.isAccepted)
+            let siblingTip = await fixture.process.status().tipCID
+            XCTAssertEqual(siblingTip, fixture.siblingCID)
+
+            _ = try await fixture.process.applyInheritedWorkSnapshot(
+                InheritedWorkSnapshot(
+                    revision: 2,
+                    workByBlock: [
+                        fixture.activeCarrierCID: WorkMeasure(
+                            try verifiedWorkContribution(
+                                id: fixture.activeCarrierCID,
+                                work: 1_000_000
+                            )
+                        ),
+                    ]
+                ),
+                from: fixture.parentAuthority.value
+            )
+            let activeTip = await fixture.process.status().tipCID
+            XCTAssertEqual(activeTip, fixture.activeCID)
+
+            // The service checkpoint and current tip are both A, so the
+            // transient peer-only B branch has no endpoint delta to replay.
+            let recovery = try await fixture.process
+                .serviceProjectionRecoveryCommit()
+            XCTAssertNil(recovery)
+            return (
+                configuration: fixture.process.configuration,
+                localCID: submitted.transactionCID,
+                peerCID: try VolumeImpl<Transaction>(
+                    node: fixture.siblingTransaction
+                ).rawCID
+            )
+        }()
+
+        // Reopen the real stores. Local submissions remain restart authority;
+        // peer transactions seen only on the transient branch do not.
+        let process = try await ChainProcess.open(
+            configuration: context.configuration
+        )
+        let service = makeService(process: process)
+        try await service.restoreLocalTransactions()
+        let inventory = await service.transactionInventoryRoots()
+        XCTAssertEqual(inventory, [context.localCID])
+        XCTAssertFalse(inventory.contains(context.peerCID))
+        let recovery = try await process.serviceProjectionRecoveryCommit()
+        XCTAssertNil(recovery)
+    }
+
+    func testRestartRestoresPreparedChildDeploymentAndExpiresItDurably()
+        async throws {
+        let storage = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "lattice-service-child-intent-restart-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        addTeardownBlock { try? FileManager.default.removeItem(at: storage) }
+        let configuration = try NodeConfiguration(
+            chainPath: ["Nexus"],
+            minimumRootWork: UInt256(1),
+            storagePath: storage,
+            privateKeyHex: String(repeating: "5f", count: 32)
+        )
+
+        var process: ChainProcess? = try await ChainProcess.open(
+            configuration: configuration
+        )
+        var service: ChainService? = makeService(process: process!)
+        let childKey = CryptoUtils.generateKeyPair()
+        let premine = try signedTransaction(
+            key: childKey,
+            chainPath: ["Nexus", "Sandbox"],
+            accountActions: [AccountAction(
+                owner: CryptoUtils.createAddress(from: childKey.publicKey),
+                delta: 1
+            )]
+        )
+        let intent = try await service!.createChildDeployIntent(
+            ChildDeployIntentRequest(
+                directory: "Sandbox",
+                spec: ChainSpec(
+                    maxNumberOfTransactionsPerBlock: 100,
+                    maxStateGrowth: 100_000,
+                    premine: 1,
+                    targetBlockTime: 1_000,
+                    initialReward: 10,
+                    halvingInterval: 100
+                ),
+                genesisTransactions: [premine],
+                target: .max,
+                timestamp: 1
+            )
+        )
+        let anchor = try signedTransaction(
+            key: CryptoUtils.generateKeyPair(),
+            chainPath: ["Nexus"],
+            genesisActions: [GenesisAction(
+                directory: intent.directory,
+                blockCID: intent.genesisCID,
+                parentWorkAuthorityKey: try childAuthority(for: intent)
+            )]
+        )
+        _ = try await service!.submitTransaction(
+            SubmitTransactionRequest(transaction: anchor)
+        )
+        _ = try await process!.evictUnretainedVolumes()
+
+        service = nil
+        process = nil
+        process = try await ChainProcess.open(configuration: configuration)
+        service = makeService(process: process!)
+        try await service!.restoreLocalTransactions()
+
+        var status = await service!.status()
+        XCTAssertEqual(status.pendingChildIntents, 1)
+        var duplicateService: ChainService? = makeService(process: process!)
+        let duplicateStatus = await duplicateService!.status()
+        XCTAssertEqual(duplicateStatus.pendingChildIntents, 0)
+        duplicateService = nil
+        let broker = try DiskBroker(
+            path: storage.appendingPathComponent("volumes.db").path
+        )
+        let intentOwner = [configuration.nexusGenesisCID, configuration.address.key]
+            .joined(separator: ":") + ":child-intents"
+        let retainedRoots = await broker.pinnedRoots(owners: [intentOwner])
+        XCTAssertTrue(retainedRoots.contains(intent.genesisCID))
+        XCTAssertGreaterThan(retainedRoots.count, 1)
+        try await broker.pin(
+            root: configuration.nexusGenesisCID,
+            owner: intentOwner
+        )
+        _ = try await process!.evictUnretainedVolumes()
+        let reconciledOwners = await broker.owners(
+            root: configuration.nexusGenesisCID
+        )
+        XCTAssertFalse(reconciledOwners.contains(intentOwner))
+        let deployment = try await service!.miningTemplate(
+            MiningTemplateRequest(mode: .deployment)
+        )
+        let deployedChild = try XCTUnwrap(
+            try deployment.block.children.node?.allKeysAndValues()["Sandbox"]?
+                .node
+        )
+        XCTAssertEqual(try BlockHeader(node: deployedChild).rawCID, intent.genesisCID)
+        let deployedTransactions = try await deployedChild.transactions.resolve(
+            fetcher: process!
+        )
+        XCTAssertEqual(deployedTransactions.node?.count, 1)
+
+        let miner = CryptoUtils.generateKeyPair()
+        let reward = try signedTransaction(
+            key: miner,
+            chainPath: ["Nexus"],
+            accountActions: [AccountAction(
+                owner: CryptoUtils.createAddress(from: miner.publicKey),
+                delta: 1
+            )]
+        )
+        let ordinary = try await service!.miningTemplate(MiningTemplateRequest(
+            rewards: [MiningReward(chainPath: ["Nexus"], transaction: reward)]
+        ))
+        _ = try await service!.submitWork(SubmitWorkRequest(
+            workID: ordinary.workID,
+            nonce: 0
+        ))
+        status = await service!.status()
+        XCTAssertEqual(status.pendingChildIntents, 0)
+        for root in retainedRoots {
+            let owners = await broker.owners(root: root)
+            XCTAssertFalse(owners.contains(intentOwner))
+        }
+
+        service = nil
+        process = nil
+        process = try await ChainProcess.open(configuration: configuration)
+        service = makeService(process: process!)
+        status = await service!.status()
+        XCTAssertEqual(status.pendingChildIntents, 0)
+    }
+
     func testCanonicalCommitReconcilesEveryAddedAndRemovedTransaction() async throws {
         let process = try await nexusProcess()
         let service = makeService(process: process)
@@ -1001,7 +1478,7 @@ final class ChainServiceTests: XCTestCase {
         XCTAssertEqual(status.mempoolCount, 0)
     }
 
-    func testChildIntentNeedsSignedGenesisAndParentAnchor() async throws {
+    func testChildIntentNeedsValidPremineAndSignedParentAnchor() async throws {
         let process = try await nexusProcess()
         let publishedProofs = PublishedProofs()
         let service = makeService(
@@ -1118,6 +1595,316 @@ final class ChainServiceTests: XCTestCase {
         ))
         let status = await service.status()
         XCTAssertEqual(status.pendingChildIntents, 0)
+    }
+
+    func testChildIntentRequiresExactValidPolicyModules() async throws {
+        let process = try await nexusProcess()
+        let service = makeService(process: process)
+        let validModule = try policySentinelModule()
+        let validModuleCID = try WasmPolicyModuleHeader(
+            node: validModule
+        ).rawCID
+        let invalidModule = WasmPolicyModule(bytes: Data([0]))
+        let invalidModuleCID = try WasmPolicyModuleHeader(
+            node: invalidModule
+        ).rawCID
+        let policySpec = ChainSpec(
+            maxNumberOfTransactionsPerBlock: 100,
+            maxStateGrowth: 100_000,
+            premine: 0,
+            targetBlockTime: 1_000,
+            initialReward: 10,
+            halvingInterval: 100,
+            wasmPolicies: [WasmPolicyRef(
+                moduleCID: validModuleCID,
+                scope: .transaction
+            )]
+        )
+        let plainSpec = ChainSpec(
+            maxNumberOfTransactionsPerBlock: 100,
+            maxStateGrowth: 100_000,
+            premine: 0,
+            targetBlockTime: 1_000,
+            initialReward: 10,
+            halvingInterval: 100
+        )
+
+        func request(
+            spec: ChainSpec,
+            modules: [WasmPolicyModule]
+        ) -> ChildDeployIntentRequest {
+            ChildDeployIntentRequest(
+                directory: "Policy",
+                spec: spec,
+                genesisTransactions: [],
+                policyModules: modules,
+                target: .max,
+                timestamp: 1
+            )
+        }
+
+        let initialStatus = await service.status()
+        await XCTAssertThrowsErrorAsync(
+            try await service.createChildDeployIntent(request(
+                spec: policySpec,
+                modules: []
+            ))
+        ) { error in
+            XCTAssertEqual(error as? ChainServiceError, .invalidChildGenesis)
+        }
+        await XCTAssertThrowsErrorAsync(
+            try await service.createChildDeployIntent(request(
+                spec: plainSpec,
+                modules: [validModule]
+            ))
+        ) { error in
+            XCTAssertEqual(error as? ChainServiceError, .invalidChildGenesis)
+        }
+        await XCTAssertThrowsErrorAsync(
+            try await service.createChildDeployIntent(request(
+                spec: policySpec,
+                modules: [validModule, validModule]
+            ))
+        ) { error in
+            XCTAssertEqual(error as? ChainServiceError, .invalidChildGenesis)
+        }
+        await XCTAssertThrowsErrorAsync(
+            try await service.createChildDeployIntent(request(
+                spec: ChainSpec(
+                    maxNumberOfTransactionsPerBlock: 100,
+                    maxStateGrowth: 100_000,
+                    premine: 0,
+                    targetBlockTime: 1_000,
+                    initialReward: 10,
+                    halvingInterval: 100,
+                    wasmPolicies: [WasmPolicyRef(
+                        moduleCID: invalidModuleCID,
+                        scope: .transaction
+                    )]
+                ),
+                modules: [invalidModule]
+            ))
+        ) { error in
+            XCTAssertEqual(error as? ChainServiceError, .invalidChildGenesis)
+        }
+        let oversizedModule = WasmPolicyModule(bytes: Data(
+            repeating: 0,
+            count: WasmPolicyEvaluator.maxModuleBytes + 1
+        ))
+        let oversizedCID = try WasmPolicyModuleHeader(
+            node: oversizedModule
+        ).rawCID
+        await XCTAssertThrowsErrorAsync(
+            try await service.createChildDeployIntent(request(
+                spec: ChainSpec(
+                    maxNumberOfTransactionsPerBlock: 100,
+                    maxStateGrowth: 100_000,
+                    premine: 0,
+                    targetBlockTime: 1_000,
+                    initialReward: 10,
+                    halvingInterval: 100,
+                    wasmPolicies: [WasmPolicyRef(
+                        moduleCID: oversizedCID,
+                        scope: .transaction
+                    )]
+                ),
+                modules: [oversizedModule]
+            ))
+        ) { error in
+            XCTAssertEqual(error as? ChainServiceError, .invalidChildGenesis)
+        }
+        let rejectedStatus = await service.status()
+        XCTAssertEqual(
+            rejectedStatus.pendingChildIntents,
+            initialStatus.pendingChildIntents
+        )
+        let broker = try DiskBroker(
+            path: process.configuration.storagePath
+                .appendingPathComponent("volumes.db").path
+        )
+        let invalidOwners = await broker.owners(root: invalidModuleCID)
+        let oversizedOwners = await broker.owners(root: oversizedCID)
+        XCTAssertTrue(invalidOwners.isEmpty)
+        XCTAssertTrue(oversizedOwners.isEmpty)
+        _ = try await broker.evictUnpinned(graceSeconds: 0)
+        let invalidVolume = await broker.fetchVolumeLocal(root: invalidModuleCID)
+        let oversizedVolume = await broker.fetchVolumeLocal(root: oversizedCID)
+        XCTAssertNil(invalidVolume)
+        XCTAssertNil(oversizedVolume)
+
+        let repeatedReferenceSpec = ChainSpec(
+            maxNumberOfTransactionsPerBlock: 100,
+            maxStateGrowth: 100_000,
+            premine: 0,
+            targetBlockTime: 1_000,
+            initialReward: 10,
+            halvingInterval: 100,
+            wasmPolicies: [
+                WasmPolicyRef(moduleCID: validModuleCID, scope: .transaction),
+                WasmPolicyRef(moduleCID: validModuleCID, scope: .action),
+            ]
+        )
+        _ = try await service.createChildDeployIntent(request(
+            spec: repeatedReferenceSpec,
+            modules: [validModule]
+        ))
+        let acceptedStatus = await service.status()
+        XCTAssertEqual(acceptedStatus.pendingChildIntents, 1)
+    }
+
+    func testPolicyChildIntentRetainsModuleAcrossEvictionAndRestart()
+        async throws {
+        let storage = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "lattice-policy-intent-restart-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        addTeardownBlock { try? FileManager.default.removeItem(at: storage) }
+        let configuration = try NodeConfiguration(
+            chainPath: ["Nexus"],
+            minimumRootWork: UInt256(1),
+            storagePath: storage,
+            privateKeyHex: String(repeating: "6f", count: 32)
+        )
+        var process: ChainProcess? = try await ChainProcess.open(
+            configuration: configuration
+        )
+        var service: ChainService? = makeService(process: process!)
+        let module = try policySentinelModule()
+        let moduleCID = try WasmPolicyModuleHeader(node: module).rawCID
+        let intent = try await service!.createChildDeployIntent(
+            ChildDeployIntentRequest(
+                directory: "Policy",
+                spec: ChainSpec(
+                    maxNumberOfTransactionsPerBlock: 100,
+                    maxStateGrowth: 100_000,
+                    premine: 0,
+                    targetBlockTime: 1_000,
+                    initialReward: 10,
+                    halvingInterval: 100,
+                    wasmPolicies: [WasmPolicyRef(
+                        moduleCID: moduleCID,
+                        scope: .action
+                    )]
+                ),
+                genesisTransactions: [],
+                policyModules: [module],
+                target: .max,
+                timestamp: 1
+            )
+        )
+        let broker = try DiskBroker(
+            path: storage.appendingPathComponent("volumes.db").path
+        )
+        let intentOwner = [configuration.nexusGenesisCID, configuration.address.key]
+            .joined(separator: ":") + ":child-intents"
+        let owners = await broker.owners(root: moduleCID)
+        XCTAssertTrue(owners.contains(intentOwner))
+        _ = try await broker.evictUnpinned(graceSeconds: 0)
+        let retainedModule = await broker.fetchVolumeLocal(root: moduleCID)
+        XCTAssertNotNil(retainedModule)
+        try await broker.pin(
+            root: configuration.nexusGenesisCID,
+            owner: intentOwner
+        )
+
+        service = nil
+        process = nil
+        process = try await ChainProcess.open(configuration: configuration)
+        service = makeService(process: process!)
+        let recoveredStatus = await service!.status()
+        XCTAssertEqual(recoveredStatus.pendingChildIntents, 1)
+        let restoredModuleOwners = await broker.owners(root: moduleCID)
+        let staleOwners = await broker.owners(
+            root: configuration.nexusGenesisCID
+        )
+        XCTAssertTrue(restoredModuleOwners.contains(intentOwner))
+        XCTAssertFalse(staleOwners.contains(intentOwner))
+
+        let anchor = try signedTransaction(
+            key: CryptoUtils.generateKeyPair(),
+            chainPath: ["Nexus"],
+            genesisActions: [GenesisAction(
+                directory: intent.directory,
+                blockCID: intent.genesisCID,
+                parentWorkAuthorityKey: try childAuthority(for: intent)
+            )]
+        )
+        _ = try await service!.submitTransaction(
+            SubmitTransactionRequest(transaction: anchor)
+        )
+        let deployment = try await service!.miningTemplate(
+            MiningTemplateRequest(mode: .deployment)
+        )
+        XCTAssertEqual(
+            try deployment.block.children.node?.allKeysAndValues()["Policy"]?
+                .rawCID,
+            intent.genesisCID
+        )
+    }
+
+    func testPolicyChildIntentFailsClosedWhenRetainedModuleIsMissing()
+        async throws {
+        let storage = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "lattice-policy-intent-missing-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        addTeardownBlock { try? FileManager.default.removeItem(at: storage) }
+        let configuration = try NodeConfiguration(
+            chainPath: ["Nexus"],
+            minimumRootWork: UInt256(1),
+            storagePath: storage,
+            privateKeyHex: String(repeating: "7f", count: 32)
+        )
+        var process: ChainProcess? = try await ChainProcess.open(
+            configuration: configuration
+        )
+        var service: ChainService? = makeService(process: process!)
+        let module = try policySentinelModule()
+        let moduleCID = try WasmPolicyModuleHeader(node: module).rawCID
+        _ = try await service!.createChildDeployIntent(
+            ChildDeployIntentRequest(
+                directory: "Policy",
+                spec: ChainSpec(
+                    maxNumberOfTransactionsPerBlock: 100,
+                    maxStateGrowth: 100_000,
+                    premine: 0,
+                    targetBlockTime: 1_000,
+                    initialReward: 10,
+                    halvingInterval: 100,
+                    wasmPolicies: [WasmPolicyRef(
+                        moduleCID: moduleCID,
+                        scope: .action
+                    )]
+                ),
+                genesisTransactions: [],
+                policyModules: [module],
+                target: .max,
+                timestamp: 1
+            )
+        )
+        let intentOwner = [configuration.nexusGenesisCID, configuration.address.key]
+            .joined(separator: ":") + ":child-intents"
+        service = nil
+        process = nil
+        let broker = try DiskBroker(
+            path: storage.appendingPathComponent("volumes.db").path
+        )
+        try await broker.unpin(
+            root: moduleCID,
+            owner: intentOwner,
+            count: Int.max
+        )
+        _ = try await broker.evictUnpinned(graceSeconds: 0)
+        let missing = await broker.fetchVolumeLocal(root: moduleCID)
+        XCTAssertNil(missing)
+
+        await XCTAssertThrowsErrorAsync(
+            try await ChainProcess.open(configuration: configuration)
+        ) { error in
+            guard case NodeStoreError.corrupt = error else {
+                return XCTFail("unexpected recovery error: \(error)")
+            }
+        }
     }
 
     func testReplacingIntentDoesNotDeleteUserOwnedAnchor() async throws {
@@ -2498,6 +3285,12 @@ private func signedTransaction(
         privateKeyHex: key.privateKey
     ))
     return Transaction(signatures: [key.publicKey: signature], body: header)
+}
+
+private func policySentinelModule() throws -> WasmPolicyModule {
+    WasmPolicyModule(bytes: try XCTUnwrap(Data(
+        base64Encoded: "AGFzbQEAAAABDAJgAX8Bf2ACf38BfwMDAgABBQMBAAEGBwF/AUGACAsHUwQGbWVtb3J5AgANbGF0dGljZV9hbGxvYwAAHGxhdHRpY2VfdmFsaWRhdGVfdHJhbnNhY3Rpb24AARdsYXR0aWNlX3ZhbGlkYXRlX2FjdGlvbgABCnICEQEBfyMAIQEjACAAaiQAIAELXgECfyABQQ9JBEBBAA8LAkADQCACIAFBD2tLDQFBACEDAkADQCADQQ9GBEBBAQ8LIAAgAmogA2otAABBECADai0AAEcNASADQQFqIQMMAAsLIAJBAWohAgwACwtBAAsLFQEAQRALD3BvbGljeS1zZW50aW5lbA=="
+    )))
 }
 
 private func transactionBody(

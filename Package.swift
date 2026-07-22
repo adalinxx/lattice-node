@@ -54,12 +54,12 @@ let package = Package(
             dependencies: [
                 .product(name: "Lattice", package: "lattice"),
                 .product(name: "cashew", package: "cashew"),
-                .product(name: "VolumeBroker", package: "VolumeBroker"),
             ]),
         .target(
             name: "LatticeNode",
             dependencies: [
                 "CSQLite",
+                "LatticeLightClient",
                 .product(name: "Lattice", package: "lattice"),
                 .product(name: "Ivy", package: "Ivy"),
                 .product(name: "Tally", package: "Tally"),
@@ -114,6 +114,7 @@ let package = Package(
             dependencies: [
                 "LatticeNode",
                 "LatticeNodeDaemon",
+                "LatticeLightClient",
                 "CSQLite",
                 .product(name: "Lattice", package: "lattice"),
                 .product(name: "Ivy", package: "Ivy"),
@@ -126,10 +127,19 @@ let package = Package(
             ],
             path: "Tests/LatticeNodeTests/Architecture"),
         .testTarget(
+            name: "LatticeLightClientTests",
+            dependencies: [
+                "LatticeLightClient",
+                "LatticeProofVerifier",
+                .product(name: "Lattice", package: "lattice"),
+                .product(name: "cashew", package: "cashew"),
+            ]),
+        .testTarget(
             name: "LatticeNodeE2ETests",
             dependencies: [
                 "LatticeNode",
                 "LatticeNodeDaemon",
+                "LatticeLightClient",
                 "LatticeMinerCore",
                 "LatticeMiningCoordinatorTool",
                 "LatticeMiner",

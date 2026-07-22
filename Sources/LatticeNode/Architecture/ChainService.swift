@@ -1,5 +1,6 @@
 import Foundation
 import Lattice
+import LatticeLightClient
 import UInt256
 import cashew
 
@@ -223,6 +224,7 @@ public struct ChildDeployIntentRequest: Codable, Sendable {
     public let directory: String
     public let spec: ChainSpec
     public let genesisTransactions: [Transaction]
+    public let policyModules: [WasmPolicyModule]
     public let target: UInt256
     public let timestamp: Int64
 
@@ -230,12 +232,14 @@ public struct ChildDeployIntentRequest: Codable, Sendable {
         directory: String,
         spec: ChainSpec,
         genesisTransactions: [Transaction],
+        policyModules: [WasmPolicyModule] = [],
         target: UInt256,
         timestamp: Int64
     ) {
         self.directory = directory
         self.spec = spec
         self.genesisTransactions = genesisTransactions
+        self.policyModules = policyModules
         self.target = target
         self.timestamp = timestamp
     }
@@ -244,6 +248,7 @@ public struct ChildDeployIntentRequest: Codable, Sendable {
         case directory
         case spec
         case genesisTransactions
+        case policyModules
         case target
         case timestamp
     }
@@ -256,6 +261,10 @@ public struct ChildDeployIntentRequest: Codable, Sendable {
             [ContentBoundTransaction].self,
             forKey: .genesisTransactions
         ).map { try $0.transaction() }
+        policyModules = try container.decodeIfPresent(
+            [WasmPolicyModule].self,
+            forKey: .policyModules
+        ) ?? []
         target = try container.decode(UInt256.self, forKey: .target)
         timestamp = try container.decode(Int64.self, forKey: .timestamp)
     }
@@ -270,6 +279,7 @@ public struct ChildDeployIntentRequest: Codable, Sendable {
             },
             forKey: .genesisTransactions
         )
+        try container.encode(policyModules, forKey: .policyModules)
         try container.encode(target, forKey: .target)
         try container.encode(timestamp, forKey: .timestamp)
     }
@@ -297,6 +307,7 @@ public struct ChainServiceStatusResponse: Codable, Sendable, Equatable {
     public let height: UInt64?
     public let revision: UInt64?
     public let parentWorkRevision: UInt64?
+    public let mempoolAvailable: Bool
     public let mempoolCount: Int
     public let mempoolBytes: Int
     public let pendingChildIntents: Int
@@ -323,6 +334,8 @@ public enum ChainServiceError: Error, Equatable, Sendable {
     case noDeploymentAvailable
     case mempoolUnavailable
     case parentUnavailable
+    case invalidResourceIdentifier
+    case resourceNotFound
 }
 
 /// Transport-independent operations for one path. A future HTTP layer only
@@ -367,6 +380,7 @@ public actor ChainService {
     private static let maximumRewardPlanBytes =
         ChainServiceLimits.maximumPayloadBytes
     private static let maximumChildIntents = 64
+    private static let maximumPolicyModules = 64
     private static let maximumChildIntentBytes =
         ChainServiceLimits.maximumPayloadBytes
     private static let maximumChildCandidateBytes = 16 * 1024 * 1024
@@ -423,6 +437,22 @@ public actor ChainService {
             lifetime: .seconds(Self.templateLifetimeSeconds),
             capacity: Self.templateCapacity
         )
+        let recoveredChildDeployIntents =
+            process.takeRecoveredChildDeployIntents()
+        self.childIntents = Dictionary(uniqueKeysWithValues:
+            recoveredChildDeployIntents.map { recovered in
+                let record = recovered.record
+                return (record.directory, ChildIntent(
+                    directory: record.directory,
+                    chainPath: process.configuration.chainPath + [record.directory],
+                    genesisCID: record.genesisCID,
+                    genesis: recovered.genesis,
+                    parentStateCID: record.parentStateCID,
+                    parentWorkAuthorityKey: record.parentWorkAuthorityKey,
+                    acquisitionEntries: recovered.acquisitionEntries
+                ))
+            }
+        )
         self.maximumChildCandidates = maximumChildCandidates
         self.parentConsensusReady = process.configuration.address.isNexus
     }
@@ -446,7 +476,9 @@ public actor ChainService {
         let status = await process.status()
         if status.phase == .active,
            let tip = try? await process.canonicalTipBlock() {
-            removeStaleChildIntents(parentStateCID: tip.postState.rawCID)
+            try? await removeStaleChildIntents(
+                parentStateCID: tip.postState.rawCID
+            )
         }
         let phase: ChainServicePhase = if status.phase != .active {
             .awaitingGenesis
@@ -463,10 +495,47 @@ public actor ChainService {
             height: status.height,
             revision: status.revision,
             parentWorkRevision: status.parentWorkRevision,
+            mempoolAvailable: mempoolAvailable,
             mempoolCount: mempoolAvailable ? await pool.count : 0,
             mempoolBytes: mempoolAvailable ? await pool.byteCount : 0,
             pendingChildIntents: childIntents.count
         )
+    }
+
+    public func acceptedBlock(_ blockCID: String) async throws -> Block {
+        await acquireOperation()
+        defer { releaseOperation() }
+        guard CIDIdentity.isCanonical(blockCID) else {
+            throw ChainServiceError.invalidResourceIdentifier
+        }
+        guard let block = try await process.acceptedBlock(blockCID) else {
+            throw ChainServiceError.resourceNotFound
+        }
+        return block
+    }
+
+    public func transaction(
+        _ transactionCID: String
+    ) async throws -> ContentBoundTransaction {
+        await acquireOperation()
+        defer { releaseOperation() }
+        guard CIDIdentity.isCanonical(transactionCID) else {
+            throw ChainServiceError.invalidResourceIdentifier
+        }
+        guard let transaction = try await process.transaction(transactionCID)
+        else {
+            throw ChainServiceError.resourceNotFound
+        }
+        return try ContentBoundTransaction(transaction: transaction)
+    }
+
+    public func accountProof(address: String) async throws -> LightClientProof {
+        await acquireOperation()
+        defer { releaseOperation() }
+        guard CryptoUtils.isValidAddress(address) else {
+            throw ChainServiceError.invalidResourceIdentifier
+        }
+        return try await process.canonicalAccountProof(address: address)
     }
 
     /// Appends a canonical commit while ChainProcess still owns mutation order.
@@ -599,35 +668,46 @@ public actor ChainService {
         return await pool.snapshot().map(\.cid).sorted()
     }
 
-    /// Rebuilds only user-submitted durable entries before networking starts.
-    /// Peer-originated transactions intentionally remain volatile.
+    /// Rebuilds durable local submissions and revalidated transactions from
+    /// disconnected canonical history before networking starts. Unconfirmed
+    /// peer-originated transactions intentionally remain volatile.
     public func restoreLocalTransactions() async throws {
         await acquireOperation()
         defer { releaseOperation() }
         let durable = try await process.localTransactions()
-        guard !durable.isEmpty else { return }
-        let tip = try await process.canonicalTipBlock()
-        let spec = try await chainSpec(for: tip)
-        for item in durable {
-            let disposition = Self.poolDisposition(
-                (try await process.preflightTransaction(item.transaction)).disposition
-            )
-            guard disposition != .invalid else {
-                try await process.removeLocalTransaction(item.transactionCID)
-                continue
+        if !durable.isEmpty {
+            let tip = try await process.canonicalTipBlock()
+            let spec = try await chainSpec(for: tip)
+            for item in durable {
+                let disposition = Self.poolDisposition(
+                    (try await process.preflightTransaction(item.transaction)).disposition
+                )
+                guard disposition != .invalid else {
+                    try await process.removeLocalTransaction(item.transactionCID)
+                    continue
+                }
+                do {
+                    _ = try await pool.submit(
+                        item.transaction,
+                        spec: spec,
+                        fetcher: process,
+                        disposition: disposition,
+                        addedAt: Date(
+                            timeIntervalSince1970: TimeInterval(item.addedAt)
+                        )
+                    )
+                } catch is TransactionPoolError {
+                    continue
+                }
             }
-            _ = try? await pool.submit(
-                item.transaction,
-                spec: spec,
-                fetcher: process,
-                disposition: disposition,
-                addedAt: Date(timeIntervalSince1970: TimeInterval(item.addedAt))
-            )
         }
         try await prepareMempoolLocked()
         let roots = Set(await pool.snapshot().map(\.cid))
         try await pruneDurableLocalTransactionsLocked(keeping: roots)
         try await syncLiveMempoolRootsLocked(roots)
+        if let commit = try await process.serviceProjectionRecoveryCommit() {
+            try await reconcileCanonicalCommitLocked(commit)
+        }
     }
 
     private func admitTransactionLocked(
@@ -636,7 +716,9 @@ public actor ChainService {
     ) async throws -> (cid: String, inserted: Bool) {
         try await prepareMempoolLocked()
         let previous = try await process.canonicalTipBlock()
-        removeStaleChildIntents(parentStateCID: previous.postState.rawCID)
+        try await removeStaleChildIntents(
+            parentStateCID: previous.postState.rawCID
+        )
         let spec = try await chainSpec(for: previous)
         guard let envelope = transaction.toData(),
               envelope.count <= spec.maxBlockSize,
@@ -760,13 +842,7 @@ public actor ChainService {
 
     private func prepareMempoolLocked() async throws {
         if mempoolUnavailable {
-            do {
-                try await pruneDurableLocalTransactionsLocked(keeping: [])
-                try await syncLiveMempoolRootsLocked([])
-                mempoolUnavailable = false
-            } catch {
-                throw ChainServiceError.mempoolUnavailable
-            }
+            throw ChainServiceError.mempoolUnavailable
         }
         let expiration = await pool.expire()
         guard !expiration.expired.isEmpty else { return }
@@ -828,8 +904,18 @@ public actor ChainService {
             throw ChainServiceError.invalidChildGenesis
         }
         let childSpec = request.spec.withParentWorkAuthorityKey(parentAuthority)
+        let policyEntries = try Self.validatedPolicyModuleEntries(
+            spec: childSpec,
+            modules: request.policyModules
+        )
+        let deployFetcher = CoalescingFetcher(OverlayContentSource(
+            entries: policyEntries,
+            fallback: FetcherContentSource(process)
+        ))
         let parent = try await process.canonicalTipBlock()
-        removeStaleChildIntents(parentStateCID: parent.postState.rawCID)
+        try await removeStaleChildIntents(
+            parentStateCID: parent.postState.rawCID
+        )
         guard childIntents[request.directory] != nil
             || childIntents.count < Self.maximumChildIntents else {
             throw ChainServiceError.childIntentLimitReached
@@ -840,24 +926,28 @@ public actor ChainService {
             transactions: request.genesisTransactions,
             timestamp: request.timestamp,
             target: request.target,
-            fetcher: process
+            fetcher: deployFetcher
         )
         let valid = try await genesis.validateGenesis(
-            fetcher: process,
+            fetcher: deployFetcher,
             chainPath: childAddress.components
         ).0
         guard valid else { throw ChainServiceError.invalidChildGenesis }
 
         let header = try BlockHeader(node: genesis)
 
-        // Store the prepared genesis envelope and its request-owned content.
-        // `parentState` deliberately references the parent's existing state;
-        // recursively claiming that graph as child-deploy content would invent
-        // cross-volume ownership.
-        try await header.storeBlock(fetcher: process, storer: process)
-        let acquisitionEntries = try await process.durableCandidateEntries(
-            for: genesis
-        )
+        let acquisitionEntries: [String: Data]
+        do {
+            acquisitionEntries = try await process.persistChildDeployIntent(
+                directory: request.directory,
+                genesis: genesis,
+                parentStateCID: parent.postState.rawCID,
+                parentWorkAuthorityKey: parentAuthority,
+                fetcher: deployFetcher
+            )
+        } catch ChainProcessError.canonicalContextChanged {
+            throw ChainServiceError.templateContextChanged
+        }
         let intent = ChildIntent(
             directory: request.directory,
             chainPath: childAddress.components,
@@ -876,6 +966,48 @@ public actor ChainService {
             genesisBlock: intent.genesis,
             parentStateCID: intent.parentStateCID
         )
+    }
+
+    private static func validatedPolicyModuleEntries(
+        spec: ChainSpec,
+        modules: [WasmPolicyModule]
+    ) throws -> [String: Data] {
+        guard spec.wasmPolicies.count <= maximumPolicyModules,
+              modules.count <= maximumPolicyModules else {
+            throw ChainServiceError.invalidChildGenesis
+        }
+        var moduleByCID: [String: WasmPolicyModule] = [:]
+        var entries: [String: Data] = [:]
+        for module in modules {
+            guard module.bytes.count <= WasmPolicyEvaluator.maxModuleBytes,
+                  let data = module.toData() else {
+                throw ChainServiceError.invalidChildGenesis
+            }
+            let header = try WasmPolicyModuleHeader(node: module)
+            guard moduleByCID.updateValue(module, forKey: header.rawCID) == nil
+            else {
+                throw ChainServiceError.invalidChildGenesis
+            }
+            entries[header.rawCID] = data
+        }
+        let expected = Set(spec.wasmPolicies.map(\.moduleCID))
+        guard expected == Set(moduleByCID.keys) else {
+            throw ChainServiceError.invalidChildGenesis
+        }
+        for policy in spec.wasmPolicies {
+            guard let module = moduleByCID[policy.moduleCID] else {
+                throw ChainServiceError.invalidChildGenesis
+            }
+            do {
+                try WasmPolicyEvaluator.validate(
+                    policy: policy,
+                    moduleBytes: module.bytes
+                )
+            } catch {
+                throw ChainServiceError.invalidChildGenesis
+            }
+        }
+        return entries
     }
 
     public func miningTemplate(
@@ -952,7 +1084,9 @@ public actor ChainService {
     ) async throws -> MiningTemplate {
         let fetcher: any Fetcher = fetcher ?? process
         let previous = try await process.canonicalTipBlock()
-        removeStaleChildIntents(parentStateCID: previous.postState.rawCID)
+        try await removeStaleChildIntents(
+            parentStateCID: previous.postState.rawCID
+        )
         let spec = try await chainSpec(for: previous)
         let rewardPlan = try await validatedRewardPlan(rewards)
         let reward = try await validatedRewardTransaction(
@@ -1251,7 +1385,7 @@ public actor ChainService {
         precondition(canonicalCommitWorkerReserved)
         while !canonicalCommitQueue.isEmpty {
             let event = canonicalCommitQueue.removeFirst()
-            await reconcileCanonicalCommitOrResetLocked(event.commit)
+            await reconcileCanonicalCommitOrFailLocked(event.commit)
             await event.receipt.finish()
         }
         canonicalCommitWorker = nil
@@ -1259,22 +1393,16 @@ public actor ChainService {
         releaseOperation()
     }
 
-    private func reconcileCanonicalCommitOrResetLocked(
+    private func reconcileCanonicalCommitOrFailLocked(
         _ commit: ChainCommit
     ) async {
         do {
             try await reconcileCanonicalCommitLocked(commit)
         } catch {
             _ = await pool.clear()
-            do {
-                try await pruneDurableLocalTransactionsLocked(keeping: [])
-                try await syncLiveMempoolRootsLocked([])
-                mempoolUnavailable = false
-            } catch {
-                mempoolUnavailable = true
-            }
+            try? await syncLiveMempoolRootsLocked([])
+            mempoolUnavailable = true
             await templates.invalidateAll()
-            childIntents.removeAll()
         }
     }
 
@@ -1289,7 +1417,7 @@ public actor ChainService {
         switch outcome.decision {
         case .canonicalized(let commit):
             if outcome.canonicalCommitReceipt == nil {
-                await reconcileCanonicalCommitOrResetLocked(commit)
+                await reconcileCanonicalCommitOrFailLocked(commit)
             }
             try? await acceptedBlockPublisher(header.rawCID)
         case .acceptedSide:
@@ -1323,7 +1451,9 @@ public actor ChainService {
                     if childIntents[anchor.directory]?.genesisCID == anchor.genesisCID,
                        childIntents[anchor.directory]?.parentWorkAuthorityKey
                         == anchor.parentWorkAuthorityKey {
-                        childIntents.removeValue(forKey: anchor.directory)
+                        try? await removeChildIntents(
+                            directories: [anchor.directory]
+                        )
                     }
                 }
             }
@@ -1415,26 +1545,35 @@ public actor ChainService {
             let disposition = Self.poolDisposition(
                 (try await process.preflightTransaction(transaction)).disposition
             )
-            _ = try? await pool.submit(
-                transaction,
-                spec: spec,
-                fetcher: process,
-                disposition: disposition
-            )
+            do {
+                _ = try await pool.submit(
+                    transaction,
+                    spec: spec,
+                    fetcher: process,
+                    disposition: disposition
+                )
+            } catch is TransactionPoolError {
+                continue
+            }
         }
         let process = self.process
         _ = try await pool.revalidate { transaction in
             let result = try await process.preflightTransaction(transaction)
             return Self.poolDisposition(result.disposition)
         }
-        try await pruneDurableLocalTransactionsLocked(
-            keeping: Set(await pool.snapshot().map(\.cid))
-        )
-        try await syncLiveMempoolRootsLocked(
-            Set(await pool.snapshot().map(\.cid))
-        )
+        let snapshot = await pool.snapshot()
+        for item in snapshot where removedByCID[item.cid] != nil {
+            _ = try await process.persistLocalTransaction(
+                item.transaction,
+                addedAt: Int64(item.addedAt.timeIntervalSince1970)
+            )
+        }
+        let roots = Set(snapshot.map(\.cid))
+        try await pruneDurableLocalTransactionsLocked(keeping: roots)
+        try await syncLiveMempoolRootsLocked(roots)
         await templates.invalidateAll()
-        removeStaleChildIntents(parentStateCID: tip.postState.rawCID)
+        try await removeStaleChildIntents(parentStateCID: tip.postState.rawCID)
+        try await process.persistServiceProjectionTip(commit.tipHash)
     }
 
     private nonisolated static func poolDisposition(
@@ -1744,9 +1883,18 @@ public actor ChainService {
         return byDirectory.values.sorted { $0.directory < $1.directory }
     }
 
-    private func removeStaleChildIntents(parentStateCID: String) {
-        childIntents = childIntents.filter {
-            $0.value.parentStateCID == parentStateCID
+    private func removeStaleChildIntents(parentStateCID: String) async throws {
+        let stale = childIntents.values.filter {
+            $0.parentStateCID != parentStateCID
+        }.map(\.directory)
+        guard !stale.isEmpty else { return }
+        try await removeChildIntents(directories: stale)
+    }
+
+    private func removeChildIntents(directories: [String]) async throws {
+        try await process.removeChildDeployIntents(directories: directories)
+        for directory in directories {
+            childIntents.removeValue(forKey: directory)
         }
     }
 

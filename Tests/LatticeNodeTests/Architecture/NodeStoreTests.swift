@@ -120,6 +120,41 @@ final class NodeStoreTests: XCTestCase {
             ).compactMap { $0["name"]?.textValue }),
             Set(["transaction_cid", "added_at"])
         )
+        XCTAssertTrue(
+            try NodeSQLite(path: path.path).query(
+                "PRAGMA table_info(node_metadata)"
+            ).contains {
+                $0["name"]?.textValue == "service_projection_tip_cid"
+            }
+        )
+    }
+
+    func testServiceProjectionCheckpointReferencesAcceptedHistory() async throws {
+        let directory = temporaryDirectory()
+        let path = directory.appendingPathComponent("state.db")
+        let store = try makeStore(path: path)
+        var checkpoint = try await store.serviceProjectionTip()
+        XCTAssertNil(checkpoint)
+
+        let accepted = inheritedWorkCID("projection-accepted")
+        try await store.stage(
+            blockBatch(postStateCID: "state", blockHash: accepted),
+            volumeRoots: []
+        )
+        try await store.setServiceProjectionTip(accepted)
+        checkpoint = try await store.serviceProjectionTip()
+        XCTAssertEqual(checkpoint, accepted)
+
+        let missing = inheritedWorkCID("projection-missing")
+        await XCTAssertThrowsErrorAsync(
+            try await store.setServiceProjectionTip(missing)
+        )
+        let database = try NodeSQLite(path: path.path)
+        try database.execute(
+            "UPDATE node_metadata SET service_projection_tip_cid = ?1 WHERE singleton = 1",
+            params: [.text(missing)]
+        )
+        await XCTAssertThrowsErrorAsync(try await store.auditNormalizedIndexes())
     }
 
     func testInheritedWorkSourceStoresMonotoneFactsAndPinsAuthority()

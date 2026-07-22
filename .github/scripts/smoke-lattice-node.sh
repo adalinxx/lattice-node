@@ -1,17 +1,19 @@
 #!/usr/bin/env bash
-# Exercise the shipped node, coordinator, and worker as one mining pipeline.
+# Exercise every shipped executable and the node/coordinator/worker mining pipeline.
 set -euo pipefail
 
-node_binary="${1:?usage: smoke-lattice-node.sh <lattice-node> <lattice-mining-coordinator> <lattice-miner>}"
-coordinator_binary="${2:?usage: smoke-lattice-node.sh <lattice-node> <lattice-mining-coordinator> <lattice-miner>}"
-miner_binary="${3:?usage: smoke-lattice-node.sh <lattice-node> <lattice-mining-coordinator> <lattice-miner>}"
+node_binary="${1:?usage: smoke-lattice-node.sh <lattice-node> <lattice-mining-coordinator> <lattice-miner> <lattice-proof-verifier>}"
+coordinator_binary="${2:?usage: smoke-lattice-node.sh <lattice-node> <lattice-mining-coordinator> <lattice-miner> <lattice-proof-verifier>}"
+miner_binary="${3:?usage: smoke-lattice-node.sh <lattice-node> <lattice-mining-coordinator> <lattice-miner> <lattice-proof-verifier>}"
+verifier_binary="${4:?usage: smoke-lattice-node.sh <lattice-node> <lattice-mining-coordinator> <lattice-miner> <lattice-proof-verifier>}"
 
-for binary in "$node_binary" "$coordinator_binary" "$miner_binary"; do
+for binary in "$node_binary" "$coordinator_binary" "$miner_binary" "$verifier_binary"; do
     [[ -x "$binary" ]] || {
         echo "artifact smoke requires an executable: $binary" >&2
         exit 1
     }
 done
+"$verifier_binary" --help >/dev/null
 for command in curl jq; do
     command -v "$command" >/dev/null 2>&1 || {
         echo "artifact smoke requires $command" >&2

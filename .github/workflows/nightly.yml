@@ -1,0 +1,44 @@
+name: Nightly realistic-node stress
+
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+jobs:
+  critical-path-stress:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    container: swift:6.1-jammy
+    env:
+      LATTICE_STRESS_ITERATIONS: 5
+      LATTICE_STRESS_ROUNDS: 24
+      E2E_NODE_BIN: ${{ github.workspace }}/.build/release/lattice-node
+      E2E_COORDINATOR_BIN: ${{ github.workspace }}/.build/release/lattice-mining-coordinator
+      E2E_MINER_BIN: ${{ github.workspace }}/.build/release/lattice-miner
+      E2E_PROOF_VERIFIER_BIN: ${{ github.workspace }}/.build/release/lattice-proof-verifier
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies for Linux
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends libsqlite3-dev
+
+      - name: Build production binaries and tests
+        run: |
+          swift build -c release -Xswiftc -warnings-as-errors
+          swift build --build-tests -Xswiftc -warnings-as-errors
+
+      - name: Repeat realistic consensus, restart, and recovery paths
+        timeout-minutes: 80
+        run: scripts/stress-critical-paths.sh
+
+      - name: Upload failed node workspaces
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lattice-node-nightly-${{ github.run_id }}-${{ github.run_attempt }}
+          path: /tmp/lattice-node-e2e-*
+          if-no-files-found: ignore
+          retention-days: 7

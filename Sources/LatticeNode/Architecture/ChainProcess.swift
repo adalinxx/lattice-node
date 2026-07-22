@@ -1,5 +1,7 @@
 import Foundation
 import Lattice
+import LatticeLightClient
+import Synchronization
 import VolumeBroker
 import cashew
 
@@ -19,6 +21,7 @@ public enum ChainProcessError: Error, Equatable, Sendable {
     case unresolvedCanonicalTip(String)
     case malformedAuthenticatedChildProof
     case acquisitionPackageTooLarge
+    case canonicalContextChanged
 }
 
 public enum ChainProcessPhase: String, Sendable {
@@ -173,6 +176,12 @@ struct DurableLocalTransaction: Sendable {
     let transaction: Transaction
 }
 
+struct RecoveredChildDeployIntent: Sendable {
+    let record: ChildDeployIntentRecord
+    let genesis: Block
+    let acquisitionEntries: [String: Data]
+}
+
 /// One process owns one absolute chain path. Child processes have an explicit
 /// pre-genesis phase so target-miss carriers can relay deeper accepted work
 /// without inventing local chain state.
@@ -192,6 +201,8 @@ public actor ChainProcess: Fetcher, VolumeStorer {
     private static let preparedChildProofCapacity = 16
 
     public nonisolated let configuration: NodeConfiguration
+    private nonisolated let recoveredChildDeployIntents:
+        Mutex<[RecoveredChildDeployIntent]>
 
     private let store: NodeStore
     private let broker: DiskBroker
@@ -204,6 +215,7 @@ public actor ChainProcess: Fetcher, VolumeStorer {
     private let retentionScope: String
     private let durableMempoolOwner: String
     private let liveMempoolOwner: String
+    private let childIntentOwner: String
     private let directoryLock: StorageDirectoryLock
     private var runtimePhase: RuntimePhase
     private var livePinnedMempoolRoots = Set<String>()
@@ -232,6 +244,8 @@ public actor ChainProcess: Fetcher, VolumeStorer {
         retentionScope: String,
         durableMempoolOwner: String,
         liveMempoolOwner: String,
+        childIntentOwner: String,
+        recoveredChildDeployIntents: [RecoveredChildDeployIntent],
         directoryLock: StorageDirectoryLock,
         runtimePhase: RuntimePhase
     ) {
@@ -245,8 +259,18 @@ public actor ChainProcess: Fetcher, VolumeStorer {
         self.retentionScope = retentionScope
         self.durableMempoolOwner = durableMempoolOwner
         self.liveMempoolOwner = liveMempoolOwner
+        self.childIntentOwner = childIntentOwner
+        self.recoveredChildDeployIntents = Mutex(recoveredChildDeployIntents)
         self.directoryLock = directoryLock
         self.runtimePhase = runtimePhase
+    }
+
+    nonisolated func takeRecoveredChildDeployIntents()
+        -> [RecoveredChildDeployIntent] {
+        recoveredChildDeployIntents.withLock { recovered in
+            defer { recovered.removeAll(keepingCapacity: false) }
+            return recovered
+        }
     }
 
     /// Completes store validation, retained-root reconciliation, and recovery
@@ -288,6 +312,7 @@ public actor ChainProcess: Fetcher, VolumeStorer {
         let legacyMempoolRetentionScope = retentionScope + ":mempool"
         let durableMempoolOwner = retentionScope + ":durable-mempool"
         let liveMempoolOwner = retentionScope + ":live-mempool"
+        let childIntentOwner = retentionScope + ":child-intents"
         let recoveryVolumeStorer = RetainingVolumeStorer(
             volumes: brokerStorer,
             broker: broker,
@@ -444,6 +469,35 @@ public actor ChainProcess: Fetcher, VolumeStorer {
             configuration: configuration
         )
 
+        let currentParentStateCID: String?
+        if case .active(let level) = runtimePhase {
+            let tipCID = await level.chain.getMainChainTip()
+            guard let tip = try await BlockHeader(
+                rawCID: tipCID,
+                node: nil,
+                encryptionInfo: nil
+            ).resolve(fetcher: localFetcher).node else {
+                throw ChainProcessError.unresolvedCanonicalTip(tipCID)
+            }
+            currentParentStateCID = tip.postState.rawCID
+        } else {
+            currentParentStateCID = nil
+        }
+        let recoveredChildDeployIntents = try await recoverChildDeployIntents(
+            store: store,
+            broker: broker,
+            localFetcher: localFetcher,
+            configuration: configuration,
+            currentParentStateCID: currentParentStateCID
+        )
+        try await broker.unpinAll(owner: childIntentOwner)
+        try await broker.pinBatch(
+            roots: Array(Set(recoveredChildDeployIntents.flatMap {
+                $0.record.volumeRoots
+            })).sorted(),
+            owner: childIntentOwner
+        )
+
         return ChainProcess(
             configuration: configuration,
             store: store,
@@ -455,6 +509,8 @@ public actor ChainProcess: Fetcher, VolumeStorer {
             retentionScope: retentionScope,
             durableMempoolOwner: durableMempoolOwner,
             liveMempoolOwner: liveMempoolOwner,
+            childIntentOwner: childIntentOwner,
+            recoveredChildDeployIntents: recoveredChildDeployIntents,
             directoryLock: directoryLock,
             runtimePhase: runtimePhase
         )
@@ -1103,6 +1159,87 @@ public actor ChainProcess: Fetcher, VolumeStorer {
         return transactions
     }
 
+    func persistChildDeployIntent(
+        directory: String,
+        genesis: Block,
+        parentStateCID: String,
+        parentWorkAuthorityKey: ParentWorkAuthorityKey,
+        fetcher: any Fetcher
+    ) async throws -> [String: Data] {
+        try await acquireMutationOperation()
+        defer { releaseOperation() }
+        guard case .active(let level) = runtimePhase else {
+            throw ChainProcessError.chainNotBootstrapped
+        }
+        let tipCID = await level.chain.getMainChainTip()
+        guard let tip = try await BlockHeader(
+            rawCID: tipCID,
+            node: nil,
+            encryptionInfo: nil
+        ).resolve(fetcher: localFetcher).node,
+              tip.postState.rawCID == parentStateCID else {
+            throw ChainProcessError.canonicalContextChanged
+        }
+
+        let header = try BlockHeader(node: genesis)
+        let storage = NodeAdmissionStorage(storage: brokerStorer)
+        try await header.storeBlock(fetcher: fetcher, storer: storage)
+        let volumeRoots = await storage.takeStoredVolumeRoots()
+        guard volumeRoots.contains(header.rawCID) else {
+            throw ChainProcessError.missingMaterializedVolume(header.rawCID)
+        }
+        let acquisitionEntries = try await Self.collectCandidateEntries(
+            for: genesis,
+            fetcher: localFetcher,
+            maximumBytes: ChildAcquisitionPackage.maximumBytes
+        )
+        let intent = ChildDeployIntentRecord(
+            directory: directory,
+            genesisCID: header.rawCID,
+            parentStateCID: parentStateCID,
+            parentWorkAuthorityKey: parentWorkAuthorityKey,
+            volumeRoots: volumeRoots
+        )
+        let current = try await store.childDeployIntents()
+        let currentRoots = Set(current.flatMap(\.volumeRoots))
+        let nextRoots = Set(current.filter { $0.directory != intent.directory }
+            .flatMap(\.volumeRoots) + intent.volumeRoots)
+        let added = nextRoots.subtracting(currentRoots)
+        let removed = currentRoots.subtracting(nextRoots)
+        try await broker.pinBatch(
+            roots: added.sorted(),
+            owner: childIntentOwner
+        )
+        do {
+            try await store.persistChildDeployIntent(intent)
+        } catch {
+            try? await broker.unpinBatch(items: added.sorted().map {
+                (root: $0, owner: childIntentOwner, count: 1)
+            })
+            throw error
+        }
+        try? await broker.unpinBatch(items: removed.sorted().map {
+            (root: $0, owner: childIntentOwner, count: 1)
+        })
+        return acquisitionEntries
+    }
+
+    func removeChildDeployIntents(directories: [String]) async throws {
+        guard !directories.isEmpty else { return }
+        try await acquireMutationOperation()
+        defer { releaseOperation() }
+        let currentRoots = Set(try await store.childDeployIntents()
+            .flatMap(\.volumeRoots))
+        try await store.removeChildDeployIntents(directories: directories)
+        let nextRoots = Set(try await store.childDeployIntents()
+            .flatMap(\.volumeRoots))
+        try? await broker.unpinBatch(
+            items: currentRoots.subtracting(nextRoots).sorted().map {
+                (root: $0, owner: childIntentOwner, count: 1)
+            }
+        )
+    }
+
     func localTransactionTimestamps() async throws -> [String: Int64] {
         await acquireOperation()
         defer { releaseOperation() }
@@ -1111,6 +1248,90 @@ public actor ChainProcess: Fetcher, VolumeStorer {
                 ($0.transactionCID, $0.addedAt)
             }
         )
+    }
+
+    /// Reconstructs the canonical delta left between a durable consensus
+    /// commit and the last completed service projection. This runs only at
+    /// startup; the ordinary path receives the delta directly from Lattice.
+    func serviceProjectionRecoveryCommit() async throws -> ChainCommit? {
+        await acquireOperation()
+        defer { releaseOperation() }
+        guard case .active(let level) = runtimePhase else { return nil }
+
+        let tip = await level.chain.getMainChainTip()
+        let checkpoint = try await store.serviceProjectionTip()
+        guard checkpoint != tip else { return nil }
+
+        func parent(of block: BlockMeta) async throws -> BlockMeta? {
+            guard (block.parentBlockHash == nil) == (block.blockHeight == 0)
+            else {
+                throw NodeStoreError.corrupt("accepted block ancestry is malformed")
+            }
+            guard let parentCID = block.parentBlockHash else { return nil }
+            guard let parent = await level.chain.getConsensusBlock(hash: parentCID),
+                  parent.blockHeight < UInt64.max,
+                  parent.blockHeight + 1 == block.blockHeight else {
+                throw NodeStoreError.corrupt("accepted block ancestry is incomplete")
+            }
+            return parent
+        }
+
+        var old: BlockMeta?
+        if let checkpoint {
+            old = await level.chain.getConsensusBlock(hash: checkpoint)
+        } else {
+            old = nil
+        }
+        if checkpoint != nil, old == nil {
+            throw NodeStoreError.corrupt(
+                "service projection checkpoint is outside accepted history"
+            )
+        }
+        guard var new = await level.chain.getConsensusBlock(hash: tip) else {
+            throw NodeStoreError.corrupt("canonical history is incomplete")
+        }
+        var added: [String: UInt64] = [:]
+        var removed = Set<String>()
+        while let previous = old {
+            if previous.blockHash == new.blockHash { break }
+            if previous.blockHeight >= new.blockHeight {
+                removed.insert(previous.blockHash)
+                old = try await parent(of: previous)
+            }
+            if new.blockHeight >= previous.blockHeight {
+                added[new.blockHash] = new.blockHeight
+                guard let parent = try await parent(of: new) else {
+                    while let remaining = old {
+                        removed.insert(remaining.blockHash)
+                        old = try await parent(of: remaining)
+                    }
+                    return ChainCommit(
+                        tipHash: tip,
+                        mainChainBlocksAdded: added,
+                        mainChainBlocksRemoved: removed
+                    )
+                }
+                new = parent
+            }
+        }
+        if old == nil {
+            while true {
+                added[new.blockHash] = new.blockHeight
+                guard let parent = try await parent(of: new) else { break }
+                new = parent
+            }
+        }
+        return ChainCommit(
+            tipHash: tip,
+            mainChainBlocksAdded: added,
+            mainChainBlocksRemoved: removed
+        )
+    }
+
+    func persistServiceProjectionTip(_ blockCID: String) async throws {
+        try await acquireMutationOperation()
+        defer { releaseOperation() }
+        try await store.setServiceProjectionTip(blockCID)
     }
 
     public func canonicalTipBlock() async throws -> Block {
@@ -1125,6 +1346,99 @@ public actor ChainProcess: Fetcher, VolumeStorer {
             throw ChainProcessError.unresolvedCanonicalTip(tip)
         }
         return block
+    }
+
+    /// Returns only blocks admitted by Lattice. VolumeBroker membership alone
+    /// is not acceptance authority: candidates may be materialized before they
+    /// are accepted or may remain loose after rejection.
+    public func acceptedBlock(_ blockCID: String) async throws -> Block? {
+        await acquireOperation()
+        defer { releaseOperation() }
+        guard try await store.hasAcceptedBlock(blockCID) else { return nil }
+        guard let block = try await BlockHeader(
+            rawCID: blockCID,
+            node: nil,
+            encryptionInfo: nil
+        ).resolve(fetcher: localFetcher).node else {
+            throw ChainProcessError.missingMaterializedVolume(blockCID)
+        }
+        return block
+    }
+
+    /// Resolves a locally retained transaction Volume, including its concrete
+    /// body. The CID is rechecked by cashew while resolving from VolumeBroker.
+    public func transaction(_ transactionCID: String) async throws -> Transaction? {
+        await acquireOperation()
+        defer { releaseOperation() }
+        guard await broker.isPinReachable(cid: transactionCID),
+              await broker.fetchVolumeLocal(root: transactionCID) != nil else {
+            return nil
+        }
+        let resolved = try await VolumeImpl<Transaction>(
+            rawCID: transactionCID
+        ).resolveRecursive(source: localSource)
+        guard let transaction = resolved.node else {
+            throw ChainProcessError.missingMaterializedVolume(transactionCID)
+        }
+        return transaction
+    }
+
+    /// Builds a self-contained witness against one canonical tip while process
+    /// mutation is fenced. The complete block binds its state root to its CID;
+    /// ancestry and fork choice remain the light client's responsibility.
+    public func canonicalAccountProof(
+        address: String
+    ) async throws -> LightClientProof {
+        await acquireOperation()
+        defer { releaseOperation() }
+        guard case .active(let level) = runtimePhase else {
+            throw ChainProcessError.chainNotBootstrapped
+        }
+        let blockCID = await level.chain.getMainChainTip()
+        guard await level.chain.isOnMainChain(hash: blockCID) else {
+            throw ChainProcessError.unresolvedCanonicalTip(blockCID)
+        }
+        guard let block = try await BlockHeader(
+            rawCID: blockCID,
+            node: nil,
+            encryptionInfo: nil
+        ).resolve(fetcher: localFetcher).node,
+              let state = try await block.postState.resolve(
+                fetcher: localFetcher
+              ).node else {
+            throw ChainProcessError.missingMaterializedVolume(blockCID)
+        }
+
+        let nonceKey = AccountStateHeader.nonceTrackingKey(address)
+        let accounts = try await state.accountState.resolve(
+            paths: [
+                [address]: .targeted,
+                [nonceKey]: .targeted,
+            ],
+            fetcher: localFetcher
+        )
+        let balance: UInt64? = accounts.node.flatMap {
+            try? $0.get(key: address)
+        }
+        let nonce: UInt64? = accounts.node.flatMap {
+            try? $0.get(key: nonceKey)
+        }
+        let witness = try await LightClientProtocol.collectAccountWitness(
+            state: state,
+            stateRoot: block.postState.rawCID,
+            address: address,
+            balanceExists: balance != nil,
+            nonceExists: nonce != nil,
+            fetcher: localFetcher
+        )
+        return LightClientProof(
+            block: block,
+            address: address,
+            balance: balance ?? 0,
+            nonce: nonce ?? 0,
+            accountRoot: witness.accountRoot,
+            witness: witness.witness
+        )
     }
 
     /// Classifies against one coherent Lattice tip while process mutations are
@@ -1627,7 +1941,24 @@ public actor ChainProcess: Fetcher, VolumeStorer {
         try await acquireMutationOperation()
         defer { releaseOperation() }
         try Task.checkCancellation()
+        try await reconcileChildIntentPins()
         return try await broker.evictUnpinned()
+    }
+
+    /// Child-intent rows are authoritative. Failed post-commit cleanup is
+    /// harmless because periodic eviction retries this exact reconciliation.
+    private func reconcileChildIntentPins() async throws {
+        let expected = Set(try await store.childDeployIntents()
+            .flatMap(\.volumeRoots))
+        let actual = Set(await broker.pinnedRoots(owners: [childIntentOwner]))
+        try await broker.pinBatch(
+            roots: expected.subtracting(actual).sorted(),
+            owner: childIntentOwner
+        )
+        try await broker.unpinBatch(items: actual.subtracting(expected)
+            .sorted().map {
+                (root: $0, owner: childIntentOwner, count: Int.max)
+            })
     }
 
     private func acquireOperation() async {
@@ -2115,6 +2446,96 @@ public actor ChainProcess: Fetcher, VolumeStorer {
                 carrierCID: carrierCID
             )
         }
+    }
+
+    private nonisolated static func recoverChildDeployIntents(
+        store: NodeStore,
+        broker: DiskBroker,
+        localFetcher: any Fetcher,
+        configuration: NodeConfiguration,
+        currentParentStateCID: String?
+    ) async throws -> [RecoveredChildDeployIntent] {
+        var recovered: [RecoveredChildDeployIntent] = []
+        let records = try await store.childDeployIntents()
+        let stale = records.filter {
+            $0.parentStateCID != currentParentStateCID
+        }.map(\.directory)
+        try await store.removeChildDeployIntents(directories: stale)
+        for record in records where record.parentStateCID == currentParentStateCID {
+            var hasCompleteVolumes = true
+            for root in record.volumeRoots {
+                if await broker.fetchVolumeLocal(root: root) == nil {
+                    hasCompleteVolumes = false
+                    break
+                }
+            }
+            guard let address = ChainAddress(
+                configuration.chainPath + [record.directory]
+            ), record.parentWorkAuthorityKey.value
+                == configuration.processPublicKey,
+              await broker.fetchVolumeLocal(root: record.genesisCID) != nil,
+              hasCompleteVolumes else {
+                throw NodeStoreError.corrupt(
+                    "child deployment intent does not match this process"
+                )
+            }
+            let header = BlockHeader(
+                rawCID: record.genesisCID,
+                node: nil,
+                encryptionInfo: nil
+            )
+            guard let genesis = try await header.resolve(fetcher: localFetcher).node,
+                  genesis.parent == nil,
+                  genesis.parentState.rawCID == record.parentStateCID,
+                  let spec = try await genesis.spec.resolve(
+                    fetcher: localFetcher
+                  ).node,
+                  Set(spec.wasmPolicies.map(\.moduleCID)).isSubset(
+                    of: Set(record.volumeRoots)
+                  ),
+                  try await genesis.validateGenesis(
+                    fetcher: localFetcher,
+                    chainPath: address.components
+                  ).0 else {
+                throw NodeStoreError.corrupt(
+                    "child deployment genesis is missing or invalid"
+                )
+            }
+            for policy in spec.wasmPolicies {
+                guard let module = try await WasmPolicyModuleHeader(
+                    rawCID: policy.moduleCID
+                ).resolve(fetcher: localFetcher).node,
+                      (try? WasmPolicyEvaluator.validate(
+                        policy: policy,
+                        moduleBytes: module.bytes
+                      )) != nil else {
+                    throw NodeStoreError.corrupt(
+                        "child deployment policy module is missing or invalid"
+                    )
+                }
+            }
+            let manifest = NodeAdmissionStorage()
+            try await header.storeBlock(
+                fetcher: localFetcher,
+                storer: manifest
+            )
+            guard await manifest.takeStoredVolumeRoots() == record.volumeRoots
+            else {
+                throw NodeStoreError.corrupt(
+                    "child deployment Volume manifest is incomplete"
+                )
+            }
+            recovered.append(RecoveredChildDeployIntent(
+                record: record,
+                genesis: genesis,
+                acquisitionEntries: try await collectCandidateEntries(
+                    for: genesis,
+                    fetcher: localFetcher,
+                    maximumBytes: ChildAcquisitionPackage.maximumBytes
+                )
+            ))
+        }
+        return recovered
     }
 
     private nonisolated static func promotePreparedChildProofsFromDurableEvidence(

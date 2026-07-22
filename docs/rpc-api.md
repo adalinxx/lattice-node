@@ -39,7 +39,9 @@ receiver can reconstruct and verify the transaction body CID:
 
 ### `GET /v1/status`
 
-Both routes return the same chain-process status:
+Both routes return the same chain-process status body. `/v1/status` always
+returns HTTP 200; `/health` returns HTTP 503 only when `mempoolAvailable` is
+false, so it can serve as a container health probe.
 
 ```json
 {
@@ -50,11 +52,17 @@ Both routes return the same chain-process status:
   "height": 42,
   "revision": 57,
   "parentWorkRevision": null,
+  "mempoolAvailable": true,
   "mempoolCount": 3,
   "mempoolBytes": 2048,
   "pendingChildIntents": 0
 }
 ```
+
+`mempoolAvailable: false` means consensus state remains readable but the
+service projection failed closed and the node must restart before transaction
+ingress or template construction resumes. `/health` returns HTTP 503 in that
+state; `/v1/status` continues to return HTTP 200 with the same diagnostic body.
 
 A child reports `phase: "awaitingGenesis"`, with null tip and height, until it
 receives its authenticated genesis link from its immediate parent.
@@ -65,6 +73,38 @@ Its retained tip may still be shown, but it is not operational consensus.
 `revision` is the local consensus mutation watermark. `parentWorkRevision` is
 the last inherited-work watermark durably completed from the configured parent;
 it is null on Nexus or before the first parent pass.
+
+## Reads and proofs
+
+### `GET /v1/blocks/{cid}`
+
+Returns a block only when this node has admitted that CID into its Lattice
+chain. A candidate whose bytes merely exist in VolumeBroker is not readable
+through this route. Accepted noncanonical branch blocks remain readable.
+
+### `GET /v1/transactions/{cid}`
+
+Returns a locally retained transaction with its concrete body and signatures in
+the content-bound form shown above. This includes durable local mempool entries
+and transactions retained with accepted block content. The requested CID is
+verified while resolving the Volume.
+
+### `GET /v1/accounts/{address}/proof`
+
+Returns a `LightClientProof` sampled under the process's canonical-tip mutation
+fence. Its witness cryptographically binds the address balance and stored nonce
+to the returned state root, including an absent account as zero balance and
+nonce. The proof carries the complete content-addressed `Block` from that same
+snapshot.
+
+`lattice-proof-verifier` recomputes the returned Block CID, takes the state root
+from that Block, and verifies the self-contained account witness against it.
+This proves the account result is committed by that exact Block. A remote client
+must separately verify the Block's ancestry and Lattice fork choice before
+treating it as canonical.
+
+Malformed CIDs and addresses return `400`; well-formed CIDs not available under
+the endpoint's rules return `404`.
 
 ## Transactions
 
@@ -167,8 +207,21 @@ Request fields:
 - `spec`: the child's `ChainSpec`.
 - `genesisTransactions`: content-bound transactions for the absolute child
   path.
+- `policyModules`: concrete `WasmPolicyModule` values referenced by `spec`.
+  Their computed CIDs must be exactly the unique `spec.wasmPolicies.moduleCID`
+  set: omit none, add no extras, and supply each shared module once even when
+  several policy references use it. Every reference, including its ABI,
+  scope, and entrypoint, is validated before the intent is retained.
 - `target`: child genesis target.
 - `timestamp`: child genesis timestamp in milliseconds.
+
+An intent may contain at most 64 policy references and 64 supplied modules.
+Each module is limited to `WasmPolicyEvaluator.maxModuleBytes` (currently 256
+KiB), and the complete
+encoded request remains subject to the 1 MiB RPC payload limit. The node
+retains the complete child-genesis Volume manifest, including policy modules,
+until deployment or replacement; restart and Volume eviction therefore cannot
+silently strand a valid intent.
 
 Response:
 
