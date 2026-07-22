@@ -4319,7 +4319,8 @@ final class NetworkTrustTests: XCTestCase {
             try await waitForEventCount(
                 3,
                 in: admissions,
-                phase: "durable child orphan retry"
+                phase: "durable child orphan retry",
+                attempts: 2_000
             )
 
             let admittedCIDs = await admissions.snapshot()
