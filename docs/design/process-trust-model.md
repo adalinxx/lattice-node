@@ -100,7 +100,16 @@ The CID is checked before configured root bootstrap, never used as a
 peer-admission signature permit. Every child genesis is ordinary content bound
 to a parent state. A prepared child intent becomes authoritative only after a
 separately signed parent `GenesisAction` transaction is accepted in a carrier
-and the child verifies the resulting parent genesis link.
+and the child verifies the resulting parent genesis link. The action and link
+identify only the child directory and exact genesis CID. That CID commits the
+child `ChainSpec.parentWorkAuthorityKey`; before admission, the child requires
+that key to equal its configured immediate parent. The authority is not copied
+into parent consensus state or asserted by the link itself.
+
+Every transaction inside a genesis block has empty signers and signatures. The
+exact genesis CID is the authorization: local configuration for Nexus and the
+signed parent action for a child. Ordinary transactions after genesis remain
+signature-strict.
 
 ## Inherited work
 

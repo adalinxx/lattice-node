@@ -334,14 +334,12 @@ public actor ChainService {
         let genesisCID: String
         let genesis: Block
         let parentStateCID: String
-        let parentWorkAuthorityKey: ParentWorkAuthorityKey
         let acquisitionEntries: [String: Data]
     }
 
     private struct Anchor: Hashable {
         let directory: String
         let genesisCID: String
-        let parentWorkAuthorityKey: ParentWorkAuthorityKey
     }
 
     private struct ValidatedRewardPlan {
@@ -864,7 +862,6 @@ public actor ChainService {
             genesisCID: header.rawCID,
             genesis: genesis,
             parentStateCID: parent.postState.rawCID,
-            parentWorkAuthorityKey: parentAuthority,
             acquisitionEntries: acquisitionEntries
         )
         childIntents[request.directory] = intent
@@ -931,15 +928,30 @@ public actor ChainService {
             children: template.childCandidates,
             capacity: Self.templateCapacity
         )
-        let acquisitionEntries = try await process.durableCandidateEntries(
+        var acquisitionEntries = try await process.durableCandidateEntries(
             for: template.block,
             fetcher: fetcher
+        )
+        for child in template.childCandidates {
+            for (cid, data) in child.acquisitionEntries {
+                if let existing = acquisitionEntries[cid], existing != data {
+                    throw ChildAcquisitionPackageError.malformed
+                }
+                acquisitionEntries[cid] = data
+            }
+        }
+        guard let blockData = template.block.toData() else {
+            throw ChildAcquisitionPackageError.malformed
+        }
+        _ = try ChildAcquisitionPackage(
+            entries: acquisitionEntries,
+            childCID: try BlockHeader(node: template.block).rawCID,
+            childData: blockData,
+            maximumBytes: ChildAcquisitionPackage.maximumBytes
         )
         return DirectChildCandidate(
             directory: process.configuration.address.directory,
             block: template.block,
-            searchTarget: template.searchTarget,
-            deploymentTarget: template.deploymentTarget,
             acquisitionEntries: acquisitionEntries
         )
     }
@@ -1059,7 +1071,7 @@ public actor ChainService {
             let localDeploymentIncluded = selectedDeploymentIndex.map {
                 anchors(in: [pooled[$0]]).isSubset(of: selectedAnchors)
             } ?? false
-            let providedChildren = try await validatedProvidedChildren(
+            let provided = try await validatedProvidedChildren(
                 context: ChildCandidateRequestContext(
                     parentCarrier: provisional.block,
                     rewards: rewardPlan.descendants,
@@ -1069,9 +1081,8 @@ public actor ChainService {
                 ),
                 deploymentCursor: childDeploymentCursor
             )
-            let providedDeployment = providedChildren.contains {
-                $0.deploymentTarget != nil
-            }
+            let providedChildren = provided.candidates
+            let providedDeployment = provided.hasDeployment
             if mode == .deployment,
                !pendingDeploymentIndices.isEmpty,
                !localDeploymentIncluded,
@@ -1311,8 +1322,7 @@ public actor ChainService {
         case .canonicalized, .acceptedSide, .duplicate:
             let transactions = (try? await blockTransactions(in: block)) ?? []
             let blockAnchors = anchors(in: transactions).sorted {
-                ($0.directory, $0.genesisCID, $0.parentWorkAuthorityKey.value)
-                    < ($1.directory, $1.genesisCID, $1.parentWorkAuthorityKey.value)
+                ($0.directory, $0.genesisCID) < ($1.directory, $1.genesisCID)
             }
             for anchor in blockAnchors {
                 if let link = try? await process.issuedParentGenesisLink(
@@ -1320,9 +1330,7 @@ public actor ChainService {
                     childGenesisCID: anchor.genesisCID
                 ) {
                     genesisLinks.append(link)
-                    if childIntents[anchor.directory]?.genesisCID == anchor.genesisCID,
-                       childIntents[anchor.directory]?.parentWorkAuthorityKey
-                        == anchor.parentWorkAuthorityKey {
+                    if childIntents[anchor.directory]?.genesisCID == anchor.genesisCID {
                         childIntents.removeValue(forKey: anchor.directory)
                     }
                 }
@@ -1602,15 +1610,11 @@ public actor ChainService {
             guard intent.parentStateCID == parentStateCID,
                   anchors.contains(Anchor(
                       directory: intent.directory,
-                      genesisCID: intent.genesisCID,
-                      parentWorkAuthorityKey: intent.parentWorkAuthorityKey
+                      genesisCID: intent.genesisCID
                   )) else { return nil }
             return DirectChildCandidate(
                 directory: intent.directory,
                 block: intent.genesis,
-                searchTarget: intent.genesis.target,
-                deploymentTarget: intent.genesis.target,
-                requiresParentTargetHit: true,
                 acquisitionEntries: intent.acquisitionEntries
             )
         }.sorted { $0.directory < $1.directory }
@@ -1620,11 +1624,14 @@ public actor ChainService {
         context: ChildCandidateRequestContext,
         deploymentCursor: Int
     ) async throws
-        -> [DirectChildCandidate] {
+        -> (candidates: [DirectChildCandidate], hasDeployment: Bool) {
         let candidates = try await childCandidateProvider(context)
         var directories: Set<String> = []
         var encodedBytes = 0
-        var accepted: [DirectChildCandidate] = []
+        var accepted: [(
+            candidate: DirectChildCandidate,
+            targets: (search: UInt256, deployment: UInt256?)
+        )] = []
         for candidate in candidates.sorted(by: candidateOrder) {
             guard let childCID = try? BlockHeader(node: candidate.block).rawCID,
                   let childData = candidate.block.toData() else { continue }
@@ -1644,47 +1651,59 @@ public actor ChainService {
                       process.configuration.chainPath + [candidate.directory]
                   ) != nil,
                   candidate.block.parentState.rawCID
-                      == context.parentCarrier.prevState.rawCID,
-                  candidate.searchTarget > .zero,
-                  context.mode == .deployment
-                    || candidate.deploymentTarget == nil,
-                  candidate.deploymentTarget.map({
-                      $0 > .zero && candidate.searchTarget <= $0
-                  }) ?? true else {
+                      == context.parentCarrier.prevState.rawCID else {
                 continue
             }
             let candidateFetcher = CoalescingFetcher(OverlayContentSource(
                 entries: package.entries,
                 fallback: FetcherContentSource(process)
             ))
-            guard let acquisitionEntries = try? await process.durableCandidateEntries(
+            guard (try? await process.durableCandidateEntries(
                 for: candidate.block,
                 fetcher: candidateFetcher,
                 maximumBytes: min(
                     Self.maximumChildCandidateBytes,
                     ChildAcquisitionPackage.maximumBytes
                 )
-            ),
+            )) != nil,
+                  let targets = try? await committedCandidateTargets(
+                    block: candidate.block,
+                    fetcher: candidateFetcher
+                  ),
+                  context.mode == .deployment
+                    || targets.deployment == nil,
                   package.framedByteCount
                     <= Self.maximumChildCandidateBytes - encodedBytes,
                   directories.insert(candidate.directory).inserted else {
                 continue
             }
             encodedBytes += package.framedByteCount
-            accepted.append(DirectChildCandidate(
-                directory: candidate.directory,
-                block: candidate.block,
-                searchTarget: candidate.searchTarget,
-                deploymentTarget: candidate.deploymentTarget,
-                acquisitionEntries: acquisitionEntries
-            ))
+            accepted.append((DirectChildCandidate(
+                    directory: candidate.directory,
+                    block: candidate.block,
+                    acquisitionEntries: package.entries
+                ), targets))
         }
-        guard context.mode == .deployment else { return accepted }
-        let deployments = accepted.filter { $0.deploymentTarget != nil }
-        guard !deployments.isEmpty else { return accepted }
+        guard context.mode == .deployment else {
+            return (
+                candidates: accepted.map(\.candidate),
+                hasDeployment: false
+            )
+        }
+        let deployments = accepted.filter { $0.targets.deployment != nil }
+        guard !deployments.isEmpty else {
+            return (
+                candidates: accepted.map(\.candidate),
+                hasDeployment: false
+            )
+        }
         let selected = deployments[deploymentCursor % deployments.count]
-        return accepted.filter { $0.deploymentTarget == nil }
-            + [selected]
+        return (
+            candidates: accepted.filter { $0.targets.deployment == nil }
+                .map(\.candidate)
+                + [selected.candidate],
+            hasDeployment: true
+        )
     }
 
     private func candidateOrder(
@@ -1769,8 +1788,7 @@ public actor ChainService {
             transaction.body.node?.genesisActions.map {
                 Anchor(
                     directory: $0.directory,
-                    genesisCID: $0.blockCID,
-                    parentWorkAuthorityKey: $0.parentWorkAuthorityKey
+                    genesisCID: $0.blockCID
                 )
             } ?? []
         })
@@ -1787,7 +1805,6 @@ public actor ChainService {
             }
             return intent.parentStateCID == parentStateCID
                 && intent.genesisCID == anchor.genesisCID
-                && intent.parentWorkAuthorityKey == anchor.parentWorkAuthorityKey
         }
     }
 

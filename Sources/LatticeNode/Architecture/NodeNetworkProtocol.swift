@@ -14,7 +14,6 @@ enum NodeNetworkTopic {
         "lattice.overlay.transaction.inventory.request.v1"
     static let transactionInventoryResponse =
         "lattice.overlay.transaction.inventory.response.v1"
-    static let predecessorRequest = "lattice.overlay.predecessor.v1"
     static let acceptedLeavesRequest = "lattice.overlay.accepted-leaves.request.v1"
     static let acceptedLeavesResponse = "lattice.overlay.accepted-leaves.response.v1"
     static let portableAttachmentAvailable =
@@ -36,7 +35,6 @@ enum NodeNetworkTopic {
         switch topic {
         case overlayHello, blockAnnouncement, transactionAvailable,
              transactionInventoryRequest, transactionInventoryResponse,
-             predecessorRequest,
              acceptedLeavesRequest, acceptedLeavesResponse,
              portableAttachmentAvailable,
              portableAttachmentIndexRequest,
@@ -140,16 +138,6 @@ struct TransactionInventoryResponseMessage: NodeJSONMessage, Equatable, Sendable
                   afterRootCID.map({ cid > $0 }) ?? true
               }),
               !hasMore || volumeRootCIDs.count == Self.maximumRoots else {
-            throw NodeNetworkWireError.malformed
-        }
-    }
-}
-
-struct PredecessorRequestMessage: NodeJSONMessage, Equatable, Sendable {
-    let predecessorCID: String
-
-    func validate() throws {
-        guard _isBoundedWireAtom(predecessorCID) else {
             throw NodeNetworkWireError.malformed
         }
     }
@@ -535,8 +523,6 @@ struct ChildCandidateResponseMessage: Sendable {
     let childPath: [String]
     let parentCID: String
     let childCID: String
-    let searchTarget: UInt256
-    let deploymentTarget: UInt256?
     let blockData: Data
     let acquisitionEntries: [String: Data]
 
@@ -545,8 +531,6 @@ struct ChildCandidateResponseMessage: Sendable {
         childPath: [String],
         parentCID: String,
         childCID: String,
-        searchTarget: UInt256,
-        deploymentTarget: UInt256? = nil,
         blockData: Data,
         acquisitionEntries: [String: Data]
     ) {
@@ -554,8 +538,6 @@ struct ChildCandidateResponseMessage: Sendable {
         self.childPath = childPath
         self.parentCID = parentCID
         self.childCID = childCID
-        self.searchTarget = searchTarget
-        self.deploymentTarget = deploymentTarget
         self.blockData = blockData
         self.acquisitionEntries = acquisitionEntries
     }
@@ -565,12 +547,8 @@ struct ChildCandidateResponseMessage: Sendable {
               _isAbsoluteChainPath(childPath), childPath.count > 1,
               childPath.count <= Int(UInt16.max),
               _isBoundedWireAtom(parentCID), _isBoundedWireAtom(childCID),
-              searchTarget > .zero,
               blockData.count <= Int(UInt32.max),
               _contentBoundBlock(cid: childCID, data: blockData) != nil,
-              deploymentTarget.map({
-                  $0 > .zero && searchTarget <= $0
-              }) ?? true,
               let package = try? ChildAcquisitionPackage(
                   entries: acquisitionEntries,
                   childCID: childCID,
@@ -582,17 +560,11 @@ struct ChildCandidateResponseMessage: Sendable {
         let pathBytes = childPath.map { Data($0.utf8) }
         let parentBytes = Data(parentCID.utf8)
         let childBytes = Data(childCID.utf8)
-        let targetBytes = Data(searchTarget.toHexString().utf8)
-        let deploymentBytes = deploymentTarget.map {
-            Data($0.toHexString().utf8)
-        }
         let extraEntries = acquisitionEntries
             .filter { $0.key != childCID }
             .sorted { $0.key < $1.key }
-        guard targetBytes.count == 64 else { throw NodeNetworkWireError.malformed }
         var size = 8 + 2 + pathBytes.reduce(0) { $0 + 2 + $1.count }
         size += 2 + parentBytes.count + 2 + childBytes.count
-        size += targetBytes.count + 1 + (deploymentBytes?.count ?? 0)
         size += 4 + blockData.count + 2
         size += package.framedByteCount - (6 + childBytes.count + blockData.count)
         guard extraEntries.count <= Int(UInt16.max),
@@ -610,9 +582,6 @@ struct ChildCandidateResponseMessage: Sendable {
         data.append(parentBytes)
         data.appendUInt16(UInt16(childBytes.count))
         data.append(childBytes)
-        data.append(targetBytes)
-        data.append(deploymentBytes == nil ? 0 : 1)
-        if let deploymentBytes { data.append(deploymentBytes) }
         data.appendUInt32(UInt32(blockData.count))
         data.append(blockData)
         data.appendUInt16(UInt16(extraEntries.count))
@@ -634,39 +603,7 @@ struct ChildCandidateResponseMessage: Sendable {
         guard let requestID = data.readUInt64(at: &position), requestID != 0,
               let childPath = data.readChainPath(at: &position),
               let parentCID = data.readString(at: &position),
-              let childCID = data.readString(at: &position),
-              data.distance(from: position, to: data.endIndex) >= 64 else {
-            throw NodeNetworkWireError.malformed
-        }
-        let targetEnd = data.index(position, offsetBy: 64)
-        guard let targetHex = String(
-                data: data[position..<targetEnd],
-                encoding: .utf8
-              ), let searchTarget = UInt256.fromHexString(targetHex) else {
-            throw NodeNetworkWireError.malformed
-        }
-        position = targetEnd
-        guard position < data.endIndex else {
-            throw NodeNetworkWireError.malformed
-        }
-        let hasDeploymentTarget = data[position]
-        position = data.index(after: position)
-        let deploymentTarget: UInt256?
-        switch hasDeploymentTarget {
-        case 0:
-            deploymentTarget = nil
-        case 1:
-            guard data.distance(from: position, to: data.endIndex) >= 64 else {
-                throw NodeNetworkWireError.malformed
-            }
-            let end = data.index(position, offsetBy: 64)
-            guard let hex = String(data: data[position..<end], encoding: .utf8),
-                  let target = UInt256.fromHexString(hex) else {
-                throw NodeNetworkWireError.malformed
-            }
-            deploymentTarget = target
-            position = end
-        default:
+              let childCID = data.readString(at: &position) else {
             throw NodeNetworkWireError.malformed
         }
         guard let blockLength = data.readUInt32(at: &position), blockLength > 0,
@@ -699,8 +636,6 @@ struct ChildCandidateResponseMessage: Sendable {
             childPath: childPath,
             parentCID: parentCID,
             childCID: childCID,
-            searchTarget: searchTarget,
-            deploymentTarget: deploymentTarget,
             blockData: blockData,
             acquisitionEntries: acquisitionEntries
         )

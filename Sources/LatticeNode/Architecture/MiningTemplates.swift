@@ -10,46 +10,57 @@ private enum MiningCandidateValidationError: Error {
 public struct DirectChildCandidate: Sendable {
     public let directory: String
     public let block: Block
-    /// The easiest target accepted anywhere in this candidate's subtree.
-    /// This affects only miner scheduling; every chain validates its own hit.
-    public let searchTarget: UInt256
-    /// Hardest pending deployment target in this subtree. Ancestors preserve
-    /// this scheduling barrier without requiring their own chain targets to hit.
-    public let deploymentTarget: UInt256?
-    /// Local-only marker: this direct child is being anchored by this block.
-    let requiresParentTargetHit: Bool
     let acquisitionEntries: [String: Data]
 
     public init(
         directory: String,
         block: Block,
-        searchTarget: UInt256,
-        deploymentTarget: UInt256? = nil,
         acquisitionEntries: [String: Data]
     ) {
         self.directory = directory
         self.block = block
-        self.searchTarget = searchTarget
-        self.deploymentTarget = deploymentTarget
-        requiresParentTargetHit = false
         self.acquisitionEntries = acquisitionEntries
     }
+}
 
-    init(
-        directory: String,
-        block: Block,
-        searchTarget: UInt256,
-        deploymentTarget: UInt256,
-        requiresParentTargetHit: Bool,
-        acquisitionEntries: [String: Data]
-    ) {
-        self.directory = directory
-        self.block = block
-        self.searchTarget = searchTarget
-        self.deploymentTarget = deploymentTarget
-        self.requiresParentTargetHit = requiresParentTargetHit
-        self.acquisitionEntries = acquisitionEntries
+/// Derives scheduling exclusively from the committed block DAG.
+func committedCandidateTargets(
+    block: Block,
+    fetcher: any Fetcher
+) async throws -> (search: UInt256, deployment: UInt256?) {
+    var pending = [block]
+    var seen: Set<String> = []
+    var searchTarget = UInt256.zero
+    var deploymentTarget = block.parent == nil ? block.target : nil
+
+    while let current = pending.popLast() {
+        let currentCID = try BlockHeader(node: current).rawCID
+        guard seen.insert(currentCID).inserted else { continue }
+        searchTarget = max(searchTarget, current.target)
+
+        let childrenHeader = try await current.children.resolve(fetcher: fetcher)
+        guard let childrenNode = childrenHeader.node else {
+            throw MiningCandidateValidationError.invalid
+        }
+        let children = try await childrenNode.resolveList(fetcher: fetcher)
+        for childHeader in try children.allKeysAndValues().values {
+            guard let child = try await childHeader.resolve(fetcher: fetcher).node else {
+                throw MiningCandidateValidationError.invalid
+            }
+            if child.parent == nil {
+                deploymentTarget = min(
+                    deploymentTarget ?? current.target,
+                    current.target,
+                    child.target
+                )
+            }
+            pending.append(child)
+        }
     }
+    guard searchTarget > .zero else {
+        throw MiningCandidateValidationError.invalid
+    }
+    return (searchTarget, deploymentTarget)
 }
 
 public struct MiningTemplate: Sendable {
@@ -236,24 +247,33 @@ public actor MiningTemplateBook {
             }
         }
         let workID = try BlockHeader(node: candidate).rawCID
-        let acceptedTarget = children.reduce(candidate.target) {
-            max($0, $1.searchTarget)
+        var schedulingEntries: [String: Data] = [:]
+        for child in children {
+            for (cid, data) in child.acquisitionEntries {
+                if let existing = schedulingEntries[cid], existing != data {
+                    throw MiningCandidateValidationError.invalid
+                }
+                schedulingEntries[cid] = data
+            }
         }
-        var deploymentTarget = children.compactMap(\.deploymentTarget).min()
-        if deploymentTarget != nil,
-           children.contains(where: \.requiresParentTargetHit) {
-            deploymentTarget = min(candidate.target, deploymentTarget!)
-        }
+        let schedulingFetcher = CoalescingFetcher(OverlayContentSource(
+            entries: schedulingEntries,
+            fallback: FetcherContentSource(fetcher)
+        ))
+        let committed = try await committedCandidateTargets(
+            block: candidate,
+            fetcher: schedulingFetcher
+        )
         let searchTarget = min(
-            acceptedTarget,
-            deploymentTarget ?? .max,
+            committed.search,
+            committed.deployment ?? .max,
             UInt256.max / minimumRootWork
         )
         let template = MiningTemplate(
             workID: workID,
             block: candidate,
             searchTarget: searchTarget,
-            deploymentTarget: deploymentTarget,
+            deploymentTarget: committed.deployment,
             chainPath: chainPath,
             expiresAt: ContinuousClock.now + lifetime,
             childCandidates: children

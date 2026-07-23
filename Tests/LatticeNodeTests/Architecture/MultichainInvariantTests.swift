@@ -44,10 +44,9 @@ final class MultichainInvariantTests: XCTestCase {
             fetcher: parent!
         )
         let childHeader = try BlockHeader(node: childGenesis)
-        let authorization = try signedGenesisAuthorization(
+        let authorization = try signedGenesisAnchorTransaction(
             directory: "Payments",
-            childGenesisCID: childHeader.rawCID,
-            parentWorkAuthorityKey: parentAuthority
+            childGenesisCID: childHeader.rawCID
         )
         try await VolumeImpl<Transaction>(node: authorization).storeRecursively(
             storer: parent!
@@ -184,10 +183,9 @@ final class MultichainInvariantTests: XCTestCase {
         )
     }
 
-    private func signedGenesisAuthorization(
+    private func signedGenesisAnchorTransaction(
         directory: String,
-        childGenesisCID: String,
-        parentWorkAuthorityKey: ParentWorkAuthorityKey
+        childGenesisCID: String
     ) throws -> Transaction {
         let key = CryptoUtils.generateKeyPair()
         let body = TransactionBody(
@@ -196,8 +194,7 @@ final class MultichainInvariantTests: XCTestCase {
             depositActions: [],
             genesisActions: [GenesisAction(
                 directory: directory,
-                blockCID: childGenesisCID,
-                parentWorkAuthorityKey: parentWorkAuthorityKey
+                blockCID: childGenesisCID
             )],
             receiptActions: [],
             withdrawalActions: [],

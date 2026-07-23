@@ -10,7 +10,7 @@ final class ParentFactCertificateTests: XCTestCase {
         let parent = try configuration(seed: 1)
         let authority = try XCTUnwrap(ParentWorkAuthorityKey(parent.processPublicKey))
         let carrier = try carrierLink()
-        let genesis = try genesisLink(authority: authority)
+        let genesis = try genesisLink()
 
         let firstCarrier = try ParentCarrierCertificateV1(
             link: carrier,
@@ -110,7 +110,7 @@ final class ParentFactCertificateTests: XCTestCase {
         let package = ChildValidationPackage(
             proof: proof(),
             parentCarrierLink: try carrierLink(),
-            parentGenesisLink: try genesisLink(authority: authority)
+            parentGenesisLink: try genesisLink()
         )
         let signed = try ChildValidationPackageEnvelope(
             package,
@@ -153,11 +153,10 @@ final class ParentFactCertificateTests: XCTestCase {
 
     func testLiveGateAcceptsUnsignedFactsButRejectsInvalidPortableSignature() throws {
         let parent = try configuration(seed: 6)
-        let authority = try XCTUnwrap(ParentWorkAuthorityKey(parent.processPublicKey))
         let package = ChildValidationPackage(
             proof: proof(),
             parentCarrierLink: try carrierLink(),
-            parentGenesisLink: try genesisLink(authority: authority)
+            parentGenesisLink: try genesisLink()
         )
         let gate = try AuthenticatedParentFactGate(
             childPath: ["Nexus", "Payments"],
@@ -217,12 +216,10 @@ final class ParentFactCertificateTests: XCTestCase {
         )
     }
 
-    private func genesisLink(
-        authority: ParentWorkAuthorityKey
-    ) throws -> ParentGenesisLink {
+    private func genesisLink() throws -> ParentGenesisLink {
         try JSONDecoder().decode(
             ParentGenesisLink.self,
-            from: Data(#"{"parentPath":["Nexus"],"directory":"Payments","childGenesisCID":"\#(NexusGenesis.expectedBlockHash)","parentWorkAuthorityKey":"\#(authority.value)"}"#.utf8)
+            from: Data(#"{"parentPath":["Nexus"],"directory":"Payments","childGenesisCID":"\#(NexusGenesis.expectedBlockHash)"}"#.utf8)
         )
     }
 }
