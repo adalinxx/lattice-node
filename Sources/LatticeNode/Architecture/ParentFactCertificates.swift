@@ -106,8 +106,7 @@ public struct ParentGenesisCertificateV1: Equatable, Sendable {
         link: ParentGenesisLink,
         signedBy configuration: NodeConfiguration
     ) throws {
-        guard link.parentPath == configuration.chainPath,
-              link.parentWorkAuthorityKey.value == configuration.processPublicKey else {
+        guard link.parentPath == configuration.chainPath else {
             throw ParentFactCertificateError.wrongConfiguration
         }
         signature = try configuration.signingKey.signature(
@@ -146,7 +145,6 @@ public struct ParentGenesisCertificateV1: Equatable, Sendable {
         expectedParentPath: [String]
     ) -> Bool {
         guard link.parentPath == expectedParentPath,
-              link.parentWorkAuthorityKey == authorityKey,
               let body = try? Self.signedBytes(
                 link: link,
                 nexusGenesisCID: expectedNexusGenesisCID
@@ -171,8 +169,7 @@ public struct ParentGenesisCertificateV1: Equatable, Sendable {
               !link.directory.contains("/"),
               link.directory.utf8.count <= Int(UInt16.max),
               _isBoundedWireAtom(link.childGenesisCID),
-              CIDIdentity.isCanonical(link.childGenesisCID),
-              (try? PeerKey(link.parentWorkAuthorityKey.value)) != nil else {
+              CIDIdentity.isCanonical(link.childGenesisCID) else {
             throw ParentFactCertificateError.malformed
         }
         return domain

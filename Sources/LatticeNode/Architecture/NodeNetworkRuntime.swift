@@ -2171,17 +2171,6 @@ public actor NodeNetworkRuntime: IvyDelegate {
                 restartAcceptedLeavesSync()
                 return
             }
-        case NodeNetworkTopic.predecessorRequest:
-            guard let request = try? PredecessorRequestMessage.decoded(message.payload),
-                  let payload = try? BlockAnnouncementMessage(
-                    blockCID: request.predecessorCID
-                ).encoded()
-            else { return }
-            _ = await overlay.sendMessage(
-                to: peer,
-                topic: NodeNetworkTopic.blockAnnouncement,
-                payload: payload
-            )
         case NodeNetworkTopic.acceptedLeavesRequest:
             guard
                 let request = try? AcceptedLeavesRequestMessage.decoded(
@@ -3159,8 +3148,6 @@ public actor NodeNetworkRuntime: IvyDelegate {
                 returning: DirectChildCandidate(
                 directory: directory,
                 block: block,
-                searchTarget: response.searchTarget,
-                deploymentTarget: response.deploymentTarget,
                 acquisitionEntries: response.acquisitionEntries
             ))
 
@@ -3699,11 +3686,7 @@ public actor NodeNetworkRuntime: IvyDelegate {
 
         // This is a required acquisition retry even when the current attempt
         // staged useful work; it is never interpreted as terminal success.
-        if let predecessor = outcome.sameChainPredecessor,
-           let payload = try? PredecessorRequestMessage(
-            predecessorCID: predecessor.predecessorCID
-            ).encoded()
-        {
+        if let predecessor = outcome.sameChainPredecessor {
             if outcome.decision.isAccepted {
                 durableDescendantsByPredecessor[
                     predecessor.predecessorCID,
@@ -3716,15 +3699,18 @@ public actor NodeNetworkRuntime: IvyDelegate {
             } else {
                 remember(candidate, waitingFor: predecessor.predecessorCID)
             }
-            for peer in overlayPeers.values {
-                guard isCurrentRuntime(generation: generation, process: process) else {
-                    return
-                }
-                _ = await overlay.sendMessage(
-                    to: peer,
-                    topic: NodeNetworkTopic.predecessorRequest,
-                    payload: payload
+            if !candidate.announcers.isEmpty {
+                var predecessorCandidate = Candidate(
+                    childCID: predecessor.predecessorCID,
+                    package: nil
                 )
+                predecessorCandidate.announcers = candidate.announcers
+                predecessorCandidate.isLocallySourced = false
+                if !enqueueCandidate(predecessorCandidate) {
+                    restartAcceptedLeavesSync()
+                }
+            } else {
+                restartAcceptedLeavesSync()
             }
         }
         guard isCurrentRuntime(generation: generation, process: process) else {
@@ -4507,8 +4493,6 @@ public actor NodeNetworkRuntime: IvyDelegate {
                 childPath: configuration.chainPath,
                 parentCID: request.parentCID,
                 childCID: childCID,
-                searchTarget: candidate.searchTarget,
-                deploymentTarget: candidate.deploymentTarget,
                 blockData: blockData,
                 acquisitionEntries: candidate.acquisitionEntries
             ).encoded() else { return }

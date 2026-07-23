@@ -1761,21 +1761,16 @@ final class ParentChildE2ETests: XCTestCase {
             directory: "Stopped",
             timestamp: 2
         )
-        let nexusAuthority = try XCTUnwrap(
-            ParentWorkAuthorityKey(nexus.processPublicKey)
-        )
         let anchor = try legacySignedTransaction(
             chainPath: ["Nexus"],
             genesisActions: [
                 GenesisAction(
                     directory: healthyIntent.directory,
-                    blockCID: healthyIntent.genesisCID,
-                    parentWorkAuthorityKey: nexusAuthority
+                    blockCID: healthyIntent.genesisCID
                 ),
                 GenesisAction(
                     directory: stoppedIntent.directory,
-                    blockCID: stoppedIntent.genesisCID,
-                    parentWorkAuthorityKey: nexusAuthority
+                    blockCID: stoppedIntent.genesisCID
                 ),
             ]
         )
@@ -2426,11 +2421,9 @@ final class ParentChildE2ETests: XCTestCase {
         let demandB: UInt64 = 125
         let nonceB: UInt128 = 8
 
-        let childGenesisTransaction = try signedTransaction(
-            key: seller,
+        let childGenesisTransaction = try unsignedGenesisTransaction(
             chainPath: childPath,
-            accountActions: [AccountAction(owner: sellerAddress, delta: 1_000)],
-            nonce: 0
+            accountActions: [AccountAction(owner: sellerAddress, delta: 1_000)]
         )
         let intent: ChildDeployIntentResponse = try await parent.post(
             "/v1/children/intents",
@@ -2494,7 +2487,7 @@ final class ParentChildE2ETests: XCTestCase {
                     amountDeposited: depositB
                 ),
             ],
-            nonce: 1
+            nonce: 0
         )
         let _: SubmitTransactionResponse = try await child.post(
             "/v1/transactions",
@@ -2800,21 +2793,16 @@ final class ParentChildE2ETests: XCTestCase {
             premine: 1_000,
             timestamp: 1
         )
-        let nexusAuthority = try XCTUnwrap(
-            ParentWorkAuthorityKey(nexus.processPublicKey)
-        )
         let siblingAnchor = try legacySignedTransaction(
             chainPath: ["Nexus"],
             genesisActions: [
                 GenesisAction(
                     directory: childAIntent.directory,
-                    blockCID: childAIntent.genesisCID,
-                    parentWorkAuthorityKey: nexusAuthority
+                    blockCID: childAIntent.genesisCID
                 ),
                 GenesisAction(
                     directory: childBIntent.directory,
-                    blockCID: childBIntent.genesisCID,
-                    parentWorkAuthorityKey: nexusAuthority
+                    blockCID: childBIntent.genesisCID
                 ),
             ]
         )
@@ -2863,7 +2851,7 @@ final class ParentChildE2ETests: XCTestCase {
                 amountDemanded: aliceDemand,
                 amountDeposited: aliceDeposit
             )],
-            nonce: 1
+            nonce: 0
         )
         let bobLocksB = try signedTransaction(
             key: bob,
@@ -2875,7 +2863,7 @@ final class ParentChildE2ETests: XCTestCase {
                 amountDemanded: bobDemand,
                 amountDeposited: bobDeposit
             )],
-            nonce: 1
+            nonce: 0
         )
         let _: SubmitTransactionResponse = try await childA.post(
             "/v1/transactions",
@@ -3407,11 +3395,9 @@ final class ParentChildE2ETests: XCTestCase {
     ) async throws -> ChildDeployIntentResponse {
         let path = ["Nexus", directory]
         let ownerAddress = CryptoUtils.createAddress(from: owner.publicKey)
-        let premineTransaction = try signedTransaction(
-            key: owner,
+        let premineTransaction = try unsignedGenesisTransaction(
             chainPath: path,
-            accountActions: [AccountAction(owner: ownerAddress, delta: Int64(premine))],
-            nonce: 0
+            accountActions: [AccountAction(owner: ownerAddress, delta: Int64(premine))]
         )
         return try await parent.post(
             "/v1/children/intents",
@@ -3437,15 +3423,11 @@ final class ParentChildE2ETests: XCTestCase {
         intent: ChildDeployIntentResponse,
         chainPath: [String]
     ) async throws {
-        let authority = try XCTUnwrap(
-            ParentWorkAuthorityKey(parent.processPublicKey)
-        )
         let anchor = try legacySignedTransaction(
             chainPath: chainPath,
             genesisActions: [GenesisAction(
                 directory: intent.directory,
-                blockCID: intent.genesisCID,
-                parentWorkAuthorityKey: authority
+                blockCID: intent.genesisCID
             )]
         )
         let _: SubmitTransactionResponse = try await parent.post(
@@ -3459,22 +3441,39 @@ final class ParentChildE2ETests: XCTestCase {
         intent: ChildDeployIntentResponse,
         chainPath: [String]
     ) async throws {
-        let authority = try XCTUnwrap(
-            ParentWorkAuthorityKey(parent.processPublicKey)
-        )
         let anchor = try signedTransaction(
             key: CryptoUtils.generateKeyPair(),
             chainPath: chainPath,
             genesisActions: [GenesisAction(
                 directory: intent.directory,
-                blockCID: intent.genesisCID,
-                parentWorkAuthorityKey: authority
+                blockCID: intent.genesisCID
             )],
             nonce: 0
         )
         let _: SubmitTransactionResponse = try await parent.post(
             "/v1/transactions",
             body: SubmitTransactionRequest(transaction: anchor)
+        )
+    }
+
+    private func unsignedGenesisTransaction(
+        chainPath: [String],
+        accountActions: [AccountAction]
+    ) throws -> Transaction {
+        Transaction(
+            signatures: [:],
+            body: try HeaderImpl(node: TransactionBody(
+                accountActions: accountActions,
+                actions: [],
+                depositActions: [],
+                genesisActions: [],
+                receiptActions: [],
+                withdrawalActions: [],
+                signers: [],
+                fee: 0,
+                nonce: 0,
+                chainPath: chainPath
+            ))
         )
     }
 

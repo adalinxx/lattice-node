@@ -369,7 +369,7 @@ public actor ChainProcess: Fetcher, VolumeStorer {
                 let admissionStorage = NodeAdmissionStorage(
                     storage: brokerStorer
                 )
-                let bootstrapped = try await ChainLevel.bootstrapConfiguredRoot(
+                let bootstrapped = try await ChainLevel.bootstrap(
                     context: context,
                     genesisHeader: try BlockHeader(node: genesis.block),
                     fetcher: localFetcher,
@@ -486,12 +486,6 @@ public actor ChainProcess: Fetcher, VolumeStorer {
 
         let package = authenticatedChildPackage?.package
         let acquisitionEntries = authenticatedChildPackage?.acquisitionEntries ?? [:]
-        // Parentless candidates can compete after this chain is active. Every
-        // one that carries a genesis authorization must bind the same direct
-        // parent that this process persists as its inherited-work source.
-        if let package, package.parentGenesisLink != nil {
-            try validateParentWorkAuthority(package)
-        }
         let attemptFetcher = try Self.attemptFetcher(
             package: package,
             acquisitionEntries: acquisitionEntries,
@@ -501,6 +495,15 @@ public actor ChainProcess: Fetcher, VolumeStorer {
                 } ?? acquisitionSource
                 : localSource
         )
+        // The child genesis CID commits its parent-work authority through the
+        // ChainSpec. It must name the same parent this process is configured to
+        // trust; the parent link deliberately carries no duplicate key.
+        if package?.parentGenesisLink != nil {
+            try await validateParentWorkAuthority(
+                blockHeader,
+                fetcher: attemptFetcher
+            )
+        }
         if case .active(let level) = runtimePhase {
             return try await admitActive(
                 blockHeader,
@@ -1770,11 +1773,20 @@ public actor ChainProcess: Fetcher, VolumeStorer {
     /// fork choice. Configuration selects the same live peer; accepting a
     /// mismatch would make the durable source differ from consensus authority.
     private func validateParentWorkAuthority(
-        _ package: ChildValidationPackage
-    ) throws {
+        _ blockHeader: BlockHeader,
+        fetcher: any Fetcher
+    ) async throws {
         guard let configured = configuration.parentEndpoint?.publicKey,
-              let authority = ParentWorkAuthorityKey(configured),
-              package.parentGenesisLink?.parentWorkAuthorityKey == authority else {
+              let authority = ParentWorkAuthorityKey(configured) else {
+            throw ChainProcessError.parentWorkAuthorityMismatch
+        }
+        let child = try await Self.resolvedCandidate(
+            blockHeader,
+            fetcher: fetcher
+        )
+        guard child.parent == nil,
+              let spec = try await child.spec.resolve(fetcher: fetcher).node,
+              spec.parentWorkAuthorityKey == authority else {
             throw ChainProcessError.parentWorkAuthorityMismatch
         }
     }

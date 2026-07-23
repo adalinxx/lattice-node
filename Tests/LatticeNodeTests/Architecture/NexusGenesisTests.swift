@@ -60,9 +60,9 @@ final class NexusGenesisArchitectureTests: XCTestCase {
             fetcher: store,
             chainPath: ["Nexus"]
         )
-        XCTAssertFalse(strict.0)
+        XCTAssertTrue(strict.0)
 
-        let bootstrap = try await ChainLevel.bootstrapConfiguredRoot(
+        let bootstrap = try await ChainLevel.bootstrap(
             context: try ChainRuntimeContext(
                 path: ["Nexus"],
                 minimumRootWork: UInt256(1)

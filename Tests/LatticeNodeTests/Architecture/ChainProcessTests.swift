@@ -13,15 +13,11 @@ final class ChainProcessTests: XCTestCase {
     {
         let directory = temporaryDirectory()
         let config = try configuration(path: ["Nexus"], storage: directory)
-        let authority = try XCTUnwrap(
-            ParentWorkAuthorityKey(config.processPublicKey)
-        )
-        let transaction = try signedGenesisAuthorization(
+        let transaction = try signedGenesisAnchorTransaction(
             directory: "Local",
             childGenesisCID: try HeaderImpl<PublicKey>(
                 node: PublicKey(key: "local-mempool-child")
-            ).rawCID,
-            parentWorkAuthorityKey: authority
+            ).rawCID
         )
         let owner = [config.nexusGenesisCID, config.address.key]
             .joined(separator: ":") + ":durable-mempool"
@@ -67,15 +63,11 @@ final class ChainProcessTests: XCTestCase {
             withIntermediateDirectories: true
         )
         let config = try configuration(path: ["Nexus"], storage: directory)
-        let authority = try XCTUnwrap(
-            ParentWorkAuthorityKey(config.processPublicKey)
-        )
-        let transaction = try signedGenesisAuthorization(
+        let transaction = try signedGenesisAnchorTransaction(
             directory: "Missing",
             childGenesisCID: try HeaderImpl<PublicKey>(
                 node: PublicKey(key: "missing-mempool-child")
-            ).rawCID,
-            parentWorkAuthorityKey: authority
+            ).rawCID
         )
         let transactionCID = try VolumeImpl<Transaction>(node: transaction).rawCID
         let store = try testNodeStore(
@@ -104,18 +96,13 @@ final class ChainProcessTests: XCTestCase {
     func testLiveMempoolPinsTrackCurrentRootsAndClearOnRestart() async throws {
         let directory = temporaryDirectory()
         let config = try configuration(path: ["Nexus"], storage: directory)
-        let authority = try XCTUnwrap(
-            ParentWorkAuthorityKey(config.processPublicKey)
-        )
-        let first = try signedGenesisAuthorization(
+        let first = try signedGenesisAnchorTransaction(
             directory: "First",
-            childGenesisCID: NexusGenesis.expectedBlockHash,
-            parentWorkAuthorityKey: authority
+            childGenesisCID: NexusGenesis.expectedBlockHash
         )
-        let second = try signedGenesisAuthorization(
+        let second = try signedGenesisAnchorTransaction(
             directory: "Second",
-            childGenesisCID: NexusGenesis.expectedBlockHash,
-            parentWorkAuthorityKey: authority
+            childGenesisCID: NexusGenesis.expectedBlockHash
         )
         var process: ChainProcess? = try await ChainProcess.open(
             configuration: config
@@ -393,10 +380,9 @@ final class ChainProcessTests: XCTestCase {
             fetcher: process!
         )
         let childCID = try BlockHeader(node: child).rawCID
-        let authorization = try signedGenesisAuthorization(
+        let authorization = try signedGenesisAnchorTransaction(
             directory: "Payments",
-            childGenesisCID: childCID,
-            parentWorkAuthorityKey: parentAuthority
+            childGenesisCID: childCID
         )
         try await VolumeImpl<Transaction>(node: authorization).storeRecursively(
             storer: process!
@@ -429,7 +415,6 @@ final class ChainProcessTests: XCTestCase {
         XCTAssertEqual(persistedGenesis?.parentPath, ["Nexus"])
         XCTAssertEqual(persistedGenesis?.directory, "Payments")
         XCTAssertEqual(persistedGenesis?.childGenesisCID, childCID)
-        XCTAssertEqual(persistedGenesis?.parentWorkAuthorityKey, parentAuthority)
     }
 
     func testAcceptedOrphanPromotesGenesisLinkOnLiveRetryAfterPredecessorArrival()
@@ -459,10 +444,9 @@ final class ChainProcessTests: XCTestCase {
             fetcher: process!
         )
         let childCID = try BlockHeader(node: child).rawCID
-        let authorization = try signedGenesisAuthorization(
+        let authorization = try signedGenesisAnchorTransaction(
             directory: "Payments",
-            childGenesisCID: childCID,
-            parentWorkAuthorityKey: parentAuthority
+            childGenesisCID: childCID
         )
         try await VolumeImpl<Transaction>(node: authorization).storeRecursively(
             storer: process!
@@ -523,7 +507,6 @@ final class ChainProcessTests: XCTestCase {
             promotedGenesis?.parentPath,
             ["Nexus"]
         )
-        XCTAssertEqual(promotedGenesis?.parentWorkAuthorityKey, parentAuthority)
         let export = await process!.parentSecuringWorkSnapshot()
         let exported = try XCTUnwrap(export)
         XCTAssertEqual(
@@ -562,7 +545,6 @@ final class ChainProcessTests: XCTestCase {
             reopenedGenesis?.parentPath,
             ["Nexus"]
         )
-        XCTAssertEqual(reopenedGenesis?.parentWorkAuthorityKey, parentAuthority)
         let reopened = await process!.parentSecuringWorkSnapshot()
         let reopenedExport = try XCTUnwrap(reopened)
         XCTAssertEqual(reopenedExport, exported)
@@ -590,10 +572,9 @@ final class ChainProcessTests: XCTestCase {
             fetcher: parent
         )
         let competingChildHeader = try BlockHeader(node: competingChild)
-        let competingAuthorization = try signedGenesisAuthorization(
+        let competingAuthorization = try signedGenesisAnchorTransaction(
             directory: "Payments",
-            childGenesisCID: competingChildHeader.rawCID,
-            parentWorkAuthorityKey: parentAuthority
+            childGenesisCID: competingChildHeader.rawCID
         )
         try await VolumeImpl<Transaction>(node: competingAuthorization).storeRecursively(
             storer: parent
@@ -647,10 +628,9 @@ final class ChainProcessTests: XCTestCase {
             fetcher: parent
         )
         let sideChildHeader = try BlockHeader(node: sideChild)
-        let authorization = try signedGenesisAuthorization(
+        let authorization = try signedGenesisAnchorTransaction(
             directory: "Payments",
-            childGenesisCID: sideChildHeader.rawCID,
-            parentWorkAuthorityKey: parentAuthority
+            childGenesisCID: sideChildHeader.rawCID
         )
         try await VolumeImpl<Transaction>(node: authorization).storeRecursively(
             storer: parent
@@ -1294,7 +1274,7 @@ final class ChainProcessTests: XCTestCase {
                     {"parentPath":["Nexus"],"carrierCID":"\(parentCarrierHeader.rawCID)","rootCID":"\(parentCarrierHeader.rawCID)"}
                     """),
                 parentGenesisLink: try decode(ParentGenesisLink.self, json: """
-                    {"parentPath":["Nexus"],"directory":"Payments","childGenesisCID":"\(siblingHeader.rawCID)","parentWorkAuthorityKey":"\(parentAuthority.value)"}
+                    {"parentPath":["Nexus"],"directory":"Payments","childGenesisCID":"\(siblingHeader.rawCID)"}
                     """)
             ),
             acquisitionEntries: siblingEntries
@@ -1416,7 +1396,7 @@ final class ChainProcessTests: XCTestCase {
                     {"parentPath":["Nexus"],"carrierCID":"\(siblingCarrierHeader.rawCID)","rootCID":"\(siblingCarrierHeader.rawCID)"}
                     """),
                 parentGenesisLink: try decode(ParentGenesisLink.self, json: """
-                    {"parentPath":["Nexus"],"directory":"Payments","childGenesisCID":"\(secondHeader.rawCID)","parentWorkAuthorityKey":"\(parentAuthority.value)"}
+                    {"parentPath":["Nexus"],"directory":"Payments","childGenesisCID":"\(secondHeader.rawCID)"}
                     """)
             ),
             acquisitionEntries: siblingEntries
@@ -1688,9 +1668,6 @@ final class ChainProcessTests: XCTestCase {
             withIntermediateDirectories: true
         )
         let config = try configuration(path: ["Nexus"], storage: directory)
-        let parentAuthority = try XCTUnwrap(
-            ParentWorkAuthorityKey(config.processPublicKey)
-        )
         let store = try testNodeStore(
             databasePath: directory.appendingPathComponent("state.db"),
             nexusGenesisCID: config.nexusGenesisCID,
@@ -1701,10 +1678,9 @@ final class ChainProcessTests: XCTestCase {
         let broker = try DiskBroker(
             path: directory.appendingPathComponent("volumes.db").path
         )
-        let volume = try VolumeImpl<Transaction>(node: signedGenesisAuthorization(
+        let volume = try VolumeImpl<Transaction>(node: signedGenesisAnchorTransaction(
             directory: "Payments",
-            childGenesisCID: NexusGenesis.expectedBlockHash,
-            parentWorkAuthorityKey: parentAuthority
+            childGenesisCID: NexusGenesis.expectedBlockHash
         ))
         try await volume.store(storer: BrokerStorer(broker: broker))
         let root = volume.rawCID
@@ -1825,9 +1801,6 @@ final class ChainProcessTests: XCTestCase {
             withIntermediateDirectories: true
         )
         let config = try configuration(path: ["Nexus"], storage: directory)
-        let parentAuthority = try XCTUnwrap(
-            ParentWorkAuthorityKey(config.processPublicKey)
-        )
         let store = try testNodeStore(
             databasePath: directory.appendingPathComponent("state.db"),
             nexusGenesisCID: config.nexusGenesisCID,
@@ -1842,10 +1815,9 @@ final class ChainProcessTests: XCTestCase {
         let admissionStorage = NodeAdmissionStorage(
             storage: BrokerStorer(broker: broker)
         )
-        let transaction = try signedGenesisAuthorization(
+        let transaction = try signedGenesisAnchorTransaction(
             directory: "Payments",
-            childGenesisCID: NexusGenesis.expectedBlockHash,
-            parentWorkAuthorityKey: parentAuthority
+            childGenesisCID: NexusGenesis.expectedBlockHash
         )
         let volume = try VolumeImpl<Transaction>(node: transaction)
         try await volume.store(storer: admissionStorage)
@@ -1908,9 +1880,6 @@ final class ChainProcessTests: XCTestCase {
             withIntermediateDirectories: true
         )
         let config = try configuration(path: ["Nexus"], storage: directory)
-        let parentAuthority = try XCTUnwrap(
-            ParentWorkAuthorityKey(config.processPublicKey)
-        )
         let store = try testNodeStore(
             databasePath: directory.appendingPathComponent("state.db"),
             nexusGenesisCID: config.nexusGenesisCID,
@@ -1941,10 +1910,9 @@ final class ChainProcessTests: XCTestCase {
                 )),
             ])
         }
-        let durableTransaction = try signedGenesisAuthorization(
+        let durableTransaction = try signedGenesisAnchorTransaction(
             directory: "Durable",
-            childGenesisCID: NexusGenesis.expectedBlockHash,
-            parentWorkAuthorityKey: parentAuthority
+            childGenesisCID: NexusGenesis.expectedBlockHash
         )
         let durableVolume = try VolumeImpl<Transaction>(node: durableTransaction)
         try await durableVolume.store(storer: admissionStorage)
@@ -1959,10 +1927,9 @@ final class ChainProcessTests: XCTestCase {
             pendingChildProofCapacity: 1
         )
 
-        let transaction = try signedGenesisAuthorization(
+        let transaction = try signedGenesisAnchorTransaction(
             directory: "Failed",
-            childGenesisCID: NexusGenesis.expectedBlockHash,
-            parentWorkAuthorityKey: parentAuthority
+            childGenesisCID: NexusGenesis.expectedBlockHash
         )
         let volume = try VolumeImpl<Transaction>(node: transaction)
         try await volume.store(storer: admissionStorage)
@@ -2006,9 +1973,6 @@ final class ChainProcessTests: XCTestCase {
     func testReopenDropsRetainedRootWithoutStagedAdmission() async throws {
         let directory = temporaryDirectory()
         let config = try configuration(path: ["Nexus"], storage: directory)
-        let parentAuthority = try XCTUnwrap(
-            ParentWorkAuthorityKey(config.processPublicKey)
-        )
         var process: ChainProcess? = try await ChainProcess.open(
             configuration: config
         )
@@ -2020,10 +1984,9 @@ final class ChainProcessTests: XCTestCase {
         )
         let scope = [config.nexusGenesisCID, config.address.key].joined(separator: ":")
         let durableRoots = try await broker.retainedRoots(scope: scope)
-        let orphan = try VolumeImpl<Transaction>(node: signedGenesisAuthorization(
+        let orphan = try VolumeImpl<Transaction>(node: signedGenesisAnchorTransaction(
             directory: "Orphan",
-            childGenesisCID: NexusGenesis.expectedBlockHash,
-            parentWorkAuthorityKey: parentAuthority
+            childGenesisCID: NexusGenesis.expectedBlockHash
         ))
         try await orphan.store(storer: BrokerStorer(broker: broker))
         let orphanRoot = orphan.rawCID
@@ -2154,7 +2117,7 @@ final class ChainProcessTests: XCTestCase {
                     """),
                 carrierEvidence: nil,
                 parentGenesisLinks: [try decode(ParentGenesisLink.self, json: """
-                    {"parentPath":["Nexus"],"directory":"Payments","childGenesisCID":"\(try BlockHeader(node: child).rawCID)","parentWorkAuthorityKey":"\(parentAuthority.value)"}
+                    {"parentPath":["Nexus"],"directory":"Payments","childGenesisCID":"\(try BlockHeader(node: child).rawCID)"}
                     """)]
             )
         )
@@ -2380,7 +2343,7 @@ final class ChainProcessTests: XCTestCase {
                     """),
                 carrierEvidence: nil,
                 parentGenesisLinks: [try decode(ParentGenesisLink.self, json: """
-                    {"parentPath":["Nexus"],"directory":"Leaf","childGenesisCID":"\(childHeader.rawCID)","parentWorkAuthorityKey":"\(parentAuthority.value)"}
+                    {"parentPath":["Nexus"],"directory":"Leaf","childGenesisCID":"\(childHeader.rawCID)"}
                     """)]
             )
         )
@@ -2562,7 +2525,7 @@ final class ChainProcessTests: XCTestCase {
                         {"parentPath":["Nexus"],"carrierCID":"\(carrierHeader.rawCID)","rootCID":"\(carrierHeader.rawCID)"}
                         """),
                     parentGenesisLink: try decode(ParentGenesisLink.self, json: """
-                        {"parentPath":["Nexus"],"directory":"Payments","childGenesisCID":"\(childCID)","parentWorkAuthorityKey":"\(parentAuthority.value)"}
+                        {"parentPath":["Nexus"],"directory":"Payments","childGenesisCID":"\(childCID)"}
                         """)
                 ),
                 acquisitionEntries: entries
@@ -2678,7 +2641,7 @@ final class ChainProcessTests: XCTestCase {
                     {"parentPath":["Nexus"],"carrierCID":"\(rootHeader.rawCID)","rootCID":"\(rootHeader.rawCID)"}
                     """),
                 parentGenesisLink: try decode(ParentGenesisLink.self, json: """
-                    {"parentPath":["Nexus"],"directory":"Payments","childGenesisCID":"\(childHeader.rawCID)","parentWorkAuthorityKey":"\(parentAuthority.value)"}
+                    {"parentPath":["Nexus"],"directory":"Payments","childGenesisCID":"\(childHeader.rawCID)"}
                     """)
             ),
             acquisitionEntries: acquisitionEntries
@@ -2722,10 +2685,9 @@ final class ChainProcessTests: XCTestCase {
     }
 }
 
-private func signedGenesisAuthorization(
+private func signedGenesisAnchorTransaction(
     directory: String,
     childGenesisCID: String,
-    parentWorkAuthorityKey: ParentWorkAuthorityKey,
     chainPath: [String] = ["Nexus"]
 ) throws -> Transaction {
     let key = CryptoUtils.generateKeyPair()
@@ -2735,8 +2697,7 @@ private func signedGenesisAuthorization(
         depositActions: [],
         genesisActions: [GenesisAction(
             directory: directory,
-            blockCID: childGenesisCID,
-            parentWorkAuthorityKey: parentWorkAuthorityKey
+            blockCID: childGenesisCID
         )],
         receiptActions: [],
         withdrawalActions: [],

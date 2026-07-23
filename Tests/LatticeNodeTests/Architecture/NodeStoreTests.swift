@@ -649,7 +649,7 @@ final class NodeStoreTests: XCTestCase {
             {"parentPath":["Nexus"],"carrierCID":"carrier","rootCID":"carrier"}
             """)
         let genesis = try decode(ParentGenesisLink.self, json: """
-            {"parentPath":["Nexus"],"directory":"Payments","childGenesisCID":"child-genesis","parentWorkAuthorityKey":"\(parentAuthorityKey)"}
+            {"parentPath":["Nexus"],"directory":"Payments","childGenesisCID":"child-genesis"}
             """)
         let artifacts = AdmissionHierarchyArtifacts(
             carrierLink: carrier,
@@ -875,7 +875,7 @@ final class NodeStoreTests: XCTestCase {
             {"parentPath":["Nexus"],"carrierCID":"carrier","rootCID":"carrier"}
             """)
         let genesis = try decode(ParentGenesisLink.self, json: """
-            {"parentPath":["Nexus"],"directory":"Child","childGenesisCID":"genesis","parentWorkAuthorityKey":"\(parentAuthorityKey)"}
+            {"parentPath":["Nexus"],"directory":"Child","childGenesisCID":"genesis"}
             """)
 
         try await store!.persistIssuedHierarchyArtifacts(
@@ -1086,7 +1086,7 @@ final class NodeStoreTests: XCTestCase {
         )
 
         let historicalAlpha = try decode(ParentGenesisLink.self, json: """
-            {"parentPath":["Nexus"],"directory":"Alpha","childGenesisCID":"historical-alpha-genesis","parentWorkAuthorityKey":"\(parentAuthorityKey)"}
+            {"parentPath":["Nexus"],"directory":"Alpha","childGenesisCID":"historical-alpha-genesis"}
             """)
         try await store.persistIssuedHierarchyArtifacts(
             AdmissionHierarchyArtifacts(
@@ -1456,7 +1456,7 @@ final class NodeStoreTests: XCTestCase {
                     )
                 ),
                 parentGenesisLinks: [try decode(ParentGenesisLink.self, json: """
-                    {"parentPath":["Nexus","A"],"directory":"A","childGenesisCID":"\(leafCID)","parentWorkAuthorityKey":"\(parentAuthorityKey)"}
+                    {"parentPath":["Nexus","A"],"directory":"A","childGenesisCID":"\(leafCID)"}
                     """)]
             )
         )
@@ -1840,7 +1840,7 @@ final class NodeStoreTests: XCTestCase {
         let genesisLink: ParentGenesisLink?
         if child.parent == nil {
             genesisLink = try decode(ParentGenesisLink.self, json: """
-                {"parentPath":\(pathJSON),"directory":"\(edge.directory)","childGenesisCID":"\(childCID)","parentWorkAuthorityKey":"\(configuration.processPublicKey)"}
+                {"parentPath":\(pathJSON),"directory":"\(edge.directory)","childGenesisCID":"\(childCID)"}
                 """)
         } else {
             genesisLink = nil

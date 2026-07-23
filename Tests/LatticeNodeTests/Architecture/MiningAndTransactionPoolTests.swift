@@ -57,7 +57,6 @@ final class MiningTemplateBookTests: XCTestCase {
         let child = DirectChildCandidate(
             directory: "Payments",
             block: fixture.genesis,
-            searchTarget: UInt256.max,
             acquisitionEntries: try await acquisitionEntries(
                 for: fixture.genesis,
                 fetcher: fixture.store
@@ -83,14 +82,22 @@ final class MiningTemplateBookTests: XCTestCase {
             chainPath: ["Nexus", "Middle"],
             minimumRootWork: UInt256(1)
         )
+        let easyBlock = try await BlockBuilder.buildBlock(
+            previous: easy.genesis,
+            timestamp: 1,
+            fetcher: easy.store
+        )
+        let easyEntries = try await acquisitionEntries(
+            for: easyBlock,
+            fetcher: easy.store
+        )
         let middle = try await middleBook.build(
             previous: hard.genesis,
             transactions: [],
             children: [DirectChildCandidate(
                 directory: "Leaf",
-                block: easy.genesis,
-                searchTarget: easy.genesis.target,
-                acquisitionEntries: [:]
+                block: easyBlock,
+                acquisitionEntries: easyEntries
             )],
             timestamp: 1,
             fetcher: hard.store
@@ -102,14 +109,18 @@ final class MiningTemplateBookTests: XCTestCase {
             chainPath: ["Nexus"],
             minimumRootWork: UInt256(1)
         )
+        var middleEntries = try await acquisitionEntries(
+            for: middle.block,
+            fetcher: hard.store
+        )
+        middleEntries.merge(easyEntries) { existing, _ in existing }
         let root = try await rootBook.build(
             previous: hard.genesis,
             transactions: [],
             children: [DirectChildCandidate(
                 directory: "Middle",
                 block: middle.block,
-                searchTarget: middle.searchTarget,
-                acquisitionEntries: [:]
+                acquisitionEntries: middleEntries
             )],
             timestamp: 2,
             fetcher: hard.store
@@ -132,10 +143,10 @@ final class MiningTemplateBookTests: XCTestCase {
             children: [DirectChildCandidate(
                 directory: "Payments",
                 block: child.genesis,
-                searchTarget: .max,
-                deploymentTarget: child.genesis.target,
-                requiresParentTargetHit: true,
-                acquisitionEntries: [:]
+                acquisitionEntries: try await acquisitionEntries(
+                    for: child.genesis,
+                    fetcher: child.store
+                )
             )],
             timestamp: 1,
             fetcher: parent.store
@@ -150,6 +161,22 @@ final class MiningTemplateBookTests: XCTestCase {
     {
         let parent = try await chainFixture(target: UInt256(4))
         let middle = try await chainFixture(target: UInt256(8))
+        let leaf = try await chainFixture(target: UInt256(16))
+        let leafEntries = try await acquisitionEntries(
+            for: leaf.genesis,
+            fetcher: leaf.store
+        )
+        let middleBlock = try await BlockBuilder.buildBlock(
+            previous: middle.genesis,
+            children: ["Leaf": leaf.genesis],
+            timestamp: 1,
+            fetcher: middle.store
+        )
+        var middleEntries = try await acquisitionEntries(
+            for: middleBlock,
+            fetcher: middle.store
+        )
+        middleEntries.merge(leafEntries) { existing, _ in existing }
         let book = MiningTemplateBook(
             chainPath: ["Nexus"],
             minimumRootWork: UInt256(1)
@@ -159,10 +186,8 @@ final class MiningTemplateBookTests: XCTestCase {
             transactions: [],
             children: [DirectChildCandidate(
                 directory: "Middle",
-                block: middle.genesis,
-                searchTarget: .max,
-                deploymentTarget: UInt256(8),
-                acquisitionEntries: [:]
+                block: middleBlock,
+                acquisitionEntries: middleEntries
             )],
             timestamp: 1,
             fetcher: parent.store
@@ -374,13 +399,11 @@ final class MiningTemplateBookTests: XCTestCase {
         let firstChild = DirectChildCandidate(
             directory: "Payments",
             block: fixture.genesis,
-            searchTarget: .max,
             acquisitionEntries: entries
         )
         let conflictingChild = DirectChildCandidate(
             directory: "Payments",
             block: fixture.genesis,
-            searchTarget: .max / UInt256(2),
             acquisitionEntries: conflictingEntries
         )
         let first = try await book.build(

@@ -1164,8 +1164,7 @@ actor NodeStore {
         if let genesisLink = evidence.parentGenesisLink {
             guard genesisLink.parentPath == expectedParentPath,
                   genesisLink.directory == chainPath.last,
-                  genesisLink.childGenesisCID == childCID,
-                  genesisLink.parentWorkAuthorityKey == parentWorkAuthorityKey else {
+                  genesisLink.childGenesisCID == childCID else {
                 throw NodeStoreError.invalidIssuedChildProof(childCID)
             }
         }
@@ -1474,7 +1473,6 @@ actor NodeStore {
                   genesisLink.parentPath == chainPath,
                   genesisLink.directory == directory,
                   genesisLink.childGenesisCID == childCID,
-                  genesisLink.parentWorkAuthorityKey == rootAuthorityKey,
                   let genesisCertificate = rootEnvelope.parentGenesisCertificate,
                   genesisCertificate.verifies(
                     link: genesisLink,

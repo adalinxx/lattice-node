@@ -88,18 +88,6 @@ private actor ContentRequestRecorder {
     func snapshot() -> [String] { values }
 }
 
-private actor RecoveryRequestRecorder {
-    private var predecessorCIDs: Set<String> = []
-
-    func append(_ predecessorCID: String) {
-        predecessorCIDs.insert(predecessorCID)
-    }
-
-    func contains(_ expected: Set<String>) -> Bool {
-        predecessorCIDs.isSuperset(of: expected)
-    }
-}
-
 private actor RecoveryAdmissionPlan {
     private let predecessorCID: String
     private let orphanCID: String
@@ -149,12 +137,10 @@ private actor RecoveryAdmissionPlan {
     func snapshot() -> [String] { events }
 }
 
-private final class RecoveryRequestPeer: IvyDelegate, Sendable {
-    private let recorder: RecoveryRequestRecorder
+private final class AcceptedLeavesPeer: IvyDelegate, Sendable {
     private let acceptedLeafCID: String
 
-    init(recorder: RecoveryRequestRecorder, acceptedLeafCID: String) {
-        self.recorder = recorder
+    init(acceptedLeafCID: String) {
         self.acceptedLeafCID = acceptedLeafCID
     }
 
@@ -178,18 +164,6 @@ private final class RecoveryRequestPeer: IvyDelegate, Sendable {
                 to: peer,
                 topic: NodeNetworkTopic.acceptedLeavesResponse,
                 payload: response
-            )
-        case NodeNetworkTopic.predecessorRequest:
-            guard let request = try? PredecessorRequestMessage.decoded(
-                message.payload
-            ), let announcement = try? BlockAnnouncementMessage(
-                blockCID: request.predecessorCID
-            ).encoded() else { return }
-            await recorder.append(request.predecessorCID)
-            _ = await ivy.sendMessage(
-                to: peer,
-                topic: NodeNetworkTopic.blockAnnouncement,
-                payload: announcement
             )
         default:
             break
@@ -1432,7 +1406,7 @@ final class NetworkTrustTests: XCTestCase {
         ).encoded())
     }
 
-    func testContextualCandidateWireBindsCarrierRewardSubtreeAndSearchTarget() async throws {
+    func testContextualCandidateWireBindsCarrierRewardAndCommittedContent() async throws {
         let parent = try await canonicalNetworkBlock()
         let parentCID = try BlockHeader(node: parent).rawCID
         let parentData = try XCTUnwrap(parent.toData())
@@ -1471,8 +1445,6 @@ final class NetworkTrustTests: XCTestCase {
             childPath: ["Nexus", "Payments"],
             parentCID: parentCID,
             childCID: parentCID,
-            searchTarget: parent.target,
-            deploymentTarget: parent.target,
             blockData: parentData,
             acquisitionEntries: [parentCID: parentData]
         )
@@ -1480,66 +1452,21 @@ final class NetworkTrustTests: XCTestCase {
             response.encoded()
         )
         XCTAssertEqual(decodedResponse.parentCID, parentCID)
-        XCTAssertEqual(decodedResponse.searchTarget, parent.target)
-        XCTAssertEqual(decodedResponse.deploymentTarget, parent.target)
         XCTAssertEqual(decodedResponse.acquisitionEntries[parentCID], parentData)
 
-        let clamped = ChildCandidateResponseMessage(
-            requestID: 12,
-            childPath: ["Nexus", "Payments"],
-            parentCID: parentCID,
-            childCID: parentCID,
-            searchTarget: parent.target / UInt256(8),
-            deploymentTarget: parent.target / UInt256(4),
-            blockData: parentData,
-            acquisitionEntries: [parentCID: parentData]
+        var forgedTarget = try response.encoded()
+        let targetOffset = 8 + 2
+            + (2 + "Nexus".utf8.count)
+            + (2 + "Payments".utf8.count)
+            + 2 + parentCID.utf8.count
+            + 2 + parentCID.utf8.count
+        forgedTarget.insert(
+            contentsOf: Data(repeating: 0x66, count: 64),
+            at: targetOffset
         )
-        let decodedClamped = try ChildCandidateResponseMessage.decoded(
-            clamped.encoded()
+        XCTAssertThrowsError(
+            try ChildCandidateResponseMessage.decoded(forgedTarget)
         )
-        XCTAssertLessThan(decodedClamped.searchTarget, parent.target)
-        XCTAssertEqual(
-            decodedClamped.deploymentTarget,
-            parent.target / UInt256(4)
-        )
-
-        let child = try await BlockBuilder.buildChildGenesis(
-            spec: NexusGenesis.spec,
-            parentState: parent.postState,
-            timestamp: 3_600_000,
-            target: parent.target / UInt256(4),
-            fetcher: try await canonicalNetworkProcess()
-        )
-        let childCID = try BlockHeader(node: child).rawCID
-        let childData = try XCTUnwrap(child.toData())
-        let inheritedBarrier = ChildCandidateResponseMessage(
-            requestID: 13,
-            childPath: ["Nexus", "Payments"],
-            parentCID: parentCID,
-            childCID: childCID,
-            searchTarget: parent.target / UInt256(2),
-            deploymentTarget: parent.target / UInt256(2),
-            blockData: childData,
-            acquisitionEntries: [childCID: childData]
-        )
-        let decodedInherited = try ChildCandidateResponseMessage.decoded(
-            inheritedBarrier.encoded()
-        )
-        XCTAssertGreaterThan(
-            try XCTUnwrap(decodedInherited.deploymentTarget),
-            child.target
-        )
-
-        XCTAssertThrowsError(try ChildCandidateResponseMessage(
-            requestID: 14,
-            childPath: ["Nexus", "Payments"],
-            parentCID: parentCID,
-            childCID: parentCID,
-            searchTarget: parent.target,
-            deploymentTarget: .zero,
-            blockData: parentData,
-            acquisitionEntries: [parentCID: parentData]
-        ).encoded())
 
         XCTAssertThrowsError(try ChildCandidateRequestMessage(
             requestID: 12,
@@ -1564,7 +1491,6 @@ final class NetworkTrustTests: XCTestCase {
                 childPath: ["Nexus", "Payments"],
                 parentCID: childCID,
                 childCID: childCID,
-                searchTarget: block.target,
                 blockData: blockData,
                 acquisitionEntries: entries
             )
@@ -2263,7 +2189,7 @@ final class NetworkTrustTests: XCTestCase {
                 rawCID: childCID,
                 node: nil,
                 encryptionInfo: nil
-            ).resolveBlockContent(source: InMemoryContentSource(mismatched))
+            ).resolveBlockContent(fetcher: InMemoryContentSource(mismatched))
             XCTFail("accessed mismatched content must fail CID verification")
         } catch {}
     }
@@ -2331,7 +2257,6 @@ final class NetworkTrustTests: XCTestCase {
             childPath: ["Nexus", "Payments"],
             parentCID: carrierHeader.rawCID,
             childCID: childHeader.rawCID,
-            searchTarget: child.target,
             blockData: childData,
             acquisitionEntries: authoredEntries
         ).encoded()
@@ -2372,8 +2297,7 @@ final class NetworkTrustTests: XCTestCase {
         let genesisLink = try genesisLink(
             parentPath: ["Nexus"],
             directory: "Payments",
-            cid: childHeader.rawCID,
-            parentWorkAuthorityKey: parentAuthority
+            cid: childHeader.rawCID
         )
         try await parentStore!.persistPreparedChildProofs(
             carrierCID: carrierHeader.rawCID,
@@ -2559,8 +2483,7 @@ final class NetworkTrustTests: XCTestCase {
         let genesisLink = try genesisLink(
             parentPath: ["Nexus", "Middle"],
             directory: "Leaf",
-            cid: leafHeader.rawCID,
-            parentWorkAuthorityKey: middleAuthority
+            cid: leafHeader.rawCID
         )
         var attachments: [PortableAttachmentTestPayload] = []
         for (proof, edge) in zip(proofs, edges) {
@@ -4028,9 +3951,7 @@ final class NetworkTrustTests: XCTestCase {
         await runtime.installAdmissionHandler { header, _, _ in
             await plan.admit(header.rawCID)
         }
-        let requestRecorder = RecoveryRequestRecorder()
-        let clientDelegate = RecoveryRequestPeer(
-            recorder: requestRecorder,
+        let clientDelegate = AcceptedLeavesPeer(
             acceptedLeafCID: descendantHeader.rawCID
         )
         let client = Ivy(config: IvyConfig(
@@ -4080,14 +4001,6 @@ final class NetworkTrustTests: XCTestCase {
                 if await plan.snapshot() == expected { break }
                 try await Task.sleep(for: .milliseconds(20))
             }
-            let requiredRequests: Set<String> = [
-                predecessorHeader.rawCID,
-                orphanHeader.rawCID,
-            ]
-            let receivedRequiredRequests = await requestRecorder.contains(
-                requiredRequests
-            )
-            XCTAssertTrue(receivedRequiredRequests)
             let recoveredAdmissions = await plan.snapshot()
             XCTAssertEqual(recoveredAdmissions, expected)
         } catch {
@@ -5247,10 +5160,9 @@ final class NetworkTrustTests: XCTestCase {
             fetcher: parent
         )
         let canonicalChildHeader = try BlockHeader(node: canonicalChild)
-        let canonicalAuthorization = try signedGenesisAuthorization(
+        let canonicalAuthorization = try signedGenesisAnchorTransaction(
             directory: "Payments",
             childGenesisCID: canonicalChildHeader.rawCID,
-            parentWorkAuthorityKey: parentAuthority,
             chainPath: parentConfiguration.chainPath
         )
         try await VolumeImpl<Transaction>(node: canonicalAuthorization).storeRecursively(
@@ -5316,10 +5228,9 @@ final class NetworkTrustTests: XCTestCase {
             fetcher: parent
         )
         let sideChildHeader = try BlockHeader(node: sideChild)
-        let sideAuthorization = try signedGenesisAuthorization(
+        let sideAuthorization = try signedGenesisAnchorTransaction(
             directory: "Payments",
             childGenesisCID: sideChildHeader.rawCID,
-            parentWorkAuthorityKey: parentAuthority,
             chainPath: parentConfiguration.chainPath
         )
         try await VolumeImpl<Transaction>(node: sideAuthorization).storeRecursively(
@@ -5616,11 +5527,12 @@ final class NetworkTrustTests: XCTestCase {
             let leafHeader = try BlockHeader(node: leafBlock)
             try await leafHeader.storeBlock(fetcher: upstream, storer: upstream)
 
-            let leafAuthorization = try signedGenesisAuthorization(
-                directory: "Receipts",
-                childGenesisCID: leafHeader.rawCID,
-                parentWorkAuthorityKey: middleAuthority,
-                chainPath: middleConfiguration.chainPath
+            let leafAuthorization = try unsignedTransaction(
+                path: middleConfiguration.chainPath,
+                genesisActions: [GenesisAction(
+                    directory: "Receipts",
+                    blockCID: leafHeader.rawCID
+                )]
             )
             try await VolumeImpl<Transaction>(node: leafAuthorization).storeRecursively(
                 storer: upstream
@@ -5637,10 +5549,9 @@ final class NetworkTrustTests: XCTestCase {
             let middleHeader = try BlockHeader(node: middleBlock)
             try await middleHeader.storeBlock(fetcher: upstream, storer: upstream)
 
-            let middleAuthorization = try signedGenesisAuthorization(
+            let middleAuthorization = try signedGenesisAnchorTransaction(
                 directory: "Payments",
                 childGenesisCID: middleHeader.rawCID,
-                parentWorkAuthorityKey: upstreamAuthority,
                 chainPath: upstreamConfiguration.chainPath
             )
             try await VolumeImpl<Transaction>(node: middleAuthorization).storeRecursively(
@@ -5700,7 +5611,6 @@ final class NetworkTrustTests: XCTestCase {
                 children: [DirectChildCandidate(
                     directory: "Receipts",
                     block: branch.leaf,
-                    searchTarget: branch.leaf.target,
                     acquisitionEntries: leafEntries
                 )],
                 capacity: 16
@@ -5710,10 +5620,9 @@ final class NetworkTrustTests: XCTestCase {
         // A second accepted parent carrier commits to the already-known middle
         // A block, but its grind misses that child's own target. Its exact edge
         // therefore arrives later as carrier evidence rather than a new block.
-        let lateAuthorization = try signedGenesisAuthorization(
+        let lateAuthorization = try signedGenesisAnchorTransaction(
             directory: "Payments",
             childGenesisCID: branchA.middleHeader.rawCID,
-            parentWorkAuthorityKey: upstreamAuthority,
             chainPath: upstreamConfiguration.chainPath
         )
         try await VolumeImpl<Transaction>(node: lateAuthorization).storeRecursively(
@@ -6371,10 +6280,9 @@ final class NetworkTrustTests: XCTestCase {
             fetcher: parentProcess
         )
         let childHeader = try BlockHeader(node: childGenesis)
-        let authorization = try signedGenesisAuthorization(
+        let authorization = try signedGenesisAnchorTransaction(
             directory: "Payments",
             childGenesisCID: childHeader.rawCID,
-            parentWorkAuthorityKey: parentAuthority,
             chainPath: parentConfiguration.chainPath
         )
         try await VolumeImpl<Transaction>(node: authorization).storeRecursively(
@@ -6415,7 +6323,6 @@ final class NetworkTrustTests: XCTestCase {
             candidate: DirectChildCandidate(
                 directory: "Payments",
                 block: childGenesis,
-                searchTarget: childGenesis.target,
                 acquisitionEntries: [childHeader.rawCID: childData]
             ),
             rootCID: provisionalCID,
@@ -6494,8 +6401,7 @@ final class NetworkTrustTests: XCTestCase {
                     parentGenesisLink: try genesisLink(
                         parentPath: ["Nexus"],
                         directory: "Payments",
-                        cid: header.rawCID,
-                        parentWorkAuthorityKey: parentAuthority
+                        cid: header.rawCID
                     )
                 ),
                 acquisitionEntries: entries
@@ -6563,12 +6469,15 @@ final class NetworkTrustTests: XCTestCase {
         ))
     }
 
-    private func unsignedTransaction(path: [String]) throws -> Transaction {
+    private func unsignedTransaction(
+        path: [String],
+        genesisActions: [GenesisAction] = []
+    ) throws -> Transaction {
         let body = TransactionBody(
             accountActions: [],
             actions: [],
             depositActions: [],
-            genesisActions: [],
+            genesisActions: genesisActions,
             receiptActions: [],
             withdrawalActions: [],
             signers: [],
@@ -6758,10 +6667,9 @@ final class NetworkTrustTests: XCTestCase {
         return serialized
     }
 
-    private func signedGenesisAuthorization(
+    private func signedGenesisAnchorTransaction(
         directory: String,
         childGenesisCID: String,
-        parentWorkAuthorityKey: ParentWorkAuthorityKey,
         chainPath: [String]
     ) throws -> Transaction {
         let key = CryptoUtils.generateKeyPair()
@@ -6771,8 +6679,7 @@ final class NetworkTrustTests: XCTestCase {
             depositActions: [],
             genesisActions: [GenesisAction(
                 directory: directory,
-                blockCID: childGenesisCID,
-                parentWorkAuthorityKey: parentWorkAuthorityKey
+                blockCID: childGenesisCID
             )],
             receiptActions: [],
             withdrawalActions: [],
@@ -6931,10 +6838,9 @@ final class NetworkTrustTests: XCTestCase {
             fetcher: process
         )
         let childHeader = try BlockHeader(node: childBlock)
-        let authorization = try signedGenesisAuthorization(
+        let authorization = try signedGenesisAnchorTransaction(
             directory: "Payments",
             childGenesisCID: childHeader.rawCID,
-            parentWorkAuthorityKey: parentAuthority,
             chainPath: configuration.chainPath
         )
         try await VolumeImpl<Transaction>(node: authorization).storeRecursively(
@@ -7244,23 +7150,19 @@ final class NetworkTrustTests: XCTestCase {
     private func genesisLink(
         parentPath: [String],
         directory: String,
-        cid: String,
-        parentWorkAuthorityKey: ParentWorkAuthorityKey? = nil
+        cid: String
     ) throws -> ParentGenesisLink {
         struct Wire: Encodable {
             let parentPath: [String]
             let directory: String
             let childGenesisCID: String
-            let parentWorkAuthorityKey: ParentWorkAuthorityKey
         }
         return try JSONDecoder().decode(
             ParentGenesisLink.self,
             from: JSONEncoder().encode(Wire(
                 parentPath: parentPath,
                 directory: directory,
-                childGenesisCID: cid,
-                parentWorkAuthorityKey: parentWorkAuthorityKey
-                    ?? Self.fixtureParentWorkAuthorityKey
+                childGenesisCID: cid
             ))
         )
     }

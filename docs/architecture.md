@@ -173,10 +173,11 @@ recomputes its CID, and requires it to equal:
 
 `bafyreiayw4z5qz4lt2sljf2enzn7uol3qa6bebadav7qwnqz7agxkiuwhq`
 
-Only then does it bootstrap the root locally. This is not a network-admission
-exception: the unsigned allowance is confined to configured local bootstrap,
-while transactions in normal blocks and child genesis remain signature-strict. On recovery, the
-store metadata and height-zero fact must name that same CID; no alternate Nexus
+Only then does it bootstrap the root locally. Every genesis transaction has
+empty signers and signatures. The exact genesis CID supplies authorization:
+local configuration for Nexus and a signed parent `GenesisAction` for a child.
+Ordinary post-genesis transactions remain signature-strict. On recovery, store
+metadata and the height-zero fact must name that same CID; no alternate Nexus
 genesis is accepted.
 
 ## External mining pipeline

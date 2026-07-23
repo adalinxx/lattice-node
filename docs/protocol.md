@@ -29,8 +29,10 @@ It contains the deterministic premine transaction for public key
 `ed01fe416588df6e7fa5213c0d3e430f504bb5203172120c86b874826b55f53bdb7d`.
 On an empty store, the node constructs it locally, recomputes its CID, and
 uses it only for configured root bootstrap. The CID is a trust anchor, never a
-peer-admission signature permit. Child genesis transactions and every ordinary
-transaction remain subject to normal Lattice signature validation.
+peer-admission signature permit. Every transaction in any genesis has empty
+signers and signatures; an exact configured Nexus CID or parent `GenesisAction`
+CID authorizes that genesis. Ordinary post-genesis transactions, including
+transactions carrying `GenesisAction`s, remain signature-strict.
 
 This genesis is a storage cutover. Existing node data is not migrated; remove
 the old chain directory before starting this version.

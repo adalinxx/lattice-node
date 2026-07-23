@@ -185,8 +185,7 @@ final class ChainServiceTests: XCTestCase {
                 chainPath: ["Nexus"],
                 genesisActions: [GenesisAction(
                     directory: intent.directory,
-                    blockCID: intent.genesisCID,
-                    parentWorkAuthorityKey: try childAuthority(for: intent)
+                    blockCID: intent.genesisCID
                 )]
             )
         ))
@@ -545,190 +544,6 @@ final class ChainServiceTests: XCTestCase {
         XCTAssertEqual(status.mempoolCount, 0)
     }
 
-    func testInheritedReorgQueuesBehindEarlierNetworkCommit() async throws {
-        let fixture = try await inheritedForkFixture()
-        _ = try await fixture.process.applyInheritedWorkSnapshot(
-            InheritedWorkSnapshot(
-                revision: 1,
-                workByBlock: [
-                    fixture.siblingCarrierCID: WorkMeasure(
-                        try verifiedWorkContribution(
-                            id: fixture.siblingCarrierCID,
-                            work: 10
-                        )
-                    ),
-                ]
-            ),
-            from: fixture.parentAuthority.value
-        )
-        _ = try await fixture.service.submitTransaction(SubmitTransactionRequest(
-            transaction: fixture.siblingTransaction
-        ))
-        let networkCommit = CanonicalCommitLatch()
-        let admission = Task {
-            try await fixture.process.admit(
-                fixture.siblingHeader,
-                authenticatedChildPackage: fixture.siblingPackage,
-                canonicalCommitPublisher: { commit in
-                    await networkCommit.wait()
-                    return await fixture.service.enqueueCanonicalCommit(commit)
-                }
-            )
-        }
-        await networkCommit.waitUntilEntered()
-
-        // The parent update acquires the service gate, then waits on the
-        // network admission's process mutation. Releasing that admission puts
-        // its commit on the FIFO before the inherited reorg is available.
-        let inheritedStarted = TaskStartLatch()
-        let inheritedContribution = try verifiedWorkContribution(
-            id: fixture.activeCarrierCID,
-            work: 1_000_000
-        )
-        let inherited = Task {
-            await inheritedStarted.signal()
-            return try await fixture.service.applyInheritedWorkSnapshot(
-                InheritedWorkSnapshot(
-                    revision: 1,
-                    workByBlock: [
-                        fixture.activeCarrierCID: WorkMeasure(inheritedContribution),
-                    ]
-                ),
-                from: fixture.parentAuthority.value
-            )
-        }
-        await inheritedStarted.wait()
-        await Task.yield()
-        await Task.yield()
-        await networkCommit.release()
-
-        let admissionOutcome = try await admission.value
-        guard admissionOutcome.decision.isAccepted,
-              admissionOutcome.canonicalCommitReceipt != nil else {
-            return XCTFail(
-                "expected queued sibling admission to publish a canonical commit, got \(admissionOutcome.decision)"
-            )
-        }
-        let inheritedCommit = try await inherited.value
-        XCTAssertTrue(inheritedCommit?.canonicalChanged ?? false)
-        let reorgTipCID = try BlockHeader(
-            node: try await fixture.process.canonicalTipBlock()
-        ).rawCID
-        XCTAssertEqual(
-            reorgTipCID,
-            fixture.activeCID
-        )
-
-        // A then B removes the sibling-genesis transaction and re-adds it
-        // when B removes that genesis. Directly reconciling B before its
-        // already-queued A would leave the transaction absent.
-        let finalStatus = await fixture.service.status()
-        XCTAssertEqual(finalStatus.mempoolCount, 1)
-    }
-
-#if DEBUG
-    func testInheritedReorgReservesFIFOAheadOfLaterNetworkCommit()
-        async throws {
-        let fixture = try await inheritedForkFixture()
-
-        // First accept the transaction-bearing sibling without involving the
-        // service. The inherited reorg below must put its transaction back in
-        // the pool, and the later branch must remove that same transaction.
-        _ = try await fixture.process.applyInheritedWorkSnapshot(
-            InheritedWorkSnapshot(
-                revision: 1,
-                workByBlock: [
-                    fixture.siblingCarrierCID: WorkMeasure(
-                        try verifiedWorkContribution(
-                            id: fixture.siblingCarrierCID,
-                            work: 10
-                        )
-                    ),
-                ]
-            ),
-            from: fixture.parentAuthority.value
-        )
-        let sibling = try await fixture.process.admit(
-            fixture.siblingHeader,
-            authenticatedChildPackage: fixture.siblingPackage
-        )
-        XCTAssertTrue(sibling.decision.isAccepted)
-        let siblingTip = await fixture.process.status().tipCID
-        XCTAssertEqual(
-            siblingTip,
-            fixture.siblingCID
-        )
-
-        let activeContribution = try verifiedWorkContribution(
-            id: fixture.activeCarrierCID,
-            work: 100
-        )
-        let lateContribution = try verifiedWorkContribution(
-            id: fixture.lateCarrierCID,
-            work: 1_000
-        )
-        let inheritedSnapshot = InheritedWorkSnapshot(
-            revision: 2,
-            workByBlock: [
-                fixture.activeCarrierCID: WorkMeasure(activeContribution),
-                fixture.lateCarrierCID: WorkMeasure(lateContribution),
-            ]
-        )
-        let inheritedPublisher = CanonicalCommitLatch()
-        let inherited = Task {
-            try await fixture.process.applyInheritedWorkSnapshot(
-                inheritedSnapshot,
-                from: fixture.parentAuthority.value,
-                canonicalCommitPublisher: { commit in
-                    await inheritedPublisher.wait()
-                    return await fixture.service.enqueueCanonicalCommit(commit)
-                }
-            )
-        }
-        await inheritedPublisher.waitUntilEntered()
-
-        // The ready network admission is waiting for the process mutation
-        // lane. Releasing the inherited publisher must enqueue that reorg
-        // before this admission can enqueue its own canonical commit.
-        let network = Task {
-            try await fixture.process.admit(
-                fixture.lateHeader,
-                authenticatedChildPackage: fixture.latePackage,
-                canonicalCommitPublisher: { commit in
-                    await fixture.service.enqueueCanonicalCommit(commit)
-                }
-            )
-        }
-        await fixture.process.waitForOperationWaiterCount(1)
-        await inheritedPublisher.release()
-
-        let inheritedUpdate = try await inherited.value
-        guard let inheritedReceipt = inheritedUpdate.canonicalCommitReceipt else {
-            return XCTFail("expected inherited canonical commit receipt")
-        }
-        let admitted = try await network.value
-        guard admitted.decision.isAccepted,
-              let networkReceipt = admitted.canonicalCommitReceipt else {
-            return XCTFail(
-                "expected later admission to publish a canonical commit, got \(admitted.decision)"
-            )
-        }
-        await inheritedReceipt.wait()
-        await networkReceipt.wait()
-
-        let tipCID = try BlockHeader(
-            node: try await fixture.process.canonicalTipBlock()
-        ).rawCID
-        XCTAssertEqual(tipCID, fixture.lateCID)
-
-        // The inherited reorg removes the sibling genesis and re-adds this
-        // transaction. The later canonical branch includes it, so ordered
-        // reconciliation must remove it again.
-        let finalStatus = await fixture.service.status()
-        XCTAssertEqual(finalStatus.mempoolCount, 0)
-    }
-#endif
-
     func testQueuedCommitFailureResetsVolatileStateAndReleasesWaiter()
         async throws {
         let service = makeService(process: try await nexusProcess())
@@ -1001,7 +816,7 @@ final class ChainServiceTests: XCTestCase {
         XCTAssertEqual(status.mempoolCount, 0)
     }
 
-    func testChildIntentNeedsSignedGenesisAndParentAnchor() async throws {
+    func testChildIntentRequiresUnsignedGenesisAndParentAnchor() async throws {
         let process = try await nexusProcess()
         let publishedProofs = PublishedProofs()
         let service = makeService(
@@ -1018,35 +833,42 @@ final class ChainServiceTests: XCTestCase {
             initialReward: 10,
             halvingInterval: 100
         )
-        let premineBody = transactionBody(
+        let premineActions = [AccountAction(
+            owner: childOwner,
+            delta: Int64(spec.premineAmount())
+        )]
+        let signedPremine = try signedTransaction(
             key: childKey,
             chainPath: ["Nexus", "Sandbox"],
-            accountActions: [AccountAction(
-                owner: childOwner,
-                delta: Int64(spec.premineAmount())
-            )]
+            accountActions: premineActions
         )
-        let unsignedPremine = Transaction(
-            signatures: [:],
-            body: try HeaderImpl(node: premineBody)
-        )
-        let unsignedRequest = ChildDeployIntentRequest(
+        let signedRequest = ChildDeployIntentRequest(
             directory: "Sandbox",
             spec: spec,
-            genesisTransactions: [unsignedPremine],
+            genesisTransactions: [signedPremine],
             target: UInt256.max,
             timestamp: 1
         )
         await XCTAssertThrowsErrorAsync(
-            try await service.createChildDeployIntent(unsignedRequest)
+            try await service.createChildDeployIntent(signedRequest)
         ) { error in
             XCTAssertEqual(error as? ChainServiceError, .invalidChildGenesis)
         }
 
-        let premine = try signedTransaction(
-            key: childKey,
-            chainPath: ["Nexus", "Sandbox"],
-            accountActions: premineBody.accountActions
+        let premine = Transaction(
+            signatures: [:],
+            body: try HeaderImpl(node: TransactionBody(
+                accountActions: premineActions,
+                actions: [],
+                depositActions: [],
+                genesisActions: [],
+                receiptActions: [],
+                withdrawalActions: [],
+                signers: [],
+                fee: 0,
+                nonce: 0,
+                chainPath: ["Nexus", "Sandbox"]
+            ))
         )
         let intent = try await service.createChildDeployIntent(
             ChildDeployIntentRequest(
@@ -1071,8 +893,7 @@ final class ChainServiceTests: XCTestCase {
             chainPath: ["Nexus"],
             genesisActions: [GenesisAction(
                 directory: intent.directory,
-                blockCID: intent.genesisCID,
-                parentWorkAuthorityKey: try childAuthority(for: intent)
+                blockCID: intent.genesisCID
             )]
         )
         _ = try await service.submitTransaction(
@@ -1134,8 +955,7 @@ final class ChainServiceTests: XCTestCase {
                 chainPath: ["Nexus"],
                 genesisActions: [GenesisAction(
                     directory: original.directory,
-                    blockCID: original.genesisCID,
-                    parentWorkAuthorityKey: try childAuthority(for: original)
+                    blockCID: original.genesisCID
                 )]
             )
         ))
@@ -1162,16 +982,13 @@ final class ChainServiceTests: XCTestCase {
         XCTAssertEqual(normal.block.children.node?.count, 0)
     }
 
-    func testDeploymentAnchorMustMatchPreparedParentAuthority() async throws {
+    func testDeploymentAnchorMustMatchPreparedGenesisCID() async throws {
         let service = makeService(process: try await nexusProcess())
         let intent = try await simpleChildIntent(
             service: service,
             directory: "Sandbox",
             timestamp: 1
         )
-        let wrongAuthority = try XCTUnwrap(ParentWorkAuthorityKey(
-            String(repeating: "a", count: ParentWorkAuthorityKey.encodedByteCount)
-        ))
         let signer = CryptoUtils.generateKeyPair()
         _ = try await service.submitTransaction(SubmitTransactionRequest(
             transaction: try signedTransaction(
@@ -1179,8 +996,7 @@ final class ChainServiceTests: XCTestCase {
                 chainPath: ["Nexus"],
                 genesisActions: [GenesisAction(
                     directory: intent.directory,
-                    blockCID: intent.genesisCID,
-                    parentWorkAuthorityKey: wrongAuthority
+                    blockCID: NexusGenesis.expectedBlockHash
                 )]
             )
         ))
@@ -1201,8 +1017,7 @@ final class ChainServiceTests: XCTestCase {
                 chainPath: ["Nexus"],
                 genesisActions: [GenesisAction(
                     directory: intent.directory,
-                    blockCID: intent.genesisCID,
-                    parentWorkAuthorityKey: try childAuthority(for: intent)
+                    blockCID: intent.genesisCID
                 )]
             )
         ))
@@ -1240,8 +1055,7 @@ final class ChainServiceTests: XCTestCase {
                 chainPath: ["Nexus", "Payments"],
                 genesisActions: [GenesisAction(
                     directory: intent.directory,
-                    blockCID: intent.genesisCID,
-                    parentWorkAuthorityKey: try childAuthority(for: intent)
+                    blockCID: intent.genesisCID
                 )]
             ))
         )
@@ -1292,8 +1106,7 @@ final class ChainServiceTests: XCTestCase {
                 chainPath: ["Nexus"],
                 genesisActions: [GenesisAction(
                     directory: intent.directory,
-                    blockCID: intent.genesisCID,
-                    parentWorkAuthorityKey: try childAuthority(for: intent)
+                    blockCID: intent.genesisCID
                 )]
             )
         ))
@@ -1429,7 +1242,6 @@ final class ChainServiceTests: XCTestCase {
                 return [DirectChildCandidate(
                     directory: "Payments",
                     block: child,
-                    searchTarget: child.target,
                     acquisitionEntries: try await process
                         .durableCandidateEntries(for: child)
                 )]
@@ -1505,7 +1317,6 @@ final class ChainServiceTests: XCTestCase {
                 return [DirectChildCandidate(
                     directory: "Existing",
                     block: child,
-                    searchTarget: child.target,
                     acquisitionEntries: childEntries
                 )]
             },
@@ -1595,13 +1406,11 @@ final class ChainServiceTests: XCTestCase {
                     DirectChildCandidate(
                         directory: "Incomplete",
                         block: rawChild,
-                        searchTarget: rawChild.target,
                         acquisitionEntries: [childCID: childData]
                     ),
                     DirectChildCandidate(
                         directory: "Healthy",
                         block: rawChild,
-                        searchTarget: rawChild.target,
                         acquisitionEntries: completeChildEntries
                     ),
                 ]
@@ -1648,7 +1457,6 @@ final class ChainServiceTests: XCTestCase {
                     DirectChildCandidate(
                         directory: $0,
                         block: child,
-                        searchTarget: child.target,
                         acquisitionEntries: childEntries
                     )
                 }
@@ -1658,12 +1466,14 @@ final class ChainServiceTests: XCTestCase {
             maximumChildCandidates: 1
         )
 
-        let template = try await service.miningTemplate(MiningTemplateRequest())
+        let template = try await service.miningTemplate(
+            MiningTemplateRequest(mode: .deployment)
+        )
         let children = try XCTUnwrap(template.block.children.node)
         XCTAssertEqual(Set(try children.allKeysAndValues().keys), ["A"])
     }
 
-    func testNormalMiningIgnoresDeploymentClaimsAndDeploymentRoundsRotate()
+    func testSchedulingComesFromCommittedCandidateContent()
         async throws
     {
         let process = try await nexusProcess()
@@ -1684,21 +1494,16 @@ final class ChainServiceTests: XCTestCase {
                     DirectChildCandidate(
                         directory: "Healthy",
                         block: child,
-                        searchTarget: .max,
                         acquisitionEntries: entries
                     ),
                     DirectChildCandidate(
                         directory: "Poisoned",
                         block: child,
-                        searchTarget: UInt256(1),
-                        deploymentTarget: UInt256(1),
                         acquisitionEntries: entries
                     ),
                     DirectChildCandidate(
                         directory: "Viable",
                         block: child,
-                        searchTarget: UInt256.max / UInt256(2),
-                        deploymentTarget: UInt256.max / UInt256(2),
                         acquisitionEntries: entries
                     ),
                 ]
@@ -1708,7 +1513,7 @@ final class ChainServiceTests: XCTestCase {
         let normal = try await service.miningTemplate(MiningTemplateRequest())
         XCTAssertEqual(
             Set(try XCTUnwrap(normal.block.children.node).allKeysAndValues().keys),
-            ["Healthy"]
+            []
         )
         XCTAssertEqual(normal.searchTarget, .max)
 
@@ -1718,17 +1523,21 @@ final class ChainServiceTests: XCTestCase {
         let second = try await service.miningTemplate(
             MiningTemplateRequest(mode: .deployment)
         )
-        XCTAssertEqual(Set([first.searchTarget, second.searchTarget]), [
-            UInt256(1),
-            UInt256.max / UInt256(2),
-        ])
+        XCTAssertEqual(first.searchTarget, .max)
+        XCTAssertEqual(second.searchTarget, .max)
+        let firstDirectories = Set(
+            try XCTUnwrap(first.block.children.node).allKeysAndValues().keys
+        )
+        let secondDirectories = Set(
+            try XCTUnwrap(second.block.children.node).allKeysAndValues().keys
+        )
+        XCTAssertNotEqual(firstDirectories, secondDirectories)
         for template in [first, second] {
             let directories = Set(
                 try XCTUnwrap(template.block.children.node)
                     .allKeysAndValues().keys
             )
-            XCTAssertTrue(directories.contains("Healthy"))
-            XCTAssertEqual(directories.count, 2)
+            XCTAssertEqual(directories.count, 1)
         }
     }
 
@@ -1747,8 +1556,6 @@ final class ChainServiceTests: XCTestCase {
                 return [DirectChildCandidate(
                     directory: "Existing",
                     block: child,
-                    searchTarget: child.target,
-                    deploymentTarget: child.target,
                     acquisitionEntries: try await process.durableCandidateEntries(
                         for: child
                     )
@@ -1766,8 +1573,7 @@ final class ChainServiceTests: XCTestCase {
                 chainPath: ["Nexus"],
                 genesisActions: [GenesisAction(
                     directory: intent.directory,
-                    blockCID: intent.genesisCID,
-                    parentWorkAuthorityKey: try childAuthority(for: intent)
+                    blockCID: intent.genesisCID
                 )]
             )
         ))
@@ -1827,8 +1633,7 @@ final class ChainServiceTests: XCTestCase {
             chainPath: ["Nexus"],
             genesisActions: [GenesisAction(
                 directory: "Payments",
-                blockCID: childHeader.rawCID,
-                parentWorkAuthorityKey: parentAuthority
+                blockCID: childHeader.rawCID
             )]
         )
         try await VolumeImpl<Transaction>(node: anchor).storeRecursively(
@@ -1910,9 +1715,6 @@ final class ChainServiceTests: XCTestCase {
                 .parentCarrierRequired
             )
         }
-        let childAuthority = try XCTUnwrap(
-            ParentWorkAuthorityKey(childProcess.configuration.processPublicKey)
-        )
         let unmatchedKey = CryptoUtils.generateKeyPair()
         let unmatchedDeployment = try signedTransaction(
             key: unmatchedKey,
@@ -1923,8 +1725,7 @@ final class ChainServiceTests: XCTestCase {
             )],
             genesisActions: [GenesisAction(
                 directory: "Orphan",
-                blockCID: childHeader.rawCID,
-                parentWorkAuthorityKey: childAuthority
+                blockCID: childHeader.rawCID
             )],
             fee: 1
         )
@@ -2067,23 +1868,6 @@ final class ChainServiceTests: XCTestCase {
         try XCTUnwrap(intent.genesisBlock.spec.node?.parentWorkAuthorityKey)
     }
 
-    private struct InheritedForkFixture {
-        let process: ChainProcess
-        let service: ChainService
-        let parentAuthority: ParentWorkAuthorityKey
-        let activeCID: String
-        let activeCarrierCID: String
-        let siblingCID: String
-        let siblingCarrierCID: String
-        let siblingHeader: BlockHeader
-        let siblingPackage: AuthenticatedChildPackage
-        let siblingTransaction: Transaction
-        let lateCID: String
-        let lateCarrierCID: String
-        let lateHeader: BlockHeader
-        let latePackage: AuthenticatedChildPackage
-    }
-
     private struct AnchoredChildGenesis {
         let block: Block
         let header: BlockHeader
@@ -2149,80 +1933,6 @@ final class ChainServiceTests: XCTestCase {
         )
     }
 
-    private func inheritedForkFixture() async throws -> InheritedForkFixture {
-        let parent = try await nexusProcess()
-        let parentGenesis = try await parent.canonicalTipBlock()
-        let parentAuthority = try XCTUnwrap(
-            ParentWorkAuthorityKey(parent.configuration.processPublicKey)
-        )
-        let siblingTransaction = try signedTransaction(
-            key: CryptoUtils.generateKeyPair(),
-            chainPath: ["Nexus", "Payments"]
-        )
-        let active = try await anchoredChildGenesis(
-            parent: parent,
-            parentGenesis: parentGenesis,
-            parentAuthority: parentAuthority,
-            transactions: [],
-            childTimestamp: 1,
-            carrierNonce: 0
-        )
-        let sibling = try await anchoredChildGenesis(
-            parent: parent,
-            parentGenesis: parentGenesis,
-            parentAuthority: parentAuthority,
-            transactions: [siblingTransaction],
-            childTimestamp: 2,
-            carrierNonce: 1
-        )
-        let late = try await anchoredChildGenesis(
-            parent: parent,
-            parentGenesis: parentGenesis,
-            parentAuthority: parentAuthority,
-            transactions: [siblingTransaction],
-            childTimestamp: 3,
-            carrierNonce: 2
-        )
-        let directory = FileManager.default.temporaryDirectory
-            .appendingPathComponent("lattice-inherited-fifo-\(UUID().uuidString)")
-        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
-        let process = try await ChainProcess.open(configuration: NodeConfiguration(
-            chainPath: ["Nexus", "Payments"],
-            minimumRootWork: UInt256(1),
-            storagePath: directory,
-            privateKeyHex: String(repeating: "02", count: 32),
-            parentEndpoint: ParentEndpoint(
-                publicKey: parent.configuration.processPublicKey,
-                host: "127.0.0.1",
-                port: 4002
-            )
-        ))
-        try await storeChildGenesis(active, in: process)
-        try await storeChildGenesis(sibling, in: process)
-        try await storeChildGenesis(late, in: process)
-        let bootstrap = try await process.admit(
-            active.header,
-            authenticatedChildPackage: active.package
-        )
-        XCTAssertTrue(bootstrap.decision.isAccepted)
-        return InheritedForkFixture(
-            process: process,
-            service: makeService(process: process),
-            parentAuthority: parentAuthority,
-            activeCID: active.header.rawCID,
-            activeCarrierCID: active.carrierCID,
-            siblingCID: sibling.header.rawCID,
-            siblingCarrierCID: sibling.carrierCID,
-            siblingHeader: sibling.header,
-            siblingPackage: sibling.package,
-            siblingTransaction: siblingTransaction,
-            lateCID: late.header.rawCID,
-            lateCarrierCID: late.carrierCID,
-            lateHeader: late.header,
-            latePackage: late.package
-        )
-    }
-
     private func anchoredChildGenesis(
         parent: ChainProcess,
         parentGenesis: Block,
@@ -2251,8 +1961,7 @@ final class ChainServiceTests: XCTestCase {
             chainPath: ["Nexus"],
             genesisActions: [GenesisAction(
                 directory: "Payments",
-                blockCID: header.rawCID,
-                parentWorkAuthorityKey: parentAuthority
+                blockCID: header.rawCID
             )]
         )
         try await VolumeImpl<Transaction>(node: authorization).storeRecursively(
@@ -2301,15 +2010,6 @@ final class ChainServiceTests: XCTestCase {
         try await child.block.postState.storeRecursively(storer: process)
     }
 
-    private func verifiedWorkContribution(
-        id: String,
-        work: UInt64
-    ) throws -> VerifiedWorkContribution {
-        try JSONDecoder().decode(
-            VerifiedWorkContribution.self,
-            from: Data("{\"id\":\"\(id)\",\"work\":\"0x\(String(work, radix: 16))\"}".utf8)
-        )
-    }
 }
 
 private enum TestPublicationError: Error {
