@@ -1,5 +1,10 @@
 import Crypto
 import Foundation
+#if canImport(Darwin)
+import Darwin
+#else
+import Glibc
+#endif
 import Ivy
 import Lattice
 import Tally
@@ -1069,20 +1074,51 @@ private struct ProvisionalRootFixture {
 }
 
 private enum NetworkTransportTestPorts {
-    private static let sliceSize = 256
     private static let lock = NSLock()
-    private static let sliceStart =
-        20_000
-        + (Int(ProcessInfo.processInfo.processIdentifier) % 128) * sliceSize
-    private nonisolated(unsafe) static var next = UInt16(
-        sliceStart
-    )
+    private nonisolated(unsafe) static var allocated = Set<UInt16>()
 
     static func allocate() -> UInt16 {
         lock.withLock {
-            precondition(Int(next) + 1 < sliceStart + sliceSize)
-            next += 1
-            return next
+            while true {
+                #if canImport(Darwin)
+                let descriptor = Darwin.socket(AF_INET, SOCK_STREAM, 0)
+                #else
+                let descriptor = Glibc.socket(
+                    AF_INET,
+                    Int32(SOCK_STREAM.rawValue),
+                    0
+                )
+                #endif
+                precondition(descriptor >= 0)
+                defer { _ = close(descriptor) }
+
+                var address = sockaddr_in()
+                #if canImport(Darwin)
+                address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+                #endif
+                address.sin_family = sa_family_t(AF_INET)
+                address.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
+                let bound = withUnsafePointer(to: &address) {
+                    $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                        bind(
+                            descriptor,
+                            $0,
+                            socklen_t(MemoryLayout<sockaddr_in>.size)
+                        )
+                    }
+                }
+                precondition(bound == 0)
+
+                var length = socklen_t(MemoryLayout<sockaddr_in>.size)
+                let named = withUnsafeMutablePointer(to: &address) {
+                    $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                        getsockname(descriptor, $0, &length)
+                    }
+                }
+                precondition(named == 0)
+                let port = UInt16(bigEndian: address.sin_port)
+                if allocated.insert(port).inserted { return port }
+            }
         }
     }
 }
@@ -3332,10 +3368,19 @@ final class NetworkTrustTests: XCTestCase {
                     chainPath: targetConfiguration.chainPath
                 ).encode()
             )
+            guard case .enqueued = await replacement.sendMessage(
+                to: PeerID(publicKey: targetConfiguration.processPublicKey),
+                topic: NodeNetworkTopic.blockAnnouncement,
+                payload: try BlockAnnouncementMessage(
+                    blockCID: leafHeader.rawCID
+                ).encoded()
+            ) else {
+                throw NetworkTestError.failedSend
+            }
             try await waitForEventCount(
                 2,
                 in: roots,
-                phase: "replacement provider retry",
+                phase: "replacement advertiser retry",
                 attempts: 2_000
             )
             let admittedRoots = await roots.snapshot()

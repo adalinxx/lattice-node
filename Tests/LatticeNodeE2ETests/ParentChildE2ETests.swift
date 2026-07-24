@@ -3891,10 +3891,11 @@ final class ParentChildE2ETests: XCTestCase {
         mode: MiningMode = .normal,
         requestTimeout: TimeInterval? = nil
     ) async throws -> E2EMinedBlock {
+        // Child candidate collection is protocol-bounded at 15 seconds.
         let template: MiningTemplateResponse = try await parent.post(
             "/v1/mining/templates",
             body: MiningTemplateRequest(rewards: rewards, mode: mode),
-            timeout: requestTimeout
+            timeout: requestTimeout ?? 20
         )
         let midstate = ProofOfWork.midstate(for: template.block)
         var nonce: UInt64 = 0
