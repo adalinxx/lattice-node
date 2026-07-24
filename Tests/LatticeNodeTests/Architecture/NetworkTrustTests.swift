@@ -310,24 +310,40 @@ private actor OverlayInventoryPeer: IvyDelegate {
         didReceiveMessage message: PeerMessage,
         from peer: AuthenticatedPeer
     ) async {
-        guard message.topic == NodeNetworkTopic.acceptedLeavesRequest,
-              let request = try? AcceptedLeavesRequestMessage.decoded(
+        if message.topic == NodeNetworkTopic.acceptedLeavesRequest {
+            guard let request = try? AcceptedLeavesRequestMessage.decoded(
                 message.payload
-              ) else { return }
-        requestSessions.append(peer.sessionID)
-        guard let leaves,
-              let payload = try? AcceptedLeavesResponseMessage(
+            ) else { return }
+            requestSessions.append(peer.sessionID)
+            guard let leaves,
+                  let payload = try? AcceptedLeavesResponseMessage(
                 requestID: request.requestID,
                 afterCID: request.afterCID,
                 snapshotSequence: request.snapshotSequence ?? 1,
                 blockCIDs: leaves,
                 hasMore: false
-              ).encoded() else { return }
-        _ = await ivy.sendMessage(
-            to: peer,
-            topic: NodeNetworkTopic.acceptedLeavesResponse,
-            payload: payload
-        )
+            ).encoded() else { return }
+            _ = await ivy.sendMessage(
+                to: peer,
+                topic: NodeNetworkTopic.acceptedLeavesResponse,
+                payload: payload
+            )
+        } else if message.topic
+            == NodeNetworkTopic.portableAttachmentIndexRequest {
+            guard let request = try? PortableAttachmentIndexRequestMessage
+                .decoded(message.payload),
+                  let payload = try? PortableAttachmentIndexResponseMessage(
+                    requestID: request.requestID,
+                    after: request.after,
+                    entries: [],
+                    hasMore: false
+                  ).encoded() else { return }
+            _ = await ivy.sendMessage(
+                to: peer,
+                topic: NodeNetworkTopic.portableAttachmentIndexResponse,
+                payload: payload
+            )
+        }
     }
 
     func requestCount() -> Int { requestSessions.count }
@@ -341,20 +357,18 @@ private struct PortableAttachmentTestPayload: Sendable {
 private actor PortableAttachmentQueuePeer: IvyDelegate, IvyContentSource {
     private let attachments: [PortableAttachmentTestPayload]
     private let firstAdmissionGate: CandidateBuildGate
-    private let portableIndexGate: CandidateBuildGate?
     private var servedAttachments = Set<String>()
+    private var portableIndexRequests = 0
 
     init(
         attachments: [PortableAttachmentTestPayload],
-        firstAdmissionGate: CandidateBuildGate,
-        portableIndexGate: CandidateBuildGate? = nil
+        firstAdmissionGate: CandidateBuildGate
     ) {
         self.attachments = attachments.sorted {
             ($0.summary.edgeCID, $0.summary.rootCID)
                 < ($1.summary.edgeCID, $1.summary.rootCID)
         }
         self.firstAdmissionGate = firstAdmissionGate
-        self.portableIndexGate = portableIndexGate
     }
 
     func ivy(
@@ -381,45 +395,29 @@ private actor PortableAttachmentQueuePeer: IvyDelegate, IvyContentSource {
         case NodeNetworkTopic.portableAttachmentIndexRequest:
             guard let request = try? PortableAttachmentIndexRequestMessage
                 .decoded(message.payload) else { return }
-            if let portableIndexGate {
-                Task {
-                    _ = await portableIndexGate.enter()
-                    await self.sendPortablePage(
-                        request,
-                        ivy: ivy,
-                        peer: peer
-                    )
-                }
-                return
-            }
-            await sendPortablePage(request, ivy: ivy, peer: peer)
+            portableIndexRequests += 1
+            await sendEmptyPortablePage(request, ivy: ivy, peer: peer)
         default:
             break
         }
     }
 
-    private func sendPortablePage(
+    private func sendEmptyPortablePage(
         _ request: PortableAttachmentIndexRequestMessage,
         ivy: Ivy,
         peer: AuthenticatedPeer
     ) async {
-            let remaining = attachments.filter { attachment in
-                guard let cursor = request.after else { return true }
-                return (attachment.summary.edgeCID, attachment.summary.rootCID)
-                    > (cursor.edgeCID, cursor.rootCID)
-            }
-            let page = Array(remaining.prefix(1))
-            guard let payload = try? PortableAttachmentIndexResponseMessage(
-                requestID: request.requestID,
-                after: request.after,
-                entries: page.map(\.summary),
-                hasMore: remaining.count > page.count
-            ).encoded() else { return }
-            _ = await ivy.sendMessage(
-                to: peer,
-                topic: NodeNetworkTopic.portableAttachmentIndexResponse,
-                payload: payload
-            )
+        guard let payload = try? PortableAttachmentIndexResponseMessage(
+            requestID: request.requestID,
+            after: request.after,
+            entries: [],
+            hasMore: false
+        ).encoded() else { return }
+        _ = await ivy.sendMessage(
+            to: peer,
+            topic: NodeNetworkTopic.portableAttachmentIndexResponse,
+            payload: payload
+        )
     }
 
     func content(
@@ -453,6 +451,7 @@ private actor PortableAttachmentQueuePeer: IvyDelegate, IvyContentSource {
     }
 
     func servedRoots() -> Set<String> { servedAttachments }
+    func indexRequestCount() -> Int { portableIndexRequests }
 }
 
 private actor HierarchyRetryRecorder {
@@ -3157,7 +3156,6 @@ final class NetworkTrustTests: XCTestCase {
         let roots = NetworkEventRecorder()
         let unavailable = NetworkEventRecorder()
         let firstAdmissionGate = CandidateBuildGate()
-        let portableIndexGate = CandidateBuildGate()
         let readiness = NetworkEventRecorder()
         let handlers = NodeNetworkHandlers(
             admission: { admission in
@@ -3204,8 +3202,7 @@ final class NetworkTrustTests: XCTestCase {
         ))
         let delegate = PortableAttachmentQueuePeer(
             attachments: attachments,
-            firstAdmissionGate: firstAdmissionGate,
-            portableIndexGate: portableIndexGate
+            firstAdmissionGate: firstAdmissionGate
         )
         await evidencePeer.installTestDelegate(delegate)
         await evidencePeer.setContentSource(delegate)
@@ -3323,6 +3320,15 @@ final class NetworkTrustTests: XCTestCase {
                 in: unavailable,
                 phase: "overlay block before portable parent proof"
             )
+            for _ in 0..<300 {
+                if await delegate.indexRequestCount() > 0 { break }
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            guard await delegate.indexRequestCount() > 0 else {
+                throw NetworkTestError.failedPhase(
+                    "initial portable attachment inventory"
+                )
+            }
             for attachment in attachments {
                 guard case .enqueued = await evidencePeer.sendMessage(
                     to: PeerID(publicKey: targetConfiguration.processPublicKey),
@@ -3404,7 +3410,6 @@ final class NetworkTrustTests: XCTestCase {
             XCTAssertEqual(admittedRoots.count, 2)
             XCTAssertEqual(Set(admittedRoots), Set(proofs.map(\.rootCID)))
         } catch {
-            await portableIndexGate.releaseAll()
             await firstAdmissionGate.releaseAll()
             await replacement.stop()
             await blockAdvertiser.stop()
@@ -3413,7 +3418,6 @@ final class NetworkTrustTests: XCTestCase {
             await runtime.stop()
             throw error
         }
-        await portableIndexGate.releaseAll()
         await firstAdmissionGate.releaseAll()
         await replacement.stop()
         await blockAdvertiser.stop()
