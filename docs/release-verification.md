@@ -25,9 +25,10 @@ suite. During bundle assembly, the smoke test exercises the bundle's node,
 assembly, the workflow extracts that archive and reruns the multichain daemon
 E2E suite against its `lattice-node`. Linux release binaries statically include
 the Swift runtime and are also executed in a plain Ubuntu container without a
-Swift toolchain. The smoke test verifies the exact Nexus genesis, mines one
-canonical block through the external mining pipeline, then restarts the node
-and verifies the same persisted tip.
+Swift toolchain. Linux hosts still need the standard system libraries used by
+the executables: libatomic, libcurl, libsqlite3, and libxml2. The smoke test
+verifies the exact Nexus genesis, mines one canonical block through the external
+mining pipeline, then restarts the node and verifies the same persisted tip.
 
 The provenance attestation binds the archive artifact's name and digest to the GitHub workflow identity for `adalinxx/lattice-node`. The SBOM attestation binds that same archive artifact to the SPDX dependency inventory generated during the same workflow run. The checksum catches transfer corruption; the manifest records the archive name, checksum subject name, archive digest, and SBOM digest for the sibling release assets.
 

@@ -182,7 +182,15 @@ jobs:
       - name: Install runtime dependencies
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends ca-certificates gzip libc-bin libsqlite3-0 tar
+          apt-get install -y --no-install-recommends \
+            ca-certificates \
+            gzip \
+            libatomic1 \
+            libc-bin \
+            libcurl4t64 \
+            libsqlite3-0 \
+            libxml2 \
+            tar
 
       - name: Download Linux release archive
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
