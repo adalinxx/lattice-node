@@ -177,7 +177,7 @@ public struct IvyRootContentSource: Sendable {
     private let maximumMembers: Int
     private let maximumStorageBytes: Int
 
-    public final class Session: ContentSource, @unchecked Sendable {
+    public final class Session: ContentSource {
         private let fetchVolume: @Sendable (String) async -> AttributedVolumeResponse
         private let context: Context
 

@@ -22,15 +22,15 @@ let package = Package(
     dependencies: [
         .package(
             url: "https://github.com/adalinxx/Lattice.git",
-            exact: "24.0.0"
+            exact: "25.0.0"
         ),
         .package(
             url: "https://github.com/adalinxx/cashew.git",
-            exact: "4.0.1"
+            exact: "4.0.2"
         ),
         .package(
             url: "https://github.com/adalinxx/Ivy.git",
-            exact: "12.0.0"
+            exact: "12.1.1"
         ),
         .package(
             url: "https://github.com/adalinxx/Tally.git",
@@ -38,7 +38,7 @@ let package = Package(
         ),
         .package(
             url: "https://github.com/adalinxx/VolumeBroker.git",
-            exact: "7.0.0"
+            exact: "7.0.1"
         ),
         .package(url: "https://github.com/hummingbird-project/hummingbird.git", from: "2.0.0"),
         .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.3.0"),

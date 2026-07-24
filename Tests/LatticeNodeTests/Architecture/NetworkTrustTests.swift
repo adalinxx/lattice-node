@@ -857,7 +857,7 @@ private actor CandidateBuildGate {
     }
 }
 
-private final class BlockingProvisionalBroker: VolumeBroker, @unchecked Sendable {
+private final class BlockingProvisionalBroker: VolumeBroker {
     let near: (any VolumeBroker)? = nil
     let far: (any VolumeBroker)? = nil
     private let backing = MemoryBroker(evictUnpinnedGrace: .zero)
