@@ -117,7 +117,7 @@ jobs:
         run: swift test --skip-build --filter LatticeNodeE2ETests
 
       - name: Run tests with code coverage
-        run: swift test --enable-code-coverage
+        run: swift test --enable-code-coverage --skip LatticeNodeE2ETests
 
       - name: Verify executables run
         run: |
