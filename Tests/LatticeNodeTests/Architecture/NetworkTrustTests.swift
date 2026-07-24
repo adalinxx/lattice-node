@@ -3336,11 +3336,16 @@ final class NetworkTrustTests: XCTestCase {
                     throw NetworkTestError.failedSend
                 }
             }
-            for _ in 0..<300 {
+            for _ in 0..<2_000 {
                 if (await delegate.servedRoots()).count == 2 { break }
                 try await Task.sleep(for: .milliseconds(10))
             }
             let initiallyServedRoots = await delegate.servedRoots()
+            guard initiallyServedRoots.count == 2 else {
+                throw NetworkTestError.failedPhase(
+                    "distinct portable attachment roots"
+                )
+            }
             XCTAssertEqual(
                 initiallyServedRoots,
                 Set(attachments.map(\.summary.attachmentCID))
