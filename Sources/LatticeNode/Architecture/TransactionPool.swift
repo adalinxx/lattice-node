@@ -65,6 +65,7 @@ public actor TransactionPool {
     private let maxCount: Int
     private let maxBytes: Int
     private let maxSignatures: Int
+    private let maxNonReadyPerSigner: Int
     private let entryLifetime: TimeInterval
     private var entries: [String: Entry] = [:]
     private var signerNonces: [SignerNonce: String] = [:]
@@ -74,15 +75,18 @@ public actor TransactionPool {
         maxCount: Int = 10_000,
         maxBytes: Int = 64 * 1024 * 1024,
         maxSignatures: Int = 64,
+        maxNonReadyPerSigner: Int = 64,
         entryLifetime: TimeInterval = 3 * 60 * 60
     ) {
         precondition(
             maxCount > 0 && maxBytes > 0 && maxSignatures > 0
+                && maxNonReadyPerSigner > 0
                 && entryLifetime > 0
         )
         self.maxCount = maxCount
         self.maxBytes = maxBytes
         self.maxSignatures = maxSignatures
+        self.maxNonReadyPerSigner = maxNonReadyPerSigner
         self.entryLifetime = entryLifetime
     }
 
@@ -191,6 +195,21 @@ public actor TransactionPool {
                 throw TransactionPoolError.replacementUnderpriced
             }
         }
+        if disposition != .ready {
+            var queuedBySigner: [String: Int] = [:]
+            for existing in entries.values
+            where existing.cid != replacedCID
+                && existing.disposition != .ready {
+                for signer in existing.conflictKey.signers {
+                    queuedBySigner[signer, default: 0] += 1
+                }
+            }
+            guard conflictKey.signers.allSatisfy({
+                queuedBySigner[$0, default: 0] < maxNonReadyPerSigner
+            }) else {
+                throw TransactionPoolError.full
+            }
+        }
 
         var prospectiveCount = entries.count - (replacedCID == nil ? 0 : 1)
         var prospectiveBytes = totalBytes
@@ -199,17 +218,12 @@ public actor TransactionPool {
         let candidates = entries.values
             .filter { $0.cid != replacedCID }
             .sorted {
-                feeRateComparison($0.fee, $0.size, $1.fee, $1.size) < 0
+                retentionComparison($0, $1) < 0
             }
         for candidate in candidates
         where prospectiveCount >= maxCount
             || storedSize > maxBytes - prospectiveBytes {
-            guard feeRateComparison(
-                entry.fee,
-                entry.size,
-                candidate.fee,
-                candidate.size
-            ) > 0 else {
+            guard retentionComparison(entry, candidate) > 0 else {
                 throw TransactionPoolError.full
             }
             evictions.append(candidate.cid)
@@ -315,6 +329,13 @@ public actor TransactionPool {
         )
         if ordering != 0 { return ordering > 0 }
         return lhs.cid < rhs.cid
+    }
+
+    private func retentionComparison(_ lhs: Entry, _ rhs: Entry) -> Int {
+        let lhsReady = lhs.disposition == .ready
+        let rhsReady = rhs.disposition == .ready
+        if lhsReady != rhsReady { return lhsReady ? 1 : -1 }
+        return feeRateComparison(lhs.fee, lhs.size, rhs.fee, rhs.size)
     }
 
     public func snapshot() -> [TransactionPoolItem] {

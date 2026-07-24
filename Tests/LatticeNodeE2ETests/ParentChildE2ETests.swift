@@ -5116,7 +5116,7 @@ private final class E2ENode {
 
     private func openLog(named name: String) throws -> FileHandle {
         let url = logDirectory.appendingPathComponent(name)
-        FileManager.default.createFile(atPath: url.path, contents: nil)
+        _ = FileManager.default.createFile(atPath: url.path, contents: nil)
         return try FileHandle(forWritingTo: url)
     }
 

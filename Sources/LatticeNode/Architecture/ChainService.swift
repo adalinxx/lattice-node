@@ -412,6 +412,8 @@ public actor ChainService {
     private var canonicalCommitQueue: [QueuedCanonicalCommit] = []
     private var canonicalCommitWorker: Task<Void, Never>?
     private var canonicalCommitWorkerReserved = false
+    private var transactionPublications = Set<String>()
+    private var transactionPublicationWorker: Task<Void, Never>?
     private var parentWorkReady: Bool
 
     // This actor calls other actors and is therefore reentrant. Keep its pool,
@@ -429,9 +431,13 @@ public actor ChainService {
         securingWorkPublisher: @escaping SecuringWorkPublisher,
         acceptedTransactionPublisher: @escaping AcceptedTransactionPublisher = { _ in },
         mempoolMaxCount: Int = 10_000,
+        mempoolMaxNonReadyPerSigner: Int = 64,
         maximumChildCandidates: Int = 64
     ) {
-        precondition(mempoolMaxCount > 0 && maximumChildCandidates > 0)
+        precondition(
+            mempoolMaxCount > 0 && mempoolMaxNonReadyPerSigner > 0
+                && maximumChildCandidates > 0
+        )
         self.process = process
         self.childCandidateProvider = childCandidateProvider
         self.childCandidateReservationReconciler =
@@ -442,7 +448,8 @@ public actor ChainService {
         self.acceptedTransactionPublisher = acceptedTransactionPublisher
         self.pool = TransactionPool(
             maxCount: mempoolMaxCount,
-            maxBytes: 64 * 1024 * 1024
+            maxBytes: 64 * 1024 * 1024,
+            maxNonReadyPerSigner: mempoolMaxNonReadyPerSigner
         )
         self.templates = MiningTemplateBook(
             chainPath: process.configuration.chainPath,
@@ -635,7 +642,7 @@ public actor ChainService {
             request.transaction,
             persistLocal: true
         )
-        try? await acceptedTransactionPublisher(admission.cid)
+        scheduleTransactionPublication(admission.cid)
         return SubmitTransactionResponse(
             transactionCID: admission.cid,
             mempoolCount: await pool.count,
@@ -1770,8 +1777,23 @@ public actor ChainService {
             parentStateCID: tip.postState.rawCID
         )
         for cid in removedByCID.keys.sorted() where pooledRoots.contains(cid) {
+            scheduleTransactionPublication(cid)
+        }
+    }
+
+    private func scheduleTransactionPublication(_ cid: String) {
+        transactionPublications.insert(cid)
+        guard transactionPublicationWorker == nil else { return }
+        transactionPublicationWorker = Task {
+            await drainTransactionPublications()
+        }
+    }
+
+    private func drainTransactionPublications() async {
+        while let cid = transactionPublications.popFirst() {
             try? await acceptedTransactionPublisher(cid)
         }
+        transactionPublicationWorker = nil
     }
 
     private func invalidateTemplatesLocked() async {

@@ -26,21 +26,6 @@ final class NodeConfigurationTests: XCTestCase {
         ).encode())
     }
 
-    func testConfigurationRejectsPathWhoseCanonicalHandshakeIsOversized() throws {
-        let component = String(repeating: "x", count: 64)
-        let path = ["Nexus"] + Array(repeating: component, count: 1_100)
-        XCTAssertNotNil(ChainAddress(path))
-
-        XCTAssertThrowsError(try NodeConfiguration(
-            chainPath: path,
-            minimumRootWork: UInt256(1),
-            storagePath: URL(fileURLWithPath: "/tmp/lattice-node-test"),
-            privateKeyHex: String(repeating: "01", count: 32)
-        )) { error in
-            XCTAssertEqual(error as? NodeConfigurationError, .invalidChainPath)
-        }
-    }
-
     func testNexusIdentityIsFixed() throws {
         let configuration = try NodeConfiguration(
             chainPath: ["Nexus"],

@@ -245,8 +245,10 @@ The pool separates executable, future-nonce, and temporarily unavailable
 transactions by signer nonce. Template selection advances a dependency
 frontier across every signer, choosing the highest-fee eligible transaction
 without copying state validity out of Lattice. The pool applies
-bounded replacement, expiry, and low-value eviction, and revalidates after every
-canonical change. Transactions confirmed on the new chain leave the pool;
+bounded replacement, expiry, and low-value eviction, caps non-ready work per
+signer, and always evicts non-ready work before executable work regardless of
+an unpaid declared fee. It revalidates after every canonical change.
+Transactions confirmed on the new chain leave the pool;
 ordinary transactions from removed blocks are reinserted when still valid.
 Locally submitted transaction roots survive restart and are revalidated before
 becoming visible again. Live pool roots use process-owner VolumeBroker pin
