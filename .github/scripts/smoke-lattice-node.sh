@@ -97,7 +97,6 @@ start_node() {
 }
 
 stop_node() {
-    local timed_out=0
     local status=0
 
     if is_running "$node_pid"; then
@@ -108,7 +107,6 @@ stop_node() {
         done
     fi
     if is_running "$node_pid"; then
-        timed_out=1
         kill -KILL "$node_pid" 2>/dev/null || true
     fi
     if wait "$node_pid"; then
@@ -118,7 +116,7 @@ stop_node() {
     fi
     node_pid=""
 
-    if ((timed_out || status != 0)); then
+    if ((status != 0)); then
         fail "node did not shut down cleanly (status $status)"
     fi
 }
