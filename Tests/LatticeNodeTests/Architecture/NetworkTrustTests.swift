@@ -9,10 +9,26 @@ import XCTest
 import cashew
 @testable import LatticeNode
 
+private let testEvidenceSourceID = "00000000-0000-4000-8000-000000000001"
+
 private enum NetworkTestError: Error {
     case failedStart
     case failedSend
     case failedPhase(String)
+}
+
+private func inertNetworkHandlers() -> NodeNetworkHandlers {
+    NodeNetworkHandlers(admission: { _ in throw CancellationError() })
+}
+
+private func duplicateNetworkHandlers() -> NodeNetworkHandlers {
+    NodeNetworkHandlers(admission: { _ in
+        NodeAdmissionOutcome(
+            decision: .duplicate,
+            parentCarrierLink: nil,
+            sameChainPredecessor: nil
+        )
+    })
 }
 
 private func inheritedWorkCID(_ seed: String) -> String {
@@ -88,55 +104,6 @@ private actor ContentRequestRecorder {
     func snapshot() -> [String] { values }
 }
 
-private actor RecoveryAdmissionPlan {
-    private let predecessorCID: String
-    private let orphanCID: String
-    private let descendantCID: String
-    private var orphanAttempts = 0
-    private var descendantAttempts = 0
-    private var events: [String] = []
-
-    init(
-        predecessorCID: String,
-        orphanCID: String,
-        descendantCID: String
-    ) {
-        self.predecessorCID = predecessorCID
-        self.orphanCID = orphanCID
-        self.descendantCID = descendantCID
-    }
-
-    func admit(_ cid: String) -> NodeAdmissionOutcome {
-        events.append(cid)
-        let requirement: SameChainPredecessorRequirement?
-        if cid == descendantCID, descendantAttempts == 0 {
-            descendantAttempts += 1
-            requirement = SameChainPredecessorRequirement(
-                descendantCID: cid,
-                predecessorCID: orphanCID
-            )
-        } else if cid == orphanCID, orphanAttempts == 0 {
-            orphanAttempts += 1
-            requirement = SameChainPredecessorRequirement(
-                descendantCID: cid,
-                predecessorCID: predecessorCID
-            )
-        } else {
-            requirement = nil
-        }
-        let accepted = requirement == nil
-        return NodeAdmissionOutcome(
-            decision: accepted
-                ? .acceptedSide(ChainCommit(tipHash: cid))
-                : .duplicate,
-            parentCarrierLink: nil,
-            sameChainPredecessor: requirement
-        )
-    }
-
-    func snapshot() -> [String] { events }
-}
-
 private final class AcceptedLeavesPeer: IvyDelegate, Sendable {
     private let acceptedLeafCID: String
 
@@ -201,6 +168,98 @@ private final class TopicRecordingPeer: IvyDelegate, Sendable {
     ) async {
         await recorder.append(message.topic)
     }
+}
+
+private actor InheritedWorkParentPeer: IvyDelegate {
+    private let hello: Data
+    private var responses: [[Data]]
+    private var hellos = 0
+    private var requests: [InheritedWorkRequestMessage] = []
+    private var topics: [String] = []
+
+    init(hello: Data, responses: [[Data]]) {
+        self.hello = hello
+        self.responses = responses
+    }
+
+    func ivy(
+        _ ivy: Ivy,
+        didReceiveMessage message: PeerMessage,
+        from peer: AuthenticatedPeer
+    ) async {
+        if message.topic == NodeNetworkTopic.hierarchyHello {
+            topics.append(message.topic)
+            while true {
+                switch await ivy.sendMessage(
+                    to: peer,
+                    topic: NodeNetworkTopic.hierarchyHello,
+                    payload: hello
+                ) {
+                case .enqueued:
+                    hellos += 1
+                    break
+                case .backpressured:
+                    guard await ivy.waitUntilWritable(to: peer) else { return }
+                    continue
+                case .locallyRejected, .notConnected:
+                    return
+                }
+                break
+            }
+            return
+        }
+        if message.topic == NodeNetworkTopic.childEvidenceIndexRequest,
+           let request = try? ChildEvidenceIndexRequestMessage.decoded(
+                message.payload
+           ),
+           let response = try? ChildEvidenceIndexResponseMessage(
+                requestID: request.requestID,
+                childPath: request.childPath,
+                sourceID: testEvidenceSourceID,
+                cursor: 0,
+                through: 0,
+                entries: [],
+                next: 0
+           ).encoded() {
+            topics.append(message.topic)
+            _ = await ivy.sendMessage(
+                to: peer,
+                topic: NodeNetworkTopic.childEvidenceIndexResponse,
+                payload: response
+            )
+            return
+        }
+        guard message.topic == NodeNetworkTopic.securingWorkRequest,
+              let request = try? InheritedWorkRequestMessage.decoded(
+                message.payload
+              ) else { return }
+        topics.append(message.topic)
+        requests.append(request)
+        guard !responses.isEmpty else { return }
+        let response = responses.removeFirst()
+        for payload in response {
+            while true {
+                switch await ivy.sendMessage(
+                    to: peer,
+                    topic: NodeNetworkTopic.inheritedWorkPush,
+                    payload: payload
+                ) {
+                case .enqueued:
+                    break
+                case .backpressured:
+                    guard await ivy.waitUntilWritable(to: peer) else { return }
+                    continue
+                case .locallyRejected, .notConnected:
+                    return
+                }
+                break
+            }
+        }
+    }
+
+    func receivedRequests() -> [InheritedWorkRequestMessage] { requests }
+    func receivedHelloCount() -> Int { hellos }
+    func receivedTopics() -> [String] { topics }
 }
 
 private final class TransactionTopicRecordingPeer: IvyDelegate, Sendable {
@@ -277,17 +336,20 @@ private struct PortableAttachmentTestPayload: Sendable {
 private actor PortableAttachmentQueuePeer: IvyDelegate, IvyContentSource {
     private let attachments: [PortableAttachmentTestPayload]
     private let firstAdmissionGate: CandidateBuildGate
+    private let portableIndexGate: CandidateBuildGate?
     private var servedAttachments = Set<String>()
 
     init(
         attachments: [PortableAttachmentTestPayload],
-        firstAdmissionGate: CandidateBuildGate
+        firstAdmissionGate: CandidateBuildGate,
+        portableIndexGate: CandidateBuildGate? = nil
     ) {
         self.attachments = attachments.sorted {
             ($0.summary.edgeCID, $0.summary.rootCID)
                 < ($1.summary.edgeCID, $1.summary.rootCID)
         }
         self.firstAdmissionGate = firstAdmissionGate
+        self.portableIndexGate = portableIndexGate
     }
 
     func ivy(
@@ -314,6 +376,28 @@ private actor PortableAttachmentQueuePeer: IvyDelegate, IvyContentSource {
         case NodeNetworkTopic.portableAttachmentIndexRequest:
             guard let request = try? PortableAttachmentIndexRequestMessage
                 .decoded(message.payload) else { return }
+            if let portableIndexGate {
+                Task {
+                    _ = await portableIndexGate.enter()
+                    await self.sendPortablePage(
+                        request,
+                        ivy: ivy,
+                        peer: peer
+                    )
+                }
+                return
+            }
+            await sendPortablePage(request, ivy: ivy, peer: peer)
+        default:
+            break
+        }
+    }
+
+    private func sendPortablePage(
+        _ request: PortableAttachmentIndexRequestMessage,
+        ivy: Ivy,
+        peer: AuthenticatedPeer
+    ) async {
             let remaining = attachments.filter { attachment in
                 guard let cursor = request.after else { return true }
                 return (attachment.summary.edgeCID, attachment.summary.rootCID)
@@ -331,9 +415,6 @@ private actor PortableAttachmentQueuePeer: IvyDelegate, IvyContentSource {
                 topic: NodeNetworkTopic.portableAttachmentIndexResponse,
                 payload: payload
             )
-        default:
-            break
-        }
     }
 
     func content(
@@ -355,9 +436,6 @@ private actor PortableAttachmentQueuePeer: IvyDelegate, IvyContentSource {
                 }
             }
             servedAttachments.insert(rootCID)
-            if servedAttachments.count == 2 {
-                await firstAdmissionGate.release(1)
-            }
         }
         var remaining = maxDataBytes
         var entries: [ContentEntry] = []
@@ -441,9 +519,11 @@ private final class HierarchyRetryPeer: IvyDelegate, Sendable {
             ), let payload = try? ChildEvidenceIndexResponseMessage(
                 requestID: request.requestID,
                 childPath: request.childPath,
-                after: request.after,
+                sourceID: testEvidenceSourceID,
+                cursor: 0,
+                through: summary?.ordinal ?? 0,
                 entries: summary.map { [$0] } ?? [],
-                hasMore: false
+                next: summary?.ordinal ?? 0
             ).encoded() else { return }
             _ = await ivy.sendMessage(
                 to: peer,
@@ -533,7 +613,9 @@ private final class ChildEvidencePeer: IvyDelegate, Sendable {
                   let payload = try? ChildEvidenceIndexRequestMessage(
                     requestID: requestID,
                     childPath: childPath,
-                    after: nil
+                    sourceID: nil,
+                    cursor: 0,
+                    through: nil
                   ).encoded()
             else { return }
             _ = await ivy.sendMessage(
@@ -599,6 +681,10 @@ private actor NetworkTestContentStore: Fetcher, Storer, VolumeStorer, IvyContent
     }
 
     func allEntries() -> [String: Data] { values }
+
+    func serializedVolume(rootCID: String) -> SerializedVolume? {
+        volumes[rootCID]
+    }
 
     func content(
         rootCID: String,
@@ -674,6 +760,40 @@ private struct NetworkTestVolumesSource: IvyContentSource, Sendable {
     }
 }
 
+private actor RecordingNetworkTestVolumesSource: IvyContentSource {
+    private let values: [String: SerializedVolume]
+    private var requestedRoots: [String] = []
+
+    init(_ values: [SerializedVolume]) {
+        self.values = Dictionary(
+            uniqueKeysWithValues: values.map { ($0.root, $0) }
+        )
+    }
+
+    func content(
+        rootCID: String,
+        cids: [String],
+        maxDataBytes: Int
+    ) -> [ContentEntry] {
+        []
+    }
+
+    func volume(
+        rootCID: String,
+        maxDataBytes: Int
+    ) -> [ContentEntry] {
+        requestedRoots.append(rootCID)
+        guard let value = values[rootCID],
+              value.entries.values.reduce(0, { $0 + $1.count })
+                <= maxDataBytes else { return [] }
+        return value.entries.sorted { $0.key < $1.key }.map {
+            ContentEntry(cid: $0.key, data: $0.value)
+        }
+    }
+
+    func requests() -> [String] { requestedRoots }
+}
+
 private actor BlockingNetworkTestVolumeSource: IvyContentSource {
     let value: SerializedVolume
     private var started = false
@@ -737,6 +857,194 @@ private actor CandidateBuildGate {
     }
 }
 
+private final class BlockingProvisionalBroker: VolumeBroker, @unchecked Sendable {
+    let near: (any VolumeBroker)? = nil
+    let far: (any VolumeBroker)? = nil
+    private let backing = MemoryBroker(evictUnpinnedGrace: .zero)
+    private let gate = CandidateBuildGate()
+
+    func waitUntilStoreStarts() async {
+        while await gate.enteredCount() == 0 { await Task.yield() }
+    }
+
+    func releaseStore() async { await gate.release(1) }
+
+    func hasVolume(root: String) async -> Bool {
+        await backing.hasVolume(root: root)
+    }
+
+    func fetchVolumeLocal(root: String) async -> SerializedVolume? {
+        await backing.fetchVolumeLocal(root: root)
+    }
+
+    func fetchDataLocal(cid: String) async -> Data? {
+        await backing.fetchDataLocal(cid: cid)
+    }
+
+    func fetchDataLocal(cids: Set<String>) async -> [String: Data] {
+        await backing.fetchDataLocal(cids: cids)
+    }
+
+    func storeVolumesLocal(_ volumes: [SerializedVolume]) async throws {
+        _ = await gate.enter()
+        try await backing.storeVolumesLocal(volumes)
+    }
+
+    func pin(
+        root: String,
+        owner: String,
+        count: Int,
+        ttl: Duration?
+    ) async throws {
+        try await backing.pin(root: root, owner: owner, count: count, ttl: ttl)
+    }
+
+    func unpin(root: String, owner: String, count: Int) async throws {
+        try await backing.unpin(root: root, owner: owner, count: count)
+    }
+
+    func unpinAll(owner: String) async throws {
+        try await backing.unpinAll(owner: owner)
+    }
+
+    func owners(root: String) async -> Set<String> {
+        await backing.owners(root: root)
+    }
+
+    func evictUnpinned() async throws -> Int {
+        try await backing.evictUnpinned()
+    }
+}
+
+private actor CandidateReservationAckGate {
+    private let apply: @Sendable ([String]) async -> Bool
+    private var snapshots: [[String]] = []
+    private var rejections: [[String]] = []
+    private var holdAnyNonempty = true
+    private var heldCandidateCIDs: Set<String>?
+    private var blocking = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    init(apply: @escaping @Sendable ([String]) async -> Bool) {
+        self.apply = apply
+    }
+
+    func handle(_ candidateCIDs: [String]) async -> Bool {
+        snapshots.append(candidateCIDs)
+        let shouldBlock = !blocking && (
+            holdAnyNonempty && !candidateCIDs.isEmpty
+                || heldCandidateCIDs == Set(candidateCIDs)
+        )
+        if shouldBlock {
+            blocking = true
+            await withCheckedContinuation { waiters.append($0) }
+        }
+        let result = await apply(candidateCIDs)
+        if !result {
+            rejections.append(candidateCIDs)
+        }
+        return result
+    }
+
+    func snapshot() -> [[String]] { snapshots }
+    func rejectionSnapshot() -> [[String]] { rejections }
+
+    func holdNext(_ candidateCIDs: Set<String>) {
+        precondition(waiters.isEmpty)
+        holdAnyNonempty = false
+        heldCandidateCIDs = candidateCIDs
+        blocking = false
+    }
+
+    func holdNextNonempty() {
+        precondition(waiters.isEmpty)
+        holdAnyNonempty = true
+        heldCandidateCIDs = nil
+        blocking = false
+    }
+
+    func release() {
+        holdAnyNonempty = false
+        heldCandidateCIDs = nil
+        let current = waiters
+        waiters.removeAll()
+        for waiter in current { waiter.resume() }
+    }
+}
+
+private actor IssuedCandidateSet {
+    private var candidateCIDs: Set<String> = []
+
+    func replace(with candidateCIDs: [String]) -> Bool {
+        self.candidateCIDs = Set(candidateCIDs)
+        return true
+    }
+
+    func snapshot() -> Set<String> { candidateCIDs }
+}
+
+private actor HierarchyVolumeProbe: IvyDelegate, IvyContentSource {
+    private let hello: Data
+    private var helloCount = 0
+    private var volumeRequests = 0
+
+    init(hello: Data) {
+        self.hello = hello
+    }
+
+    func ivy(
+        _ ivy: Ivy,
+        didReceiveMessage message: PeerMessage,
+        from peer: AuthenticatedPeer
+    ) async {
+        switch message.topic {
+        case NodeNetworkTopic.hierarchyHello:
+            helloCount += 1
+            _ = await ivy.sendMessage(
+                to: peer,
+                topic: NodeNetworkTopic.hierarchyHello,
+                payload: hello
+            )
+        case NodeNetworkTopic.childEvidenceIndexRequest:
+            guard let request = try? ChildEvidenceIndexRequestMessage.decoded(
+                message.payload
+            ), let response = try? ChildEvidenceIndexResponseMessage(
+                requestID: request.requestID,
+                childPath: request.childPath,
+                sourceID: testEvidenceSourceID,
+                cursor: 0,
+                through: 0,
+                entries: [],
+                next: 0
+            ).encoded() else { return }
+            _ = await ivy.sendMessage(
+                to: peer,
+                topic: NodeNetworkTopic.childEvidenceIndexResponse,
+                payload: response
+            )
+        default:
+            break
+        }
+    }
+
+    func content(
+        rootCID: String,
+        cids: [String],
+        maxDataBytes: Int
+    ) -> [ContentEntry] {
+        []
+    }
+
+    func volume(rootCID: String, maxDataBytes: Int) -> [ContentEntry] {
+        volumeRequests += 1
+        return []
+    }
+
+    func didReceiveHello() -> Bool { helloCount > 0 }
+    func resetVolumeRequests() { volumeRequests = 0 }
+    func volumeRequestCount() -> Int { volumeRequests }
+}
+
 private struct NetworkChildGenesisCandidate {
     let header: BlockHeader
     let package: AuthenticatedChildPackage
@@ -751,25 +1059,28 @@ private struct NetworkHierarchyBranch {
 }
 
 private struct ProvisionalRootFixture {
+    let childConfiguration: NodeConfiguration
     let parentRuntime: NodeNetworkRuntime
     let childRuntime: NodeNetworkRuntime
     let parentProcess: ChainProcess
     let childProcess: ChainProcess
     let context: ChildCandidateRequestContext
     let candidate: DirectChildCandidate
-    let rootCID: String
-    let nestedCID: String
-    let nestedData: Data
 }
 
 private enum NetworkTransportTestPorts {
+    private static let sliceSize = 256
     private static let lock = NSLock()
+    private static let sliceStart =
+        20_000
+        + (Int(ProcessInfo.processInfo.processIdentifier) % 128) * sliceSize
     private nonisolated(unsafe) static var next = UInt16(
-        30_000 + ProcessInfo.processInfo.processIdentifier % 10_000
+        sliceStart
     )
 
     static func allocate() -> UInt16 {
         lock.withLock {
+            precondition(Int(next) + 1 < sliceStart + sliceSize)
             next += 1
             return next
         }
@@ -779,8 +1090,8 @@ private enum NetworkTransportTestPorts {
 final class NetworkTrustTests: XCTestCase {
     private let nexusCID = "bafyreiaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     private let minimumRootWork = String(repeating: "0", count: 63) + "1"
-    private static let fixtureParentWorkAuthorityKey = ParentWorkAuthorityKey(
-        String(repeating: "a", count: ParentWorkAuthorityKey.encodedByteCount)
+    private static let fixtureParentProcessKey = ParentProcessKey(
+        String(repeating: "a", count: ParentProcessKey.encodedByteCount)
     )!
 
     private func overlayRuntime(
@@ -838,8 +1149,7 @@ final class NetworkTrustTests: XCTestCase {
             )
         )
         let process = try await ChainProcess.open(
-            configuration: configuration,
-            remoteSource: runtime.remoteContentSource
+            configuration: configuration
         )
         let peerID = PeerID(publicKey: configuration.processPublicKey)
         return (
@@ -853,8 +1163,7 @@ final class NetworkTrustTests: XCTestCase {
             ),
             try ChainHello(
                 nexusGenesisCID: configuration.nexusGenesisCID,
-                chainPath: configuration.chainPath,
-                minimumRootWorkHex: configuration.minimumRootWork.toHexString()
+                chainPath: configuration.chainPath
             ).encode()
         )
     }
@@ -881,23 +1190,23 @@ final class NetworkTrustTests: XCTestCase {
         }
     }
 
-    func testChainHelloPinsNexusPathAndWorkFloor() throws {
+    func testChainHelloPinsProtocolIdentityButNotLocalWorkFloor() throws {
         let hello = ChainHello(
             nexusGenesisCID: nexusCID,
-            chainPath: ["Nexus"],
-            minimumRootWorkHex: minimumRootWork
+            chainPath: ["Nexus"]
         )
-        let decoded = try ChainHello.decode(hello.encode())
+        let encoded = try hello.encode()
+        XCTAssertFalse(String(decoding: encoded, as: UTF8.self)
+            .contains("minimumRootWork"))
+        let decoded = try ChainHello.decode(encoded)
         XCTAssertNoThrow(try decoded.validateCompatibility(
             expectedNexusGenesisCID: nexusCID,
-            expectedChainPath: ["Nexus"],
-            expectedMinimumRootWorkHex: minimumRootWork
+            expectedChainPath: ["Nexus"]
         ))
 
         XCTAssertThrowsError(try decoded.validateCompatibility(
             expectedNexusGenesisCID: "different-nexus",
-            expectedChainPath: ["Nexus"],
-            expectedMinimumRootWorkHex: minimumRootWork
+            expectedChainPath: ["Nexus"]
         )) { error in
             XCTAssertEqual(error as? ChainHelloError, .wrongNexusGenesis)
         }
@@ -913,8 +1222,7 @@ final class NetworkTrustTests: XCTestCase {
         )
         XCTAssertThrowsError(try legacy.validateCompatibility(
             expectedNexusGenesisCID: nexusCID,
-            expectedChainPath: ["Nexus"],
-            expectedMinimumRootWorkHex: minimumRootWork
+            expectedChainPath: ["Nexus"]
         )) { error in
             XCTAssertEqual(error as? ChainHelloError, .incompatibleProtocol)
         }
@@ -942,6 +1250,15 @@ final class NetworkTrustTests: XCTestCase {
         var trailing = encoded
         trailing.append(0)
         XCTAssertThrowsError(try ChildValidationPackageEnvelope.decode(trailing))
+        XCTAssertThrowsError(try ChildValidationPackageEnvelope.decode(
+            encoded,
+            maximumEncodedSize: encoded.count - 1
+        )) { error in
+            XCTAssertEqual(
+                error as? ChildValidationPackageEnvelopeError,
+                .oversized
+            )
+        }
 
         XCTAssertThrowsError(try ChildValidationPackageEnvelope.decode(
             Data(repeating: 0, count: ChildValidationPackageEnvelope.maximumEncodedSize + 1)
@@ -1171,11 +1488,9 @@ final class NetworkTrustTests: XCTestCase {
                 port: 4002
             )
         )
-        let work = configuration.minimumRootWork.toHexString()
         let parentHello = ChainHello(
             nexusGenesisCID: configuration.nexusGenesisCID,
-            chainPath: ["Nexus"],
-            minimumRootWorkHex: work
+            chainPath: ["Nexus"]
         )
         XCTAssertEqual(
             NodeNetworkRuntime.hierarchyRole(
@@ -1194,8 +1509,7 @@ final class NetworkTrustTests: XCTestCase {
         let childPath = ["Nexus", "Payments", "Receipts"]
         let childHello = ChainHello(
             nexusGenesisCID: configuration.nexusGenesisCID,
-            chainPath: childPath,
-            minimumRootWorkHex: work
+            chainPath: childPath
         )
         XCTAssertEqual(
             NodeNetworkRuntime.hierarchyRole(
@@ -1208,8 +1522,7 @@ final class NetworkTrustTests: XCTestCase {
         XCTAssertNil(NodeNetworkRuntime.hierarchyRole(
             for: ChainHello(
                 nexusGenesisCID: configuration.nexusGenesisCID,
-                chainPath: ["Nexus", "Other", "Receipts"],
-                minimumRootWorkHex: work
+                chainPath: ["Nexus", "Other", "Receipts"]
             ),
             peerKey: peerKey(other).hex,
             configuration: configuration
@@ -1263,11 +1576,9 @@ final class NetworkTrustTests: XCTestCase {
             )
         }
 
-        let unscoped = await source.fetch([rootCID])
-        XCTAssertTrue(unscoped.isEmpty)
-        let result = await source.withRootTracing(rootCID) {
-            let root = await source.fetch([rootCID])
-            let descendants = await source.fetch([leftCID, rightCID])
+        let result = await source.withRootTracing(rootCID) { session in
+            let root = await session.fetch([rootCID])
+            let descendants = await session.fetch([leftCID, rightCID])
             return (root, descendants)
         }
 
@@ -1280,6 +1591,158 @@ final class NetworkTrustTests: XCTestCase {
         XCTAssertTrue(result.attribution.allResponsesComplete)
         let requests = await recorder.snapshot()
         XCTAssertEqual(requests, [rootCID])
+    }
+
+    func testRootScopedContentBoundsAllRetainedMembers() async {
+        let root = try! HeaderImpl<PublicKey>(node: PublicKey(key: "root"))
+        let padding = try! HeaderImpl<PublicKey>(node: PublicKey(key: "padding"))
+        let nested = try! HeaderImpl<PublicKey>(node: PublicKey(key: "nested"))
+        let rootEntries = [
+            root.rawCID: try! root.mapToData(),
+            padding.rawCID: try! padding.mapToData(),
+        ]
+        let nestedEntries = [nested.rawCID: try! nested.mapToData()]
+        let source = IvyRootContentSource(
+            maximumMembers: rootEntries.count,
+            maximumStorageBytes: .max
+        ) { requested in
+            AttributedVolumeResponse(
+                rootCID: requested,
+                entries: requested == root.rawCID ? rootEntries : nestedEntries,
+                servedBy: nil
+            )
+        }
+
+        let result = await source.withRootTracing(root.rawCID) { session in
+            let rootData = await session.fetch([root.rawCID])
+            let nestedData = await session.fetch([nested.rawCID])
+            return (rootData, nestedData)
+        }
+
+        XCTAssertEqual(result.value.0, [root.rawCID: rootEntries[root.rawCID]!])
+        XCTAssertTrue(result.value.1.isEmpty)
+        XCTAssertFalse(result.attribution.allResponsesComplete)
+    }
+
+    func testRootScopedContentBoundsAllRetainedStorage() async {
+        let root = try! HeaderImpl<PublicKey>(node: PublicKey(key: "root"))
+        let nested = try! HeaderImpl<PublicKey>(node: PublicKey(key: "nested"))
+        let rootData = try! root.mapToData()
+        let nestedData = try! nested.mapToData()
+        let rootStorageBytes = root.rawCID.utf8.count + rootData.count + 6
+        let source = IvyRootContentSource(
+            maximumMembers: .max,
+            maximumStorageBytes: rootStorageBytes
+        ) { requested in
+            AttributedVolumeResponse(
+                rootCID: requested,
+                entries: requested == root.rawCID
+                    ? [root.rawCID: rootData]
+                    : [nested.rawCID: nestedData],
+                servedBy: nil
+            )
+        }
+
+        let result = await source.withRootTracing(root.rawCID) { session in
+            let rootResult = await session.fetch([root.rawCID])
+            let nestedResult = await session.fetch([nested.rawCID])
+            return (rootResult, nestedResult)
+        }
+
+        XCTAssertEqual(result.value.0, [root.rawCID: rootData])
+        XCTAssertTrue(result.value.1.isEmpty)
+        XCTAssertFalse(result.attribution.allResponsesComplete)
+    }
+
+    func testRootScopedContentAttributesLocalCapacityWithoutBlamingPeer() async {
+        let root = try! HeaderImpl<PublicKey>(node: PublicKey(key: "root"))
+        let source = IvyRootContentSource { _ in .localCapacityUnavailable }
+
+        let result = await source.withRootTracing(root.rawCID) { session in
+            await session.fetch([root.rawCID])
+        }
+
+        XCTAssertTrue(result.value.isEmpty)
+        XCTAssertFalse(result.attribution.allResponsesComplete)
+        XCTAssertTrue(result.attribution.localCapacityUnavailable)
+        XCTAssertFalse(result.attribution.contentUnavailable)
+        XCTAssertTrue(result.attribution.servedByPublicKeys.isEmpty)
+        XCTAssertNil(result.attribution.soleRemoteSupplierPublicKey)
+    }
+
+    func testRootScopedContentRecordsTransientUnavailableVolume() async {
+        let root = try! HeaderImpl<PublicKey>(node: PublicKey(key: "root"))
+        let missing = try! HeaderImpl<PublicKey>(node: PublicKey(key: "missing"))
+        let rootData = try! root.mapToData()
+        let source = IvyRootContentSource { requested in
+            requested == root.rawCID
+                ? AttributedVolumeResponse(
+                    rootCID: root.rawCID,
+                    entries: [root.rawCID: rootData],
+                    servedBy: nil
+                )
+                : .empty
+        }
+
+        let result = await source.withRootTracing(root.rawCID) { session in
+            _ = await session.fetch([root.rawCID])
+            return await session.fetch([missing.rawCID])
+        }
+
+        XCTAssertTrue(result.value.isEmpty)
+        XCTAssertFalse(result.attribution.allResponsesComplete)
+        XCTAssertFalse(result.attribution.localCapacityUnavailable)
+        XCTAssertTrue(result.attribution.contentUnavailable)
+    }
+
+    func testRootScopedContentAttributesMalformedVolumeToItsSupplier() async {
+        let root = try! HeaderImpl<PublicKey>(node: PublicKey(key: "root"))
+        let supplier = peerKey(signingKey(0x44)).hex
+        let source = IvyRootContentSource { requested in
+            AttributedVolumeResponse(
+                rootCID: requested,
+                entries: [requested: Data([0])],
+                servedBy: PeerID(publicKey: supplier)
+            )
+        }
+
+        let result = await source.withRootTracing(root.rawCID) { session in
+            await session.fetch([root.rawCID])
+        }
+
+        XCTAssertTrue(result.value.isEmpty)
+        XCTAssertEqual(
+            result.attribution.deficientVolumeSuppliers,
+            [root.rawCID: [supplier]]
+        )
+    }
+
+    func testExactPeerSourcePreservesLocalFailuresBeforeAttribution() {
+        let expected = PeerID(publicKey: "expected")
+        let other = PeerID(publicKey: "other")
+        XCTAssertEqual(
+            IvyRootContentSource.response(.localCapacityUnavailable, from: expected),
+            .localCapacityUnavailable
+        )
+        let callerBound = AttributedVolumeResponse(
+            rootCID: "",
+            entries: [:],
+            servedBy: nil,
+            failure: .callerBoundaryExceeded
+        )
+        XCTAssertEqual(
+            IvyRootContentSource.response(callerBound, from: expected),
+            callerBound
+        )
+        let wrongPeer = AttributedVolumeResponse(
+            rootCID: "root",
+            entries: ["root": Data([1])],
+            servedBy: other
+        )
+        XCTAssertEqual(
+            IvyRootContentSource.response(wrongPeer, from: expected),
+            .empty
+        )
     }
 
     func testEvidenceMergeAccumulatesCarrierAndGenesisWithoutAlternating() throws {
@@ -1313,26 +1776,31 @@ final class NetworkTrustTests: XCTestCase {
     func testEvidenceIndexPagesAreCanonicalAndCursorBound() throws {
         let summaries = [
             IssuedChildEvidenceSummary(
+                ordinal: 1,
                 childCID: inheritedWorkCID("child-a"),
                 rootCID: inheritedWorkCID("root-a"),
                 attachmentCID: inheritedWorkCID("attachment-a")
             ),
             IssuedChildEvidenceSummary(
+                ordinal: 2,
                 childCID: inheritedWorkCID("child-b"),
                 rootCID: inheritedWorkCID("root-a"),
                 attachmentCID: inheritedWorkCID("attachment-b")
             ),
             IssuedChildEvidenceSummary(
+                ordinal: 3,
                 childCID: inheritedWorkCID("child-b"),
                 rootCID: inheritedWorkCID("root-b"),
                 attachmentCID: inheritedWorkCID("attachment-c")
             ),
-        ].sorted { ($0.childCID, $0.rootCID) < ($1.childCID, $1.rootCID) }
+        ]
         let cursor = summaries[0]
         let request = ChildEvidenceIndexRequestMessage(
             requestID: 9,
             childPath: ["Nexus", "Payments"],
-            after: cursor
+            sourceID: testEvidenceSourceID,
+            cursor: cursor.ordinal,
+            through: 3
         )
         XCTAssertEqual(
             try ChildEvidenceIndexRequestMessage.decoded(request.encoded()),
@@ -1342,9 +1810,11 @@ final class NetworkTrustTests: XCTestCase {
         let response = ChildEvidenceIndexResponseMessage(
             requestID: 9,
             childPath: ["Nexus", "Payments"],
-            after: cursor,
+            sourceID: testEvidenceSourceID,
+            cursor: cursor.ordinal,
+            through: 3,
             entries: entries,
-            hasMore: true
+            next: 3
         )
         XCTAssertEqual(
             try ChildEvidenceIndexResponseMessage.decoded(response.encoded()),
@@ -1353,16 +1823,20 @@ final class NetworkTrustTests: XCTestCase {
         XCTAssertThrowsError(try ChildEvidenceIndexResponseMessage(
             requestID: 9,
             childPath: ["Nexus", "Payments"],
-            after: cursor,
+            sourceID: testEvidenceSourceID,
+            cursor: cursor.ordinal,
+            through: 3,
             entries: Array(response.entries.reversed()),
-            hasMore: false
+            next: 3
         ).encoded())
         XCTAssertThrowsError(try ChildEvidenceIndexResponseMessage(
             requestID: 9,
             childPath: ["Nexus", "Payments"],
-            after: cursor,
+            sourceID: testEvidenceSourceID,
+            cursor: cursor.ordinal,
+            through: 3,
             entries: [],
-            hasMore: true
+            next: 2
         ).encoded())
     }
 
@@ -1446,13 +1920,15 @@ final class NetworkTrustTests: XCTestCase {
             parentCID: parentCID,
             childCID: parentCID,
             blockData: parentData,
-            acquisitionEntries: [parentCID: parentData]
+            searchWitness: nil,
+            deploymentWitness: nil
         )
         let decodedResponse = try ChildCandidateResponseMessage.decoded(
             response.encoded()
         )
         XCTAssertEqual(decodedResponse.parentCID, parentCID)
-        XCTAssertEqual(decodedResponse.acquisitionEntries[parentCID], parentData)
+        XCTAssertNil(decodedResponse.searchWitness)
+        XCTAssertNil(decodedResponse.deploymentWitness)
 
         var forgedTarget = try response.encoded()
         let targetOffset = 8 + 2
@@ -1481,42 +1957,159 @@ final class NetworkTrustTests: XCTestCase {
         ).encoded())
     }
 
-    func testCandidateAndEvidencePackagesRejectMissingMismatchedAndOversizedContent() async throws {
+    func testCandidateWireRejectsMismatchedAndOversizedContent() async throws {
         let block = try await canonicalNetworkBlock()
         let childCID = try BlockHeader(node: block).rawCID
         let blockData = try XCTUnwrap(block.toData())
-        func candidate(_ entries: [String: Data]) -> ChildCandidateResponseMessage {
+        func candidate(_ data: Data) -> ChildCandidateResponseMessage {
             ChildCandidateResponseMessage(
                 requestID: 19,
                 childPath: ["Nexus", "Payments"],
                 parentCID: childCID,
                 childCID: childCID,
-                blockData: blockData,
-                acquisitionEntries: entries
+                blockData: data,
+                searchWitness: nil,
+                deploymentWitness: nil
             )
         }
 
-        XCTAssertThrowsError(try candidate([:]).encoded())
-        XCTAssertThrowsError(try candidate([
-            childCID: blockData + Data([0]),
-        ]).encoded())
-        let oversizedEntries = [
-            childCID: blockData,
-            "extra": Data(
-                repeating: 0,
-                count: ChildAcquisitionPackage.maximumBytes
-            ),
-        ]
-        XCTAssertThrowsError(try candidate(oversizedEntries).encoded())
+        XCTAssertThrowsError(try candidate(blockData + Data([0])).encoded())
+        XCTAssertThrowsError(try candidate(
+            Data(repeating: 0, count: Int(IvyConfig.protocolMaxFrameSize))
+        ).encoded())
 
         XCTAssertThrowsError(try ChildEvidenceAvailableMessage(
             childPath: ["Nexus", "Payments"],
+            sourceID: testEvidenceSourceID,
+            ordinal: 1,
             childCID: childCID,
             rootCID: childCID,
             attachmentCID: "not-a-cid"
         ).encoded()) { error in
             XCTAssertEqual(error as? NodeNetworkWireError, .malformed)
         }
+    }
+
+    func testCandidateWireCanonicalizesSharedSchedulingWitness() async throws {
+        let source = NetworkTestContentStore()
+        try await LatticeState.emptyHeader.storeRecursively(
+            storer: source as any Storer
+        )
+        let child = try await BlockBuilder.buildChildGenesis(
+            spec: NexusGenesis.spec,
+            parentState: LatticeState.emptyHeader,
+            timestamp: 1,
+            target: .max,
+            fetcher: source
+        )
+        let carrier = try await BlockBuilder.buildGenesis(
+            spec: NexusGenesis.spec,
+            children: ["Payments": child],
+            timestamp: 2,
+            target: .max,
+            fetcher: source
+        )
+        let carrierHeader = try BlockHeader(node: carrier)
+        let childCID = try BlockHeader(node: child).rawCID
+        let witness = ChildSchedulingWitness(
+            proof: try await ChildBlockProof.generate(
+                rootHeader: carrierHeader,
+                childDirectory: "Payments",
+                fetcher: source
+            ),
+            terminal: child
+        )
+        let message = ChildCandidateResponseMessage(
+            requestID: 20,
+            childPath: ["Nexus", "Payments"],
+            parentCID: carrierHeader.rawCID,
+            childCID: carrierHeader.rawCID,
+            blockData: try XCTUnwrap(carrier.toData()),
+            searchWitness: witness,
+            deploymentWitness: witness
+        )
+
+        let decoded = try ChildCandidateResponseMessage.decoded(message.encoded())
+        XCTAssertEqual(
+            try decoded.searchWitness?.proof.serialize(),
+            try witness.proof.serialize()
+        )
+        XCTAssertEqual(
+            try decoded.deploymentWitness?.proof.serialize(),
+            try witness.proof.serialize()
+        )
+        XCTAssertEqual(
+            try BlockHeader(node: decoded.searchWitness!.terminal).rawCID,
+            childCID
+        )
+
+        XCTAssertThrowsError(try ChildCandidateResponseMessage(
+            requestID: 21,
+            childPath: ["Nexus", "Payments"],
+            parentCID: carrierHeader.rawCID,
+            childCID: carrierHeader.rawCID,
+            blockData: try XCTUnwrap(carrier.toData()),
+            searchWitness: witness,
+            deploymentWitness: ChildSchedulingWitness(
+                proof: witness.proof,
+                terminal: carrier
+            )
+        ).encoded())
+    }
+
+    func testCandidateWireAllowsContextualPathsToTheSameTerminal() async throws {
+        let source = NetworkTestContentStore()
+        try await LatticeState.emptyHeader.storeRecursively(
+            storer: source as any Storer
+        )
+        let child = try await BlockBuilder.buildChildGenesis(
+            spec: NexusGenesis.spec,
+            parentState: LatticeState.emptyHeader,
+            timestamp: 1,
+            target: .max,
+            fetcher: source
+        )
+        let carrier = try await BlockBuilder.buildGenesis(
+            spec: NexusGenesis.spec,
+            children: ["Alpha": child, "Beta": child],
+            timestamp: 2,
+            target: .max,
+            fetcher: source
+        )
+        let carrierHeader = try BlockHeader(node: carrier)
+        let alpha = ChildSchedulingWitness(
+            proof: try await ChildBlockProof.generate(
+                rootHeader: carrierHeader,
+                childDirectory: "Alpha",
+                fetcher: source
+            ),
+            terminal: child
+        )
+        let beta = ChildSchedulingWitness(
+            proof: try await ChildBlockProof.generate(
+                rootHeader: carrierHeader,
+                childDirectory: "Beta",
+                fetcher: source
+            ),
+            terminal: child
+        )
+        let message = ChildCandidateResponseMessage(
+            requestID: 22,
+            childPath: ["Nexus", "Alpha"],
+            parentCID: carrierHeader.rawCID,
+            childCID: carrierHeader.rawCID,
+            blockData: try XCTUnwrap(carrier.toData()),
+            searchWitness: alpha,
+            deploymentWitness: beta
+        )
+
+        let decoded = try ChildCandidateResponseMessage.decoded(message.encoded())
+        XCTAssertEqual(decoded.searchWitness?.proof.directoryPath, ["Alpha"])
+        XCTAssertEqual(decoded.deploymentWitness?.proof.directoryPath, ["Beta"])
+        XCTAssertEqual(
+            try BlockHeader(node: decoded.searchWitness!.terminal).rawCID,
+            try BlockHeader(node: decoded.deploymentWitness!.terminal).rawCID
+        )
     }
 
     func testCandidateRequestEnforcesRewardAndActualFrameBounds() async throws {
@@ -1575,32 +2168,66 @@ final class NetworkTrustTests: XCTestCase {
         XCTAssertTrue(slots.allSatisfy { $0.peer == 0 })
     }
 
-    func testCandidateInboxIsBoundedFIFOAndDeduplicated() throws {
-        var inbox = CandidateInbox()
-        XCTAssertTrue(inbox.enqueue("first"))
-        XCTAssertTrue(inbox.enqueue("second"))
-        XCTAssertTrue(inbox.enqueue("first"))
-        XCTAssertEqual(try XCTUnwrap(inbox.dequeue()), "first")
-        XCTAssertEqual(try XCTUnwrap(inbox.dequeue()), "second")
-        XCTAssertNil(inbox.dequeue())
+    func testCandidateAcquirerIsBoundedFIFOAndDeduplicated() throws {
+        var acquirer = CandidateAcquirer()
+        XCTAssertTrue(acquirer.observe(.init(
+            blockCID: "first",
+            package: nil
+        )).accepted)
+        XCTAssertTrue(acquirer.observe(.init(
+            blockCID: "second",
+            package: nil
+        )).accepted)
+        XCTAssertTrue(acquirer.observe(.init(
+            blockCID: "first",
+            package: nil
+        )).accepted)
+        let first = try XCTUnwrap(acquirer.next())
+        XCTAssertEqual(first.blockCID, "first")
+        XCTAssertTrue(acquirer.complete(
+            first.ticket,
+            resolution: .terminal
+        ))
+        let second = try XCTUnwrap(acquirer.next())
+        XCTAssertEqual(second.blockCID, "second")
+        XCTAssertTrue(acquirer.complete(
+            second.ticket,
+            resolution: .terminal
+        ))
+        XCTAssertNil(acquirer.next())
 
-        for index in 0..<CandidateInbox.capacity {
-            XCTAssertTrue(inbox.enqueue("cid-\(index)"))
+        for index in 0..<CandidateAcquirer.readyCapacity {
+            XCTAssertTrue(acquirer.observe(.init(
+                blockCID: "cid-\(index)",
+                package: nil
+            )).accepted)
         }
-        XCTAssertFalse(inbox.enqueue("overflow"))
+        XCTAssertFalse(acquirer.observe(.init(
+            blockCID: "overflow",
+            package: nil
+        )).accepted)
     }
 
-    func testCandidateInboxReservesOneAcceptedLeafPage() {
-        var inbox = CandidateInbox()
+    func testCandidateAcquirerReservesOneAcceptedLeafPage() {
+        var acquirer = CandidateAcquirer()
         let pageSize = AcceptedLeavesResponseMessage.maximumLeaves
-        for index in 0..<(CandidateInbox.capacity - pageSize) {
-            XCTAssertTrue(inbox.enqueue("cid-\(index)"))
+        for index in 0..<(CandidateAcquirer.readyCapacity - pageSize) {
+            XCTAssertTrue(acquirer.observe(.init(
+                blockCID: "cid-\(index)",
+                package: nil
+            )).accepted)
         }
-        XCTAssertTrue(inbox.reserveAcceptedLeafPage())
-        XCTAssertFalse(inbox.reserveAcceptedLeafPage())
-        XCTAssertFalse(inbox.enqueue("gossip-overflow"))
-        inbox.releaseAcceptedLeafPage()
-        XCTAssertTrue(inbox.enqueue("next"))
+        XCTAssertTrue(acquirer.reserveAcceptedLeafPage(pageSize))
+        XCTAssertFalse(acquirer.reserveAcceptedLeafPage(pageSize))
+        XCTAssertFalse(acquirer.observe(.init(
+            blockCID: "gossip-overflow",
+            package: nil
+        )).accepted)
+        acquirer.releaseAcceptedLeafPage(pageSize)
+        XCTAssertTrue(acquirer.observe(.init(
+            blockCID: "next",
+            package: nil
+        )).accepted)
     }
 
     func testInheritedWorkFragmentsFitTheirWireBudgetAndMergeOutOfOrder() throws {
@@ -1684,13 +2311,7 @@ final class NetworkTrustTests: XCTestCase {
             ]
         )
 
-        for snapshot in [
-            emptyMeasure,
-            emptyGrind,
-            zeroWork,
-            alternateCIDSpelling,
-            alternateBlockCIDSpelling,
-        ] {
+        for snapshot in [emptyMeasure, emptyGrind, zeroWork] {
             let message = InheritedWorkPushMessage(
                 snapshot: snapshot
             )
@@ -1699,13 +2320,56 @@ final class NetworkTrustTests: XCTestCase {
             }
         }
         for snapshot in [alternateCIDSpelling, alternateBlockCIDSpelling] {
-            let inboundPayload = try _canonicalJSONEncode(InheritedWorkPushMessage(
-                snapshot: snapshot
-            ))
-            XCTAssertThrowsError(try InheritedWorkPushMessage.decoded(inboundPayload)) { error in
-                XCTAssertEqual(error as? NodeNetworkWireError, .malformed)
-            }
+            let message = InheritedWorkPushMessage(snapshot: snapshot)
+            let decoded = try InheritedWorkPushMessage.decoded(message.encoded())
+            XCTAssertEqual(decoded, message)
+            XCTAssertEqual(decoded.snapshot.blockCIDs, [canonicalCID])
         }
+    }
+
+    func testInheritedWorkCursorMetadataIsCanonicalAndStableAcrossFragments()
+        throws {
+        let sourceID = UUID().uuidString.lowercased()
+        let request = InheritedWorkRequestMessage(
+            sourceID: sourceID,
+            revision: 4
+        )
+        XCTAssertEqual(
+            try InheritedWorkRequestMessage.decoded(request.encoded()),
+            request
+        )
+        XCTAssertThrowsError(try InheritedWorkRequestMessage(
+            sourceID: sourceID,
+            revision: nil
+        ).encoded())
+
+        let snapshot = InheritedWorkSnapshot(
+            revision: 7,
+            workByBlock: [
+                inheritedWorkCID("metadata-block"): WorkMeasure(
+                    contribution(id: inheritedWorkCID("metadata-grind"), work: 1)
+                ),
+            ]
+        )
+        let payloads = try XCTUnwrap(
+            NodeNetworkRuntime.inheritedWorkPushPayloads(
+                snapshot: snapshot,
+                sourceID: sourceID,
+                baseRevision: 4
+            )
+        )
+        let messages = try payloads.map(InheritedWorkPushMessage.decoded)
+        XCTAssertTrue(messages.allSatisfy {
+            $0.sourceID == sourceID && $0.baseRevision == 4
+        })
+
+        var assembler = ParentWorkAssembler(sessionID: Data([0x7f]))
+        XCTAssertNotNil(assembler.ingest(try XCTUnwrap(messages.first)))
+        XCTAssertNil(assembler.ingest(InheritedWorkPushMessage(
+            sourceID: UUID().uuidString.lowercased(),
+            baseRevision: 4,
+            snapshot: InheritedWorkSnapshot(revision: 7, facts: [])
+        )))
     }
 
     func testInheritedWorkStreamEndsWithAnEmptySessionCompletionMarker() throws {
@@ -1837,7 +2501,57 @@ final class NetworkTrustTests: XCTestCase {
         XCTAssertEqual(assembler.completedRevision, revision)
     }
 
-    func testAwaitingParentPublicBoundarySuppressesConsensusTrafficButKeepsProofs()
+    func testParentWorkAssemblerCollapsesDuplicateFragments() {
+        let snapshot = InheritedWorkSnapshot(
+            revision: 8,
+            workByBlock: [
+                inheritedWorkCID("duplicate-block"): WorkMeasure(
+                    contribution(
+                        id: inheritedWorkCID("duplicate-grind"),
+                        work: 3
+                    )
+                ),
+            ]
+        )
+        var assembler = ParentWorkAssembler(sessionID: Data([5]))
+
+        for _ in 0..<10_000 {
+            guard case .pending? = assembler.ingest(snapshot) else {
+                return XCTFail("duplicate fragment was rejected")
+            }
+        }
+        guard case .completed(let completed)? = assembler.ingest(
+            InheritedWorkSnapshot(revision: 8, facts: [])
+        ) else {
+            return XCTFail("duplicate pass did not complete")
+        }
+        XCTAssertEqual(completed, snapshot)
+    }
+
+    func testParentWorkAssemblerStreamsHighCardinalityPass() {
+        var assembler = ParentWorkAssembler(sessionID: Data([6]))
+        for index in 0..<2_048 {
+            let fragment = InheritedWorkSnapshot(
+                revision: 9,
+                facts: [InheritedWorkFact(
+                    blockCID: inheritedWorkCID("stream-block-\(index)"),
+                    grindID: inheritedWorkCID("stream-grind-\(index)"),
+                    work: UInt256(UInt64(index + 1))
+                )!]
+            )
+            guard case .pending? = assembler.ingest(fragment) else {
+                return XCTFail("stream fragment \(index) was rejected")
+            }
+        }
+        guard case .completed(let completed)? = assembler.ingest(
+            InheritedWorkSnapshot(revision: 9, facts: [])
+        ) else {
+            return XCTFail("streamed pass did not complete")
+        }
+        XCTAssertEqual(completed.facts.count, 2_048)
+    }
+
+    func testAwaitingParentPublicBoundarySuppressesConsensusTrafficAndUnstoredProofs()
         async throws
     {
         let storage = FileManager.default.temporaryDirectory.appendingPathComponent(
@@ -1864,13 +2578,8 @@ final class NetworkTrustTests: XCTestCase {
         )
         let runtime = try NodeNetworkRuntime(configuration: configuration)
         let process = try await ChainProcess.open(
-            configuration: configuration,
-            remoteSource: runtime.remoteContentSource
+            configuration: configuration
         )
-        await runtime.installAdmissionHandler { _, _, _ in
-            throw CancellationError()
-        }
-
         let overlayTopics = TopicRecorder()
         let overlayPeer = Ivy(config: IvyConfig(
             signingKey: signingKey(0x8e),
@@ -1884,7 +2593,10 @@ final class NetworkTrustTests: XCTestCase {
         ))
 
         do {
-            try await runtime.start(process: process)
+            try await runtime.start(
+                process: process,
+                handlers: inertNetworkHandlers()
+            )
             try await connectAndHello(
                 overlayPeer,
                 peerID: PeerID(publicKey: configuration.processPublicKey),
@@ -1895,9 +2607,7 @@ final class NetworkTrustTests: XCTestCase {
                 ),
                 hello: try ChainHello(
                     nexusGenesisCID: configuration.nexusGenesisCID,
-                    chainPath: configuration.chainPath,
-                    minimumRootWorkHex:
-                        configuration.minimumRootWork.toHexString()
+                    chainPath: configuration.chainPath
                 ).encode()
             )
             for _ in 0..<100 {
@@ -1917,17 +2627,56 @@ final class NetworkTrustTests: XCTestCase {
             )
             XCTAssertTrue(candidates.isEmpty)
 
-            let proof = ChildBlockProof(
-                rootCID: "historical-proof-root",
-                directoryPath: ["Payments", "Leaf"],
-                entries: []
+            let content = NetworkTestContentStore()
+            try await LatticeState.emptyHeader.storeRecursively(
+                storer: content as any Storer
             )
-            let published = try await runtime.publishChildProof(
-                proof,
+            let leaf = try await BlockBuilder.buildChildGenesis(
+                spec: NexusGenesis.spec,
+                parentState: LatticeState.emptyHeader,
+                timestamp: 1,
+                target: .max,
+                fetcher: content
+            )
+            let payments = try await BlockBuilder.buildChildGenesis(
+                spec: NexusGenesis.spec,
+                parentState: LatticeState.emptyHeader,
+                children: ["Leaf": leaf],
+                timestamp: 2,
+                target: .max,
+                fetcher: content
+            )
+            let nexus = try await BlockBuilder.buildGenesis(
+                spec: NexusGenesis.spec,
+                children: ["Payments": payments],
+                timestamp: 3,
+                target: .max,
+                fetcher: content
+            )
+            let paymentsProof = try await ChildBlockProof.generate(
+                rootHeader: BlockHeader(node: nexus),
+                childDirectory: "Payments",
+                fetcher: content
+            )
+            let leafProof = try await ChildBlockProof.generate(
+                rootHeader: BlockHeader(node: payments),
                 childDirectory: "Leaf",
-                child: tip
+                fetcher: content
             )
-            XCTAssertEqual(try published.serialize(), try proof.serialize())
+            let proof = paymentsProof.composing(hop: leafProof)
+            do {
+                _ = try await runtime.publishChildProof(
+                    proof,
+                    childDirectory: "Leaf",
+                    childCID: try BlockHeader(node: leaf).rawCID
+                )
+                XCTFail("an unstored proof must not be advertised")
+            } catch {
+                XCTAssertEqual(
+                    error as? NodeNetworkRuntimeError,
+                    .invalidChildProof
+                )
+            }
 
             try await Task.sleep(for: .milliseconds(100))
             let announcedStaleBlock = await overlayTopics.contains(
@@ -2144,239 +2893,40 @@ final class NetworkTrustTests: XCTestCase {
         let process = try await canonicalNetworkProcess()
         let block = try await process.canonicalTipBlock()
         let childCID = try BlockHeader(node: block).rawCID
-        let entries = try await process.durableCandidateEntries(for: block)
         let envelope = try ChildValidationPackageEnvelope(
             ChildValidationPackage(proof: proof())
         )
         let attachment = try ChildEvidenceVolume(
             envelopeBytes: envelope.encode(),
-            acquisitionEntries: entries,
             childCID: childCID
         )
         let response = ChildEvidenceAvailableMessage(
             childPath: ["Nexus", "Payments"],
+            sourceID: testEvidenceSourceID,
+            ordinal: 1,
             childCID: childCID,
             rootCID: childCID,
             attachmentCID: attachment.rawCID
         )
         let decoded = try ChildEvidenceAvailableMessage.decoded(response.encoded())
         XCTAssertEqual(decoded.attachmentCID, attachment.rawCID)
-        let attached = NodeNetworkRuntime.attachingEvidenceContent(
-            acquisitionEntries: entries,
-            to: AuthenticatedChildPackage(
-                package: try envelope.makeValidationPackage()
-            )
-        )
-        XCTAssertEqual(attached?.acquisitionEntries, entries)
-
-        let extraTransaction = try unsignedTransaction(path: ["Nexus"])
-        let extraBody = try XCTUnwrap(extraTransaction.body.node)
-        let extraCID = extraTransaction.body.rawCID
-        var expanded = entries
-        expanded[extraCID] = try XCTUnwrap(extraBody.toData())
-        let expandedAttachment = NodeNetworkRuntime.attachingEvidenceContent(
-            acquisitionEntries: expanded,
-            to: AuthenticatedChildPackage(
-                package: try envelope.makeValidationPackage()
-            )
-        )
-        XCTAssertEqual(expandedAttachment?.acquisitionEntries, expanded)
-
-        var mismatched = entries
-        mismatched[childCID]?.append(0)
-        do {
-            _ = try await BlockHeader(
-                rawCID: childCID,
-                node: nil,
-                encryptionInfo: nil
-            ).resolveBlockContent(fetcher: InMemoryContentSource(mismatched))
-            XCTFail("accessed mismatched content must fail CID verification")
-        } catch {}
+        XCTAssertEqual(attachment.serialized.entries.count, 1)
+        XCTAssertNil(attachment.serialized.entries[childCID])
     }
 
-    func testPolicyChildBootstrapsFromRestartedParentPackageWithoutOverlay() async throws {
-        let source = NetworkTestContentStore()
-        let parentAuthority = try XCTUnwrap(ParentWorkAuthorityKey(
-            peerKey(signingKey(0x6a)).hex
-        ))
-        try await LatticeState.emptyHeader.storeRecursively(
-            storer: source as any Storer
+    func testParentEvidenceDoesNotContainChildValidationContent() async throws {
+        let child = try await canonicalNetworkBlock()
+        let childCID = try BlockHeader(node: child).rawCID
+        let envelope = try ChildValidationPackageEnvelope(
+            ChildValidationPackage(proof: proof())
         )
-        let module = try WasmPolicyModuleHeader(
-            node: WasmPolicyModule(bytes: Data([0x00, 0x61, 0x73, 0x6d, 0x01, 0, 0, 0]))
+        let attachment = try ChildEvidenceVolume(
+            envelopeBytes: envelope.encode(),
+            childCID: childCID
         )
-        try await module.storeRecursively(storer: source as any Storer)
-        let policy = WasmPolicyRef(
-            moduleCID: module.rawCID,
-            scope: .transaction
-        )
-        let base = NexusGenesis.spec
-        let spec = ChainSpec(
-            maxNumberOfTransactionsPerBlock:
-                base.maxNumberOfTransactionsPerBlock,
-            maxStateGrowth: base.maxStateGrowth,
-            maxBlockSize: base.maxBlockSize,
-            premine: 0,
-            targetBlockTime: base.targetBlockTime,
-            initialReward: base.initialReward,
-            halvingInterval: base.halvingInterval,
-            retargetWindow: base.retargetWindow,
-            wasmPolicies: [policy],
-            parentWorkAuthorityKey: parentAuthority
-        )
-        let child = try await BlockBuilder.buildChildGenesis(
-            spec: spec,
-            parentState: LatticeState.emptyHeader,
-            timestamp: 1,
-            target: UInt256.max,
-            fetcher: source
-        )
-        let childHeader = try BlockHeader(node: child)
-        let childData: Data = try XCTUnwrap(child.toData())
-        let carrier = try await BlockBuilder.buildGenesis(
-            spec: NexusGenesis.spec,
-            children: ["Payments": child],
-            timestamp: 2,
-            target: UInt256.max,
-            fetcher: source
-        )
-        let carrierHeader = try BlockHeader(node: carrier)
-        try await carrierHeader.storeRecursively(storer: source as any Storer)
-        let proof = try await ChildBlockProof.generate(
-            rootHeader: carrierHeader,
-            childDirectory: "Payments",
-            fetcher: source
-        )
-        let collector = NetworkTestContentStore()
-        try await childHeader.storeBlock(fetcher: source, storer: collector)
-        let authoredEntries = await collector.allEntries()
-        XCTAssertNotNil(authoredEntries[policy.moduleCID])
 
-        let candidateWire = try ChildCandidateResponseMessage(
-            requestID: 91,
-            childPath: ["Nexus", "Payments"],
-            parentCID: carrierHeader.rawCID,
-            childCID: childHeader.rawCID,
-            blockData: childData,
-            acquisitionEntries: authoredEntries
-        ).encoded()
-        let candidate = try ChildCandidateResponseMessage.decoded(candidateWire)
-        XCTAssertEqual(candidate.acquisitionEntries[policy.moduleCID],
-                       authoredEntries[policy.moduleCID])
-
-        let parentDirectory = FileManager.default.temporaryDirectory
-            .appendingPathComponent("lattice-parent-package-\(UUID().uuidString)")
-        let childDirectory = FileManager.default.temporaryDirectory
-            .appendingPathComponent("lattice-child-package-\(UUID().uuidString)")
-        addTeardownBlock {
-            try? FileManager.default.removeItem(at: parentDirectory)
-            try? FileManager.default.removeItem(at: childDirectory)
-        }
-        try FileManager.default.createDirectory(
-            at: parentDirectory,
-            withIntermediateDirectories: true
-        )
-        let parentConfiguration = try NodeConfiguration(
-            chainPath: ["Nexus"],
-            minimumRootWork: UInt256(1),
-            storagePath: parentDirectory,
-            privateKeyHex: String(repeating: "6a", count: 32)
-        )
-        var parentStore: NodeStore? = try testNodeStore(
-            databasePath: parentDirectory.appendingPathComponent("state.db"),
-            nexusGenesisCID: parentConfiguration.nexusGenesisCID,
-            chainPath: parentConfiguration.chainPath,
-            minimumRootWork: parentConfiguration.minimumRootWork,
-            issuingAuthorityKey: parentConfiguration.processPublicKey
-        )
-        let carrierLink = try carrierLink(
-            parentPath: ["Nexus"],
-            carrierCID: carrierHeader.rawCID,
-            rootCID: carrierHeader.rawCID
-        )
-        let genesisLink = try genesisLink(
-            parentPath: ["Nexus"],
-            directory: "Payments",
-            cid: childHeader.rawCID
-        )
-        try await parentStore!.persistPreparedChildProofs(
-            carrierCID: carrierHeader.rawCID,
-            proofs: [try PreparedChildProof(
-                directory: "Payments",
-                child: child,
-                proof: proof,
-                acquisitionEntries: candidate.acquisitionEntries
-            )],
-            capacity: 16
-        )
-        try await parentStore!.persistIssuedHierarchyArtifacts(
-            AdmissionHierarchyArtifacts(
-                carrierLink: carrierLink,
-                carrierEvidence: nil,
-                parentGenesisLinks: [genesisLink]
-            )
-        )
-        parentStore = nil
-
-        let parent = try await ChainProcess.open(
-            configuration: parentConfiguration
-        )
-        let recoveredEvidence = try await parent.issuedChildEvidence(
-            childCID: childHeader.rawCID,
-            directory: "Payments",
-            rootCID: carrierHeader.rawCID
-        )
-        let recovered = try XCTUnwrap(recoveredEvidence)
-        XCTAssertEqual(recovered.acquisitionEntries[policy.moduleCID],
-                       authoredEntries[policy.moduleCID])
-        let summaries = try await parent.issuedChildEvidenceSummaries(
-            directory: "Payments",
-            after: nil,
-            limit: 2
-        )
-        XCTAssertEqual(summaries.count, 1)
-        XCTAssertEqual(summaries.first?.childCID, childHeader.rawCID)
-        XCTAssertEqual(summaries.first?.rootCID, carrierHeader.rawCID)
-        XCTAssertTrue(summaries.first.map {
-            CIDIdentity.isCanonical($0.attachmentCID)
-        } ?? false)
-        XCTAssertEqual(recovered.parentCarrierLink, carrierLink)
-        XCTAssertEqual(recovered.parentGenesisLink, genesisLink)
-        XCTAssertNotNil(recovered.parentCarrierCertificate)
-        XCTAssertNotNil(recovered.parentGenesisCertificate)
-        let childProcess = try await ChainProcess.open(configuration:
-            NodeConfiguration(
-                chainPath: ["Nexus", "Payments"],
-                minimumRootWork: UInt256(1),
-                storagePath: childDirectory,
-                privateKeyHex: String(repeating: "6b", count: 32),
-                parentEndpoint: ParentEndpoint(
-                    publicKey: parentConfiguration.processPublicKey,
-                    host: "127.0.0.1",
-                    port: 4002
-                )
-            )
-        )
-        let outcome = try await childProcess.admit(
-            BlockHeader(
-                rawCID: childHeader.rawCID,
-                node: nil,
-                encryptionInfo: nil
-            ),
-            authenticatedChildPackage: AuthenticatedChildPackage(
-                package: ChildValidationPackage(
-                    proof: recovered.proof,
-                    parentCarrierLink: recovered.parentCarrierLink,
-                    parentGenesisLink: recovered.parentGenesisLink
-                ),
-                acquisitionEntries: recovered.acquisitionEntries,
-                parentCarrierCertificate: recovered.parentCarrierCertificate,
-                parentGenesisCertificate: recovered.parentGenesisCertificate
-            )
-        )
-        XCTAssertTrue(outcome.decision.isAccepted)
-        let childStatus = await childProcess.status()
-        XCTAssertEqual(childStatus.phase, .active)
+        XCTAssertEqual(attachment.serialized.entries.count, 1)
+        XCTAssertNil(attachment.serialized.entries[childCID])
     }
 
     func testPortableAttachmentsKeepDistinctRootsForTheSameChildWhileAdmissionIsBlocked()
@@ -2389,7 +2939,7 @@ final class NetworkTrustTests: XCTestCase {
         addTeardownBlock { try? FileManager.default.removeItem(at: storage) }
         let rootKey = signingKey(0x73)
         let rootAuthority = try XCTUnwrap(
-            ParentWorkAuthorityKey(peerKey(rootKey).hex)
+            ParentProcessKey(peerKey(rootKey).hex)
         )
         let middleConfiguration = try NodeConfiguration(
             chainPath: ["Nexus", "Middle"],
@@ -2406,7 +2956,7 @@ final class NetworkTrustTests: XCTestCase {
             )
         )
         let middleAuthority = try XCTUnwrap(
-            ParentWorkAuthorityKey(middleConfiguration.processPublicKey)
+            ParentProcessKey(middleConfiguration.processPublicKey)
         )
         let overlayPort = NetworkTransportTestPorts.allocate()
         let hierarchyPort = NetworkTransportTestPorts.allocate()
@@ -2431,15 +2981,21 @@ final class NetworkTrustTests: XCTestCase {
             storer: content as any Storer
         )
         let leaf = try await BlockBuilder.buildChildGenesis(
-            spec: NexusGenesis.spec.withParentWorkAuthorityKey(middleAuthority),
+            spec: NexusGenesis.spec,
             parentState: LatticeState.emptyHeader,
             timestamp: 1,
             target: UInt256.max,
             fetcher: content
         )
         let leafHeader = try BlockHeader(node: leaf)
+        let leafVolume = try VolumeImpl<Block>(node: leaf)
+        try await leafVolume.store(storer: content)
+        let storedLeafVolume = await content.serializedVolume(
+            rootCID: leafHeader.rawCID
+        )
+        let leafSerializedVolume = try XCTUnwrap(storedLeafVolume)
         let middle = try await BlockBuilder.buildChildGenesis(
-            spec: NexusGenesis.spec.withParentWorkAuthorityKey(rootAuthority),
+            spec: NexusGenesis.spec,
             parentState: LatticeState.emptyHeader,
             children: ["Leaf": leaf],
             timestamp: 2,
@@ -2477,9 +3033,6 @@ final class NetworkTrustTests: XCTestCase {
         XCTAssertEqual(Set(edges.compactMap(\.edgeCID)).count, 1)
         XCTAssertEqual(Set(proofs.map(\.rootCID)).count, 2)
 
-        let leafContent = NetworkTestContentStore()
-        try await leafHeader.storeBlock(fetcher: content, storer: leafContent)
-        let acquisitionEntries = await leafContent.allEntries()
         let genesisLink = try genesisLink(
             parentPath: ["Nexus", "Middle"],
             directory: "Leaf",
@@ -2503,12 +3056,11 @@ final class NetworkTrustTests: XCTestCase {
             )
             let attachment = try ChildEvidenceVolume(
                 envelopeBytes: try envelope.encode(),
-                acquisitionEntries: acquisitionEntries,
                 childCID: leafHeader.rawCID
             )
             let attachmentBroker = MemoryBroker()
             try await attachment.store(
-                storer: BrokerStorer(broker: attachmentBroker)
+                storer: attachmentBroker
             )
             let fetchedAttachment = await attachmentBroker.fetchVolumeLocal(
                 root: attachment.rawCID
@@ -2559,27 +3111,50 @@ final class NetworkTrustTests: XCTestCase {
             )
         )
         let process = try await ChainProcess.open(
-            configuration: targetConfiguration,
-            remoteSource: runtime.remoteContentSource
+            configuration: targetConfiguration
         )
         let roots = NetworkEventRecorder()
+        let unavailable = NetworkEventRecorder()
         let firstAdmissionGate = CandidateBuildGate()
-        await runtime.installAdmissionHandler { header, package, _ in
-            guard let rootCID = package?.package.proof.rootCID else {
-                throw NetworkTestError.failedPhase("missing portable root")
+        let portableIndexGate = CandidateBuildGate()
+        let readiness = NetworkEventRecorder()
+        let handlers = NodeNetworkHandlers(
+            admission: { admission in
+                guard let rootCID = admission.authenticatedChildPackage?
+                    .package.proof.rootCID else {
+                    await unavailable.append(admission.header.rawCID)
+                    return NodeAdmissionOutcome(
+                        decision: .unavailable(.childProof(
+                            chainPath: targetConfiguration.chainPath,
+                            childCID: admission.header.rawCID
+                        )),
+                        parentCarrierLink: nil,
+                        sameChainPredecessor: nil
+                    )
+                }
+                guard (await admission.contentSource.fetch(
+                    Set([admission.header.rawCID])
+                ))[admission.header.rawCID] != nil else {
+                    throw NetworkTestError.failedPhase("child Volume unavailable")
+                }
+                if (await roots.snapshot()).isEmpty {
+                    _ = await firstAdmissionGate.enter()
+                }
+                await roots.append(rootCID)
+                return NodeAdmissionOutcome(
+                    decision: .acceptedSide(ChainCommit(
+                        tipHash: admission.header.rawCID
+                    )),
+                    parentCarrierLink: nil,
+                    sameChainPredecessor: nil
+                )
+            },
+            parentWorkReadiness: { ready in
+                await readiness.append(ready ? "ready" : "not-ready")
             }
-            await roots.append(rootCID)
-            if (await roots.snapshot()).count == 1 {
-                _ = await firstAdmissionGate.enter()
-            }
-            return NodeAdmissionOutcome(
-                decision: .acceptedSide(ChainCommit(tipHash: header.rawCID)),
-                parentCarrierLink: nil,
-                sameChainPredecessor: nil
-            )
-        }
+        )
 
-        let peer = Ivy(config: IvyConfig(
+        let evidencePeer = Ivy(config: IvyConfig(
             signingKey: signingKey(0x76),
             listenPort: 0,
             stunServers: [],
@@ -2588,24 +3163,52 @@ final class NetworkTrustTests: XCTestCase {
         ))
         let delegate = PortableAttachmentQueuePeer(
             attachments: attachments,
+            firstAdmissionGate: firstAdmissionGate,
+            portableIndexGate: portableIndexGate
+        )
+        await evidencePeer.installTestDelegate(delegate)
+        await evidencePeer.setContentSource(delegate)
+        let blockKey = signingKey(0x77)
+        let blockAdvertiser = Ivy(config: IvyConfig(
+            signingKey: blockKey,
+            listenPort: 0,
+            stunServers: [],
+            healthConfig: PeerHealthConfig(enabled: false),
+            mode: .overlay
+        ))
+        let replacement = Ivy(config: IvyConfig(
+            signingKey: blockKey,
+            listenPort: 0,
+            stunServers: [],
+            healthConfig: PeerHealthConfig(enabled: false),
+            mode: .overlay
+        ))
+        let blockDelegate = PortableAttachmentQueuePeer(
+            attachments: [],
             firstAdmissionGate: firstAdmissionGate
         )
-        await peer.installTestDelegate(delegate)
-        await peer.setContentSource(delegate)
+        await blockAdvertiser.installTestDelegate(blockDelegate)
+        await replacement.installTestDelegate(blockDelegate)
+        await blockAdvertiser.setContentSource(
+            NetworkTestVolumeSource(value: leafSerializedVolume)
+        )
+        await replacement.setContentSource(
+            NetworkTestVolumeSource(value: leafSerializedVolume)
+        )
         let parent = Ivy(config: IvyConfig(
             signingKey: middleConfiguration.signingKey,
             listenPort: parentPort,
             stunServers: [],
             healthConfig: PeerHealthConfig(enabled: false),
+            privateContentExchangeEnabled: true,
             mode: .privateNetwork
         ))
-        let readiness = NetworkEventRecorder()
-        await runtime.installParentReadinessHandler { ready in
-            await readiness.append(ready ? "ready" : "not-ready")
-        }
+        // Parent authentication authorizes the attachment; availability is
+        // independent. The exact overlay advertiser serves the complete child
+        // genesis Volume while the live parent supplies only readiness/work.
         do {
             try await parent.start()
-            try await runtime.start(process: process)
+            try await runtime.start(process: process, handlers: handlers)
             let childPeer = PeerID(publicKey: targetConfiguration.processPublicKey)
             for _ in 0..<100 {
                 if (await parent.connectedPeers).contains(childPeer) { break }
@@ -2613,9 +3216,7 @@ final class NetworkTrustTests: XCTestCase {
             }
             let hierarchyHello = try ChainHello(
                 nexusGenesisCID: targetConfiguration.nexusGenesisCID,
-                chainPath: middleConfiguration.chainPath,
-                minimumRootWorkHex:
-                    targetConfiguration.minimumRootWork.toHexString()
+                chainPath: middleConfiguration.chainPath
             ).encode()
             guard (await parent.connectedPeers).contains(childPeer),
                   case .enqueued = await parent.sendMessage(
@@ -2644,7 +3245,7 @@ final class NetworkTrustTests: XCTestCase {
                 throw NetworkTestError.failedPhase("parent readiness")
             }
             try await connectAndHello(
-                peer,
+                evidencePeer,
                 peerID: PeerID(publicKey: targetConfiguration.processPublicKey),
                 endpoint: PeerEndpoint(
                     publicKey: targetConfiguration.processPublicKey,
@@ -2653,15 +3254,84 @@ final class NetworkTrustTests: XCTestCase {
                 ),
                 hello: try ChainHello(
                     nexusGenesisCID: targetConfiguration.nexusGenesisCID,
-                    chainPath: targetConfiguration.chainPath,
-                    minimumRootWorkHex:
-                        targetConfiguration.minimumRootWork.toHexString()
+                    chainPath: targetConfiguration.chainPath
                 ).encode()
             )
+            try await connectAndHello(
+                blockAdvertiser,
+                peerID: PeerID(publicKey: targetConfiguration.processPublicKey),
+                endpoint: PeerEndpoint(
+                    publicKey: targetConfiguration.processPublicKey,
+                    host: "127.0.0.1",
+                    port: overlayPort
+                ),
+                hello: try ChainHello(
+                    nexusGenesisCID: targetConfiguration.nexusGenesisCID,
+                    chainPath: targetConfiguration.chainPath
+                ).encode()
+            )
+            guard case .enqueued = await blockAdvertiser.sendMessage(
+                to: PeerID(publicKey: targetConfiguration.processPublicKey),
+                topic: NodeNetworkTopic.blockAnnouncement,
+                payload: try BlockAnnouncementMessage(
+                    blockCID: leafHeader.rawCID
+                ).encoded()
+            ) else {
+                throw NetworkTestError.failedSend
+            }
+            try await waitForEventCount(
+                1,
+                in: unavailable,
+                phase: "overlay block before portable parent proof"
+            )
+            for attachment in attachments {
+                guard case .enqueued = await evidencePeer.sendMessage(
+                    to: PeerID(publicKey: targetConfiguration.processPublicKey),
+                    topic: NodeNetworkTopic.portableAttachmentAvailable,
+                    payload: try PortableAttachmentAvailableMessage(
+                        edgeCID: attachment.summary.edgeCID,
+                        rootCID: attachment.summary.rootCID,
+                        attachmentCID: attachment.summary.attachmentCID
+                    ).encoded()
+                ) else {
+                    throw NetworkTestError.failedSend
+                }
+            }
             for _ in 0..<300 {
-                if (await roots.snapshot()).count == 2 { break }
+                if (await delegate.servedRoots()).count == 2 { break }
                 try await Task.sleep(for: .milliseconds(10))
             }
+            let initiallyServedRoots = await delegate.servedRoots()
+            XCTAssertEqual(
+                initiallyServedRoots,
+                Set(attachments.map(\.summary.attachmentCID))
+            )
+
+            await blockAdvertiser.stop()
+            await firstAdmissionGate.release(1)
+            try await waitForEventCount(
+                1,
+                in: roots,
+                phase: "first root before advertiser replacement"
+            )
+            try await connectAndHello(
+                replacement,
+                peerID: PeerID(publicKey: targetConfiguration.processPublicKey),
+                endpoint: PeerEndpoint(
+                    publicKey: targetConfiguration.processPublicKey,
+                    host: "127.0.0.1",
+                    port: overlayPort
+                ),
+                hello: try ChainHello(
+                    nexusGenesisCID: targetConfiguration.nexusGenesisCID,
+                    chainPath: targetConfiguration.chainPath
+                ).encode()
+            )
+            try await waitForEventCount(
+                2,
+                in: roots,
+                phase: "replacement provider retry"
+            )
             let admittedRoots = await roots.snapshot()
             let servedRoots = await delegate.servedRoots()
             XCTAssertEqual(
@@ -2671,14 +3341,20 @@ final class NetworkTrustTests: XCTestCase {
             XCTAssertEqual(admittedRoots.count, 2)
             XCTAssertEqual(Set(admittedRoots), Set(proofs.map(\.rootCID)))
         } catch {
+            await portableIndexGate.releaseAll()
             await firstAdmissionGate.releaseAll()
-            await peer.stop()
+            await replacement.stop()
+            await blockAdvertiser.stop()
+            await evidencePeer.stop()
             await parent.stop()
             await runtime.stop()
             throw error
         }
+        await portableIndexGate.releaseAll()
         await firstAdmissionGate.releaseAll()
-        await peer.stop()
+        await replacement.stop()
+        await blockAdvertiser.stop()
+        await evidencePeer.stop()
         await parent.stop()
         await runtime.stop()
     }
@@ -2840,9 +3516,8 @@ final class NetworkTrustTests: XCTestCase {
             runtime: target.runtime
         )
         let transactionAttempts = NetworkEventRecorder()
-        await installTransactionService(
+        let handlers = transactionServiceHandlers(
             service,
-            on: target.runtime,
             transactions: transactionAttempts
         )
 
@@ -2894,7 +3569,10 @@ final class NetworkTrustTests: XCTestCase {
         await unavailable.installTestDelegate(unavailableDelegate)
 
         do {
-            try await target.runtime.start(process: target.process)
+            try await target.runtime.start(
+                process: target.process,
+                handlers: handlers
+            )
             try await connectAndHello(
                 observer,
                 peerID: target.peerID,
@@ -3025,14 +3703,12 @@ final class NetworkTrustTests: XCTestCase {
         let firstInventoryRequests = NetworkEventRecorder()
         let secondInventoryRequests = NetworkEventRecorder()
         let secondTransactions = NetworkEventRecorder()
-        await installTransactionService(
+        let firstHandlers = transactionServiceHandlers(
             firstService,
-            on: first.runtime,
             inventoryRequests: firstInventoryRequests
         )
-        await installTransactionService(
+        let secondHandlers = transactionServiceHandlers(
             secondService,
-            on: second.runtime,
             inventoryRequests: secondInventoryRequests,
             transactions: secondTransactions
         )
@@ -3054,7 +3730,10 @@ final class NetworkTrustTests: XCTestCase {
             hello: Data
         )?
         do {
-            try await first.runtime.start(process: first.process)
+            try await first.runtime.start(
+                process: first.process,
+                handlers: firstHandlers
+            )
             try await connectAndHello(
                 publicationObserver,
                 peerID: first.peerID,
@@ -3076,7 +3755,10 @@ final class NetworkTrustTests: XCTestCase {
                 NodeNetworkTopic.transactionAvailable,
                 in: publicationTopics
             )
-            try await second.runtime.start(process: second.process)
+            try await second.runtime.start(
+                process: second.process,
+                handlers: secondHandlers
+            )
             try await waitForEvent(
                 in: secondInventoryRequests,
                 phase: "second inventory handshake"
@@ -3106,7 +3788,10 @@ final class NetworkTrustTests: XCTestCase {
             // that peer's ordinary inventory, not from the original source.
             await first.runtime.stop()
             await second.runtime.stop()
-            try await second.runtime.start(process: second.process)
+            try await second.runtime.start(
+                process: second.process,
+                handlers: secondHandlers
+            )
 
             let joined = try await overlayRuntime(
                 keyByte: 0xa6,
@@ -3118,8 +3803,11 @@ final class NetworkTrustTests: XCTestCase {
                 process: joined.process,
                 runtime: joined.runtime
             )
-            await installTransactionService(lateService, on: joined.runtime)
-            try await joined.runtime.start(process: joined.process)
+            let lateHandlers = transactionServiceHandlers(lateService)
+            try await joined.runtime.start(
+                process: joined.process,
+                handlers: lateHandlers
+            )
             try await waitForMempoolCount(
                 1,
                 service: lateService,
@@ -3153,9 +3841,8 @@ final class NetworkTrustTests: XCTestCase {
         let service = networkService(process: target.process, runtime: target.runtime)
         let transactions = NetworkEventRecorder()
         let inventoryRequests = NetworkEventRecorder()
-        await installTransactionService(
+        let handlers = transactionServiceHandlers(
             service,
-            on: target.runtime,
             inventoryRequests: inventoryRequests,
             transactions: transactions
         )
@@ -3174,7 +3861,10 @@ final class NetworkTrustTests: XCTestCase {
         await advertiser.setContentSource(source)
 
         do {
-            try await target.runtime.start(process: target.process)
+            try await target.runtime.start(
+                process: target.process,
+                handlers: handlers
+            )
             try await connectAndHello(
                 advertiser,
                 peerID: target.peerID,
@@ -3304,8 +3994,7 @@ final class NetworkTrustTests: XCTestCase {
             planeConfigurations: planes
         )
         let process = try await ChainProcess.open(
-            configuration: configuration,
-            remoteSource: runtime.remoteContentSource
+            configuration: configuration
         )
         let candidateVolume = try await canonicalNetworkBlockVolumes(count: 1)[0]
         let candidateCID = candidateVolume.root
@@ -3313,15 +4002,15 @@ final class NetworkTrustTests: XCTestCase {
         let delivered = expectation(
             description: "real Ivy application message reaches runtime delegate"
         )
-        await runtime.installAdmissionHandler { header, _, _ in
-            await admissions.append(header.rawCID)
+        let handlers = NodeNetworkHandlers(admission: { admission in
+            await admissions.append(admission.header.rawCID)
             delivered.fulfill()
             return NodeAdmissionOutcome(
                 decision: .duplicate,
                 parentCarrierLink: nil,
                 sameChainPredecessor: nil
             )
-        }
+        })
         let client = Ivy(config: IvyConfig(
             signingKey: signingKey(94),
             listenPort: 0,
@@ -3332,7 +4021,7 @@ final class NetworkTrustTests: XCTestCase {
             value: candidateVolume
         ))
         do {
-            try await runtime.start(process: process)
+            try await runtime.start(process: process, handlers: handlers)
             try await client.start()
             let runtimePeer = PeerID(publicKey: configuration.processPublicKey)
             try await client.connect(to: PeerEndpoint(
@@ -3342,8 +4031,7 @@ final class NetworkTrustTests: XCTestCase {
             ))
             let hello = try ChainHello(
                 nexusGenesisCID: configuration.nexusGenesisCID,
-                chainPath: configuration.chainPath,
-                minimumRootWorkHex: configuration.minimumRootWork.toHexString()
+                chainPath: configuration.chainPath
             ).encode()
             guard case .enqueued = await client.sendMessage(
                 to: runtimePeer,
@@ -3372,20 +4060,146 @@ final class NetworkTrustTests: XCTestCase {
         await runtime.stop()
     }
 
+    func testOnceAnnouncedFutureBlockRetriesUntilAdmissible() async throws {
+        let fixture = try await overlayRuntime(
+            keyByte: 0xb1,
+            requestTimeout: .milliseconds(25)
+        )
+        let service = networkService(
+            process: fixture.process,
+            runtime: fixture.runtime
+        )
+        let decisions = NetworkEventRecorder()
+        let handlers = NodeNetworkHandlers(admission: { admission in
+            let outcome = try await service.admitNetworkCandidate(
+                admission.header,
+                authenticatedChildPackage: admission.authenticatedChildPackage,
+                preparingChildDirectories: admission.preparingChildDirectories,
+                contentSource: admission.contentSource
+            )
+            let decision = switch outcome.decision {
+            case .canonicalized: "canonicalized"
+            case .acceptedSide: "acceptedSide"
+            case .carrier: "carrier"
+            case .duplicate: "duplicate"
+            case .unavailable: "unavailable"
+            case .temporarilyInvalid: "temporarilyInvalid"
+            case .invalid: "invalid"
+            case .localFailure: "localFailure"
+            case .storageFailed: "storageFailed"
+            }
+            await decisions.append(decision)
+            return outcome
+        })
+        let advertiser = Ivy(config: IvyConfig(
+            signingKey: signingKey(0xb2),
+            listenPort: 0,
+            stunServers: [],
+            healthConfig: PeerHealthConfig(enabled: false),
+            mode: .overlay
+        ))
+
+        do {
+            try await fixture.runtime.start(
+                process: fixture.process,
+                handlers: handlers
+            )
+            try await connectAndHello(
+                advertiser,
+                peerID: fixture.peerID,
+                endpoint: fixture.endpoint,
+                hello: fixture.hello
+            )
+
+            let parent = try await fixture.process.canonicalTipBlock()
+            let timestamp = Int64(Date().timeIntervalSince1970 * 1_000)
+                + 2 * 60 * 60 * 1_000 + 5_000
+            var nonce: UInt64 = 0
+            var future = try await BlockBuilder.buildBlock(
+                previous: parent,
+                timestamp: timestamp,
+                nonce: nonce,
+                fetcher: fixture.process
+            )
+            while future.proofOfWorkHash() > future.target {
+                nonce += 1
+                future = try await BlockBuilder.buildBlock(
+                    previous: parent,
+                    timestamp: timestamp,
+                    nonce: nonce,
+                    fetcher: fixture.process
+                )
+            }
+            let header = try BlockHeader(node: future)
+            let source = NetworkTestContentStore()
+            try await header.storeBlock(
+                fetcher: fixture.process,
+                storer: source
+            )
+            let storedVolume = await source.serializedVolume(
+                rootCID: header.rawCID
+            )
+            let volume = try XCTUnwrap(storedVolume)
+            await advertiser.setContentSource(
+                NetworkTestVolumeSource(value: volume)
+            )
+
+            guard case .enqueued = await advertiser.sendMessage(
+                to: fixture.peerID,
+                topic: NodeNetworkTopic.blockAnnouncement,
+                payload: try BlockAnnouncementMessage(
+                    blockCID: header.rawCID
+                ).encoded()
+            ) else {
+                throw NetworkTestError.failedSend
+            }
+            for _ in 0..<200 {
+                if (await decisions.snapshot()).contains("temporarilyInvalid") {
+                    break
+                }
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            let futureDecisions = await decisions.snapshot()
+            XCTAssertTrue(futureDecisions.contains("temporarilyInvalid"))
+            for _ in 0..<800 {
+                if await fixture.process.status().tipCID == header.rawCID,
+                   (await decisions.snapshot()).contains("canonicalized") {
+                    break
+                }
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            let admittedStatus = await fixture.process.status()
+            let admittedDecisions = await decisions.snapshot()
+            XCTAssertEqual(admittedStatus.tipCID, header.rawCID)
+            XCTAssertTrue(
+                admittedDecisions.contains("canonicalized"),
+                "decisions: \(admittedDecisions)"
+            )
+        } catch {
+            await advertiser.stop()
+            await fixture.runtime.stop()
+            throw error
+        }
+        await advertiser.stop()
+        await fixture.runtime.stop()
+    }
+
     func testAcceptedLeafSyncRotatesPastSilentOverlayPeer() async throws {
         let fixture = try await overlayRuntime(
             keyByte: 0x75,
             requestTimeout: .milliseconds(150)
         )
         let admitted = NetworkEventRecorder()
-        await fixture.runtime.installAdmissionHandler { header, _, _ in
-            await admitted.append(header.rawCID)
+        let handlers = NodeNetworkHandlers(admission: { admission in
+            await admitted.append(admission.header.rawCID)
             return NodeAdmissionOutcome(
-                decision: .acceptedSide(ChainCommit(tipHash: header.rawCID)),
+                decision: .acceptedSide(ChainCommit(
+                    tipHash: admission.header.rawCID
+                )),
                 parentCarrierLink: nil,
                 sameChainPredecessor: nil
             )
-        }
+        })
 
         let silentDelegate = OverlayInventoryPeer(leaves: nil)
         let silent = Ivy(config: IvyConfig(
@@ -3412,7 +4226,10 @@ final class NetworkTrustTests: XCTestCase {
         ))
 
         do {
-            try await fixture.runtime.start(process: fixture.process)
+            try await fixture.runtime.start(
+                process: fixture.process,
+                handlers: handlers
+            )
             try await connectAndHello(
                 silent,
                 peerID: fixture.peerID,
@@ -3451,6 +4268,199 @@ final class NetworkTrustTests: XCTestCase {
         await fixture.runtime.stop()
     }
 
+    func testAcceptedLeafRetriesTransientEmptyAdvertiserWithoutReconnect()
+        async throws {
+        let fixture = try await overlayRuntime(
+            keyByte: 0x7b,
+            requestTimeout: .milliseconds(100)
+        )
+        let volume = try await canonicalNetworkBlockVolumes(count: 1)[0]
+        let source = BlockingNetworkTestVolumeSource(value: volume)
+        let inventory = OverlayInventoryPeer(leaves: [volume.root])
+        let advertiser = Ivy(config: IvyConfig(
+            signingKey: signingKey(0x7c),
+            listenPort: 0,
+            stunServers: [],
+            healthConfig: PeerHealthConfig(enabled: false),
+            mode: .overlay
+        ))
+        await advertiser.installTestDelegate(inventory)
+        await advertiser.setContentSource(source)
+        let admitted = NetworkEventRecorder()
+        let handlers = NodeNetworkHandlers(admission: { admission in
+            await admitted.append(admission.header.rawCID)
+            return NodeAdmissionOutcome(
+                decision: .duplicate,
+                parentCarrierLink: nil,
+                sameChainPredecessor: nil
+            )
+        })
+
+        do {
+            try await fixture.runtime.start(
+                process: fixture.process,
+                handlers: handlers
+            )
+            try await connectAndHello(
+                advertiser,
+                peerID: fixture.peerID,
+                endpoint: fixture.endpoint,
+                hello: fixture.hello
+            )
+            for _ in 0..<200 {
+                if await source.didStart() { break }
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            let firstRequestStarted = await source.didStart()
+            XCTAssertTrue(firstRequestStarted)
+
+            // Ivy's first exact request expires as an unattributed `.empty`.
+            // The same session then serves the same advertised Volume.
+            try await Task.sleep(for: .milliseconds(200))
+            await source.release()
+            for _ in 0..<300 {
+                if (await admitted.snapshot()).contains(volume.root) { break }
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            let admittedCIDs = await admitted.snapshot()
+            let inventoryRequests = await inventory.requestCount()
+            XCTAssertEqual(admittedCIDs, [volume.root])
+            XCTAssertEqual(inventoryRequests, 1)
+        } catch {
+            await advertiser.stop()
+            await fixture.runtime.stop()
+            throw error
+        }
+        await advertiser.stop()
+        await fixture.runtime.stop()
+    }
+
+    func testBlockValidationFindsMissingVolumeFromAdvertisedProvider()
+        async throws
+    {
+        let fixture = try await overlayRuntime(
+            keyByte: 0x6b,
+            requestTimeout: .milliseconds(150)
+        )
+        let process = try await canonicalNetworkProcess()
+        let transaction = try unsignedTransaction(path: ["Nexus"])
+        let transactionVolume = try await transactionVolume(transaction)
+        try await VolumeImpl<Transaction>(node: transaction)
+            .storeRecursively(storer: process)
+        let previous = try await process.canonicalTipBlock()
+        let block = try await BlockBuilder.buildBlock(
+            previous: previous,
+            transactions: [transaction],
+            timestamp: 1,
+            nonce: 1,
+            fetcher: process
+        )
+        let header = try BlockHeader(node: block)
+        try await header.storeBlock(fetcher: process, storer: process)
+        let storedBlockVolume = await process.volume(header.rawCID)
+        let blockVolume = try XCTUnwrap(storedBlockVolume)
+
+        let badSource = RecordingNetworkTestVolumesSource([blockVolume])
+        let bad = Ivy(config: IvyConfig(
+            signingKey: signingKey(0x6c),
+            listenPort: 0,
+            stunServers: [],
+            healthConfig: PeerHealthConfig(enabled: false),
+            mode: .overlay
+        ))
+        await bad.setContentSource(badSource)
+
+        let honestPort = NetworkTransportTestPorts.allocate()
+        let honestSource = RecordingNetworkTestVolumesSource([
+            transactionVolume
+        ])
+        let honest = Ivy(config: IvyConfig(
+            signingKey: signingKey(0x6d),
+            listenPort: honestPort,
+            stunServers: [],
+            healthConfig: PeerHealthConfig(enabled: false),
+            mode: .overlay
+        ))
+        await honest.setContentSource(honestSource)
+        let admitted = NetworkEventRecorder()
+        let handlers = NodeNetworkHandlers(admission: { admission in
+            let root = await admission.contentSource.fetch([
+                admission.header.rawCID
+            ])
+            let nested = await admission.contentSource.fetch([
+                transactionVolume.root
+            ])
+            guard root[admission.header.rawCID] != nil,
+                  nested[transactionVolume.root] != nil else {
+                throw NetworkTestError.failedPhase(
+                    "split Volume acquisition"
+                )
+            }
+            await admitted.append(admission.header.rawCID)
+            return NodeAdmissionOutcome(
+                decision: .acceptedSide(ChainCommit(
+                    tipHash: admission.header.rawCID
+                )),
+                parentCarrierLink: nil,
+                sameChainPredecessor: nil
+            )
+        })
+
+        do {
+            try await fixture.runtime.start(
+                process: fixture.process,
+                handlers: handlers
+            )
+            try await connectAndHello(
+                honest,
+                peerID: fixture.peerID,
+                endpoint: fixture.endpoint,
+                hello: fixture.hello
+            )
+            await honest.announceProvider(
+                rootCID: transactionVolume.root,
+                expiresAt: UInt64(Date().timeIntervalSince1970) + 60
+            )
+            try await connectAndHello(
+                bad,
+                peerID: fixture.peerID,
+                endpoint: fixture.endpoint,
+                hello: fixture.hello
+            )
+            guard case .enqueued = await bad.sendMessage(
+                to: fixture.peerID,
+                topic: NodeNetworkTopic.blockAnnouncement,
+                payload: try BlockAnnouncementMessage(
+                    blockCID: blockVolume.root
+                ).encoded()
+            ) else {
+                throw NetworkTestError.failedSend
+            }
+
+            for _ in 0..<400 {
+                if (await admitted.snapshot()).contains(blockVolume.root) {
+                    break
+                }
+                try await Task.sleep(for: .milliseconds(10))
+            }
+
+            let admittedCIDs = await admitted.snapshot()
+            let badRequests = await badSource.requests()
+            let honestRequests = await honestSource.requests()
+            XCTAssertEqual(admittedCIDs, [blockVolume.root])
+            XCTAssertTrue(badRequests.contains(transactionVolume.root))
+            XCTAssertTrue(honestRequests.contains(transactionVolume.root))
+        } catch {
+            await bad.stop()
+            await honest.stop()
+            await fixture.runtime.stop()
+            throw error
+        }
+        await bad.stop()
+        await honest.stop()
+        await fixture.runtime.stop()
+    }
+
     func testLocalAdmissionFailureDoesNotPunishReplacementSession()
         async throws {
         let fixture = try await overlayRuntime(
@@ -3463,18 +4473,20 @@ final class NetworkTrustTests: XCTestCase {
         let honestCID = volumes[2].root
         let gate = CandidateBuildGate()
         let admitted = NetworkEventRecorder()
-        await fixture.runtime.installAdmissionHandler { header, _, _ in
-            await admitted.append(header.rawCID)
-            if header.rawCID == stalledCID {
+        let handlers = NodeNetworkHandlers(admission: { admission in
+            await admitted.append(admission.header.rawCID)
+            if admission.header.rawCID == stalledCID {
                 _ = await gate.enter()
                 throw NetworkTestError.failedPhase("stalled acquisition")
             }
             return NodeAdmissionOutcome(
-                decision: .acceptedSide(ChainCommit(tipHash: header.rawCID)),
+                decision: .acceptedSide(ChainCommit(
+                    tipHash: admission.header.rawCID
+                )),
                 parentCarrierLink: nil,
                 sameChainPredecessor: nil
             )
-        }
+        })
 
         let attackerKey = signingKey(0x79)
         let firstDelegate = OverlayInventoryPeer(leaves: [])
@@ -3509,7 +4521,10 @@ final class NetworkTrustTests: XCTestCase {
         await honest.setContentSource(NetworkTestVolumeSource(value: volumes[2]))
 
         do {
-            try await fixture.runtime.start(process: fixture.process)
+            try await fixture.runtime.start(
+                process: fixture.process,
+                handlers: handlers
+            )
             try await connectAndHello(
                 first,
                 peerID: fixture.peerID,
@@ -3600,9 +4615,6 @@ final class NetworkTrustTests: XCTestCase {
             keyByte: 0x7b,
             requestTimeout: .milliseconds(150)
         )
-        await fixture.runtime.installAdmissionHandler { _, _, _ in
-            throw CancellationError()
-        }
         let silent = Ivy(config: IvyConfig(
             signingKey: signingKey(0x7c),
             listenPort: 0,
@@ -3621,7 +4633,10 @@ final class NetworkTrustTests: XCTestCase {
         await authorized.installTestDelegate(authorizedDelegate)
 
         do {
-            try await fixture.runtime.start(process: fixture.process)
+            try await fixture.runtime.start(
+                process: fixture.process,
+                handlers: inertNetworkHandlers()
+            )
             try await silent.start()
             try await silent.connect(to: fixture.endpoint)
             for _ in 0..<100 {
@@ -3704,8 +4719,7 @@ final class NetworkTrustTests: XCTestCase {
         )
         let runtime = try NodeNetworkRuntime(configuration: configuration)
         let process = try await ChainProcess.open(
-            configuration: configuration,
-            remoteSource: runtime.remoteContentSource
+            configuration: configuration
         )
         let boundary = try VolumeImpl<PublicKey>(
             node: PublicKey(key: "hierarchy-content")
@@ -3714,14 +4728,10 @@ final class NetworkTrustTests: XCTestCase {
         let rootCID = boundary.rawCID
         let storedVolume = await process.volume(rootCID)
         let expectedVolume = try XCTUnwrap(storedVolume)
-        await runtime.installAdmissionHandler { _, _, _ in
-            throw CancellationError()
-        }
         let runtimePeer = PeerID(publicKey: configuration.processPublicKey)
         let parentHello = try ChainHello(
             nexusGenesisCID: configuration.nexusGenesisCID,
-            chainPath: ["Nexus"],
-            minimumRootWorkHex: configuration.minimumRootWork.toHexString()
+            chainPath: ["Nexus"]
         ).encode()
 
         func makeParent(
@@ -3770,7 +4780,10 @@ final class NetworkTrustTests: XCTestCase {
         var parentPair: (Ivy, TopicRecordingPeer)? = await makeParent(firstRecorder)
         do {
             try await parentPair!.0.start()
-            try await runtime.start(process: process)
+            try await runtime.start(
+                process: process,
+                handlers: inertNetworkHandlers()
+            )
             try await waitForRuntimeHello(firstRecorder)
             let beforeFirstHello = await parentPair!.0.fetchVolume(rootCID: rootCID)
             XCTAssertEqual(beforeFirstHello, .empty)
@@ -3922,8 +4935,7 @@ final class NetworkTrustTests: XCTestCase {
             planeConfigurations: planes
         )
         let recoveredProcess = try await ChainProcess.open(
-            configuration: configuration,
-            remoteSource: runtime.remoteContentSource
+            configuration: configuration
         )
         let recoveredRequirements = await recoveredProcess
             .unresolvedSameChainPredecessors()
@@ -3943,14 +4955,16 @@ final class NetworkTrustTests: XCTestCase {
             }
         )
 
-        let plan = RecoveryAdmissionPlan(
-            predecessorCID: predecessorHeader.rawCID,
-            orphanCID: orphanHeader.rawCID,
-            descendantCID: descendantHeader.rawCID
-        )
-        await runtime.installAdmissionHandler { header, _, _ in
-            await plan.admit(header.rawCID)
-        }
+        let handlers = NodeNetworkHandlers(admission: { admission in
+            try await recoveredProcess.admit(
+                admission.header,
+                authenticatedChildPackage:
+                    admission.authenticatedChildPackage,
+                preparingChildDirectories:
+                    admission.preparingChildDirectories,
+                remoteSource: admission.contentSource
+            )
+        })
         let clientDelegate = AcceptedLeavesPeer(
             acceptedLeafCID: descendantHeader.rawCID
         )
@@ -3964,7 +4978,10 @@ final class NetworkTrustTests: XCTestCase {
         await client.setContentSource(remoteContent)
 
         do {
-            try await runtime.start(process: recoveredProcess)
+            try await runtime.start(
+                process: recoveredProcess,
+                handlers: handlers
+            )
             try await client.start()
             let runtimePeer = PeerID(publicKey: configuration.processPublicKey)
             try await client.connect(to: PeerEndpoint(
@@ -3984,25 +5001,21 @@ final class NetworkTrustTests: XCTestCase {
                 topic: NodeNetworkTopic.overlayHello,
                 payload: try ChainHello(
                     nexusGenesisCID: configuration.nexusGenesisCID,
-                    chainPath: configuration.chainPath,
-                    minimumRootWorkHex: configuration.minimumRootWork.toHexString()
+                    chainPath: configuration.chainPath
                 ).encode()
             ) else {
                 throw NetworkTestError.failedSend
             }
-            let expected = [
-                descendantHeader.rawCID,
-                orphanHeader.rawCID,
-                predecessorHeader.rawCID,
-                orphanHeader.rawCID,
-                descendantHeader.rawCID,
-            ]
             for _ in 0..<200 {
-                if await plan.snapshot() == expected { break }
+                if await recoveredProcess.status().tipCID
+                    == descendantHeader.rawCID {
+                    break
+                }
                 try await Task.sleep(for: .milliseconds(20))
             }
-            let recoveredAdmissions = await plan.snapshot()
-            XCTAssertEqual(recoveredAdmissions, expected)
+            let recoveredStatus = await recoveredProcess.status()
+            XCTAssertEqual(recoveredStatus.tipCID, descendantHeader.rawCID)
+            XCTAssertEqual(recoveredStatus.height, descendant.height)
         } catch {
             await client.stop()
             await runtime.stop()
@@ -4021,7 +5034,7 @@ final class NetworkTrustTests: XCTestCase {
         )
         addTeardownBlock { try? FileManager.default.removeItem(at: storage) }
         let parentPeer = peerKey(signingKey(0x97))
-        let parentAuthority = try XCTUnwrap(ParentWorkAuthorityKey(parentPeer.hex))
+        let parentAuthority = try XCTUnwrap(ParentProcessKey(parentPeer.hex))
         let overlayPort = NetworkTransportTestPorts.allocate()
         let configuration = try NodeConfiguration(
             chainPath: ["Nexus", "Payments"],
@@ -4098,10 +5111,6 @@ final class NetworkTrustTests: XCTestCase {
                 childDirectory: "Payments",
                 fetcher: source
             )
-            let collector = NetworkTestContentStore()
-            try await header.storeBlock(fetcher: source, storer: collector)
-            var entries = await collector.allEntries()
-            entries[carrierHeader.rawCID] = try XCTUnwrap(carrier.toData())
             return (
                 AuthenticatedChildPackage(
                     package: ChildValidationPackage(
@@ -4112,8 +5121,7 @@ final class NetworkTrustTests: XCTestCase {
                             rootCID: carrierHeader.rawCID
                         ),
                         parentGenesisLink: nil
-                    ),
-                    acquisitionEntries: entries
+                    )
                 ),
                 carrierHeader.rawCID
             )
@@ -4180,22 +5188,21 @@ final class NetworkTrustTests: XCTestCase {
 
         let runtime = try NodeNetworkRuntime(configuration: configuration)
         let recovered = try await ChainProcess.open(
-            configuration: configuration,
-            remoteSource: runtime.remoteContentSource
+            configuration: configuration
         )
         let admissions = NetworkEventRecorder()
-        await runtime.installAdmissionHandler { [weak recovered] header, package, _ in
+        let handlers = NodeNetworkHandlers(admission: { [weak recovered] admission in
             guard let recovered else { throw CancellationError() }
             let outcome = try await recovered.admit(
-                header,
-                authenticatedChildPackage: header.rawCID == predecessorHeader.rawCID
+                admission.header,
+                authenticatedChildPackage: admission.header.rawCID == predecessorHeader.rawCID
                     ? predecessorPackage
-                    : package,
-                allowsRemoteAcquisition: true
+                    : admission.authenticatedChildPackage,
+                remoteSource: admission.contentSource
             )
-            await admissions.append(header.rawCID)
+            await admissions.append(admission.header.rawCID)
             return outcome
-        }
+        })
         let client = Ivy(config: IvyConfig(
             signingKey: signingKey(0x99),
             listenPort: 0,
@@ -4205,7 +5212,7 @@ final class NetworkTrustTests: XCTestCase {
         await client.setContentSource(remoteContent)
         let runtimePeer = PeerID(publicKey: configuration.processPublicKey)
         do {
-            try await runtime.start(process: recovered)
+            try await runtime.start(process: recovered, handlers: handlers)
             try await connectAndHello(
                 client,
                 peerID: runtimePeer,
@@ -4216,8 +5223,7 @@ final class NetworkTrustTests: XCTestCase {
                 ),
                 hello: try ChainHello(
                     nexusGenesisCID: configuration.nexusGenesisCID,
-                    chainPath: configuration.chainPath,
-                    minimumRootWorkHex: configuration.minimumRootWork.toHexString()
+                    chainPath: configuration.chainPath
                 ).encode()
             )
             guard case .enqueued = await client.sendMessage(
@@ -4317,7 +5323,7 @@ final class NetworkTrustTests: XCTestCase {
                 bootstrapPeers: [configuration.parentEndpoint!.ivy],
                 inboundAdmissionBypassPeerKeys: [parentPeerKey],
                 tallyConfig: TallyConfig(
-                    perPeerRequestCapacity: 1,
+                    perPeerRequestCapacity: 3,
                     perPeerRequestRefillPerSecond: 0
                 ),
                 stunServers: [],
@@ -4333,8 +5339,7 @@ final class NetworkTrustTests: XCTestCase {
             planeConfigurations: planes
         )
         let process = try await ChainProcess.open(
-            configuration: configuration,
-            remoteSource: runtime.remoteContentSource
+            configuration: configuration
         )
         let parent = Ivy(config: IvyConfig(
             signingKey: parentKey,
@@ -4343,17 +5348,19 @@ final class NetworkTrustTests: XCTestCase {
             mode: .privateNetwork
         ))
         let received = InheritedSnapshotRecorder()
-        await runtime.installAdmissionHandler { _, _, _ in
-            NodeAdmissionOutcome(
-                decision: .duplicate,
-                parentCarrierLink: nil,
-                sameChainPredecessor: nil
-            )
-        }
-        await runtime.installInheritedWorkHandler { snapshot, _ in
-            await received.append(snapshot)
-            return nil
-        }
+        let handlers = NodeNetworkHandlers(
+            admission: { _ in
+                NodeAdmissionOutcome(
+                    decision: .duplicate,
+                    parentCarrierLink: nil,
+                    sameChainPredecessor: nil
+                )
+            },
+            inheritedWork: { snapshot, _, _, _ in
+                await received.append(snapshot)
+                return nil
+            }
+        )
 
         let child = inheritedWorkCID("child")
         let exported = InheritedWorkSnapshot(
@@ -4375,7 +5382,7 @@ final class NetworkTrustTests: XCTestCase {
 
         do {
             try await parent.start()
-            try await runtime.start(process: process)
+            try await runtime.start(process: process, handlers: handlers)
             let childPeer = PeerID(publicKey: configuration.processPublicKey)
             for _ in 0..<100 {
                 if (await parent.connectedPeers).contains(childPeer) { break }
@@ -4390,8 +5397,7 @@ final class NetworkTrustTests: XCTestCase {
                 topic: NodeNetworkTopic.hierarchyHello,
                 payload: try ChainHello(
                     nexusGenesisCID: configuration.nexusGenesisCID,
-                    chainPath: ["Nexus"],
-                    minimumRootWorkHex: configuration.minimumRootWork.toHexString()
+                    chainPath: ["Nexus"]
                 ).encode()
             )
             guard case .enqueued = helloSend else {
@@ -4452,7 +5458,10 @@ final class NetworkTrustTests: XCTestCase {
 
         do {
             try await fixture.parent.start()
-            try await fixture.runtime.start(process: fixture.process)
+            try await fixture.runtime.start(
+                process: fixture.process,
+                handlers: duplicateNetworkHandlers()
+            )
             for _ in 0..<400 {
                 let trace = await fixture.recorder.sessionTrace()
                 if trace.hellos.count >= 2, !trace.indexes.isEmpty { break }
@@ -4487,7 +5496,10 @@ final class NetworkTrustTests: XCTestCase {
         var provider: Ivy?
 
         do {
-            try await fixture.runtime.start(process: fixture.process)
+            try await fixture.runtime.start(
+                process: fixture.process,
+                handlers: duplicateNetworkHandlers()
+            )
             try await fixture.child.start()
             try await waitForEvidenceIndexes(fixture, count: 1)
             let initial = await fixture.recorder.snapshot()
@@ -4546,7 +5558,10 @@ final class NetworkTrustTests: XCTestCase {
         let parentID = PeerID(publicKey: fixture.configuration.processPublicKey)
 
         do {
-            try await fixture.runtime.start(process: fixture.process)
+            try await fixture.runtime.start(
+                process: fixture.process,
+                handlers: duplicateNetworkHandlers()
+            )
             try await fixture.child.start()
             try await waitForEvidenceIndexes(fixture, count: 1)
             let hierarchyTally = await fixture.runtime.hierarchy.tally
@@ -4609,7 +5624,7 @@ final class NetworkTrustTests: XCTestCase {
         await fixture.runtime.stop()
     }
 
-    func testRealParentIvyWorkPushReorgsChildAndSurvivesOldReplay()
+    func testLiveParentDeltaReorgSurvivesChildRestartWithEmptyReconnectDelta()
         async throws {
         let storage = FileManager.default.temporaryDirectory.appendingPathComponent(
             "lattice-parent-work-reorg-\(UUID().uuidString)",
@@ -4620,7 +5635,7 @@ final class NetworkTrustTests: XCTestCase {
         let parentKey = signingKey(96)
         let parentPeerKey = peerKey(parentKey)
         let parentAuthority = try XCTUnwrap(
-            ParentWorkAuthorityKey(parentPeerKey.hex)
+            ParentProcessKey(parentPeerKey.hex)
         )
         let parentFactPort = NetworkTransportTestPorts.allocate()
         let childOverlayPort = NetworkTransportTestPorts.allocate()
@@ -4658,6 +5673,7 @@ final class NetworkTrustTests: XCTestCase {
         let firstGrind = inheritedWorkCID("real-ivy-first")
         let secondGrind = inheritedWorkCID("real-ivy-second")
         let newSecondGrind = inheritedWorkCID("real-ivy-new-second")
+        let workSourceID = UUID().uuidString.lowercased()
         let firstCarrierCID = try XCTUnwrap(
             first.package.package.parentCarrierLink?.carrierCID
         )
@@ -4685,6 +5701,7 @@ final class NetworkTrustTests: XCTestCase {
         let initialFrames = try XCTUnwrap(
             NodeNetworkRuntime.inheritedWorkPushPayloads(
                 snapshot: initial,
+                sourceID: workSourceID,
                 maximumPayloadBytes: 350
             )
         )
@@ -4699,12 +5716,22 @@ final class NetworkTrustTests: XCTestCase {
             ]
         )
         let strengtheningPayload = try InheritedWorkPushMessage(
+            sourceID: workSourceID,
+            baseRevision: 17,
             snapshot: strengthening
         ).encoded()
         let strengtheningCompletion = try InheritedWorkPushMessage(
+            sourceID: workSourceID,
+            baseRevision: 17,
             snapshot: InheritedWorkSnapshot(revision: strengthening.revision, facts: [])
         ).encoded()
-
+        let reconnectFrames = try XCTUnwrap(
+            NodeNetworkRuntime.inheritedWorkPushPayloads(
+                snapshot: InheritedWorkSnapshot(revision: 18, facts: []),
+                sourceID: workSourceID,
+                baseRevision: 18
+            )
+        )
         func childPlanes() throws -> NodeNetworkPlaneConfigurations {
             try NodeNetworkPlaneConfigurations(
                 overlay: IvyConfig(
@@ -4718,10 +5745,6 @@ final class NetworkTrustTests: XCTestCase {
                     listenPort: childFactPort,
                     bootstrapPeers: [configuration.parentEndpoint!.ivy],
                     inboundAdmissionBypassPeerKeys: [parentPeerKey],
-                    tallyConfig: TallyConfig(
-                        perPeerRequestCapacity: 1,
-                        perPeerRequestRefillPerSecond: 0
-                    ),
                     stunServers: [],
                     maxConnections: IvyConfig.defaultMaxConnections,
                     maxConnectionsPerNetgroup: IvyConfig.defaultMaxConnections,
@@ -4737,7 +5760,8 @@ final class NetworkTrustTests: XCTestCase {
         ) async throws -> (
             runtime: NodeNetworkRuntime,
             deliveries: InheritedSnapshotRecorder,
-            service: ChainService
+            service: ChainService,
+            handlers: NodeNetworkHandlers
         ) {
             let runtime = try NodeNetworkRuntime(
                 configuration: configuration,
@@ -4747,63 +5771,65 @@ final class NetworkTrustTests: XCTestCase {
                 process: process,
                 childCandidateProvider: { _ in [] },
                 childProofPublisher: { _ in },
-                acceptedBlockPublisher: { _ in }
+                acceptedBlockPublisher: { _ in },
+                securingWorkPublisher: {}
             )
             let deliveries = InheritedSnapshotRecorder()
-            await runtime.installAdmissionHandler { _, _, _ in
-                NodeAdmissionOutcome(
-                    decision: .duplicate,
-                    parentCarrierLink: nil,
-                    sameChainPredecessor: nil
-                )
-            }
-            await runtime.installInheritedWorkHandler { [weak service] snapshot, key in
-                guard let service else { throw CancellationError() }
-                await deliveries.append(snapshot)
-                return try await service.applyInheritedWorkSnapshot(
-                    snapshot,
-                    from: key
-                )
-            }
-            return (runtime, deliveries, service)
+            let handlers = NodeNetworkHandlers(
+                admission: { _ in
+                    NodeAdmissionOutcome(
+                        decision: .duplicate,
+                        parentCarrierLink: nil,
+                        sameChainPredecessor: nil
+                    )
+                },
+                inheritedWork: {
+                    [weak service] snapshot, sourceID, baseRevision, key in
+                    guard let service else { throw CancellationError() }
+                    await deliveries.append(snapshot)
+                    return try await service.applyInheritedWorkExport(
+                        snapshot,
+                        sourceID: sourceID,
+                        baseRevision: baseRevision,
+                        from: key
+                    )
+                }
+            )
+            return (runtime, deliveries, service, handlers)
         }
 
-        func makeParent() -> Ivy {
-            Ivy(config: IvyConfig(
+        func makeParent(
+            responses: [[Data]]
+        ) async throws -> (ivy: Ivy, delegate: InheritedWorkParentPeer) {
+            let ivy = Ivy(config: IvyConfig(
                 signingKey: parentKey,
                 listenPort: parentFactPort,
                 stunServers: [],
                 mode: .privateNetwork
             ))
+            let delegate = InheritedWorkParentPeer(
+                hello: try ChainHello(
+                    nexusGenesisCID: configuration.nexusGenesisCID,
+                    chainPath: ["Nexus"]
+                ).encode(),
+                responses: responses
+            )
+            await ivy.installTestDelegate(delegate)
+            return (ivy, delegate)
         }
 
         func connect(
             parent: Ivy,
             runtime: NodeNetworkRuntime,
-            process: ChainProcess
+            process: ChainProcess,
+            handlers: NodeNetworkHandlers,
+            startParent: Bool
         ) async throws -> PeerID {
-            try await parent.start()
-            try await runtime.start(process: process)
-            let childPeer = PeerID(publicKey: configuration.processPublicKey)
-            for _ in 0..<100 {
-                if (await parent.connectedPeers).contains(childPeer) { break }
-                try await Task.sleep(for: .milliseconds(20))
+            if startParent {
+                try await parent.start()
             }
-            guard (await parent.connectedPeers).contains(childPeer) else {
-                throw NetworkTestError.failedStart
-            }
-            guard case .enqueued = await parent.sendMessage(
-                to: childPeer,
-                topic: NodeNetworkTopic.hierarchyHello,
-                payload: try ChainHello(
-                    nexusGenesisCID: configuration.nexusGenesisCID,
-                    chainPath: ["Nexus"],
-                    minimumRootWorkHex: configuration.minimumRootWork.toHexString()
-                ).encode()
-            ) else {
-                throw NetworkTestError.failedSend
-            }
-            return childPeer
+            try await runtime.start(process: process, handlers: handlers)
+            return PeerID(publicKey: configuration.processPublicKey)
         }
 
         func send(
@@ -4823,8 +5849,10 @@ final class NetworkTrustTests: XCTestCase {
                     guard await parent.waitUntilWritable(to: childPeer) else {
                         throw NetworkTestError.failedSend
                     }
-                case .locallyRejected, .notConnected:
-                    throw NetworkTestError.failedSend
+                case .locallyRejected:
+                    throw NetworkTestError.failedPhase("parent send locally rejected")
+                case .notConnected:
+                    throw NetworkTestError.failedPhase("parent send disconnected")
                 }
             }
         }
@@ -4837,7 +5865,26 @@ final class NetworkTrustTests: XCTestCase {
                 if await deliveries.snapshot().count >= count { return }
                 try await Task.sleep(for: .milliseconds(20))
             }
-            throw NetworkTestError.failedStart
+            throw NetworkTestError.failedPhase(
+                "inherited-work deliveries \(await deliveries.snapshot().count)/\(count)"
+            )
+        }
+
+        func waitForRequests(
+            _ parent: InheritedWorkParentPeer,
+            count: Int,
+            phase: String
+        ) async throws {
+            for _ in 0..<200 {
+                if await parent.receivedRequests().count >= count { return }
+                try await Task.sleep(for: .milliseconds(20))
+            }
+            throw NetworkTestError.failedPhase(
+                "\(phase) inherited-work requests "
+                    + "\(await parent.receivedRequests().count)/\(count), "
+                    + "hellos \(await parent.receivedHelloCount()), "
+                    + "topics \(await parent.receivedTopics())"
+            )
         }
 
         func waitForTip(
@@ -4868,7 +5915,10 @@ final class NetworkTrustTests: XCTestCase {
         var runtime: NodeNetworkRuntime? = nil
         var deliveries: InheritedSnapshotRecorder? = nil
         var service: ChainService? = nil
+        var handlers: NodeNetworkHandlers? = nil
         var parent: Ivy? = nil
+        var parentDelegate: InheritedWorkParentPeer? = nil
+        var phase = "initial setup"
         do {
             process = try await ChainProcess.open(
                 configuration: configuration
@@ -4889,32 +5939,37 @@ final class NetworkTrustTests: XCTestCase {
                 runtime = firstRuntime.runtime
                 deliveries = firstRuntime.deliveries
                 service = firstRuntime.service
+                handlers = firstRuntime.handlers
             }
-            parent = makeParent()
+            (parent, parentDelegate) = try await makeParent(
+                responses: [initialFrames, reconnectFrames]
+            )
+            phase = "initial connect"
             let firstPeer = try await connect(
                 parent: parent!,
                 runtime: runtime!,
-                process: process!
+                process: process!,
+                handlers: handlers!,
+                startParent: true
             )
 
-            let completion = try XCTUnwrap(initialFrames.last)
-            let factFrames = initialFrames.dropLast()
-            let reorderedFacts = Array(factFrames.reversed()) + [
-                try XCTUnwrap(factFrames.first),
-            ]
-            for payload in reorderedFacts {
-                try await send(payload, parent: parent!, to: firstPeer)
-            }
-            try await Task.sleep(for: .milliseconds(100))
-            let preMarkerDeliveryCount = await deliveries!.snapshot().count
-            XCTAssertEqual(preMarkerDeliveryCount, 0)
-            try await send(completion, parent: parent!, to: firstPeer)
+            phase = "initial inherited work"
+            try await waitForRequests(
+                parentDelegate!,
+                count: 1,
+                phase: "initial"
+            )
             try await waitForDeliveries(
                 deliveries!,
                 count: 1
             )
+            let firstRequests = await parentDelegate!.receivedRequests()
+            XCTAssertEqual(firstRequests, [
+                InheritedWorkRequestMessage(sourceID: nil, revision: nil),
+            ])
             try await waitForTip(process!, first.header.rawCID)
 
+            phase = "live strengthening"
             try await send(
                 strengtheningPayload,
                 parent: parent!,
@@ -4935,17 +5990,18 @@ final class NetworkTrustTests: XCTestCase {
             )
             try await waitForTip(process!, second.header.rawCID)
 
-            // The live Ivy delivery above made the change. Restart only proves
-            // raw facts survive and an older full replay cannot add work again.
-            await parent!.stop()
+            // The live Ivy delta above made the change. Restart proves the
+            // durable cursor requests and accepts an empty O(1) reconnect pass.
+            phase = "child shutdown"
             await runtime!.stop()
-            parent = nil
             runtime = nil
             deliveries = nil
             _ = service
             service = nil
+            handlers = nil
             process = nil
 
+            phase = "child reopen"
             process = try await reopenAfterRuntimeTeardown()
             try await waitForTip(process!, second.header.rawCID)
             do {
@@ -4953,26 +6009,40 @@ final class NetworkTrustTests: XCTestCase {
                 runtime = replayRuntime.runtime
                 deliveries = replayRuntime.deliveries
                 service = replayRuntime.service
+                handlers = replayRuntime.handlers
             }
-            parent = makeParent()
-            let replayPeer = try await connect(
+            phase = "child reconnect"
+            _ = try await connect(
                 parent: parent!,
                 runtime: runtime!,
-                process: process!
+                process: process!,
+                handlers: handlers!,
+                startParent: false
             )
-            for payload in Array(initialFrames.dropLast().reversed())
-                + [try XCTUnwrap(initialFrames.last)] {
-                try await send(payload, parent: parent!, to: replayPeer)
-            }
+            phase = "reconnect inherited work"
+            try await waitForRequests(
+                parentDelegate!,
+                count: 2,
+                phase: "reconnect"
+            )
             try await waitForDeliveries(
                 deliveries!,
                 count: 1
             )
+            let reconnectRequests = await parentDelegate!.receivedRequests()
+            XCTAssertEqual(reconnectRequests, [
+                InheritedWorkRequestMessage(sourceID: nil, revision: nil),
+                InheritedWorkRequestMessage(
+                    sourceID: workSourceID,
+                    revision: 18
+                ),
+            ])
             try await waitForTip(process!, second.header.rawCID)
 
             await parent!.stop()
             await runtime!.stop()
             parent = nil
+            parentDelegate = nil
             runtime = nil
             deliveries = nil
             _ = service
@@ -4983,7 +6053,6 @@ final class NetworkTrustTests: XCTestCase {
                 databasePath: configuration.storagePath.appendingPathComponent("state.db"),
                 nexusGenesisCID: configuration.nexusGenesisCID,
                 chainPath: configuration.chainPath,
-                minimumRootWork: configuration.minimumRootWork,
                 spawningParentKey: parentAuthority.value,
                 issuingAuthorityKey: configuration.processPublicKey
             )
@@ -5003,11 +6072,11 @@ final class NetworkTrustTests: XCTestCase {
         } catch {
             if let parent { await parent.stop() }
             if let runtime { await runtime.stop() }
-            throw error
+            throw NetworkTestError.failedPhase("\(phase): \(error)")
         }
     }
 
-    func testAcceptedNoncanonicalParentDescendantsDoNotReweightChild()
+    func testAcceptedNoncanonicalDescendantsExportWithoutCrossingChildBinding()
         async throws {
         let parentStorage = FileManager.default.temporaryDirectory.appendingPathComponent(
             "lattice-service-side-parent-\(UUID().uuidString)",
@@ -5052,12 +6121,10 @@ final class NetworkTrustTests: XCTestCase {
         let parentRuntime = try NodeNetworkRuntime(configuration: parentConfiguration)
         let childRuntime = try NodeNetworkRuntime(configuration: childConfiguration)
         let parent = try await ChainProcess.open(
-            configuration: parentConfiguration,
-            remoteSource: parentRuntime.remoteContentSource
+            configuration: parentConfiguration
         )
         let child = try await ChainProcess.open(
-            configuration: childConfiguration,
-            remoteSource: childRuntime.remoteContentSource
+            configuration: childConfiguration
         )
         let published = NetworkEventRecorder()
         let deliveries = InheritedSnapshotRecorder()
@@ -5072,47 +6139,62 @@ final class NetworkTrustTests: XCTestCase {
                 _ = try await parentRuntime.publishChildProof(
                     publication.proof,
                     childDirectory: publication.directory,
-                    child: publication.childBlock
+                    childCID: publication.childCID
                 )
             },
             acceptedBlockPublisher: { [weak parentRuntime] blockCID in
                 await published.append(blockCID)
                 guard let parentRuntime else { throw CancellationError() }
                 try await parentRuntime.publishAcceptedBlock(blockCID)
+            },
+            securingWorkPublisher: { [weak parentRuntime] in
+                await parentRuntime?.publishSecuringWork()
             }
         )
         let childService = networkService(process: child, runtime: childRuntime)
-        await parentRuntime.installAdmissionHandler { [weak parentService] header, package, directories in
-            guard let parentService else { throw CancellationError() }
-            return try await parentService.admitNetworkCandidate(
-                header,
-                authenticatedChildPackage: package,
-                preparingChildDirectories: directories
-            )
-        }
-        await parentRuntime.installInheritedWorkHandler { [weak parentService] snapshot, key in
-            guard let parentService else { throw CancellationError() }
-            return try await parentService.applyInheritedWorkSnapshot(
-                snapshot,
-                from: key
-            )
-        }
-        await childRuntime.installAdmissionHandler { [weak childService] header, package, directories in
-            guard let childService else { throw CancellationError() }
-            return try await childService.admitNetworkCandidate(
-                header,
-                authenticatedChildPackage: package,
-                preparingChildDirectories: directories
-            )
-        }
-        await childRuntime.installInheritedWorkHandler { [weak childService] snapshot, key in
-            await deliveries.append(snapshot)
-            guard let childService else { throw CancellationError() }
-            return try await childService.applyInheritedWorkSnapshot(
-                snapshot,
-                from: key
-            )
-        }
+        let parentHandlers = NodeNetworkHandlers(
+            admission: { [weak parentService] admission in
+                guard let parentService else { throw CancellationError() }
+                return try await parentService.admitNetworkCandidate(
+                    admission.header,
+                    authenticatedChildPackage: admission.authenticatedChildPackage,
+                    preparingChildDirectories: admission.preparingChildDirectories,
+                    contentSource: admission.contentSource
+                )
+            },
+            inheritedWork: {
+                [weak parentService] snapshot, sourceID, baseRevision, key in
+                guard let parentService else { throw CancellationError() }
+                return try await parentService.applyInheritedWorkExport(
+                    snapshot,
+                    sourceID: sourceID,
+                    baseRevision: baseRevision,
+                    from: key
+                )
+            }
+        )
+        let childHandlers = NodeNetworkHandlers(
+            admission: { [weak childService] admission in
+                guard let childService else { throw CancellationError() }
+                return try await childService.admitNetworkCandidate(
+                    admission.header,
+                    authenticatedChildPackage: admission.authenticatedChildPackage,
+                    preparingChildDirectories: admission.preparingChildDirectories,
+                    contentSource: admission.contentSource
+                )
+            },
+            inheritedWork: {
+                [weak childService] snapshot, sourceID, baseRevision, key in
+                await deliveries.append(snapshot)
+                guard let childService else { throw CancellationError() }
+                return try await childService.applyInheritedWorkExport(
+                    snapshot,
+                    sourceID: sourceID,
+                    baseRevision: baseRevision,
+                    from: key
+                )
+            }
+        )
 
         func waitForTip(_ expected: String) async throws {
             for _ in 0..<200 {
@@ -5136,9 +6218,24 @@ final class NetworkTrustTests: XCTestCase {
             throw NetworkTestError.failedStart
         }
 
-        let parentAuthority = try XCTUnwrap(
-            ParentWorkAuthorityKey(parentConfiguration.processPublicKey)
-        )
+        func waitForReceivedWork(
+            after count: Int,
+            locations: [(blockCID: String, grindID: String)]
+        ) async throws {
+            for _ in 0..<200 {
+                let received = await deliveries.snapshot()
+                if received.count > count,
+                   locations.allSatisfy({
+                       received.merged.sourceWork(forBlock: $0.blockCID)
+                           .work(forGrind: $0.grindID) != nil
+                   }) {
+                    return
+                }
+                try await Task.sleep(for: .milliseconds(20))
+            }
+            throw NetworkTestError.failedStart
+        }
+
         let parentGenesis = try await parent.canonicalTipBlock()
         var canonical = parentGenesis
         for step in 1...5 {
@@ -5153,7 +6250,7 @@ final class NetworkTrustTests: XCTestCase {
         }
 
         let canonicalChild = try await BlockBuilder.buildChildGenesis(
-            spec: NexusGenesis.spec.withParentWorkAuthorityKey(parentAuthority),
+            spec: NexusGenesis.spec,
             parentState: canonical.postState,
             timestamp: 21_600_000,
             target: UInt256.max,
@@ -5221,7 +6318,7 @@ final class NetworkTrustTests: XCTestCase {
         let predecessorHeader = try BlockHeader(node: predecessor)
         try await predecessorHeader.storeBlock(fetcher: parent, storer: parent)
         let sideChild = try await BlockBuilder.buildChildGenesis(
-            spec: NexusGenesis.spec.withParentWorkAuthorityKey(parentAuthority),
+            spec: NexusGenesis.spec,
             parentState: predecessor.postState,
             timestamp: 7_200_000,
             target: UInt256.max,
@@ -5322,15 +6419,29 @@ final class NetworkTrustTests: XCTestCase {
         let directWinner = try XCTUnwrap(directStatus.tipCID)
 
         do {
-            try await parentRuntime.start(process: parent)
-            try await childRuntime.start(process: child)
+            try await parentRuntime.start(
+                process: parent,
+                handlers: parentHandlers
+            )
+            try await childRuntime.start(
+                process: child,
+                handlers: childHandlers
+            )
             try await waitForTip(directWinner)
+            let carrierGrinds: Set<String> = [sideCarrierHeader.rawCID]
+            try await waitForReceivedWork(
+                blockCID: sideCarrierHeader.rawCID,
+                grinds: carrierGrinds
+            )
+            let deliveryCountBeforeDescendants =
+                await deliveries.snapshot().count
 
             for header in [sideOneHeader, sideTwoHeader, sideThreeHeader, sideFourHeader] {
                 let admitted = try await parentService.admitNetworkCandidate(
                     header,
                     authenticatedChildPackage: nil,
-                    preparingChildDirectories: []
+                    preparingChildDirectories: [],
+                    contentSource: FetcherContentSource(parent)
                 )
                 guard case .acceptedSide = admitted.decision else {
                     await childRuntime.stop()
@@ -5352,22 +6463,40 @@ final class NetworkTrustTests: XCTestCase {
                     sideFourHeader.rawCID,
                 ]
             )
-            let expectedGrinds: Set<String> = [sideCarrierHeader.rawCID]
+            // The side carrier remains exported despite being noncanonical.
+            // Its descendants remain at their own parent-block locations and
+            // cannot move through the carrier's direct child commitment.
+            let descendantLocations = [
+                (blockCID: sideOneHeader.rawCID, grindID: sideOneHeader.rawCID),
+                (blockCID: sideTwoHeader.rawCID, grindID: sideTwoHeader.rawCID),
+                (blockCID: sideThreeHeader.rawCID, grindID: sideThreeHeader.rawCID),
+                (blockCID: sideFourHeader.rawCID, grindID: sideFourHeader.rawCID),
+            ]
             let parentSnapshot = await parent.parentSecuringWorkSnapshot()
             let exported = try XCTUnwrap(parentSnapshot)
             XCTAssertEqual(
                 Set(exported.sourceWork(forBlock: sideCarrierHeader.rawCID).grindIDs),
-                expectedGrinds
+                carrierGrinds
             )
             try await waitForReceivedWork(
-                blockCID: sideCarrierHeader.rawCID,
-                grinds: expectedGrinds
+                after: deliveryCountBeforeDescendants,
+                locations: descendantLocations
             )
             let received = await deliveries.snapshot().merged
             XCTAssertEqual(
                 Set(received.sourceWork(forBlock: sideCarrierHeader.rawCID).grindIDs),
-                expectedGrinds
+                carrierGrinds
             )
+            for location in descendantLocations {
+                XCTAssertNotNil(
+                    exported.sourceWork(forBlock: location.blockCID)
+                        .work(forGrind: location.grindID)
+                )
+                XCTAssertNotNil(
+                    received.sourceWork(forBlock: location.blockCID)
+                        .work(forGrind: location.grindID)
+                )
+            }
         } catch {
             await childRuntime.stop()
             await parentRuntime.stop()
@@ -5377,7 +6506,7 @@ final class NetworkTrustTests: XCTestCase {
         await parentRuntime.stop()
     }
 
-    func testInheritedParentSideWorkRelaysToGrandchildWithoutMiddleReorg()
+    func testInheritedParentSideWorkRelaysRecursivelyAcrossMiddleReorg()
         async throws {
         let upstreamStorage = FileManager.default.temporaryDirectory.appendingPathComponent(
             "lattice-recursive-parent-\(UUID().uuidString)",
@@ -5445,71 +6574,83 @@ final class NetworkTrustTests: XCTestCase {
         let middleRuntime = try NodeNetworkRuntime(configuration: middleConfiguration)
         let leafRuntime = try NodeNetworkRuntime(configuration: leafConfiguration)
         let middle = try await ChainProcess.open(
-            configuration: middleConfiguration,
-            remoteSource: middleRuntime.remoteContentSource
+            configuration: middleConfiguration
         )
         let leaf = try await ChainProcess.open(
-            configuration: leafConfiguration,
-            remoteSource: leafRuntime.remoteContentSource
+            configuration: leafConfiguration
         )
 
+        let middleAcceptedPublications = NetworkEventRecorder()
+        let middleWorkPublications = NetworkEventRecorder()
         let middleService = networkService(
             process: middle,
-            runtime: middleRuntime
+            runtime: middleRuntime,
+            acceptedBlockRecorder: middleAcceptedPublications,
+            securingWorkRecorder: middleWorkPublications
         )
         let leafService = networkService(process: leaf, runtime: leafRuntime)
         let middleCommits = NetworkEventRecorder()
         let middleReadiness = NetworkEventRecorder()
         let leafReadiness = NetworkEventRecorder()
         let leafDeliveries = InheritedSnapshotRecorder()
-        await middleRuntime.installParentReadinessHandler { ready in
-            await middleReadiness.append(ready ? "ready" : "not-ready")
-        }
-        await leafRuntime.installParentReadinessHandler { ready in
-            await leafReadiness.append(ready ? "ready" : "not-ready")
-        }
-        await middleRuntime.installAdmissionHandler { [weak middleService] header, package, directories in
-            guard let middleService else { throw CancellationError() }
-            return try await middleService.admitNetworkCandidate(
-                header,
-                authenticatedChildPackage: package,
-                preparingChildDirectories: directories
-            )
-        }
-        await middleRuntime.installInheritedWorkHandler { [weak middleService] snapshot, key in
-            guard let middleService else { throw CancellationError() }
-            let commit = try await middleService.applyInheritedWorkSnapshot(
-                snapshot,
-                from: key
-            )
-            if let commit {
-                await middleCommits.append(commit.canonicalChanged ? "true" : "false")
+        let middleHandlers = NodeNetworkHandlers(
+            admission: { [weak middleService] admission in
+                guard let middleService else { throw CancellationError() }
+                return try await middleService.admitNetworkCandidate(
+                    admission.header,
+                    authenticatedChildPackage: admission.authenticatedChildPackage,
+                    preparingChildDirectories: admission.preparingChildDirectories,
+                    contentSource: admission.contentSource
+                )
+            },
+            inheritedWork: {
+                [weak middleService] snapshot, sourceID, baseRevision, key in
+                guard let middleService else { throw CancellationError() }
+                let commit = try await middleService.applyInheritedWorkExport(
+                    snapshot,
+                    sourceID: sourceID,
+                    baseRevision: baseRevision,
+                    from: key
+                )
+                if let commit {
+                    await middleCommits.append(
+                        commit.canonicalChanged ? "true" : "false"
+                    )
+                }
+                return commit
+            },
+            parentWorkReadiness: { [weak middleService] ready in
+                await middleService?.setParentWorkReady(ready)
+                await middleReadiness.append(ready ? "ready" : "not-ready")
             }
-            return commit
-        }
-        await leafRuntime.installAdmissionHandler { [weak leafService] header, package, directories in
-            guard let leafService else { throw CancellationError() }
-            return try await leafService.admitNetworkCandidate(
-                header,
-                authenticatedChildPackage: package,
-                preparingChildDirectories: directories
-            )
-        }
-        await leafRuntime.installInheritedWorkHandler { [weak leafService] snapshot, key in
-            await leafDeliveries.append(snapshot)
-            guard let leafService else { throw CancellationError() }
-            return try await leafService.applyInheritedWorkSnapshot(
-                snapshot,
-                from: key
-            )
-        }
+        )
+        let leafHandlers = NodeNetworkHandlers(
+            admission: { [weak leafService] admission in
+                guard let leafService else { throw CancellationError() }
+                return try await leafService.admitNetworkCandidate(
+                    admission.header,
+                    authenticatedChildPackage: admission.authenticatedChildPackage,
+                    preparingChildDirectories: admission.preparingChildDirectories,
+                    contentSource: admission.contentSource
+                )
+            },
+            inheritedWork: {
+                [weak leafService] snapshot, sourceID, baseRevision, key in
+                await leafDeliveries.append(snapshot)
+                guard let leafService else { throw CancellationError() }
+                return try await leafService.applyInheritedWorkExport(
+                    snapshot,
+                    sourceID: sourceID,
+                    baseRevision: baseRevision,
+                    from: key
+                )
+            },
+            parentWorkReadiness: { [weak leafService] ready in
+                await leafService?.setParentWorkReady(ready)
+                await leafReadiness.append(ready ? "ready" : "not-ready")
+            }
+        )
 
-        let upstreamAuthority = try XCTUnwrap(
-            ParentWorkAuthorityKey(upstreamConfiguration.processPublicKey)
-        )
-        let middleAuthority = try XCTUnwrap(
-            ParentWorkAuthorityKey(middleConfiguration.processPublicKey)
-        )
         let upstreamGenesis = try await upstream.canonicalTipBlock()
 
         func makeBranch(
@@ -5518,7 +6659,7 @@ final class NetworkTrustTests: XCTestCase {
             leafTarget: UInt256
         ) async throws -> NetworkHierarchyBranch {
             let leafBlock = try await BlockBuilder.buildChildGenesis(
-                spec: NexusGenesis.spec.withParentWorkAuthorityKey(middleAuthority),
+                spec: NexusGenesis.spec,
                 parentState: LatticeState.emptyHeader,
                 timestamp: timestamp,
                 target: leafTarget,
@@ -5538,7 +6679,7 @@ final class NetworkTrustTests: XCTestCase {
                 storer: upstream
             )
             let middleBlock = try await BlockBuilder.buildChildGenesis(
-                spec: NexusGenesis.spec.withParentWorkAuthorityKey(upstreamAuthority),
+                spec: NexusGenesis.spec,
                 parentState: upstreamGenesis.postState,
                 transactions: [leafAuthorization],
                 children: ["Receipts": leafBlock],
@@ -5599,9 +6740,6 @@ final class NetworkTrustTests: XCTestCase {
             let outcome = try await upstream.admit(branch.rootHeader)
             XCTAssertTrue(outcome.decision.isAccepted)
 
-            let leafEntries = try await upstream.durableCandidateEntries(
-                for: branch.leaf
-            )
             try await branch.middleHeader.store(
                 paths: [["children", "Receipts"]: .targeted],
                 storer: middle
@@ -5610,8 +6748,7 @@ final class NetworkTrustTests: XCTestCase {
                 for: branch.middle,
                 children: [DirectChildCandidate(
                     directory: "Receipts",
-                    block: branch.leaf,
-                    acquisitionEntries: leafEntries
+                    block: branch.leaf
                 )],
                 capacity: 16
             )
@@ -5812,7 +6949,10 @@ final class NetworkTrustTests: XCTestCase {
         ))
         do {
             try await upstreamIvy.start()
-            try await middleRuntime.start(process: middle)
+            try await middleRuntime.start(
+                process: middle,
+                handlers: middleHandlers
+            )
             let middlePeer = PeerID(publicKey: middleConfiguration.processPublicKey)
             for _ in 0..<200 {
                 if (await upstreamIvy.connectedPeers).contains(middlePeer) { break }
@@ -5826,8 +6966,7 @@ final class NetworkTrustTests: XCTestCase {
                 topic: NodeNetworkTopic.hierarchyHello,
                 payload: try ChainHello(
                     nexusGenesisCID: middleConfiguration.nexusGenesisCID,
-                    chainPath: upstreamConfiguration.chainPath,
-                    minimumRootWorkHex: upstreamConfiguration.minimumRootWork.toHexString()
+                    chainPath: upstreamConfiguration.chainPath
                 ).encode()
             ) else {
                 throw NetworkTestError.failedSend
@@ -5840,7 +6979,7 @@ final class NetworkTrustTests: XCTestCase {
                 to: middlePeer
             )
 
-            try await leafRuntime.start(process: leaf)
+            try await leafRuntime.start(process: leaf, handlers: leafHandlers)
             try await waitForLeafDeliveries(1)
             try await waitForTip(leaf, branchA.leafHeader.rawCID)
             // Hierarchy hello and evidence-index replay may each send the
@@ -5896,7 +7035,7 @@ final class NetworkTrustTests: XCTestCase {
                 workByBlock: [
                     branchB.rootHeader.rawCID: WorkMeasure(contribution(
                         id: reorgGrind,
-                        work: 2
+                        work: 5
                     )),
                 ]
             )
@@ -5919,8 +7058,8 @@ final class NetworkTrustTests: XCTestCase {
             )
             try await waitForMiddleCommits(2)
             recordedMiddleCommits = await middleCommits.snapshot()
-            XCTAssertEqual(recordedMiddleCommits, ["false", "false"])
-            try await waitForTip(middle, branchA.middleHeader.rawCID)
+            XCTAssertEqual(recordedMiddleCommits, ["false", "true"])
+            try await waitForTip(middle, branchB.middleHeader.rawCID)
             try await waitForLeafDeliveries(deliveriesAfterWarmup + 1)
             try await waitForTip(leaf, branchB.leafHeader.rawCID)
             let readinessAfterDelta = await middleReadiness.snapshot()
@@ -5944,7 +7083,7 @@ final class NetworkTrustTests: XCTestCase {
             XCTAssertEqual(
                 relayed.sourceWork(forBlock: branchB.middleHeader.rawCID)
                     .work(forGrind: reorgGrind),
-                UInt256(2)
+                UInt256(5)
             )
             let received = await leafDeliveries.snapshot().merged
             XCTAssertNil(
@@ -5963,7 +7102,7 @@ final class NetworkTrustTests: XCTestCase {
             XCTAssertEqual(
                 received.sourceWork(forBlock: branchB.middleHeader.rawCID)
                     .work(forGrind: reorgGrind),
-                UInt256(2)
+                UInt256(5)
             )
 
             let deliveriesBeforeLateEdge = try await waitForQuietLeafDeliveries()
@@ -6004,13 +7143,30 @@ final class NetworkTrustTests: XCTestCase {
                     .work(forGrind: lateRootHeader.rawCID)
             )
 
+            let acceptedPublicationsBeforeLateEdge =
+                await middleAcceptedPublications.snapshot().count
+            let workPublicationsBeforeLateEdge =
+                await middleWorkPublications.snapshot().count
             let lateEdge = try await middleService.admitNetworkCandidate(
                 branchA.middleHeader,
                 authenticatedChildPackage: lateMiddlePackage,
-                preparingChildDirectories: []
+                preparingChildDirectories: [],
+                contentSource: FetcherContentSource(middle)
             )
             XCTAssertEqual(lateEdge.decision, .carrier)
             XCTAssertTrue(lateEdge.inheritedWorkChanged)
+            let acceptedPublicationsAfterLateEdge =
+                await middleAcceptedPublications.snapshot().count
+            let workPublicationsAfterLateEdge =
+                await middleWorkPublications.snapshot().count
+            XCTAssertEqual(
+                acceptedPublicationsAfterLateEdge,
+                acceptedPublicationsBeforeLateEdge
+            )
+            XCTAssertEqual(
+                workPublicationsAfterLateEdge,
+                workPublicationsBeforeLateEdge + 1
+            )
             try await waitForLeafDeliveries(deliveriesBeforeLateEdge + 1)
             let lateReceived = await leafDeliveries.snapshot().merged
             XCTAssertEqual(
@@ -6046,47 +7202,253 @@ final class NetworkTrustTests: XCTestCase {
         await upstreamIvy.stop()
     }
 
-    func testConcurrentSameCarrierRequestsRetainProvisionalRootUntilBothFinish()
-        async throws {
-        let fixture = try await provisionalRootFixture(keyByte: 0x81)
-        let gate = CandidateBuildGate()
+    func testProvisionalVolumeRegistryRetainsUntilLastLease() async throws {
+        let volume = try await transactionVolume(
+            unsignedTransaction(path: [])
+        )
+        let registry = ProvisionalVolumeRegistry()
+
+        let firstLease = await registry.retain(volume, generation: 7)
+        let secondLease = await registry.retain(volume, generation: 7)
+        XCTAssertTrue(firstLease)
+        XCTAssertTrue(secondLease)
+        await registry.release(volume.root, generation: 7)
+        let retained = await registry.volume(volume.root, generation: 7)
+        XCTAssertNotNil(retained)
+
+        await registry.release(volume.root, generation: 7)
+        let released = await registry.volume(volume.root, generation: 7)
+        XCTAssertNil(released)
+
+        let nextGeneration = await registry.retain(volume, generation: 8)
+        XCTAssertTrue(nextGeneration)
+        let stale = await registry.volume(volume.root, generation: 7)
+        let current = await registry.volume(volume.root, generation: 8)
+        XCTAssertNil(stale)
+        XCTAssertNotNil(current)
+    }
+
+    func testProvisionalVolumeRegistryRejectsRetainRacingReset() async throws {
+        let volume = try await transactionVolume(unsignedTransaction(path: []))
+        let broker = BlockingProvisionalBroker()
+        let registry = ProvisionalVolumeRegistry(broker: broker)
+        let retain = Task { await registry.retain(volume, generation: 7) }
+
+        await broker.waitUntilStoreStarts()
+        await registry.removeAll()
+        await broker.releaseStore()
+
+        let retained = await retain.value
+        let registered = await registry.volume(volume.root, generation: 7)
+        let stored = await broker.hasVolume(root: volume.root)
+        XCTAssertFalse(retained)
+        XCTAssertNil(registered)
+        XCTAssertFalse(stored)
+    }
+
+    func testContextualCandidateReadsOnlyExactRequestingParentSession()
+        async throws
+    {
+        let descendantKey = signingKey(0x91)
+        let fixture = try await provisionalRootFixture(keyByte: 0x8f)
+        let readiness = NetworkEventRecorder()
+        let childHandlers = NodeNetworkHandlers(
+            childCandidateBuilder: { context, parentSource in
+                let parentCID = try BlockHeader(
+                    node: context.parentCarrier
+                ).rawCID
+                let fetched = await parentSource.fetch([parentCID])
+                guard fetched[parentCID] == context.parentCarrier.toData() else {
+                    throw NetworkTestError.failedPhase(
+                        "exact parent carrier content"
+                    )
+                }
+                return fixture.candidate
+            },
+            candidateReservations: { _ in true },
+            admission: { _ in throw CancellationError() },
+            parentWorkReadiness: { ready in
+                await readiness.append(ready ? "ready" : "not-ready")
+            }
+        )
+        let descendantHello = try ChainHello(
+            nexusGenesisCID: fixture.childConfiguration.nexusGenesisCID,
+            chainPath: fixture.childConfiguration.chainPath + ["Leaf"]
+        ).encode()
+        let probe = HierarchyVolumeProbe(hello: descendantHello)
+        let descendant = Ivy(config: IvyConfig(
+            signingKey: descendantKey,
+            listenPort: 0,
+            stunServers: [],
+            healthConfig: PeerHealthConfig(enabled: false),
+            privateContentExchangeEnabled: true,
+            mode: .privateNetwork
+        ))
+        await descendant.installTestDelegate(probe)
+        await descendant.setContentSource(probe)
 
         do {
-            try await fixture.parentRuntime.start(process: fixture.parentProcess)
-            try await fixture.childRuntime.start(process: fixture.childProcess)
+            try await fixture.parentRuntime.start(
+                process: fixture.parentProcess,
+                handlers: inertNetworkHandlers()
+            )
+            try await fixture.childRuntime.start(
+                process: fixture.childProcess,
+                handlers: childHandlers
+            )
+            for _ in 0..<250 {
+                if await readiness.snapshot().last == "ready" { break }
+                try await Task.sleep(for: .milliseconds(20))
+            }
+            guard await readiness.snapshot().last == "ready" else {
+                throw NetworkTestError.failedPhase("parent readiness")
+            }
+
+            try await descendant.start()
+            try await descendant.connect(to: PeerEndpoint(
+                publicKey: fixture.childConfiguration.processPublicKey,
+                host: "127.0.0.1",
+                port: fixture.childConfiguration.factListenPort
+            ))
+            for _ in 0..<250 {
+                if await probe.didReceiveHello() { break }
+                try await Task.sleep(for: .milliseconds(20))
+            }
+            guard await probe.didReceiveHello() else {
+                throw NetworkTestError.failedPhase("descendant hierarchy hello")
+            }
+            await probe.resetVolumeRequests()
+
             try await waitForChildCandidate(fixture)
-            let parentContent = await fixture.parentProcess.content([fixture.rootCID])
-            let childContent = await fixture.childProcess.content([fixture.rootCID])
-            XCTAssertNil(parentContent[fixture.rootCID])
-            XCTAssertNil(childContent[fixture.rootCID])
-            await fixture.childRuntime.installChildCandidateBuilder { context in
-                _ = await gate.enter()
-                let entries = await fixture.childRuntime.hierarchyContentSource.fetch(
-                    [fixture.nestedCID]
-                )
-                guard entries[fixture.nestedCID] == fixture.nestedData,
-                      context.parentCarrier.toData() == fixture.context.parentCarrier.toData()
-                else { return nil }
-                return fixture.candidate
-            }
-
-            let first = Task {
-                await fixture.parentRuntime.directChildCandidates(fixture.context)
-            }
-            try await waitForBuilds(gate, count: 1)
-            let second = Task {
-                await fixture.parentRuntime.directChildCandidates(fixture.context)
-            }
-            try await waitForBuilds(gate, count: 2)
-
-            await gate.release(1)
-            let firstCandidates = await first.value
-            XCTAssertEqual(firstCandidates.count, 1)
-            await gate.release(2)
-            let secondCandidates = await second.value
-            XCTAssertEqual(secondCandidates.count, 1)
+            let candidates = await fixture.parentRuntime.directChildCandidates(
+                fixture.context
+            )
+            let descendantVolumeRequests = await probe.volumeRequestCount()
+            XCTAssertEqual(candidates.count, 1)
+            XCTAssertEqual(descendantVolumeRequests, 0)
         } catch {
-            await gate.releaseAll()
+            await descendant.stop()
+            await fixture.childRuntime.stop()
+            await fixture.parentRuntime.stop()
+            throw error
+        }
+        await descendant.stop()
+        await fixture.childRuntime.stop()
+        await fixture.parentRuntime.stop()
+    }
+
+    func testInvalidParentEvidenceCannotPinCandidateOrOvertakeReservation()
+        async throws
+    {
+        let fixture = try await provisionalRootFixture(keyByte: 0x93)
+        let childTip = try await fixture.childProcess.canonicalTipBlock()
+        let candidateBlock = try await BlockBuilder.buildBlock(
+            previous: childTip,
+            timestamp: childTip.timestamp + 1,
+            nonce: 77,
+            fetcher: fixture.childProcess
+        )
+        let candidateHeader = try BlockHeader(node: candidateBlock)
+        let readiness = NetworkEventRecorder()
+        let reservations = NetworkEventRecorder()
+        let childHandlers = NodeNetworkHandlers(
+            candidateReservations: { candidateCIDs in
+                await reservations.append("called")
+                return (try? await fixture.childProcess
+                    .replaceIssuedContextualCandidates(
+                        Set(candidateCIDs),
+                        capacity: 16
+                    )) == true
+            },
+            admission: { _ in throw CancellationError() },
+            parentWorkReadiness: { ready in
+                await readiness.append(ready ? "ready" : "not-ready")
+            }
+        )
+
+        do {
+            try await fixture.parentRuntime.start(
+                process: fixture.parentProcess,
+                handlers: inertNetworkHandlers()
+            )
+            try await fixture.childRuntime.start(
+                process: fixture.childProcess,
+                handlers: childHandlers
+            )
+
+            for _ in 0..<250 {
+                if !(await reservations.snapshot()).isEmpty { break }
+                try await Task.sleep(for: .milliseconds(20))
+            }
+            let reservationBaseline = await reservations.snapshot().count
+            guard reservationBaseline > 0 else {
+                throw NetworkTestError.failedPhase(
+                    "initial reservation reconciliation"
+                )
+            }
+            try await fixture.childProcess.storeContextualCandidate(
+                candidateHeader,
+                fetcher: fixture.childProcess,
+                capacity: 16
+            )
+            let readinessBaseline = await readiness.snapshot().count
+            let candidateCID = candidateHeader.rawCID
+            let retainedBeforeEvidence = try await fixture.childProcess
+                .contextualCandidateChildren(candidateCIDs: [candidateCID])
+            XCTAssertNotNil(retainedBeforeEvidence)
+
+            let childPeer = PeerID(
+                publicKey: fixture.childConfiguration.processPublicKey
+            )
+            let invalidEvidence = try ChildEvidenceAvailableMessage(
+                childPath: fixture.childConfiguration.chainPath,
+                sourceID: testEvidenceSourceID,
+                ordinal: 1,
+                childCID: candidateCID,
+                rootCID: inheritedWorkCID("invalid-parent-evidence-root"),
+                attachmentCID: inheritedWorkCID(
+                    "invalid-parent-evidence-attachment"
+                )
+            ).encoded()
+            let reservation = try ChildCandidateReservationRequestMessage(
+                requestID: 1,
+                childPath: fixture.childConfiguration.chainPath,
+                candidateCIDs: [candidateCID]
+            ).encoded()
+            guard case .enqueued =
+                    await fixture.parentRuntime.hierarchy.sendMessage(
+                        to: childPeer,
+                        topic: NodeNetworkTopic.childEvidenceAvailable,
+                        payload: invalidEvidence
+                    ) else {
+                throw NetworkTestError.failedPhase(
+                    "invalid evidence advertisement"
+                )
+            }
+            guard case .enqueued =
+                    await fixture.parentRuntime.hierarchy.sendMessage(
+                        to: childPeer,
+                        topic: NodeNetworkTopic.childCandidateReservationRequest,
+                        payload: reservation
+                    ) else {
+                throw NetworkTestError.failedPhase("reservation ordering")
+            }
+
+            for _ in 0..<250 {
+                if await readiness.snapshot().count > readinessBaseline { break }
+                try await Task.sleep(for: .milliseconds(20))
+            }
+            let readinessEvents = await readiness.snapshot()
+            let reservationEvents = await reservations.snapshot()
+            XCTAssertGreaterThan(readinessEvents.count, readinessBaseline)
+            XCTAssertEqual(reservationEvents.count, reservationBaseline)
+            let replaced = try await fixture.childProcess
+                .replaceIssuedContextualCandidates([], capacity: 16)
+            XCTAssertTrue(replaced)
+            let retainedAfterInvalidEvidence = try await fixture.childProcess
+                .contextualCandidateChildren(candidateCIDs: [candidateCID])
+            XCTAssertNil(retainedAfterInvalidEvidence)
+        } catch {
             await fixture.childRuntime.stop()
             await fixture.parentRuntime.stop()
             throw error
@@ -6095,7 +7457,802 @@ final class NetworkTrustTests: XCTestCase {
         await fixture.parentRuntime.stop()
     }
 
-    func testRealNetworkRuntimeStartsStopsAndRestartsBothPlanes() async throws {
+    func testExactParentSessionRunsOnlyOneReservationHandler() async throws {
+        let fixture = try await provisionalRootFixture(keyByte: 0x95)
+        let reservationGate = CandidateReservationAckGate { _ in true }
+        let readiness = NetworkEventRecorder()
+        let childHandlers = NodeNetworkHandlers(
+            candidateReservations: { candidateCIDs in
+                await reservationGate.handle(candidateCIDs)
+            },
+            admission: { _ in throw CancellationError() },
+            parentWorkReadiness: { ready in
+                await readiness.append(ready ? "ready" : "not-ready")
+            }
+        )
+
+        do {
+            try await fixture.parentRuntime.start(
+                process: fixture.parentProcess,
+                handlers: inertNetworkHandlers()
+            )
+            try await fixture.childRuntime.start(
+                process: fixture.childProcess,
+                handlers: childHandlers
+            )
+            for _ in 0..<250 {
+                if !(await reservationGate.snapshot()).isEmpty { break }
+                try await Task.sleep(for: .milliseconds(20))
+            }
+            let baseline = await reservationGate.snapshot().count
+            guard baseline > 0 else {
+                throw NetworkTestError.failedPhase(
+                    "initial reservation reconciliation"
+                )
+            }
+            let readinessBaseline = await readiness.snapshot().count
+            let childPeer = PeerID(
+                publicKey: fixture.childConfiguration.processPublicKey
+            )
+            let candidateCID = inheritedWorkCID("single-flight-reservation")
+            for requestID in [UInt64(91), UInt64(92)] {
+                let payload = try ChildCandidateReservationRequestMessage(
+                    requestID: requestID,
+                    childPath: fixture.childConfiguration.chainPath,
+                    candidateCIDs: [candidateCID]
+                ).encoded()
+                guard case .enqueued =
+                        await fixture.parentRuntime.hierarchy.sendMessage(
+                            to: childPeer,
+                            topic: NodeNetworkTopic
+                                .childCandidateReservationRequest,
+                            payload: payload
+                        ) else {
+                    throw NetworkTestError.failedPhase(
+                        "reservation request \(requestID)"
+                    )
+                }
+                if requestID == 91 {
+                    for _ in 0..<250 {
+                        if await reservationGate.snapshot().count > baseline {
+                            break
+                        }
+                        try await Task.sleep(for: .milliseconds(20))
+                    }
+                }
+            }
+
+            for _ in 0..<250 {
+                if await readiness.snapshot().count > readinessBaseline { break }
+                try await Task.sleep(for: .milliseconds(20))
+            }
+            let snapshots = await reservationGate.snapshot()
+            let readinessCount = await readiness.snapshot().count
+            XCTAssertEqual(snapshots.count, baseline + 1)
+            XCTAssertEqual(snapshots.last, [candidateCID])
+            XCTAssertGreaterThan(readinessCount, readinessBaseline)
+        } catch {
+            await reservationGate.release()
+            await fixture.childRuntime.stop()
+            await fixture.parentRuntime.stop()
+            throw error
+        }
+        await reservationGate.release()
+        await fixture.childRuntime.stop()
+        await fixture.parentRuntime.stop()
+    }
+
+    func testParentTemplateWaitsForDurableChildCandidateReservationAck()
+        async throws
+    {
+        let fixture = try await provisionalRootFixture(keyByte: 0x92)
+        let childService = networkService(
+            process: fixture.childProcess,
+            runtime: fixture.childRuntime
+        )
+        let reservationGate = CandidateReservationAckGate {
+            [weak childService] candidateCIDs in
+            guard let childService else { return false }
+            return await childService.replaceIssuedCandidateReservations(
+                candidateCIDs
+            )
+        }
+        await reservationGate.holdNext([])
+        let completion = NetworkEventRecorder()
+        let parentService = ChainService(
+            process: fixture.parentProcess,
+            childCandidateProvider: { [weak runtime = fixture.parentRuntime] context in
+                guard let runtime else { return [] }
+                return await runtime.directChildCandidates(context)
+            },
+            childCandidateReservationReconciler: {
+                [weak runtime = fixture.parentRuntime] references in
+                guard let runtime else { return references.isEmpty }
+                return await runtime.reconcileChildCandidateReservations(
+                    references
+                )
+            },
+            childProofPublisher: {
+                [weak runtime = fixture.parentRuntime] publication in
+                guard let runtime else { return }
+                _ = try await runtime.publishChildProof(
+                    publication.proof,
+                    childDirectory: publication.directory,
+                    childCID: publication.childCID
+                )
+            },
+            acceptedBlockPublisher: { _ in },
+            securingWorkPublisher: {}
+        )
+        let childHandlers = NodeNetworkHandlers(
+            childCandidateBuilder: { [weak childService] context, parentSource in
+                guard let childService else { return nil }
+                return try await childService.miningCandidate(
+                    parentCarrier: context.parentCarrier,
+                    parentContentSource: parentSource,
+                    rewards: context.rewards,
+                    mode: context.mode
+                )
+            },
+            candidateReservations: { [weak reservationGate] candidateCIDs in
+                guard let reservationGate else { return false }
+                return await reservationGate.handle(candidateCIDs)
+            },
+            admission: { _ in throw CancellationError() },
+            parentWorkReadiness: { [weak childService] ready in
+                await childService?.setParentWorkReady(ready)
+            }
+        )
+
+        do {
+            try await fixture.parentRuntime.start(
+                process: fixture.parentProcess,
+                handlers: inertNetworkHandlers()
+            )
+            try await fixture.childRuntime.start(
+                process: fixture.childProcess,
+                handlers: childHandlers
+            )
+            for _ in 0..<250 {
+                if await childService.status().phase == .active { break }
+                try await Task.sleep(for: .milliseconds(20))
+            }
+            let childPhase = await childService.status().phase
+            XCTAssertEqual(childPhase, .active)
+
+            for _ in 0..<250 {
+                if await reservationGate.snapshot().contains([]) { break }
+                try await Task.sleep(for: .milliseconds(20))
+            }
+            let initialSnapshots = await reservationGate.snapshot()
+            XCTAssertTrue(initialSnapshots.contains([]))
+
+            let unavailable = await fixture.parentRuntime
+                .directChildCandidates(fixture.context)
+            XCTAssertTrue(unavailable.isEmpty)
+            let snapshotsWhileInitialAckBlocked =
+                await reservationGate.snapshot()
+            XCTAssertFalse(snapshotsWhileInitialAckBlocked.contains {
+                !$0.isEmpty
+            })
+
+            await reservationGate.release()
+            try await waitForChildCandidate(fixture)
+            await reservationGate.holdNextNonempty()
+
+            let mining = Task {
+                let response = try await parentService.miningTemplate(
+                    MiningTemplateRequest()
+                )
+                await completion.append("returned")
+                return response
+            }
+            for _ in 0..<250 {
+                if await reservationGate.snapshot().contains(where: {
+                    !$0.isEmpty
+                }) {
+                    break
+                }
+                try await Task.sleep(for: .milliseconds(20))
+            }
+            let nonempty = await reservationGate.snapshot().filter {
+                !$0.isEmpty
+            }
+            XCTAssertEqual(nonempty.count, 1)
+            let reservation = try XCTUnwrap(nonempty.first)
+            XCTAssertEqual(reservation.count, 1)
+            await Task.yield()
+            let completionBeforeAck = await completion.snapshot()
+            XCTAssertTrue(completionBeforeAck.isEmpty)
+
+            await reservationGate.release()
+            let response = try await mining.value
+            let reservationRejections =
+                await reservationGate.rejectionSnapshot()
+            XCTAssertEqual(reservationRejections, [])
+            let completionAfterAck = await completion.snapshot()
+            XCTAssertEqual(completionAfterAck, ["returned"])
+            let children = try XCTUnwrap(response.block.children.node)
+            let childValues = try children.allKeysAndValues()
+            XCTAssertEqual(children.count, 1)
+            XCTAssertEqual(childValues.keys.sorted(), ["Payments"])
+            let reservationAfterAck = await reservationGate.snapshot().last
+            XCTAssertEqual(reservationAfterAck, reservation)
+            let childCID = try XCTUnwrap(childValues["Payments"]?.rawCID)
+            XCTAssertEqual(reservation, [childCID])
+
+            let retentionScope = [
+                fixture.childConfiguration.nexusGenesisCID,
+                fixture.childConfiguration.address.key,
+            ].joined(separator: ":")
+            let store = try testNodeStore(
+                databasePath: fixture.childConfiguration.storagePath
+                    .appendingPathComponent("state.db"),
+                nexusGenesisCID: fixture.childConfiguration.nexusGenesisCID,
+                chainPath: fixture.childConfiguration.chainPath,
+                spawningParentKey: try XCTUnwrap(
+                    fixture.childConfiguration.parentEndpoint
+                ).publicKey,
+                issuingAuthorityKey:
+                    fixture.childConfiguration.processPublicKey,
+                contextualCandidateOwner:
+                    retentionScope + ":contextual-candidates"
+            )
+            let issuedCandidateCIDs =
+                try await store.issuedContextualCandidateCIDs()
+            XCTAssertEqual(
+                issuedCandidateCIDs,
+                [childCID]
+            )
+
+            let snapshotsBeforeSubmission =
+                await reservationGate.snapshot().count
+            await reservationGate.holdNext([])
+            let submissionCompletion = NetworkEventRecorder()
+            let submissionTask = Task {
+                let result = try await parentService.submitWork(
+                    SubmitWorkRequest(workID: response.workID, nonce: 0)
+                )
+                await submissionCompletion.append("returned")
+                return result
+            }
+            for _ in 0..<250 {
+                let snapshots = await reservationGate.snapshot()
+                if snapshots.count > snapshotsBeforeSubmission,
+                   snapshots.last?.isEmpty == true {
+                    break
+                }
+                try await Task.sleep(for: .milliseconds(20))
+            }
+            for _ in 0..<250 {
+                if await submissionCompletion.snapshot() == ["returned"] {
+                    break
+                }
+                try await Task.sleep(for: .milliseconds(20))
+            }
+            let completionWhileReleaseBlocked =
+                await submissionCompletion.snapshot()
+            XCTAssertEqual(
+                completionWhileReleaseBlocked,
+                ["returned"],
+                "a child withholding a release ACK must not stall its parent"
+            )
+            await reservationGate.release()
+            let submission = try await submissionTask.value
+            XCTAssertTrue(submission.accepted)
+            let snapshotsAfterSubmission =
+                await reservationGate.snapshot()
+            XCTAssertGreaterThan(
+                snapshotsAfterSubmission.count,
+                snapshotsBeforeSubmission
+            )
+            XCTAssertEqual(snapshotsAfterSubmission.last, [])
+            for _ in 0..<250 {
+                if try await store.issuedContextualCandidateCIDs().isEmpty {
+                    break
+                }
+                try await Task.sleep(for: .milliseconds(20))
+            }
+            let releasedCandidateCIDs = try await store
+                .issuedContextualCandidateCIDs()
+            XCTAssertTrue(releasedCandidateCIDs.isEmpty)
+
+            await fixture.childRuntime.stop()
+            await fixture.parentRuntime.stop()
+            let eviction = try DiskBroker(
+                path: fixture.childConfiguration.storagePath
+                    .appendingPathComponent("volumes.db").path,
+                evictUnpinnedGraceSeconds: 0
+            )
+            _ = try await eviction.evictUnpinned()
+            let retainedAfterReleaseAndGC = await eviction.fetchVolumeLocal(
+                root: childCID
+            )
+            XCTAssertNotNil(retainedAfterReleaseAndGC)
+        } catch {
+            await reservationGate.release()
+            await fixture.childRuntime.stop()
+            await fixture.parentRuntime.stop()
+            throw error
+        }
+        await reservationGate.release()
+        await fixture.childRuntime.stop()
+        await fixture.parentRuntime.stop()
+    }
+
+    func testReconnectReservationCannotOverwriteNewerExactSet()
+        async throws
+    {
+        let fixture = try await provisionalRootFixture(keyByte: 0x94)
+        let issued = IssuedCandidateSet()
+        let reservationGate = CandidateReservationAckGate {
+            [weak issued] candidateCIDs in
+            guard let issued else { return false }
+            return await issued.replace(with: candidateCIDs)
+        }
+        await reservationGate.release()
+        let childHandlers = NodeNetworkHandlers(
+            candidateReservations: { [weak reservationGate] candidateCIDs in
+                guard let reservationGate else { return false }
+                return await reservationGate.handle(candidateCIDs)
+            },
+            admission: { _ in throw CancellationError() }
+        )
+        let firstCID = inheritedWorkCID("reservation-race-first")
+        let secondCID = inheritedWorkCID("reservation-race-second")
+        let childPeerKey = try PeerKey(
+            fixture.childConfiguration.processPublicKey
+        )
+        let first = ChildCandidateReservationReference(
+            peerKey: childPeerKey,
+            candidateCID: firstCID
+        )
+        let newer = [
+            first,
+            ChildCandidateReservationReference(
+                peerKey: childPeerKey,
+                candidateCID: secondCID
+            ),
+        ]
+
+        do {
+            try await fixture.parentRuntime.start(
+                process: fixture.parentProcess,
+                handlers: inertNetworkHandlers()
+            )
+            try await fixture.childRuntime.start(
+                process: fixture.childProcess,
+                handlers: childHandlers
+            )
+            var initiallyApplied = false
+            for _ in 0..<250 {
+                if await fixture.parentRuntime
+                    .reconcileChildCandidateReservations([first]) {
+                    initiallyApplied = true
+                    break
+                }
+                try await Task.sleep(for: .milliseconds(20))
+            }
+            XCTAssertTrue(initiallyApplied)
+            let initiallyIssued = await issued.snapshot()
+            XCTAssertEqual(initiallyIssued, [firstCID])
+
+            await fixture.childRuntime.stop()
+            await reservationGate.holdNext([firstCID])
+            let reconnectStart = await reservationGate.snapshot().count
+            try await fixture.childRuntime.start(
+                process: fixture.childProcess,
+                handlers: childHandlers
+            )
+            for _ in 0..<250 {
+                let snapshots = await reservationGate.snapshot()
+                if snapshots.count > reconnectStart,
+                   Set(snapshots.last ?? []) == [firstCID] {
+                    break
+                }
+                try await Task.sleep(for: .milliseconds(20))
+            }
+            let heldReconnect = await reservationGate.snapshot()
+            XCTAssertGreaterThan(heldReconnect.count, reconnectStart)
+            XCTAssertEqual(Set(heldReconnect.last ?? []), [firstCID])
+
+            let completion = NetworkEventRecorder()
+            let reconciliation = Task {
+                let accepted = await fixture.parentRuntime
+                    .reconcileChildCandidateReservations(newer)
+                await completion.append(accepted ? "accepted" : "rejected")
+                return accepted
+            }
+            try await Task.sleep(for: .milliseconds(500))
+            let completionWhileHelloHeld = await completion.snapshot()
+            XCTAssertTrue(completionWhileHelloHeld.isEmpty)
+            let snapshotsWhileHelloHeld =
+                await reservationGate.snapshot()
+            XCTAssertEqual(
+                snapshotsWhileHelloHeld.count,
+                heldReconnect.count
+            )
+
+            await reservationGate.release()
+            let accepted = await reconciliation.value
+            XCTAssertTrue(accepted)
+            let completed = await completion.snapshot()
+            XCTAssertEqual(completed, ["accepted"])
+            let finallyIssued = await issued.snapshot()
+            XCTAssertEqual(
+                finallyIssued,
+                [firstCID, secondCID]
+            )
+            let finalReservationSnapshot =
+                await reservationGate.snapshot().last
+            XCTAssertEqual(
+                Set(finalReservationSnapshot ?? []),
+                [firstCID, secondCID]
+            )
+        } catch {
+            await reservationGate.release()
+            await fixture.childRuntime.stop()
+            await fixture.parentRuntime.stop()
+            throw error
+        }
+        await reservationGate.release()
+        await fixture.childRuntime.stop()
+        await fixture.parentRuntime.stop()
+    }
+
+    func testConcurrentExactReservationReconciliationIsLinearizable()
+        async throws
+    {
+        let fixture = try await provisionalRootFixture(keyByte: 0x9a)
+        let applied = IssuedCandidateSet()
+        let reservationGate = CandidateReservationAckGate {
+            [weak applied] candidateCIDs in
+            guard let applied else { return false }
+            return await applied.replace(with: candidateCIDs)
+        }
+        await reservationGate.release()
+        let childHandlers = NodeNetworkHandlers(
+            candidateReservations: { [weak reservationGate] candidateCIDs in
+                guard let reservationGate else { return false }
+                return await reservationGate.handle(candidateCIDs)
+            },
+            admission: { _ in throw CancellationError() }
+        )
+        let childPeerKey = try PeerKey(
+            fixture.childConfiguration.processPublicKey
+        )
+        let first = ChildCandidateReservationReference(
+            peerKey: childPeerKey,
+            candidateCID: inheritedWorkCID("reservation-linear-first")
+        )
+        let expanded = [
+            first,
+            ChildCandidateReservationReference(
+                peerKey: childPeerKey,
+                candidateCID: inheritedWorkCID(
+                    "reservation-linear-second"
+                )
+            ),
+        ]
+
+        do {
+            try await fixture.parentRuntime.start(
+                process: fixture.parentProcess,
+                handlers: inertNetworkHandlers()
+            )
+            try await fixture.childRuntime.start(
+                process: fixture.childProcess,
+                handlers: childHandlers
+            )
+            var initiallyApplied = false
+            for _ in 0..<250 {
+                if await fixture.parentRuntime
+                    .reconcileChildCandidateReservations([first]) {
+                    initiallyApplied = true
+                    break
+                }
+                try await Task.sleep(for: .milliseconds(20))
+            }
+            XCTAssertTrue(initiallyApplied)
+
+            await reservationGate.holdNext(
+                Set(expanded.map(\.candidateCID))
+            )
+            let expandedTask = Task {
+                await fixture.parentRuntime
+                    .reconcileChildCandidateReservations(expanded)
+            }
+            for _ in 0..<250 {
+                if Set(await reservationGate.snapshot().last ?? [])
+                    == Set(expanded.map(\.candidateCID)) {
+                    break
+                }
+                try await Task.sleep(for: .milliseconds(20))
+            }
+            let heldExpanded = await reservationGate.snapshot().last
+            XCTAssertEqual(
+                Set(heldExpanded ?? []),
+                Set(expanded.map(\.candidateCID))
+            )
+
+            let restored = NetworkEventRecorder()
+            let restoreTask = Task {
+                let accepted = await fixture.parentRuntime
+                    .reconcileChildCandidateReservations([first])
+                await restored.append(accepted ? "accepted" : "rejected")
+                return accepted
+            }
+            try await Task.sleep(for: .milliseconds(200))
+            let restoredWhileHeld = await restored.snapshot()
+            XCTAssertTrue(restoredWhileHeld.isEmpty)
+
+            await reservationGate.release()
+            let expandedAccepted = await expandedTask.value
+            let restoreAccepted = await restoreTask.value
+            XCTAssertTrue(expandedAccepted)
+            XCTAssertTrue(restoreAccepted)
+            for _ in 0..<250 {
+                if Set(await reservationGate.snapshot().last ?? [])
+                    == [first.candidateCID],
+                   await applied.snapshot() == [first.candidateCID] {
+                    break
+                }
+                try await Task.sleep(for: .milliseconds(20))
+            }
+            let finalReservations = await reservationGate.snapshot().last
+            let finalApplied = await applied.snapshot()
+            let restoreCompletions = await restored.snapshot()
+            XCTAssertEqual(
+                Set(finalReservations ?? []),
+                [first.candidateCID]
+            )
+            XCTAssertEqual(finalApplied, [first.candidateCID])
+            XCTAssertEqual(restoreCompletions, ["accepted"])
+        } catch {
+            await reservationGate.release()
+            await fixture.childRuntime.stop()
+            await fixture.parentRuntime.stop()
+            throw error
+        }
+        await reservationGate.release()
+        await fixture.childRuntime.stop()
+        await fixture.parentRuntime.stop()
+    }
+
+    func testOldSessionReservationAckCannotSatisfyReplacementSession()
+        async throws
+    {
+        let fixture = try await provisionalRootFixture(keyByte: 0x96)
+        let applied = IssuedCandidateSet()
+        let reservationGate = CandidateReservationAckGate {
+            [weak applied] candidateCIDs in
+            guard let applied else { return false }
+            return await applied.replace(with: candidateCIDs)
+        }
+        await reservationGate.release()
+        let childHandlers = NodeNetworkHandlers(
+            candidateReservations: { [weak reservationGate] candidateCIDs in
+                guard let reservationGate else { return false }
+                return await reservationGate.handle(candidateCIDs)
+            },
+            admission: { _ in throw CancellationError() }
+        )
+        let childPeerKey = try PeerKey(
+            fixture.childConfiguration.processPublicKey
+        )
+        let first = ChildCandidateReservationReference(
+            peerKey: childPeerKey,
+            candidateCID: inheritedWorkCID("reservation-session-first")
+        )
+        let stale = [
+            first,
+            ChildCandidateReservationReference(
+                peerKey: childPeerKey,
+                candidateCID: inheritedWorkCID("reservation-session-stale")
+            ),
+        ]
+        let replacement = [
+            first,
+            ChildCandidateReservationReference(
+                peerKey: childPeerKey,
+                candidateCID: inheritedWorkCID("reservation-session-replacement")
+            ),
+        ]
+
+        do {
+            try await fixture.parentRuntime.start(
+                process: fixture.parentProcess,
+                handlers: inertNetworkHandlers()
+            )
+            try await fixture.childRuntime.start(
+                process: fixture.childProcess,
+                handlers: childHandlers
+            )
+            var initiallyApplied = false
+            for _ in 0..<250 {
+                if await fixture.parentRuntime
+                    .reconcileChildCandidateReservations([first]) {
+                    initiallyApplied = true
+                    break
+                }
+                try await Task.sleep(for: .milliseconds(20))
+            }
+            XCTAssertTrue(initiallyApplied)
+
+            await reservationGate.holdNext(
+                Set(stale.map(\.candidateCID))
+            )
+            let staleReconciliation = Task {
+                await fixture.parentRuntime
+                    .reconcileChildCandidateReservations(stale)
+            }
+            for _ in 0..<250 {
+                if Set(await reservationGate.snapshot().last ?? [])
+                    == Set(stale.map(\.candidateCID)) {
+                    break
+                }
+                try await Task.sleep(for: .milliseconds(20))
+            }
+            let heldStaleSnapshot = await reservationGate.snapshot().last
+            XCTAssertEqual(
+                Set(heldStaleSnapshot ?? []),
+                Set(stale.map(\.candidateCID))
+            )
+
+            // Replacing the authenticated child session must fail the suspended
+            // request locally. Releasing its handler later may attempt an old
+            // response, but that response cannot satisfy any replacement-session
+            // reservation.
+            await fixture.childRuntime.stop()
+            let staleAccepted = await staleReconciliation.value
+            XCTAssertFalse(staleAccepted)
+            let replacementStart = await reservationGate.snapshot().count
+            try await fixture.childRuntime.start(
+                process: fixture.childProcess,
+                handlers: childHandlers
+            )
+            for _ in 0..<250 {
+                let snapshots = await reservationGate.snapshot()
+                if snapshots.count > replacementStart,
+                   Set(snapshots.last ?? []) == [first.candidateCID] {
+                    break
+                }
+                try await Task.sleep(for: .milliseconds(20))
+            }
+            let reconnectedSnapshot = await reservationGate.snapshot().last
+            XCTAssertEqual(Set(reconnectedSnapshot ?? []), [first.candidateCID])
+
+            let replacementAccepted = await fixture.parentRuntime
+                .reconcileChildCandidateReservations(replacement)
+            XCTAssertTrue(replacementAccepted)
+            let replacementSnapshot = await reservationGate.snapshot().last
+            XCTAssertEqual(
+                Set(replacementSnapshot ?? []),
+                Set(replacement.map(\.candidateCID))
+            )
+
+            await reservationGate.release()
+            for _ in 0..<250 {
+                if await reservationGate.snapshot().count >= replacementStart + 3 {
+                    break
+                }
+                try await Task.sleep(for: .milliseconds(20))
+            }
+
+            let final = replacement + [
+                ChildCandidateReservationReference(
+                    peerKey: childPeerKey,
+                    candidateCID: inheritedWorkCID("reservation-session-final")
+                ),
+            ]
+            let finalAccepted = await fixture.parentRuntime
+                .reconcileChildCandidateReservations(final)
+            XCTAssertTrue(finalAccepted)
+            let finalSnapshot = await reservationGate.snapshot().last
+            XCTAssertEqual(
+                Set(finalSnapshot ?? []),
+                Set(final.map(\.candidateCID))
+            )
+        } catch {
+            await reservationGate.release()
+            await fixture.childRuntime.stop()
+            await fixture.parentRuntime.stop()
+            throw error
+        }
+        await reservationGate.release()
+        await fixture.childRuntime.stop()
+        await fixture.parentRuntime.stop()
+    }
+
+    func testBlockedReadinessCallbackCannotResumeIntoRestartedRuntime()
+        async throws {
+        let fixture = try await provisionalRootFixture(keyByte: 0x83)
+        let gate = CandidateBuildGate()
+        let firstReadiness = NetworkEventRecorder()
+        let secondReadiness = NetworkEventRecorder()
+        let firstGeneration = NodeNetworkHandlers(
+            admission: { _ in throw CancellationError() },
+            parentWorkReadiness: { ready in
+                await firstReadiness.append(
+                    ready ? "ready-entered" : "not-ready"
+                )
+                if ready {
+                    _ = await gate.enter()
+                    await firstReadiness.append("ready-returned")
+                }
+            }
+        )
+        let secondGeneration = NodeNetworkHandlers(
+            admission: { _ in throw CancellationError() },
+            parentWorkReadiness: { ready in
+                await secondReadiness.append(ready ? "ready" : "not-ready")
+            }
+        )
+
+        do {
+            try await fixture.parentRuntime.start(
+                process: fixture.parentProcess,
+                handlers: inertNetworkHandlers()
+            )
+            try await fixture.childRuntime.start(
+                process: fixture.childProcess,
+                handlers: firstGeneration
+            )
+            try await waitForBuilds(gate, count: 1)
+
+            let stopping = Task { await fixture.childRuntime.stop() }
+            for _ in 0..<250 {
+                if await firstReadiness.snapshot().last == "not-ready" { break }
+                try await Task.sleep(for: .milliseconds(20))
+            }
+            guard await firstReadiness.snapshot().last == "not-ready" else {
+                throw NetworkTestError.failedPhase("generation-one stop")
+            }
+            await stopping.value
+
+            try await fixture.childRuntime.start(
+                process: fixture.childProcess,
+                handlers: secondGeneration
+            )
+            for _ in 0..<250 {
+                if await secondReadiness.snapshot().last == "ready" { break }
+                try await Task.sleep(for: .milliseconds(20))
+            }
+            guard await secondReadiness.snapshot().last == "ready" else {
+                throw NetworkTestError.failedPhase("generation-two readiness")
+            }
+            await gate.release(1)
+            for _ in 0..<100 {
+                if await firstReadiness.snapshot().last == "ready-returned" {
+                    break
+                }
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            let firstGenerationFinal = await firstReadiness.snapshot().last
+            XCTAssertEqual(firstGenerationFinal, "ready-returned")
+            // A real hierarchy session may legitimately be replaced while the
+            // old callback is suspended. Wait through that current-generation
+            // churn; the stale callback must not prevent the new runtime from
+            // becoming ready and operating normally.
+            for _ in 0..<250 {
+                if await secondReadiness.snapshot().last == "ready" { break }
+                try await Task.sleep(for: .milliseconds(20))
+            }
+            let secondGenerationFinal = await secondReadiness.snapshot().last
+            XCTAssertEqual(secondGenerationFinal, "ready")
+            try await fixture.childRuntime.canonicalTipDidChange()
+        } catch {
+            await gate.releaseAll()
+            await fixture.childRuntime.stop()
+            await fixture.parentRuntime.stop()
+            throw error
+        }
+        await gate.releaseAll()
+        await fixture.childRuntime.stop()
+        await fixture.parentRuntime.stop()
+    }
+
+    func testRealNetworkRuntimeRestartsBothPlanesWithAtomicHandlers() async throws {
         let storage = FileManager.default.temporaryDirectory.appendingPathComponent(
             "lattice-network-runtime-\(UUID().uuidString)",
             isDirectory: true
@@ -6130,24 +8287,13 @@ final class NetworkTrustTests: XCTestCase {
             planeConfigurations: planes
         )
         let process = try await ChainProcess.open(
-            configuration: configuration,
-            remoteSource: runtime.remoteContentSource
+            configuration: configuration
         )
+        let handlers = inertNetworkHandlers()
 
         do {
-            do {
-                try await runtime.start(process: process)
-                XCTFail("a runtime without service ingress must not start")
-            } catch {
-                XCTAssertEqual(
-                    error as? NodeNetworkRuntimeError,
-                    .missingIngressHandler
-                )
-            }
-            await runtime.installAdmissionHandler { _, _, _ in
-                throw CancellationError()
-            }
-
+            // `start` requires the complete generation value; there is no
+            // running state in which admission can be installed or replaced.
             do {
                 try await runtime.canonicalTipDidChange()
                 XCTFail("a stopped runtime must reject canonical-tip changes")
@@ -6160,7 +8306,10 @@ final class NetworkTrustTests: XCTestCase {
                 for _ in 0..<2 {
                     group.addTask {
                         do {
-                            try await runtime.start(process: process)
+                            try await runtime.start(
+                                process: process,
+                                handlers: handlers
+                            )
                             return .started
                         } catch let error as NodeNetworkRuntimeError {
                             return .failed(error)
@@ -6187,11 +8336,14 @@ final class NetworkTrustTests: XCTestCase {
             }
             await runtime.stop()
 
-            try await runtime.start(process: process)
+            try await runtime.start(process: process, handlers: handlers)
             try await runtime.canonicalTipDidChange()
             await runtime.stop()
 
-            let starting = await runtime.enqueueStart(process: process)
+            let starting = await runtime.enqueueStart(
+                process: process,
+                handlers: handlers
+            )
             await runtime.stop()
             try await starting.value
             do {
@@ -6251,29 +8403,19 @@ final class NetworkTrustTests: XCTestCase {
             )
         )
         let parentRuntime = try NodeNetworkRuntime(configuration: parentConfiguration)
-        let childRuntime = try NodeNetworkRuntime(configuration: childConfiguration)
+        let childRuntime = try NodeNetworkRuntime(
+            configuration: childConfiguration
+        )
         let parentProcess = try await ChainProcess.open(
-            configuration: parentConfiguration,
-            remoteSource: parentRuntime.remoteContentSource
+            configuration: parentConfiguration
         )
         let childProcess = try await ChainProcess.open(
-            configuration: childConfiguration,
-            remoteSource: childRuntime.remoteContentSource
-        )
-        await parentRuntime.installAdmissionHandler { _, _, _ in
-            throw CancellationError()
-        }
-        await childRuntime.installAdmissionHandler { _, _, _ in
-            throw CancellationError()
-        }
-
-        let parentAuthority = try XCTUnwrap(
-            ParentWorkAuthorityKey(parentConfiguration.processPublicKey)
+            configuration: childConfiguration
         )
         let parentGenesis = try await parentProcess.canonicalTipBlock()
         let timestamp = parentGenesis.timestamp + 3_600_000
         let childGenesis = try await BlockBuilder.buildChildGenesis(
-            spec: NexusGenesis.spec.withParentWorkAuthorityKey(parentAuthority),
+            spec: NexusGenesis.spec,
             parentState: parentGenesis.postState,
             timestamp: timestamp,
             target: UInt256.max,
@@ -6300,6 +8442,19 @@ final class NetworkTrustTests: XCTestCase {
         let carrierHeader = try BlockHeader(node: carrier)
         let carrierAdmission = try await parentProcess.admit(carrierHeader)
         XCTAssertTrue(carrierAdmission.decision.isAccepted)
+        let childPackage = try await networkChildPackage(
+            parent: parentProcess,
+            carrierCID: carrierHeader.rawCID,
+            rootCID: carrierHeader.rawCID,
+            directory: "Payments",
+            childCID: childHeader.rawCID
+        )
+        let childBootstrap = try await childProcess.admit(
+            childHeader,
+            authenticatedChildPackage: childPackage,
+            remoteSource: FetcherContentSource(parentProcess)
+        )
+        XCTAssertTrue(childBootstrap.decision.isAccepted)
 
         let provisional = try await BlockBuilder.buildBlock(
             previous: carrier,
@@ -6307,11 +8462,8 @@ final class NetworkTrustTests: XCTestCase {
             nonce: 2,
             fetcher: parentProcess
         )
-        let provisionalCID = try BlockHeader(node: provisional).rawCID
-        let carrierContent = await parentProcess.content([carrierHeader.rawCID])
-        let nestedData = try XCTUnwrap(carrierContent[carrierHeader.rawCID])
-        let childData = try XCTUnwrap(childGenesis.toData())
         return ProvisionalRootFixture(
+            childConfiguration: childConfiguration,
             parentRuntime: parentRuntime,
             childRuntime: childRuntime,
             parentProcess: parentProcess,
@@ -6322,21 +8474,14 @@ final class NetworkTrustTests: XCTestCase {
             ),
             candidate: DirectChildCandidate(
                 directory: "Payments",
-                block: childGenesis,
-                acquisitionEntries: [childHeader.rawCID: childData]
-            ),
-            rootCID: provisionalCID,
-            nestedCID: carrierHeader.rawCID,
-            nestedData: nestedData
+                block: childGenesis
+            )
         )
     }
 
     private func waitForChildCandidate(
         _ fixture: ProvisionalRootFixture
     ) async throws {
-        await fixture.childRuntime.installChildCandidateBuilder { _ in
-            fixture.candidate
-        }
         for _ in 0..<250 {
             if await fixture.parentRuntime.directChildCandidates(fixture.context).count == 1 {
                 return
@@ -6354,16 +8499,19 @@ final class NetworkTrustTests: XCTestCase {
             if await gate.enteredCount() >= count { return }
             try await Task.sleep(for: .milliseconds(20))
         }
-        throw NetworkTestError.failedPhase("provisional child candidate build")
+        let entered = await gate.enteredCount()
+        throw NetworkTestError.failedPhase(
+            "provisional child candidate build \(count), entered \(entered)"
+        )
     }
 
     private func networkChildGenesisCandidate(
-        parentAuthority: ParentWorkAuthorityKey,
+        parentAuthority: ParentProcessKey,
         timestamp: Int64,
         source: NetworkTestContentStore
     ) async throws -> NetworkChildGenesisCandidate {
         let child = try await BlockBuilder.buildChildGenesis(
-            spec: NexusGenesis.spec.withParentWorkAuthorityKey(parentAuthority),
+            spec: NexusGenesis.spec,
             parentState: LatticeState.emptyHeader,
             timestamp: timestamp,
             target: UInt256.max,
@@ -6403,8 +8551,7 @@ final class NetworkTrustTests: XCTestCase {
                         directory: "Payments",
                         cid: header.rawCID
                     )
-                ),
-                acquisitionEntries: entries
+                )
             )
         )
     }
@@ -6496,9 +8643,10 @@ final class NetworkTrustTests: XCTestCase {
         // "Nexus" is fixed, and an absolute path needs at least one child.
         var remaining = encodedContribution - 7
         var contributions: [Int] = []
-        while remaining > Int(UInt16.max) + 2 {
-            contributions.append(Int(UInt16.max) + 2)
-            remaining -= Int(UInt16.max) + 2
+        let maximumContribution = StateAtomLimits.maximumDirectoryBytes + 2
+        while remaining > maximumContribution {
+            contributions.append(maximumContribution)
+            remaining -= maximumContribution
         }
         if remaining >= 3 {
             contributions.append(remaining)
@@ -6514,7 +8662,9 @@ final class NetworkTrustTests: XCTestCase {
 
     private func networkService(
         process: ChainProcess,
-        runtime: NodeNetworkRuntime
+        runtime: NodeNetworkRuntime,
+        acceptedBlockRecorder: NetworkEventRecorder? = nil,
+        securingWorkRecorder: NetworkEventRecorder? = nil
     ) -> ChainService {
         ChainService(
             process: process,
@@ -6527,12 +8677,17 @@ final class NetworkTrustTests: XCTestCase {
                 _ = try await runtime.publishChildProof(
                     publication.proof,
                     childDirectory: publication.directory,
-                    child: publication.childBlock
+                    childCID: publication.childCID
                 )
             },
             acceptedBlockPublisher: { [weak runtime] blockCID in
+                await acceptedBlockRecorder?.append(blockCID)
                 guard let runtime else { throw CancellationError() }
                 try await runtime.publishAcceptedBlock(blockCID)
+            },
+            securingWorkPublisher: { [weak runtime] in
+                await securingWorkRecorder?.append("work")
+                await runtime?.publishSecuringWork()
             },
             acceptedTransactionPublisher: { [weak runtime] rootCID in
                 guard let runtime else { throw CancellationError() }
@@ -6541,42 +8696,44 @@ final class NetworkTrustTests: XCTestCase {
         )
     }
 
-    private func installTransactionService(
+    private func transactionServiceHandlers(
         _ service: ChainService,
-        on runtime: NodeNetworkRuntime,
         inventoryRequests: NetworkEventRecorder? = nil,
         transactions: NetworkEventRecorder? = nil
-    ) async {
-        await runtime.installAdmissionHandler {
-            [weak service] header,
-            package,
-            directories in
-            guard let service else { throw CancellationError() }
-            return try await service.admitNetworkCandidate(
-                header,
-                authenticatedChildPackage: package,
-                preparingChildDirectories: directories
-            )
-        }
-        await runtime.installInheritedWorkHandler { [weak service] snapshot, key in
-            guard let service else { throw CancellationError() }
-            return try await service.applyInheritedWorkSnapshot(
-                snapshot,
-                from: key
-            )
-        }
-        await runtime.installTransactionHandler { [weak service] transaction in
-            guard let service else { throw CancellationError() }
-            await transactions?.append("attempt")
-            let inserted = try await service.submitNetworkTransaction(transaction)
-            await transactions?.append("accepted")
-            return inserted
-        }
-        await runtime.installTransactionInventoryProvider { [weak service] in
-            guard let service else { return [] }
-            await inventoryRequests?.append("request")
-            return await service.transactionInventoryRoots()
-        }
+    ) -> NodeNetworkHandlers {
+        NodeNetworkHandlers(
+            admission: { [weak service] admission in
+                guard let service else { throw CancellationError() }
+                return try await service.admitNetworkCandidate(
+                    admission.header,
+                    authenticatedChildPackage: admission.authenticatedChildPackage,
+                    preparingChildDirectories: admission.preparingChildDirectories,
+                    contentSource: admission.contentSource
+                )
+            },
+            inheritedWork: {
+                [weak service] snapshot, sourceID, baseRevision, key in
+                guard let service else { throw CancellationError() }
+                return try await service.applyInheritedWorkExport(
+                    snapshot,
+                    sourceID: sourceID,
+                    baseRevision: baseRevision,
+                    from: key
+                )
+            },
+            transaction: { [weak service] transaction in
+                guard let service else { throw CancellationError() }
+                await transactions?.append("attempt")
+                let inserted = try await service.submitNetworkTransaction(transaction)
+                await transactions?.append("accepted")
+                return inserted
+            },
+            transactionInventory: { [weak service] in
+                guard let service else { return [] }
+                await inventoryRequests?.append("request")
+                return await service.transactionInventoryRoots()
+            }
+        )
     }
 
     private func waitForTopic(
@@ -6717,6 +8874,9 @@ final class NetworkTrustTests: XCTestCase {
         ) else {
             throw NetworkTestError.failedStart
         }
+        _ = try await parent.retryPendingChildProofs(
+            carrierCID: carrierCID
+        )
         let proofs = try await parent.durableDirectChildProofs(
             carrierCID: carrierCID,
             rootCID: rootCID
@@ -6731,8 +8891,7 @@ final class NetworkTrustTests: XCTestCase {
                 proof: proof.proof,
                 parentCarrierLink: carrierLink,
                 parentGenesisLink: genesisLink
-            ),
-            acquisitionEntries: proof.acquisitionEntries
+            )
         )
     }
 
@@ -6788,17 +8947,8 @@ final class NetworkTrustTests: XCTestCase {
             )
         )
         let process = try await ChainProcess.open(
-            configuration: configuration,
-            remoteSource: runtime.remoteContentSource
+            configuration: configuration
         )
-        await runtime.installAdmissionHandler { _, _, _ in
-            NodeAdmissionOutcome(
-                decision: .duplicate,
-                parentCarrierLink: nil,
-                sameChainPredecessor: nil
-            )
-        }
-
         let genesis = try await process.canonicalTipBlock()
         var canonical = genesis
         for step in 1...3 {
@@ -6827,11 +8977,8 @@ final class NetworkTrustTests: XCTestCase {
             throw NetworkTestError.failedPhase("side fixture predecessor")
         }
 
-        let parentAuthority = try XCTUnwrap(
-            ParentWorkAuthorityKey(configuration.processPublicKey)
-        )
         let childBlock = try await BlockBuilder.buildChildGenesis(
-            spec: NexusGenesis.spec.withParentWorkAuthorityKey(parentAuthority),
+            spec: NexusGenesis.spec,
             parentState: sidePredecessor.postState,
             timestamp: 7_200_000,
             target: UInt256.max,
@@ -6861,13 +9008,10 @@ final class NetworkTrustTests: XCTestCase {
             childDirectory: "Payments",
             fetcher: process
         )
-        var remoteEntries = Dictionary(
+        let remoteEntries = Dictionary(
             proof.entries.map { ($0.cid, $0.data) },
             uniquingKeysWith: { first, _ in first }
         )
-        remoteEntries.merge(
-            try await process.durableCandidateEntries(for: childBlock)
-        ) { existing, _ in existing }
         await remoteContent.store(entries: remoteEntries)
         try await childHeader.storeBlock(
             fetcher: process,
@@ -6900,7 +9044,8 @@ final class NetworkTrustTests: XCTestCase {
             == [carrierHeader.rawCID],
               try await process.issuedChildEvidenceSummaries(
                 directory: "Payments",
-                after: nil,
+                afterOrdinal: 0,
+                throughOrdinal: UInt64(Int64.max),
                 limit: 1
               ).isEmpty,
               await process.status().tipCID == canonicalTipCID
@@ -6914,8 +9059,7 @@ final class NetworkTrustTests: XCTestCase {
             recorder: recorder,
             hello: try ChainHello(
                 nexusGenesisCID: configuration.nexusGenesisCID,
-                chainPath: childPath,
-                minimumRootWorkHex: configuration.minimumRootWork.toHexString()
+                chainPath: childPath
             ).encode(),
             childPath: childPath
         )
@@ -6992,9 +9136,7 @@ final class NetworkTrustTests: XCTestCase {
                     topic: NodeNetworkTopic.overlayHello,
                     payload: try ChainHello(
                         nexusGenesisCID: fixture.configuration.nexusGenesisCID,
-                        chainPath: fixture.configuration.chainPath,
-                        minimumRootWorkHex:
-                            fixture.configuration.minimumRootWork.toHexString()
+                        chainPath: fixture.configuration.chainPath
                     ).encode()
                   )
             else {
@@ -7052,10 +9194,6 @@ final class NetworkTrustTests: XCTestCase {
                     listenPort: hierarchyPort,
                     bootstrapPeers: [configuration.parentEndpoint!.ivy],
                     inboundAdmissionBypassPeerKeys: [parentPeerKey],
-                    tallyConfig: TallyConfig(
-                        perPeerRequestCapacity: 1,
-                        perPeerRequestRefillPerSecond: 5
-                    ),
                     requestTimeout: .milliseconds(100),
                     stunServers: [],
                     maxConnections: IvyConfig.defaultMaxConnections,
@@ -7067,16 +9205,8 @@ final class NetworkTrustTests: XCTestCase {
             )
         )
         let process = try await ChainProcess.open(
-            configuration: configuration,
-            remoteSource: runtime.remoteContentSource
+            configuration: configuration
         )
-        await runtime.installAdmissionHandler { _, _, _ in
-            NodeAdmissionOutcome(
-                decision: .duplicate,
-                parentCarrierLink: nil,
-                sameChainPredecessor: nil
-            )
-        }
         let recorder = HierarchyRetryRecorder(
             withholdFirstHello: withholdFirstHello
         )
@@ -7090,8 +9220,7 @@ final class NetworkTrustTests: XCTestCase {
             recorder: recorder,
             parentHello: try ChainHello(
                 nexusGenesisCID: configuration.nexusGenesisCID,
-                chainPath: ["Nexus"],
-                minimumRootWorkHex: configuration.minimumRootWork.toHexString()
+                chainPath: ["Nexus"]
             ).encode(),
             summary: summary
         )

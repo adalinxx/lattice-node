@@ -163,10 +163,13 @@ Build an ordinary direct-child genesis against the current parent state.
 
 Request fields:
 
-- `directory`: one non-empty direct-child edge label; it cannot contain `/`.
+- `directory`: one 1–64 byte visible-ASCII direct-child edge label; it cannot
+  contain `/`.
 - `spec`: the child's `ChainSpec`.
 - `genesisTransactions`: content-bound transactions for the absolute child
   path.
+- `policyModules`: the exact complete module Volumes named by `spec.wasmPolicies`,
+  encoded as `{rootCID, bytes}`. The field is empty when the spec has no policy.
 - `target`: child genesis target.
 - `timestamp`: child genesis timestamp in milliseconds.
 
@@ -184,6 +187,11 @@ Response:
 
 The response is the content-addressed block itself, not an opaque serialized
 bootstrap field.
+The request is validated through an in-memory content overlay, so a novel
+module need not already exist in the node's broker. Only a valid intent is
+published to VolumeBroker. Its complete genesis, transaction, spec, state-witness,
+and module Volumes remain exactly retained through template creation, and are
+released when the intent is replaced, anchored, or made stale by parent state.
 Creating the intent does not mutate the parent chain. The caller separately
 constructs and signs the parent transaction containing the matching
 `GenesisAction`, submits it through `/v1/transactions`, and mines it. A child
@@ -201,4 +209,7 @@ delivers the authenticated genesis link.
   Requests`.
 - A temporarily unavailable transaction policy returns `503 Service
   Unavailable`.
-- JSON transaction and child-intent payloads are bounded to 1 MiB.
+- Ordinary JSON requests are bounded to 1 MiB. Child-intent bodies use a
+  node-local byte ceiling before decoding because they may carry a genesis
+  Volume plus content-bound policy modules; exceeding it is local capacity, not
+  chain invalidity.

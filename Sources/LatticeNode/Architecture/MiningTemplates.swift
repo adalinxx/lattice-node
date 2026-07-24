@@ -1,4 +1,5 @@
 import Foundation
+import Ivy
 import Lattice
 import UInt256
 import cashew
@@ -10,57 +11,81 @@ private enum MiningCandidateValidationError: Error {
 public struct DirectChildCandidate: Sendable {
     public let directory: String
     public let block: Block
-    let acquisitionEntries: [String: Data]
+    let searchWitness: ChildSchedulingWitness?
+    let deploymentWitness: ChildSchedulingWitness?
+    let parentCreatedGenesis: Bool
+    let advertiserPeerKey: PeerKey?
 
     public init(
         directory: String,
         block: Block,
-        acquisitionEntries: [String: Data]
+        searchWitness: ChildSchedulingWitness? = nil,
+        deploymentWitness: ChildSchedulingWitness? = nil
     ) {
         self.directory = directory
         self.block = block
-        self.acquisitionEntries = acquisitionEntries
+        self.searchWitness = searchWitness
+        self.deploymentWitness = deploymentWitness
+        parentCreatedGenesis = false
+        advertiserPeerKey = nil
+    }
+
+    init(
+        directory: String,
+        block: Block,
+        searchWitness: ChildSchedulingWitness? = nil,
+        deploymentWitness: ChildSchedulingWitness? = nil,
+        parentCreatedGenesis: Bool,
+        advertiserPeerKey: PeerKey? = nil
+    ) {
+        self.directory = directory
+        self.block = block
+        self.searchWitness = searchWitness
+        self.deploymentWitness = deploymentWitness
+        self.parentCreatedGenesis = parentCreatedGenesis
+        self.advertiserPeerKey = advertiserPeerKey
     }
 }
 
-/// Derives scheduling exclusively from the committed block DAG.
-func committedCandidateTargets(
-    block: Block,
-    fetcher: any Fetcher
-) async throws -> (search: UInt256, deployment: UInt256?) {
-    var pending = [block]
-    var seen: Set<String> = []
-    var searchTarget = UInt256.zero
-    var deploymentTarget = block.parent == nil ? block.target : nil
+public struct ChildSchedulingWitness: Sendable {
+    public let proof: ChildBlockProof
+    public let terminal: Block
 
-    while let current = pending.popLast() {
-        let currentCID = try BlockHeader(node: current).rawCID
-        guard seen.insert(currentCID).inserted else { continue }
-        searchTarget = max(searchTarget, current.target)
+    public init(proof: ChildBlockProof, terminal: Block) {
+        self.proof = proof
+        self.terminal = terminal
+    }
+}
 
-        let childrenHeader = try await current.children.resolve(fetcher: fetcher)
-        guard let childrenNode = childrenHeader.node else {
-            throw MiningCandidateValidationError.invalid
-        }
-        let children = try await childrenNode.resolveList(fetcher: fetcher)
-        for childHeader in try children.allKeysAndValues().values {
-            guard let child = try await childHeader.resolve(fetcher: fetcher).node else {
-                throw MiningCandidateValidationError.invalid
-            }
-            if child.parent == nil {
-                deploymentTarget = min(
-                    deploymentTarget ?? current.target,
-                    current.target,
-                    child.target
-                )
-            }
-            pending.append(child)
-        }
+func schedulingTargets(
+    for candidate: DirectChildCandidate
+) async -> (search: UInt256, deployment: UInt256?)? {
+    let search: UInt256
+    if let witness = candidate.searchWitness {
+        guard let targets = await witness.proof.schedulingTargets(
+            root: candidate.block,
+            terminal: witness.terminal
+        ) else { return nil }
+        search = targets.searchTarget
+    } else {
+        search = candidate.block.target
     }
-    guard searchTarget > .zero else {
-        throw MiningCandidateValidationError.invalid
+
+    let deployment: UInt256?
+    if let witness = candidate.deploymentWitness {
+        guard let targets = await witness.proof.schedulingTargets(
+            root: candidate.block,
+            terminal: witness.terminal
+        ), let target = targets.deploymentTarget else {
+            return nil
+        }
+        deployment = target
+    } else {
+        deployment = candidate.block.parent == nil
+            ? candidate.block.target
+            : nil
     }
-    return (searchTarget, deploymentTarget)
+    return (search, deployment)
 }
 
 public struct MiningTemplate: Sendable {
@@ -71,6 +96,8 @@ public struct MiningTemplate: Sendable {
     public let chainPath: [String]
     public let expiresAt: ContinuousClock.Instant
     let childCandidates: [DirectChildCandidate]
+    let searchWitness: ChildSchedulingWitness?
+    let deploymentWitness: ChildSchedulingWitness?
 
     var remainingLifetimeMilliseconds: UInt64 {
         let components = ContinuousClock.now.duration(to: expiresAt).components
@@ -112,9 +139,7 @@ public actor MiningTemplateBook {
         lifetime: Duration = .seconds(30),
         capacity: Int = 16
     ) {
-        precondition(
-            capacity > 0 && lifetime > .zero && minimumRootWork > .zero
-        )
+        precondition(capacity > 0 && lifetime > .zero)
         self.chainPath = chainPath
         self.minimumRootWork = minimumRootWork
         self.lifetime = lifetime
@@ -143,10 +168,18 @@ public actor MiningTemplateBook {
     }
 
     func issue(_ template: MiningTemplate) -> MiningTemplate {
+        issueTrackingInsertion(template).template
+    }
+
+    func issueTrackingInsertion(
+        _ template: MiningTemplate
+    ) -> (template: MiningTemplate, inserted: Bool) {
         precondition(template.chainPath == chainPath)
         if let existing = templates[template.workID],
            ContinuousClock.now < existing.expiresAt {
-            return existing
+            order.removeAll { $0 == template.workID }
+            order.append(template.workID)
+            return (existing, false)
         }
         templates[template.workID] = template
         order.removeAll { $0 == template.workID }
@@ -154,7 +187,27 @@ public actor MiningTemplateBook {
         while order.count > capacity {
             templates.removeValue(forKey: order.removeFirst())
         }
-        return template
+        return (template, true)
+    }
+
+    func discard(workID: String) {
+        templates.removeValue(forKey: workID)
+        order.removeAll { $0 == workID }
+    }
+
+    func activeChildCandidates() -> [DirectChildCandidate] {
+        let now = ContinuousClock.now
+        let expired = order.filter {
+            templates[$0].map { now >= $0.expiresAt } ?? true
+        }
+        for workID in expired {
+            templates.removeValue(forKey: workID)
+        }
+        if !expired.isEmpty {
+            let expiredSet = Set(expired)
+            order.removeAll { expiredSet.contains($0) }
+        }
+        return order.compactMap { templates[$0] }.flatMap(\.childCandidates)
     }
 
     /// Assembles candidate context without issuing miner work or consuming cache
@@ -191,14 +244,21 @@ public actor MiningTemplateBook {
     ) async throws -> MiningTemplate {
         precondition(transactionLimit >= 0)
         var childBlocks: [String: Block] = [:]
+        var childTargets: [
+            String: (search: UInt256, deployment: UInt256?)
+        ] = [:]
         for child in children {
-            guard !child.directory.isEmpty, !child.directory.contains("/") else {
+            guard StateAtomLimits.isDirectory(child.directory) else {
                 throw MiningTemplateError.invalidChildDirectory
             }
             guard childBlocks[child.directory] == nil else {
                 throw MiningTemplateError.duplicateChildDirectory
             }
+            guard let targets = await schedulingTargets(for: child) else {
+                throw MiningCandidateValidationError.invalid
+            }
             childBlocks[child.directory] = child.block
+            childTargets[child.directory] = targets
         }
         // A stale/conflicting pool entry must never suppress all external work.
         // Accept valid chunks greedily and bisect only the chunks that fail the
@@ -247,38 +307,98 @@ public actor MiningTemplateBook {
             }
         }
         let workID = try BlockHeader(node: candidate).rawCID
-        var schedulingEntries: [String: Data] = [:]
-        for child in children {
-            for (cid, data) in child.acquisitionEntries {
-                if let existing = schedulingEntries[cid], existing != data {
-                    throw MiningCandidateValidationError.invalid
-                }
-                schedulingEntries[cid] = data
-            }
-        }
-        let schedulingFetcher = CoalescingFetcher(OverlayContentSource(
-            entries: schedulingEntries,
-            fallback: FetcherContentSource(fetcher)
-        ))
-        let committed = try await committedCandidateTargets(
-            block: candidate,
-            fetcher: schedulingFetcher
+        let scheduling = try await Self.scheduling(
+            root: candidate,
+            children: children,
+            targets: childTargets,
+            fetcher: fetcher
         )
+        let localFloorTarget = minimumRootWork == .zero
+            ? UInt256.max
+            : UInt256.max / minimumRootWork
         let searchTarget = min(
-            committed.search,
-            committed.deployment ?? .max,
-            UInt256.max / minimumRootWork
+            scheduling.searchTarget,
+            scheduling.deploymentTarget ?? .max,
+            localFloorTarget
         )
         let template = MiningTemplate(
             workID: workID,
             block: candidate,
             searchTarget: searchTarget,
-            deploymentTarget: committed.deployment,
+            deploymentTarget: scheduling.deploymentTarget,
             chainPath: chainPath,
             expiresAt: ContinuousClock.now + lifetime,
-            childCandidates: children
+            childCandidates: children,
+            searchWitness: scheduling.searchWitness,
+            deploymentWitness: scheduling.deploymentWitness
         )
         return template
+    }
+
+    private nonisolated static func scheduling(
+        root: Block,
+        children: [DirectChildCandidate],
+        targets: [String: (search: UInt256, deployment: UInt256?)],
+        fetcher: any Fetcher
+    ) async throws -> (
+        searchTarget: UInt256,
+        deploymentTarget: UInt256?,
+        searchWitness: ChildSchedulingWitness?,
+        deploymentWitness: ChildSchedulingWitness?
+    ) {
+        let rootHeader = try BlockHeader(node: root)
+        var searchTarget = root.target
+        var searchWitness: ChildSchedulingWitness?
+        var deploymentTarget = root.parent == nil ? root.target : nil
+        var deploymentWitness: ChildSchedulingWitness?
+
+        for child in children.sorted(by: { $0.directory < $1.directory }) {
+            guard let childTargets = targets[child.directory] else {
+                throw MiningCandidateValidationError.invalid
+            }
+            let direct = try await ChildBlockProof.generate(
+                rootHeader: rootHeader,
+                childDirectory: child.directory,
+                fetcher: fetcher
+            )
+            if childTargets.search > searchTarget {
+                searchTarget = childTargets.search
+                if let descendant = child.searchWitness {
+                    searchWitness = ChildSchedulingWitness(
+                        proof: direct.composing(hop: descendant.proof),
+                        terminal: descendant.terminal
+                    )
+                } else {
+                    searchWitness = ChildSchedulingWitness(
+                        proof: direct,
+                        terminal: child.block
+                    )
+                }
+            }
+            if let childDeployment = childTargets.deployment {
+                let target = min(root.target, childDeployment)
+                if deploymentTarget == nil || target < deploymentTarget! {
+                    deploymentTarget = target
+                    if let descendant = child.deploymentWitness {
+                        deploymentWitness = ChildSchedulingWitness(
+                            proof: direct.composing(hop: descendant.proof),
+                            terminal: descendant.terminal
+                        )
+                    } else {
+                        deploymentWitness = ChildSchedulingWitness(
+                            proof: direct,
+                            terminal: child.block
+                        )
+                    }
+                }
+            }
+        }
+        return (
+            searchTarget,
+            deploymentTarget,
+            searchWitness,
+            deploymentWitness
+        )
     }
 
     private nonisolated static func makeCandidate(

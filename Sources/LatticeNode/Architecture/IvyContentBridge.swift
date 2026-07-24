@@ -1,15 +1,21 @@
 import Foundation
 import Ivy
+import Lattice
 import Tally
 import VolumeBroker
 import cashew
 
 /// A cashew source whose network request is always bound to the candidate root
 /// selected by the caller. The root is never guessed from a frontier of CIDs.
-public struct IvyRootContentSource: ContentSource, Sendable {
+public struct IvyRootContentSource: Sendable {
+    private static let defaultPolicy = NodeResourcePolicy.default
+
     public struct Attribution: Sendable, Equatable {
         public let servedByPublicKeys: Set<String>
         public let allResponsesComplete: Bool
+        public let localCapacityUnavailable: Bool
+        public let contentUnavailable: Bool
+        public let deficientVolumeSuppliers: [String: Set<String>]
 
         public var soleRemoteSupplierPublicKey: String? {
             servedByPublicKeys.count == 1 ? servedByPublicKeys.first : nil
@@ -35,13 +41,30 @@ public struct IvyRootContentSource: ContentSource, Sendable {
         private let lock = NSLock()
         private var peerPublicKeys: Set<String> = []
         private var complete = true
+        private var locallyLimited = false
+        private var unavailable = false
+        private var deficientVolumeSuppliers: [String: Set<String>] = [:]
 
-        func record(_ response: AttributedVolumeResponse, complete: Bool) {
+        func record(
+            _ response: AttributedVolumeResponse,
+            requestedRoot: String,
+            complete: Bool,
+            providerDeficient: Bool
+        ) {
             lock.lock()
             if let peer = response.servedBy {
                 peerPublicKeys.insert(peer.publicKey)
+                if providerDeficient {
+                    deficientVolumeSuppliers[
+                        requestedRoot,
+                        default: []
+                    ].insert(peer.publicKey)
+                }
             }
             self.complete = self.complete && complete
+            locallyLimited = locallyLimited
+                || response.failure == .localCapacityUnavailable
+            unavailable = unavailable || response == .empty
             lock.unlock()
         }
 
@@ -50,7 +73,10 @@ public struct IvyRootContentSource: ContentSource, Sendable {
             defer { lock.unlock() }
             return Attribution(
                 servedByPublicKeys: peerPublicKeys,
-                allResponsesComplete: complete
+                allResponsesComplete: complete,
+                localCapacityUnavailable: locallyLimited,
+                contentUnavailable: unavailable,
+                deficientVolumeSuppliers: deficientVolumeSuppliers
             )
         }
 
@@ -60,94 +86,255 @@ public struct IvyRootContentSource: ContentSource, Sendable {
     }
 
     private final class Context: @unchecked Sendable {
-        private static let maximumVolumes = 10_000
-        private static let maximumBytes = 64 * 1024 * 1024
-
         let rootCID: String
         let trace = Trace()
+        private let maximumMembers: Int
+        private let maximumStorageBytes: Int
+        private let maximumVolumes: Int
+        private let broker = MemoryBroker()
         private let lock = NSLock()
-        private var entries: [String: Data] = [:]
-        private var volumes: [String: SerializedVolume] = [:]
         private var attemptedRoots = Set<String>()
-        private var byteCount = 0
+        private var accountedMembers = Set<String>()
+        private var storageByteCount = 0
 
-        init(rootCID: String) {
+        init(
+            rootCID: String,
+            maximumVolumes: Int,
+            maximumMembers: Int,
+            maximumStorageBytes: Int
+        ) {
             self.rootCID = rootCID
+            self.maximumVolumes = maximumVolumes
+            self.maximumMembers = maximumMembers
+            self.maximumStorageBytes = maximumStorageBytes
         }
 
-        func cached(_ cids: Set<String>) -> [String: Data] {
-            lock.withLock { entries.filter { cids.contains($0.key) } }
+        func cached(_ cids: Set<String>) async -> [String: Data] {
+            await broker.fetch(cids)
         }
 
         func reserve(rootCID: String) -> Bool {
             lock.withLock {
-                guard volumes[rootCID] == nil,
-                      attemptedRoots.count < Self.maximumVolumes else {
+                guard attemptedRoots.count < maximumVolumes else {
                     return false
                 }
                 return attemptedRoots.insert(rootCID).inserted
             }
         }
 
-        func store(_ volume: SerializedVolume) -> Bool {
-            lock.withLock {
-                var addedBytes = 0
-                for (cid, data) in volume.entries where entries[cid] == nil {
-                    let next = addedBytes.addingReportingOverflow(data.count)
+        func store(_ volume: SerializedVolume) async -> Bool {
+            let fits = lock.withLock {
+                var addedMembers = 0
+                var addedStorageBytes = 0
+                for (cid, data) in volume.entries
+                    where !accountedMembers.contains(cid) {
+                    addedMembers += 1
+                    let framed = cid.utf8.count
+                        .addingReportingOverflow(data.count)
+                    guard !framed.overflow else { return false }
+                    let framedWithOverhead = framed.partialValue
+                        .addingReportingOverflow(6)
+                    guard !framedWithOverhead.overflow else { return false }
+                    let next = addedStorageBytes.addingReportingOverflow(
+                        framedWithOverhead.partialValue
+                    )
                     guard !next.overflow else { return false }
-                    addedBytes = next.partialValue
+                    addedStorageBytes = next.partialValue
                 }
-                let nextTotal = byteCount.addingReportingOverflow(addedBytes)
-                guard !nextTotal.overflow,
-                      nextTotal.partialValue <= Self.maximumBytes else {
+                let nextMembers = accountedMembers.count.addingReportingOverflow(
+                    addedMembers
+                )
+                let nextStorageBytes = storageByteCount.addingReportingOverflow(
+                    addedStorageBytes
+                )
+                guard !nextMembers.overflow,
+                      nextMembers.partialValue <= maximumMembers,
+                      !nextStorageBytes.overflow,
+                      nextStorageBytes.partialValue <= maximumStorageBytes else {
                     return false
                 }
-                for (cid, data) in volume.entries {
-                    if let existing = entries[cid], existing != data { return false }
-                }
-                entries.merge(volume.entries) { existing, _ in existing }
-                volumes[volume.root] = volume
-                byteCount = nextTotal.partialValue
+                accountedMembers.formUnion(volume.entries.keys)
+                storageByteCount = nextStorageBytes.partialValue
                 return true
+            }
+            guard fits else { return false }
+            do {
+                try await broker.store(volume: volume)
+                return true
+            } catch {
+                return false
             }
         }
 
-        func volume(rootCID: String) -> SerializedVolume? {
-            lock.withLock { volumes[rootCID] }
+        func volume(rootCID: String) async -> SerializedVolume? {
+            guard rootCID == self.rootCID else { return nil }
+            return await broker.fetchVolume(root: rootCID)
         }
-    }
-
-    private enum Scope {
-        @TaskLocal static var context: Context?
     }
 
     private let fetch: @Sendable (String) async -> AttributedVolumeResponse
+    private let maximumVolumes: Int
+    private let maximumMembers: Int
+    private let maximumStorageBytes: Int
 
-    public init(ivy: Ivy) {
-        fetch = { rootCID in
-            await ivy.fetchVolume(rootCID: rootCID)
+    public final class Session: ContentSource, @unchecked Sendable {
+        private let fetchVolume: @Sendable (String) async -> AttributedVolumeResponse
+        private let context: Context
+
+        fileprivate init(
+            rootCID: String,
+            maximumVolumes: Int,
+            maximumMembers: Int,
+            maximumStorageBytes: Int,
+            fetch: @escaping @Sendable (String) async -> AttributedVolumeResponse
+        ) {
+            self.fetchVolume = fetch
+            context = Context(
+                rootCID: rootCID,
+                maximumVolumes: maximumVolumes,
+                maximumMembers: maximumMembers,
+                maximumStorageBytes: maximumStorageBytes
+            )
+        }
+
+        fileprivate func acceptInitialResponse(
+            _ response: AttributedVolumeResponse
+        ) async {
+            let volume = SerializedVolume(
+                root: response.rootCID,
+                entries: response.entries
+            )
+            let valid = response.rootCID == context.rootCID
+                && (try? volume.validate()) != nil
+                && context.reserve(rootCID: context.rootCID)
+            let complete = valid ? await context.store(volume) : false
+            context.trace.record(
+                response,
+                requestedRoot: context.rootCID,
+                complete: complete,
+                providerDeficient: !valid
+            )
+        }
+
+        public func fetch(_ cids: Set<String>) async -> [String: Data] {
+            guard !cids.isEmpty,
+                  cids.allSatisfy({ _isBoundedWireAtom($0) }) else {
+                return [:]
+            }
+            let cached = await context.cached(cids)
+            for rootCID in cids.subtracting(cached.keys).sorted() {
+                guard context.reserve(rootCID: rootCID) else { continue }
+                let response = await fetchVolume(rootCID)
+                let volume = SerializedVolume(
+                    root: response.rootCID,
+                    entries: response.entries
+                )
+                let valid = response.rootCID == rootCID
+                    && (try? volume.validate()) != nil
+                let complete = valid ? await context.store(volume) : false
+                context.trace.record(
+                    response,
+                    requestedRoot: rootCID,
+                    complete: complete,
+                    providerDeficient: !valid
+                )
+            }
+            let result = await context.cached(cids)
+            if result.count != cids.count {
+                context.trace.markIncomplete()
+                return [:]
+            }
+            return result
+        }
+
+        public var attribution: Attribution { context.trace.snapshot() }
+
+        func volume(rootCID: String) async -> SerializedVolume? {
+            guard context.rootCID == rootCID else { return nil }
+            if await context.volume(rootCID: rootCID) == nil {
+                _ = await fetch([rootCID])
+            }
+            return await context.volume(rootCID: rootCID)
         }
     }
 
-    public init(ivy: Ivy, peer: AuthenticatedPeer) {
+    public init(ivy: Ivy, policy: NodeResourcePolicy = .default) {
+        maximumVolumes = policy.maximumAcquisitionVolumes
+        maximumMembers = policy.maximumAcquisitionMembers
+        maximumStorageBytes = policy.maximumAcquisitionStorageBytes
+        fetch = { rootCID in
+            await ivy.fetchVolume(
+                rootCID: rootCID,
+                maximumArchiveBytes: policy.maximumAcquisitionStorageBytes,
+                maximumEntries: policy.maximumAcquisitionMembers
+            )
+        }
+    }
+
+    public init(
+        ivy: Ivy,
+        peer: AuthenticatedPeer,
+        policy: NodeResourcePolicy = .default
+    ) {
+        maximumVolumes = policy.maximumAcquisitionVolumes
+        maximumMembers = policy.maximumAcquisitionMembers
+        maximumStorageBytes = policy.maximumAcquisitionStorageBytes
         fetch = { rootCID in
             let response = await ivy.fetchVolume(
                 rootCID: rootCID,
-                from: peer
+                from: peer,
+                maximumArchiveBytes: policy.maximumAcquisitionStorageBytes,
+                maximumEntries: policy.maximumAcquisitionMembers
             )
-            return response.servedBy == peer.id ? response : .empty
+            return Self.response(response, from: peer.id)
         }
     }
 
     init(
+        ivy: Ivy,
+        peer: AuthenticatedPeer,
+        maximumMembers: Int,
+        maximumStorageBytes: Int,
+        maximumArchiveBytes: Int
+    ) {
+        maximumVolumes = maximumMembers
+        self.maximumMembers = maximumMembers
+        self.maximumStorageBytes = maximumStorageBytes
+        fetch = { rootCID in
+            let response = await ivy.fetchVolume(
+                rootCID: rootCID,
+                from: peer,
+                maximumArchiveBytes: maximumArchiveBytes,
+                maximumEntries: maximumMembers
+            )
+            return Self.response(response, from: peer.id)
+        }
+    }
+
+    static func response(
+        _ response: AttributedVolumeResponse,
+        from peer: PeerID
+    ) -> AttributedVolumeResponse {
+        response.failure != nil || response.servedBy == peer
+            ? response
+            : .empty
+    }
+
+    init(
+        maximumVolumes: Int = Self.defaultPolicy.maximumAcquisitionVolumes,
+        maximumMembers: Int = Self.defaultPolicy.maximumAcquisitionMembers,
+        maximumStorageBytes: Int = Self.defaultPolicy.maximumAcquisitionStorageBytes,
         fetch: @escaping @Sendable (String) async -> AttributedVolumeResponse
     ) {
+        self.maximumVolumes = maximumVolumes
+        self.maximumMembers = maximumMembers
+        self.maximumStorageBytes = maximumStorageBytes
         self.fetch = fetch
     }
 
     public func withRoot<T: Sendable>(
         _ rootCID: String,
-        operation: @Sendable () async throws -> T
+        operation: @Sendable (Session) async throws -> T
     ) async rethrows -> T {
         let result = try await withRootTracing(rootCID, operation: operation)
         return result.value
@@ -157,68 +344,27 @@ public struct IvyRootContentSource: ContentSource, Sendable {
         _ rootCID: String,
         initialResponse: AttributedVolumeResponse? = nil,
         capture: AttributionCapture? = nil,
-        operation: @Sendable () async throws -> T
+        operation: @Sendable (Session) async throws -> T
     ) async rethrows -> (value: T, attribution: Attribution) {
-        let context = Context(rootCID: rootCID)
+        let session = Session(
+            rootCID: rootCID,
+            maximumVolumes: maximumVolumes,
+            maximumMembers: maximumMembers,
+            maximumStorageBytes: maximumStorageBytes,
+            fetch: fetch
+        )
         if let initialResponse {
-            let initialVolume = SerializedVolume(
-                root: initialResponse.rootCID,
-                entries: initialResponse.entries
-            )
-            let complete = initialResponse.rootCID == rootCID
-                && (try? initialVolume.validate()) != nil
-                && context.reserve(rootCID: rootCID)
-                && context.store(initialVolume)
-            context.trace.record(initialResponse, complete: complete)
+            await session.acceptInitialResponse(initialResponse)
         }
         do {
-            let value = try await Scope.$context.withValue(
-                context,
-                operation: operation
-            )
-            let attribution = context.trace.snapshot()
+            let value = try await operation(session)
+            let attribution = session.attribution
             capture?.record(attribution)
             return (value, attribution)
         } catch {
-            capture?.record(context.trace.snapshot())
+            capture?.record(session.attribution)
             throw error
         }
-    }
-
-    public func fetch(_ cids: Set<String>) async -> [String: Data] {
-        guard let context = Scope.context else { return [:] }
-        guard !cids.isEmpty,
-              cids.allSatisfy({ _isBoundedWireAtom($0) }) else {
-            return [:]
-        }
-        let cached = context.cached(cids)
-        for rootCID in cids.subtracting(cached.keys).sorted() {
-            guard context.reserve(rootCID: rootCID) else { continue }
-            let response = await fetch(rootCID)
-            let volume = SerializedVolume(
-                root: response.rootCID,
-                entries: response.entries
-            )
-            let complete = response.rootCID == rootCID
-                && (try? volume.validate()) != nil
-                && context.store(volume)
-            context.trace.record(response, complete: complete)
-        }
-        let result = context.cached(cids)
-        if result.count != cids.count {
-            context.trace.markIncomplete()
-            return [:]
-        }
-        return result
-    }
-
-    func volume(rootCID: String) async -> SerializedVolume? {
-        guard let context = Scope.context,
-              context.rootCID == rootCID else { return nil }
-        if context.volume(rootCID: rootCID) == nil {
-            _ = await fetch([rootCID])
-        }
-        return context.volume(rootCID: rootCID)
     }
 }
 
@@ -258,7 +404,7 @@ struct ChainProcessIvyContentSource: IvyContentSource {
         cids: [String],
         maxDataBytes: Int
     ) async -> [ContentEntry] {
-        // Node protocol v2 exchanges complete Volumes. Entry selection cannot
+        // Node protocol v3 exchanges complete Volumes. Entry selection cannot
         // prove membership in the named root and is therefore never served.
         []
     }
@@ -272,9 +418,11 @@ struct ChainProcessIvyContentSource: IvyContentSource {
         } else {
             return []
         }
-        guard (try? volume.validate()) != nil,
-              volume.entries.values.reduce(0, { $0 + $1.count }) <= maxDataBytes else {
-            return []
+        guard (try? volume.validate()) != nil else { return [] }
+        var remaining = maxDataBytes
+        for data in volume.entries.values {
+            guard data.count <= remaining else { return [] }
+            remaining -= data.count
         }
         return volume.entries.sorted { $0.key < $1.key }.map {
             ContentEntry(cid: $0.key, data: $0.value)

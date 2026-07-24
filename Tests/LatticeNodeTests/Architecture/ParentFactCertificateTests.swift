@@ -8,7 +8,7 @@ import XCTest
 final class ParentFactCertificateTests: XCTestCase {
     func testCertificatesRoundTripAndVerifyUnderTheirOwnDomains() throws {
         let parent = try configuration(seed: 1)
-        let authority = try XCTUnwrap(ParentWorkAuthorityKey(parent.processPublicKey))
+        let authority = try XCTUnwrap(ParentProcessKey(parent.processPublicKey))
         let carrier = try carrierLink()
         let genesis = try genesisLink()
 
@@ -51,8 +51,8 @@ final class ParentFactCertificateTests: XCTestCase {
     func testTamperingAndWrongAuthorityFailVerification() throws {
         let parent = try configuration(seed: 2)
         let other = try configuration(seed: 3)
-        let authority = try XCTUnwrap(ParentWorkAuthorityKey(parent.processPublicKey))
-        let otherAuthority = try XCTUnwrap(ParentWorkAuthorityKey(other.processPublicKey))
+        let authority = try XCTUnwrap(ParentProcessKey(parent.processPublicKey))
+        let otherAuthority = try XCTUnwrap(ParentProcessKey(other.processPublicKey))
         let carrier = try carrierLink()
         let certificate = try ParentCarrierCertificateV1(
             link: carrier,
@@ -106,7 +106,7 @@ final class ParentFactCertificateTests: XCTestCase {
 
     func testPortableGateRequiresBothSignedParentFacts() throws {
         let parent = try configuration(seed: 4)
-        let authority = try XCTUnwrap(ParentWorkAuthorityKey(parent.processPublicKey))
+        let authority = try XCTUnwrap(ParentProcessKey(parent.processPublicKey))
         let package = ChildValidationPackage(
             proof: proof(),
             parentCarrierLink: try carrierLink(),
@@ -124,13 +124,13 @@ final class ParentFactCertificateTests: XCTestCase {
 
         XCTAssertNoThrow(try gate.acceptPortable(
             decoded,
-            durableParentWorkAuthorityKey: authority
+            durableParentProcessKey: authority
         ))
 
         let unsigned = try ChildValidationPackageEnvelope(package)
         XCTAssertThrowsError(try gate.acceptPortable(
             unsigned,
-            durableParentWorkAuthorityKey: authority
+            durableParentProcessKey: authority
         )) { error in
             XCTAssertEqual(
                 error as? AuthenticatedParentFactGateError,
@@ -139,10 +139,10 @@ final class ParentFactCertificateTests: XCTestCase {
         }
 
         let other = try configuration(seed: 5)
-        let otherAuthority = try XCTUnwrap(ParentWorkAuthorityKey(other.processPublicKey))
+        let otherAuthority = try XCTUnwrap(ParentProcessKey(other.processPublicKey))
         XCTAssertThrowsError(try gate.acceptPortable(
             decoded,
-            durableParentWorkAuthorityKey: otherAuthority
+            durableParentProcessKey: otherAuthority
         )) { error in
             XCTAssertEqual(
                 error as? AuthenticatedParentFactGateError,

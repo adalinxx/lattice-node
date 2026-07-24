@@ -9,6 +9,41 @@ import cashew
 @testable import LatticeNodeDaemon
 
 final class DaemonHTTPTests: XCTestCase {
+    func testVolumeMaintenanceInvokesEviction() async {
+        let invoked = expectation(description: "volume eviction invoked")
+        let counter = MaintenanceInvocationCounter()
+        let task = Task {
+            await runVolumeMaintenance(everyNanoseconds: 1_000_000) {
+                if await counter.record() == 1 {
+                    invoked.fulfill()
+                }
+            }
+        }
+
+        await fulfillment(of: [invoked], timeout: 1)
+        task.cancel()
+        await task.value
+
+        let invocationCount = await counter.value
+        XCTAssertGreaterThanOrEqual(invocationCount, 1)
+    }
+
+    func testVolumeMaintenanceCancellationStopsBeforeEviction() async {
+        let counter = MaintenanceInvocationCounter()
+        let task = Task {
+            await runVolumeMaintenance(everyNanoseconds: 60_000_000_000) {
+                _ = await counter.record()
+            }
+        }
+
+        await Task.yield()
+        task.cancel()
+        await task.value
+
+        let invocationCount = await counter.value
+        XCTAssertEqual(invocationCount, 0)
+    }
+
     func testParentUnavailableIsServiceUnavailable() async throws {
         let storage = FileManager.default.temporaryDirectory.appendingPathComponent(
             "lattice-http-parent-unavailable-\(UUID().uuidString)"
@@ -24,9 +59,10 @@ final class DaemonHTTPTests: XCTestCase {
             process: process,
             childCandidateProvider: { _ in [] },
             childProofPublisher: { _ in },
-            acceptedBlockPublisher: { _ in }
+            acceptedBlockPublisher: { _ in },
+            securingWorkPublisher: {}
         )
-        await service.setParentConsensusReady(false)
+        await service.setParentWorkReady(false)
         let app = makeApplication(service: service, host: "127.0.0.1", port: 8080)
         let body = try JSONEncoder().encode(MiningTemplateRequest())
 
@@ -75,7 +111,8 @@ final class DaemonHTTPTests: XCTestCase {
             process: process,
             childCandidateProvider: { _ in [] },
             childProofPublisher: { _ in },
-            acceptedBlockPublisher: { _ in }
+            acceptedBlockPublisher: { _ in },
+            securingWorkPublisher: {}
         )
         let app = makeApplication(
             service: service,
@@ -152,7 +189,8 @@ final class DaemonHTTPTests: XCTestCase {
             process: process,
             childCandidateProvider: { _ in [] },
             childProofPublisher: { _ in },
-            acceptedBlockPublisher: { _ in }
+            acceptedBlockPublisher: { _ in },
+            securingWorkPublisher: {}
         )
         let app = makeApplication(
             service: service,
@@ -203,5 +241,16 @@ final class DaemonHTTPTests: XCTestCase {
                 )
             }
         }
+    }
+}
+
+private actor MaintenanceInvocationCounter {
+    private var count = 0
+
+    var value: Int { count }
+
+    func record() -> Int {
+        count += 1
+        return count
     }
 }

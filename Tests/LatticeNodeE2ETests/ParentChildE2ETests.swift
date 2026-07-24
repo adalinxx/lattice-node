@@ -139,17 +139,59 @@ final class ParentChildE2ETests: XCTestCase {
         let queued = try await child.waitForStatus { $0.mempoolCount == 1 }
         XCTAssertEqual(queued.mempoolCount, 1)
 
-        // The anchor block proves bootstrap. A second root round through the
-        // shipped coordinator and process worker proves the live
-        // parent-child candidate/proof loop, not just intent deployment.
-        let secondWork = try await mineWithCoordinator(
-            parent,
-            coordinator: coordinator,
-            miner: miner
+        // Abandon more than one full candidate window through the public RPC.
+        // Distinct parent carriers must replace old local availability rather
+        // than permanently exhausting the child. The latest real work remains
+        // valid across a child restart before parent submission.
+        var parentCarrierCIDs: Set<String> = []
+        var latestTemplate: MiningTemplateResponse?
+        let emptyChildrenCID =
+            try HeaderImpl<MerkleDictionaryImpl<VolumeImpl<Block>>>(
+                node: MerkleDictionaryImpl<VolumeImpl<Block>>()
+            ).rawCID
+        for _ in 0...16 {
+            let template: MiningTemplateResponse = try await parent.post(
+                "/v1/mining/templates",
+                body: MiningTemplateRequest()
+            )
+            XCTAssertNotEqual(template.block.children.rawCID, emptyChildrenCID)
+            parentCarrierCIDs.insert(
+                try BlockHeader(node: template.block).rawCID
+            )
+            latestTemplate = template
+            try await Task.sleep(for: .milliseconds(2))
+        }
+        XCTAssertEqual(parentCarrierCIDs.count, 17)
+        let retainedTemplate = try XCTUnwrap(latestTemplate)
+        let retainedMidstate = ProofOfWork.midstate(for: retainedTemplate.block)
+        var retainedNonce: UInt64 = 0
+        while ProofOfWork.hash(
+            midstate: retainedMidstate,
+            nonce: retainedNonce
+        ) > retainedTemplate.searchTarget {
+            retainedNonce += 1
+        }
+        child.forceTerminate()
+        let retainedWork: SubmitWorkResponse = try await parent.post(
+            "/v1/mining/work",
+            body: SubmitWorkRequest(
+                workID: retainedTemplate.workID,
+                nonce: retainedNonce
+            )
         )
-        XCTAssertEqual(secondWork.result, "submitted")
-        XCTAssertTrue(secondWork.accepted)
-        XCTAssertEqual(secondWork.disposition, "canonicalized")
+        XCTAssertTrue(retainedWork.accepted)
+        let progressedParentTip = try XCTUnwrap(retainedWork.tipCID)
+
+        // Crash both processes in the exact handoff window: the child has
+        // durably ACKed the candidate, but has not received the parent's proof.
+        // Restart must recover that reservation through ordinary daemon state.
+        parent.forceTerminate()
+
+        try parent.start()
+        _ = try await parent.waitForStatus { status in
+            status.phase == .active && status.tipCID == progressedParentTip
+        }
+        try child.start()
         let progressed = try await child.waitForStatus { status in
             status.phase == .active
                 && status.tipCID != intent.genesisCID
@@ -159,34 +201,48 @@ final class ParentChildE2ETests: XCTestCase {
         XCTAssertNotEqual(progressed.tipCID, intent.genesisCID)
         let progressedTip = try XCTUnwrap(progressed.tipCID)
         let progressedHeight = try XCTUnwrap(progressed.height)
-        let progressedParentTip = try XCTUnwrap(secondWork.tipCID)
-        _ = try await parent.waitForStatus { status in
-            status.phase == .active && status.tipCID == progressedParentTip
+
+        // A further round through the shipped coordinator and worker verifies
+        // the same recursive path through the production mining binaries.
+        let coordinatorWork = try await mineWithCoordinator(
+            parent,
+            coordinator: coordinator,
+            miner: miner
+        )
+        XCTAssertEqual(coordinatorWork.result, "submitted")
+        XCTAssertTrue(coordinatorWork.accepted)
+        XCTAssertEqual(coordinatorWork.disposition, "canonicalized")
+        let finalParentTip = try XCTUnwrap(coordinatorWork.tipCID)
+        let coordinatorChild = try await child.waitForStatus { status in
+            status.phase == .active
+                && (status.height ?? 0) > progressedHeight
         }
+        let finalChildTip = try XCTUnwrap(coordinatorChild.tipCID)
+        let finalChildHeight = try XCTUnwrap(coordinatorChild.height)
 
         // The accepted parent carrier and direct proof survive a parent
         // process restart while the live child retains its own projection.
         try await parent.stop()
         try parent.start()
         let restoredParent = try await parent.waitForStatus { status in
-            status.phase == .active && status.tipCID == progressedParentTip
+            status.phase == .active && status.tipCID == finalParentTip
         }
-        XCTAssertEqual(restoredParent.tipCID, progressedParentTip)
+        XCTAssertEqual(restoredParent.tipCID, finalParentTip)
         let preservedChild = try await child.waitForStatus { status in
             status.phase == .active
-                && status.tipCID == progressedTip
-                && status.height == progressedHeight
+                && status.tipCID == finalChildTip
+                && status.height == finalChildHeight
         }
-        XCTAssertEqual(preservedChild.height, progressedHeight)
+        XCTAssertEqual(preservedChild.height, finalChildHeight)
 
         // A child restores its own accepted forest; it does not need the
         // parent to re-bootstrap its genesis after a local process restart.
         try await child.stop()
         try child.start()
         let restoredChild = try await child.waitForStatus { status in
-            status.phase == .active && status.tipCID == progressedTip
+            status.phase == .active && status.tipCID == finalChildTip
         }
-        XCTAssertEqual(restoredChild.height, progressedHeight)
+        XCTAssertEqual(restoredChild.height, finalChildHeight)
 
         // Parent and child reconnect independently after their process
         // restarts, so allow bounded physical root rounds for the next live
@@ -198,7 +254,7 @@ final class ParentChildE2ETests: XCTestCase {
             guard let status = try? await child.waitForStatus(
                 timeout: .seconds(2),
                 where: { status in
-                    status.phase == .active && (status.height ?? 0) > progressedHeight
+                    status.phase == .active && (status.height ?? 0) > finalChildHeight
                 }
             ) else { continue }
             reprogressed = status
@@ -369,10 +425,12 @@ final class ParentChildE2ETests: XCTestCase {
         // operational on both same-chain peers.
         try parent.start()
         _ = try await parent.waitForStatus { $0.phase == .active }
-        _ = try await source.waitForStatus(timeout: .seconds(20)) {
+        // Both child processes reconnect independently. Ivy's configured-peer
+        // backoff is capped at 30 seconds, so each assertion spans one cap.
+        _ = try await source.waitForStatus(timeout: .seconds(40)) {
             $0.phase == .active && $0.tipCID == expectedTip.tipCID
         }
-        let recovered = try await late.waitForStatus(timeout: .seconds(20)) {
+        let recovered = try await late.waitForStatus(timeout: .seconds(40)) {
             $0.phase == .active && $0.tipCID == expectedTip.tipCID
         }
         XCTAssertEqual(recovered.height, expectedTip.height)
@@ -390,7 +448,7 @@ final class ParentChildE2ETests: XCTestCase {
 
         try parent.start()
         _ = try await parent.waitForStatus { $0.phase == .active }
-        let reopened = try await late.waitForStatus(timeout: .seconds(20)) {
+        let reopened = try await late.waitForStatus(timeout: .seconds(40)) {
             $0.phase == .active && $0.tipCID == expectedTip.tipCID
         }
         XCTAssertEqual(reopened.height, expectedTip.height)
@@ -618,6 +676,230 @@ final class ParentChildE2ETests: XCTestCase {
         XCTAssertNotEqual(finalReceipts.tipCID, receiptsIntent.genesisCID)
 
         try await cluster.stopAll()
+        passed = true
+    }
+
+    func testLiveHierarchyPartitionRevokesAndRestoresDescendantConsensus()
+        async throws
+    {
+        let workspace = try E2EWorkspace()
+        let cluster = E2ECluster()
+        let binary = try E2EBinary.latticeNode()
+        let nexusIdentity = try workspace.makeIdentity(named: "partition-nexus")
+        let nexusKey = try PeerKey(nexusIdentity.publicKey)
+        let paymentsIdentity = try workspace.makeIdentity(named: "partition-payments")
+        let paymentsKey = try PeerKey(paymentsIdentity.publicKey)
+        let receiptsIdentity = try workspace.makeIdentity(named: "partition-receipts")
+        let ports = try E2EPorts.allocate(count: 10)
+        let proxy = LoopbackTCPFaultProxy(
+            listenPort: ports[9],
+            targetPort: ports[1]
+        )
+        var passed = false
+        defer {
+            proxy.stop()
+            cluster.forceTerminateAll()
+            if passed {
+                try? workspace.remove()
+            } else {
+                print("lattice-node E2E artifacts retained at \(workspace.url.path)")
+            }
+        }
+
+        let nexus = E2ENode(
+            binary: binary,
+            configuration: E2ENode.Configuration(
+                name: "partition-nexus",
+                chainPath: "Nexus",
+                storage: workspace.url.appendingPathComponent("partition-nexus"),
+                identity: nexusIdentity,
+                overlayPort: ports[0],
+                factPort: ports[1],
+                rpcPort: ports[2]
+            ),
+            logDirectory: workspace.logs
+        )
+        let payments = E2ENode(
+            binary: binary,
+            configuration: E2ENode.Configuration(
+                name: "partition-payments",
+                chainPath: "Nexus/Payments",
+                storage: workspace.url.appendingPathComponent("partition-payments"),
+                identity: paymentsIdentity,
+                overlayPort: ports[3],
+                factPort: ports[4],
+                rpcPort: ports[5],
+                parent: .init(
+                    publicKey: nexusKey.hex,
+                    factPort: ports[9]
+                )
+            ),
+            logDirectory: workspace.logs
+        )
+        let receipts = E2ENode(
+            binary: binary,
+            configuration: E2ENode.Configuration(
+                name: "partition-receipts",
+                chainPath: "Nexus/Payments/Receipts",
+                storage: workspace.url.appendingPathComponent("partition-receipts"),
+                identity: receiptsIdentity,
+                overlayPort: ports[6],
+                factPort: ports[7],
+                rpcPort: ports[8],
+                parent: .init(
+                    publicKey: paymentsKey.hex,
+                    factPort: ports[4]
+                )
+            ),
+            logDirectory: workspace.logs
+        )
+        cluster.add(nexus)
+        cluster.add(payments)
+        cluster.add(receipts)
+
+        E2EPorts.release([ports[9]])
+        try proxy.start()
+        try nexus.start()
+        _ = try await waitForNexus(nexus)
+
+        let paymentsIntent = try await childIntent(
+            on: nexus,
+            directory: "Payments",
+            timestamp: 1
+        )
+        try await submitLegacyGenesisAnchor(
+            on: nexus,
+            intent: paymentsIntent,
+            chainPath: ["Nexus"]
+        )
+        let paymentsDeployment = try await mine(nexus, mode: .deployment)
+        XCTAssertTrue(paymentsDeployment.accepted)
+
+        try payments.start()
+        try await proxy.waitForConnections(1)
+        _ = try await payments.waitForStatus {
+            $0.phase == .active && $0.tipCID == paymentsIntent.genesisCID
+        }
+
+        let receiptsIntent = try await childIntent(
+            on: payments,
+            directory: "Receipts",
+            timestamp: 2
+        )
+        try await submitLegacyGenesisAnchor(
+            on: payments,
+            intent: receiptsIntent,
+            chainPath: ["Nexus", "Payments"]
+        )
+        let receiptsDeployment = try await mine(nexus, mode: .deployment)
+        XCTAssertTrue(receiptsDeployment.accepted)
+
+        try receipts.start()
+        let paymentsBeforePartition = try await payments.waitForStatus {
+            $0.phase == .active
+                && $0.tipCID != paymentsIntent.genesisCID
+                && ($0.height ?? 0) > 0
+                && $0.mempoolCount == 0
+        }
+        let receiptsGenesis = try await receipts.waitForStatus {
+            $0.phase == .active && $0.tipCID == receiptsIntent.genesisCID
+        }
+        let paymentsTip = try XCTUnwrap(paymentsBeforePartition.tipCID)
+        let paymentsHeight = try XCTUnwrap(paymentsBeforePartition.height)
+        let paymentsWorkRevision = try XCTUnwrap(
+            paymentsBeforePartition.parentWorkRevision
+        )
+        let receiptsTip = try XCTUnwrap(receiptsGenesis.tipCID)
+        let receiptsHeight = try XCTUnwrap(receiptsGenesis.height)
+        let receiptsWorkRevision = try XCTUnwrap(
+            receiptsGenesis.parentWorkRevision
+        )
+
+        proxy.cut()
+        try await proxy.waitForNoActiveConnections()
+        let partitionedPayments = try await payments.waitForStatus(
+            timeout: .seconds(20)
+        ) {
+            $0.phase == .awaitingParent && $0.tipCID == paymentsTip
+        }
+        let partitionedReceipts = try await receipts.waitForStatus(
+            timeout: .seconds(20)
+        ) {
+            $0.phase == .awaitingParent && $0.tipCID == receiptsTip
+        }
+        XCTAssertEqual(partitionedPayments.height, paymentsHeight)
+        XCTAssertEqual(partitionedReceipts.height, receiptsHeight)
+        for node in [payments, receipts] {
+            do {
+                let _: MiningTemplateResponse = try await node.post(
+                    "/v1/mining/templates",
+                    body: MiningTemplateRequest()
+                )
+                XCTFail("partitioned descendant issued mining work")
+            } catch let error as E2EHTTPError {
+                XCTAssertEqual(error.status, 503)
+            }
+        }
+
+        let parentDuringPartition = try await mine(nexus)
+        XCTAssertTrue(parentDuringPartition.accepted)
+        _ = try await nexus.waitForStatus {
+            $0.tipCID == parentDuringPartition.tipCID
+        }
+        let stillPartitioned = try await payments.waitForStatus {
+            $0.phase == .awaitingParent && $0.tipCID == paymentsTip
+        }
+        XCTAssertEqual(stillPartitioned.height, paymentsHeight)
+
+        proxy.heal()
+        try await proxy.waitForConnections(2)
+        _ = try await payments.waitForStatus(timeout: .seconds(20)) {
+            $0.phase == .active
+                && $0.tipCID == paymentsTip
+                && ($0.parentWorkRevision ?? 0) > paymentsWorkRevision
+        }
+        _ = try await receipts.waitForStatus(timeout: .seconds(20)) {
+            $0.phase == .active
+                && $0.tipCID == receiptsTip
+                && $0.parentWorkRevision == receiptsWorkRevision
+        }
+
+        let transaction = try legacySignedTransaction(
+            chainPath: ["Nexus", "Payments", "Receipts"]
+        )
+        let _: SubmitTransactionResponse = try await receipts.post(
+            "/v1/transactions",
+            body: SubmitTransactionRequest(transaction: transaction)
+        )
+        _ = try await receipts.waitForStatus { $0.mempoolCount == 1 }
+
+        var advancedPayments: ChainServiceStatusResponse?
+        var advancedReceipts: ChainServiceStatusResponse?
+        for _ in 0..<5 {
+            let work = try await mine(nexus)
+            XCTAssertTrue(work.accepted)
+            guard let nextPayments = try? await payments.waitForStatus(
+                timeout: .seconds(2),
+                where: {
+                    $0.phase == .active && ($0.height ?? 0) > paymentsHeight
+                }
+            ), let nextReceipts = try? await receipts.waitForStatus(
+                timeout: .seconds(2),
+                where: {
+                    $0.phase == .active
+                        && ($0.height ?? 0) > receiptsHeight
+                        && $0.mempoolCount == 0
+                }
+            ) else { continue }
+            advancedPayments = nextPayments
+            advancedReceipts = nextReceipts
+            break
+        }
+        XCTAssertNotNil(advancedPayments)
+        XCTAssertNotNil(advancedReceipts)
+
+        try await cluster.stopAll()
+        proxy.stop()
         passed = true
     }
 
@@ -1136,7 +1418,355 @@ final class ParentChildE2ETests: XCTestCase {
         passed = true
     }
 
-    func testPureParentDescendantsDoNotReweightChildAfterPartitionHeal()
+    func testPartitionedChildReplicasCreateSiblingBranchesAndColdJoin()
+        async throws
+    {
+        let workspace = try E2EWorkspace()
+        let cluster = E2ECluster()
+        var passed = false
+        defer {
+            cluster.forceTerminateAll()
+            if passed {
+                try? workspace.remove()
+            } else {
+                print("lattice-node E2E artifacts retained at \(workspace.url.path)")
+            }
+        }
+
+        let binary = try E2EBinary.latticeNode()
+        let nexusIdentity = try workspace.makeIdentity(named: "nexus")
+        let aIdentity = try workspace.makeIdentity(named: "payments-a")
+        let bIdentity = try workspace.makeIdentity(named: "payments-b")
+        let coldIdentity = try workspace.makeIdentity(named: "payments-cold")
+        let ownerA = CryptoUtils.generateKeyPair()
+        let ownerB = CryptoUtils.generateKeyPair()
+        let outputA = CryptoUtils.generateKeyPair()
+        let outputB = CryptoUtils.generateKeyPair()
+        let sink = CryptoUtils.generateKeyPair()
+        let ownerAAddress = CryptoUtils.createAddress(from: ownerA.publicKey)
+        let ownerBAddress = CryptoUtils.createAddress(from: ownerB.publicKey)
+        let outputAAddress = CryptoUtils.createAddress(from: outputA.publicKey)
+        let outputBAddress = CryptoUtils.createAddress(from: outputB.publicKey)
+        let sinkAddress = CryptoUtils.createAddress(from: sink.publicKey)
+        let childPath = ["Nexus", "Payments"]
+        let nexusKey = try PeerKey(nexusIdentity.publicKey)
+        let ports = try E2EPorts.allocate(count: 12)
+        let aPeer = try overlayPeer(identity: aIdentity, port: ports[3])
+        let bPeer = try overlayPeer(identity: bIdentity, port: ports[6])
+        let nexus = nexusNode(
+            binary: binary,
+            workspace: workspace,
+            name: "nexus",
+            identity: nexusIdentity,
+            overlayPort: ports[0],
+            factPort: ports[1],
+            rpcPort: ports[2]
+        )
+        let a = childNode(
+            binary: binary,
+            workspace: workspace,
+            name: "payments-a",
+            directory: "Payments",
+            identity: aIdentity,
+            parentPublicKey: nexusKey.hex,
+            parentFactPort: ports[1],
+            overlayPort: ports[3],
+            factPort: ports[4],
+            rpcPort: ports[5]
+        )
+        let b = childNode(
+            binary: binary,
+            workspace: workspace,
+            name: "payments-b",
+            directory: "Payments",
+            identity: bIdentity,
+            parentPublicKey: nexusKey.hex,
+            parentFactPort: ports[1],
+            overlayPort: ports[6],
+            factPort: ports[7],
+            rpcPort: ports[8]
+        )
+        let cold = childNode(
+            binary: binary,
+            workspace: workspace,
+            name: "payments-cold",
+            directory: "Payments",
+            identity: coldIdentity,
+            parentPublicKey: nexusKey.hex,
+            parentFactPort: ports[1],
+            overlayPort: ports[9],
+            factPort: ports[10],
+            rpcPort: ports[11]
+        )
+        cold.setOverlayPeers([aPeer, bPeer])
+        cluster.add(nexus)
+        cluster.add(a)
+        cluster.add(b)
+        cluster.add(cold)
+
+        try nexus.start()
+        try a.start()
+        try b.start()
+        _ = try await waitForNexus(nexus)
+        let genesisTransaction = try unsignedGenesisTransaction(
+            chainPath: childPath,
+            accountActions: [
+                AccountAction(owner: ownerAAddress, delta: 10),
+                AccountAction(owner: ownerBAddress, delta: 10),
+            ]
+        )
+        let intent: ChildDeployIntentResponse = try await nexus.post(
+            "/v1/children/intents",
+            body: ChildDeployIntentRequest(
+                directory: "Payments",
+                spec: ChainSpec(
+                    maxNumberOfTransactionsPerBlock: 100,
+                    maxStateGrowth: 100_000,
+                    premine: 20,
+                    targetBlockTime: 1_000,
+                    initialReward: 10,
+                    halvingInterval: 100
+                ),
+                genesisTransactions: [genesisTransaction],
+                target: .max,
+                timestamp: 1
+            )
+        )
+        try await submitGenesisAnchor(
+            on: nexus,
+            intent: intent,
+            chainPath: ["Nexus"]
+        )
+        let deployment = try await mine(nexus, mode: .deployment)
+        XCTAssertTrue(deployment.accepted)
+        _ = try await a.waitForStatus {
+            $0.phase == .active && $0.tipCID == intent.genesisCID
+        }
+        _ = try await b.waitForStatus {
+            $0.phase == .active && $0.tipCID == intent.genesisCID
+        }
+
+        let transactionA = try signedTransaction(
+            key: ownerA,
+            chainPath: childPath,
+            accountActions: [
+                AccountAction(owner: ownerAAddress, delta: -1),
+                AccountAction(owner: outputAAddress, delta: 1),
+            ],
+            nonce: 0
+        )
+        let transactionB = try signedTransaction(
+            key: ownerB,
+            chainPath: childPath,
+            accountActions: [
+                AccountAction(owner: ownerBAddress, delta: -1),
+                AccountAction(owner: outputBAddress, delta: 1),
+            ],
+            nonce: 0
+        )
+        let _: SubmitTransactionResponse = try await a.post(
+            "/v1/transactions",
+            body: SubmitTransactionRequest(transaction: transactionA)
+        )
+        let _: SubmitTransactionResponse = try await b.post(
+            "/v1/transactions",
+            body: SubmitTransactionRequest(transaction: transactionB)
+        )
+        _ = try await a.waitForStatus { $0.mempoolCount == 1 }
+        _ = try await b.waitForStatus { $0.mempoolCount == 1 }
+
+        // Two miners obtain competing parent templates before either submits
+        // work. The parent's real child scheduler rotates across the two
+        // isolated replicas, so each template carries that replica's private
+        // transaction on a sibling child block.
+        let emptyChildrenCID =
+            try HeaderImpl<MerkleDictionaryImpl<VolumeImpl<Block>>>(
+                node: MerkleDictionaryImpl<VolumeImpl<Block>>()
+            ).rawCID
+        var seenChildren = Set<String>()
+        var competingTemplates: [MiningTemplateResponse] = []
+        for _ in 0..<200 {
+            let template: MiningTemplateResponse = try await nexus.post(
+                "/v1/mining/templates",
+                body: MiningTemplateRequest()
+            )
+            let childrenCID = template.block.children.rawCID
+            if childrenCID != emptyChildrenCID,
+               seenChildren.insert(childrenCID).inserted {
+                competingTemplates.append(template)
+            }
+            if competingTemplates.count == 2 { break }
+            try await Task.sleep(for: .milliseconds(100))
+        }
+        XCTAssertEqual(competingTemplates.count, 2)
+        let firstTemplate = try XCTUnwrap(competingTemplates.first)
+        let secondTemplate = try XCTUnwrap(competingTemplates.dropFirst().first)
+
+        let firstWork: SubmitWorkResponse
+        do {
+            firstWork = try await submitTemplate(firstTemplate, to: nexus)
+        } catch {
+            XCTFail("first sibling template submission failed: \(error)")
+            throw error
+        }
+        XCTAssertTrue(firstWork.accepted)
+        XCTAssertEqual(firstWork.publishedChildProofs.count, 1)
+        let firstProof = try XCTUnwrap(firstWork.publishedChildProofs.first)
+        XCTAssertEqual(firstProof.directory, "Payments")
+
+        let secondWork: SubmitWorkResponse
+        do {
+            secondWork = try await submitTemplate(secondTemplate, to: nexus)
+        } catch {
+            XCTFail("second sibling template submission failed: \(error)")
+            throw error
+        }
+        XCTAssertTrue(secondWork.accepted)
+        XCTAssertEqual(secondWork.publishedChildProofs.count, 1)
+        let secondProof = try XCTUnwrap(secondWork.publishedChildProofs.first)
+        XCTAssertEqual(secondProof.directory, "Payments")
+        XCTAssertNotEqual(firstProof.childCID, secondProof.childCID)
+
+        let isolatedBranchCIDs = Set([
+            firstProof.childCID,
+            secondProof.childCID,
+        ])
+        let isolatedA = try await a.waitForStatus {
+            $0.phase == .active
+                && $0.tipCID.map(isolatedBranchCIDs.contains) == true
+                && $0.mempoolCount == 0
+        }
+        let isolatedB = try await b.waitForStatus {
+            $0.phase == .active
+                && $0.tipCID.map(isolatedBranchCIDs.contains) == true
+                && $0.mempoolCount == 0
+        }
+        XCTAssertEqual(
+            Set([try XCTUnwrap(isolatedA.tipCID), try XCTUnwrap(isolatedB.tipCID)]),
+            isolatedBranchCIDs
+        )
+
+        a.forceTerminate()
+        b.forceTerminate()
+        a.setOverlayPeers([bPeer])
+        b.setOverlayPeers([aPeer])
+        try a.start()
+        try b.start()
+        let convergedTip = try await waitForReplicaConvergence(
+            a,
+            b,
+            excluding: intent.genesisCID
+        )
+        XCTAssertTrue(
+            [firstProof.childCID, secondProof.childCID].contains(convergedTip)
+        )
+
+        // The losing branch's still-valid transaction returns to the pool.
+        // Both peers must observe it before a normal parent round consumes it.
+        _ = try await a.waitForStatus {
+            $0.phase == .active && $0.tipCID == convergedTip
+                && $0.mempoolCount == 1
+        }
+        _ = try await b.waitForStatus {
+            $0.phase == .active && $0.tipCID == convergedTip
+                && $0.mempoolCount == 1
+        }
+        var settledTip: String?
+        for _ in 0..<5 {
+            let settlement: SubmitWorkResponse
+            do {
+                settlement = try await mine(nexus)
+            } catch {
+                XCTFail("post-reorg settlement mining failed: \(error)")
+                throw error
+            }
+            XCTAssertTrue(settlement.accepted)
+            guard let next = try? await waitForReplicaConvergence(
+                a,
+                b,
+                excluding: convergedTip
+            ), let aStatus = try? await a.waitForStatus(
+                timeout: .seconds(2),
+                where: { $0.tipCID == next && $0.mempoolCount == 0 }
+            ), let bStatus = try? await b.waitForStatus(
+                timeout: .seconds(2),
+                where: { $0.tipCID == next && $0.mempoolCount == 0 }
+            ), aStatus.height == bStatus.height else { continue }
+            settledTip = next
+            break
+        }
+        let committedTip = try XCTUnwrap(
+            settledTip,
+            "losing child transaction was not requeued and committed"
+        )
+
+        // This transaction is valid only if both branch outputs survived the
+        // reorg and settlement. Its inclusion proves state convergence, not
+        // merely matching tip strings and empty pools.
+        let spendBothOutputs = try signedTransaction(
+            keys: [outputA, outputB],
+            chainPath: childPath,
+            accountActions: [
+                AccountAction(owner: outputAAddress, delta: -1),
+                AccountAction(owner: outputBAddress, delta: -1),
+                AccountAction(owner: sinkAddress, delta: 2),
+            ],
+            nonce: 0
+        )
+        do {
+            let _: SubmitTransactionResponse = try await a.post(
+                "/v1/transactions",
+                body: SubmitTransactionRequest(transaction: spendBothOutputs)
+            )
+        } catch {
+            XCTFail("dependent branch-state transaction failed: \(error)")
+            throw error
+        }
+        _ = try await a.waitForStatus { $0.mempoolCount == 1 }
+        var stateProvenTip: String?
+        for _ in 0..<5 {
+            let work: SubmitWorkResponse
+            do {
+                work = try await mine(nexus)
+            } catch {
+                XCTFail("dependent-state mining failed: \(error)")
+                throw error
+            }
+            XCTAssertTrue(work.accepted)
+            guard let next = try? await waitForReplicaConvergence(
+                a,
+                b,
+                excluding: committedTip
+            ), let status = try? await a.waitForStatus(
+                timeout: .seconds(2),
+                where: { $0.tipCID == next && $0.mempoolCount == 0 }
+            ), status.phase == .active else { continue }
+            stateProvenTip = next
+            break
+        }
+        let finalTip = try XCTUnwrap(
+            stateProvenTip,
+            "dependent spend did not prove both branch effects"
+        )
+
+        a.forceTerminate()
+        b.forceTerminate()
+        try a.start()
+        try b.start()
+        _ = try await a.waitForStatus { $0.tipCID == finalTip }
+        _ = try await b.waitForStatus { $0.tipCID == finalTip }
+
+        try cold.start()
+        let coldStatus = try await cold.waitForStatus {
+            $0.phase == .active && $0.tipCID == finalTip
+        }
+        XCTAssertEqual(coldStatus.tipCID, finalTip)
+
+        try await cluster.stopAll()
+        passed = true
+    }
+
+    func testParentDescendantsDoNotFlowThroughAncestorCarrierAfterPartitionHeal()
         async throws
     {
         let workspace = try E2EWorkspace()
@@ -1344,8 +1974,7 @@ final class ParentChildE2ETests: XCTestCase {
             bootstrapPeer: parentPeer,
             hello: ChainHello(
                 nexusGenesisCID: NexusGenesis.expectedBlockHash,
-                chainPath: ["Nexus"],
-                minimumRootWorkHex: String(repeating: "0", count: 63) + "1"
+                chainPath: ["Nexus"]
             )
         )
         addTeardownBlock { await observer.stop() }
@@ -1398,7 +2027,7 @@ final class ParentChildE2ETests: XCTestCase {
         passed = true
     }
 
-    func testPureAncestorDescendantsDoNotReweightNestedChildren()
+    func testAncestorDescendantsWithoutDirectCommitmentsDoNotReweightNestedChildren()
         async throws
     {
         let workspace = try E2EWorkspace()
@@ -1631,8 +2260,7 @@ final class ParentChildE2ETests: XCTestCase {
             bootstrapPeer: parentPeer,
             hello: ChainHello(
                 nexusGenesisCID: NexusGenesis.expectedBlockHash,
-                chainPath: ["Nexus"],
-                minimumRootWorkHex: String(repeating: "0", count: 63) + "1"
+                chainPath: ["Nexus"]
             )
         )
         addTeardownBlock { await observer.stop() }
@@ -2167,8 +2795,7 @@ final class ParentChildE2ETests: XCTestCase {
             bootstrapPeer: dPeer,
             hello: ChainHello(
                 nexusGenesisCID: NexusGenesis.expectedBlockHash,
-                chainPath: ["Nexus"],
-                minimumRootWorkHex: String(repeating: "0", count: 63) + "1"
+                chainPath: ["Nexus"]
             )
         )
         addTeardownBlock { await liveObserver.stop() }
@@ -2364,8 +2991,9 @@ final class ParentChildE2ETests: XCTestCase {
         let binary = try E2EBinary.latticeNode()
         let parentIdentity = try workspace.makeIdentity(named: "nexus")
         let childIdentity = try workspace.makeIdentity(named: "market")
+        let lateIdentity = try workspace.makeIdentity(named: "market-late")
         let parentPeerKey = try PeerKey(parentIdentity.publicKey)
-        let ports = try E2EPorts.allocate(count: 6)
+        let ports = try E2EPorts.allocate(count: 9)
         let parent = E2ENode(
             binary: binary,
             configuration: E2ENode.Configuration(
@@ -2393,8 +3021,24 @@ final class ParentChildE2ETests: XCTestCase {
             ),
             logDirectory: workspace.logs
         )
+        let late = E2ENode(
+            binary: binary,
+            configuration: E2ENode.Configuration(
+                name: "market-late",
+                chainPath: "Nexus/Market",
+                storage: workspace.url.appendingPathComponent("market-late", isDirectory: true),
+                identity: lateIdentity,
+                overlayPort: ports[6],
+                factPort: ports[7],
+                rpcPort: ports[8],
+                overlayPeers: [try overlayPeer(identity: childIdentity, port: ports[3])],
+                parent: .init(publicKey: parentPeerKey.hex, factPort: ports[1])
+            ),
+            logDirectory: workspace.logs
+        )
         cluster.add(parent)
         cluster.add(child)
+        cluster.add(late)
 
         try parent.start()
         try child.start()
@@ -2684,6 +3328,26 @@ final class ParentChildE2ETests: XCTestCase {
             $0.mempoolCount == 2
                 && $0.height == spent.height.map { $0 + 1 }
         }
+
+        // A cold peer has no child-chain state except what the exact Market
+        // advertiser serves over Ivy. In particular, validating the historic
+        // withdrawal requires the parent receipt-state witness committed by
+        // that child block; the live trusted parent supplies only current
+        // inherited work and readiness.
+        let settledStatus = try await child.waitForStatus { $0.phase == .active }
+        let settledTip = try XCTUnwrap(settledStatus.tipCID)
+        try late.start()
+        let joined = try await waitForTip(late, settledTip)
+
+        // Reopen the accepted chain with the advertiser offline and no overlay
+        // peers. The parent remains live so consensus may resume, while the
+        // exact tip and height must come entirely from late's durable stores.
+        try await late.stop()
+        try await child.stop()
+        late.setOverlayPeers([])
+        try late.start()
+        let reopened = try await waitForTip(late, settledTip)
+        XCTAssertEqual(reopened.height, joined.height)
 
         try await cluster.stopAll()
         passed = true
@@ -3096,15 +3760,23 @@ final class ParentChildE2ETests: XCTestCase {
             let a = try? await childA.waitForStatus(
                 timeout: .seconds(2),
                 where: {
-                    $0.mempoolCount == 0
-                        && $0.height == withdrawnA.height.map { $0 + 1 }
+                    guard $0.mempoolCount == 0,
+                          let height = $0.height,
+                          let withdrawnHeight = withdrawnA.height else {
+                        return false
+                    }
+                    return height >= withdrawnHeight + 1
                 }
             )
             let b = try? await childB.waitForStatus(
                 timeout: .seconds(2),
                 where: {
-                    $0.mempoolCount == 0
-                        && $0.height == withdrawnB.height.map { $0 + 1 }
+                    guard $0.mempoolCount == 0,
+                          let height = $0.height,
+                          let withdrawnHeight = withdrawnB.height else {
+                        return false
+                    }
+                    return height >= withdrawnHeight + 1
                 }
             )
             if let a, let b {
@@ -3231,9 +3903,22 @@ final class ParentChildE2ETests: XCTestCase {
         {
             nonce += 1
         }
+        let directChildCount: Int
+        if let children = template.block.children.node,
+           let entries = try? children.allKeysAndValues() {
+            directChildCount = entries.count
+        } else {
+            directChildCount = 0
+        }
+        // Submission validates the parent plus one proof route per direct
+        // child. Give each chain one bounded CI-safe unit instead of turning
+        // this correctness suite into an accidental latency benchmark.
+        let submitTimeout = requestTimeout
+            ?? TimeInterval((directChildCount + 1) * 10)
         let response: SubmitWorkResponse = try await parent.post(
             "/v1/mining/work",
-            body: SubmitWorkRequest(workID: template.workID, nonce: nonce)
+            body: SubmitWorkRequest(workID: template.workID, nonce: nonce),
+            timeout: submitTimeout
         )
         return E2EMinedBlock(
             template: template,
@@ -3241,6 +3926,52 @@ final class ParentChildE2ETests: XCTestCase {
             blockCID: try BlockHeader(
                 node: ProofOfWork.withNonce(template.block, nonce: nonce)
             ).rawCID
+        )
+    }
+
+    private func submitTemplate(
+        _ template: MiningTemplateResponse,
+        to node: E2ENode
+    ) async throws -> SubmitWorkResponse {
+        let midstate = ProofOfWork.midstate(for: template.block)
+        var nonce: UInt64 = 0
+        while ProofOfWork.hash(midstate: midstate, nonce: nonce)
+            > template.searchTarget
+        {
+            nonce += 1
+        }
+        return try await node.post(
+            "/v1/mining/work",
+            body: SubmitWorkRequest(workID: template.workID, nonce: nonce)
+        )
+    }
+
+    private func waitForReplicaConvergence(
+        _ first: E2ENode,
+        _ second: E2ENode,
+        excluding excludedCID: String
+    ) async throws -> String {
+        let clock = ContinuousClock()
+        let deadline = clock.now + .seconds(30)
+        while clock.now < deadline {
+            let firstStatus = try? await first.waitForStatus(
+                timeout: .seconds(1),
+                where: { $0.phase == .active }
+            )
+            let secondStatus = try? await second.waitForStatus(
+                timeout: .seconds(1),
+                where: { $0.phase == .active }
+            )
+            if let firstTip = firstStatus?.tipCID,
+               firstTip != excludedCID,
+               firstTip == secondStatus?.tipCID {
+                return firstTip
+            }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        throw E2EHTTPError(
+            status: 0,
+            body: "same-path replicas did not converge"
         )
     }
 
@@ -3737,6 +4468,345 @@ private struct E2EHTTPError: Error, LocalizedError {
     }
 }
 
+private final class LoopbackTCPFaultProxy: @unchecked Sendable {
+    private final class Session: @unchecked Sendable {
+        let id = UUID()
+        private let client: Int32
+        private let upstream: Int32
+        private let onClose: @Sendable (UUID) -> Void
+        private let lock = NSLock()
+        private var closed = false
+
+        init(
+            client: Int32,
+            upstream: Int32,
+            onClose: @escaping @Sendable (UUID) -> Void
+        ) {
+            self.client = client
+            self.upstream = upstream
+            self.onClose = onClose
+            Self.suppressBrokenPipe(client)
+            Self.suppressBrokenPipe(upstream)
+        }
+
+        func start() {
+            DispatchQueue.global().async { [self] in
+                pump(from: client, to: upstream)
+            }
+            DispatchQueue.global().async { [self] in
+                pump(from: upstream, to: client)
+            }
+        }
+
+        func close() {
+            let shouldClose = lock.withLock {
+                guard !closed else { return false }
+                closed = true
+                return true
+            }
+            guard shouldClose else { return }
+            Self.close(client)
+            Self.close(upstream)
+            onClose(id)
+        }
+
+        private func pump(from source: Int32, to destination: Int32) {
+            var buffer = [UInt8](repeating: 0, count: 16 * 1_024)
+            while true {
+                let received = buffer.withUnsafeMutableBytes {
+                    recv(source, $0.baseAddress, $0.count, 0)
+                }
+                if received < 0 && errno == EINTR { continue }
+                guard received > 0 else { break }
+
+                var sent = 0
+                while sent < received {
+                    let result = buffer.withUnsafeBytes { bytes in
+                        let start = bytes.baseAddress!.advanced(by: sent)
+                        #if canImport(Darwin)
+                        return Darwin.send(
+                            destination,
+                            start,
+                            received - sent,
+                            0
+                        )
+                        #else
+                        return Glibc.send(
+                            destination,
+                            start,
+                            received - sent,
+                            Int32(MSG_NOSIGNAL)
+                        )
+                        #endif
+                    }
+                    if result < 0 && errno == EINTR { continue }
+                    guard result > 0 else {
+                        close()
+                        return
+                    }
+                    sent += result
+                }
+            }
+            close()
+        }
+
+        private static func suppressBrokenPipe(_ descriptor: Int32) {
+            #if canImport(Darwin)
+            var enabled: Int32 = 1
+            _ = withUnsafePointer(to: &enabled) {
+                setsockopt(
+                    descriptor,
+                    SOL_SOCKET,
+                    SO_NOSIGPIPE,
+                    $0,
+                    socklen_t(MemoryLayout<Int32>.size)
+                )
+            }
+            #endif
+        }
+
+        private static func close(_ descriptor: Int32) {
+            _ = shutdown(descriptor, Int32(SHUT_RDWR))
+            #if canImport(Darwin)
+            _ = Darwin.close(descriptor)
+            #else
+            _ = Glibc.close(descriptor)
+            #endif
+        }
+    }
+
+    private let listenPort: UInt16
+    private let targetPort: UInt16
+    private let lock = NSLock()
+    private var listener: Int32 = -1
+    private var running = false
+    private var forwarding = true
+    private var connectionCount = 0
+    private var sessions: [UUID: Session] = [:]
+
+    init(listenPort: UInt16, targetPort: UInt16) {
+        self.listenPort = listenPort
+        self.targetPort = targetPort
+    }
+
+    func start() throws {
+        let descriptor = Self.socket()
+        guard descriptor >= 0 else {
+            throw E2EHTTPError(status: 0, body: "could not create fault proxy")
+        }
+        do {
+            try Self.listen(descriptor, port: listenPort)
+        } catch {
+            Self.close(descriptor)
+            throw error
+        }
+        lock.withLock {
+            listener = descriptor
+            running = true
+            forwarding = true
+        }
+        DispatchQueue.global().async { [weak self] in
+            self?.acceptConnections(listener: descriptor)
+        }
+    }
+
+    func cut() {
+        let active = lock.withLock {
+            forwarding = false
+            return Array(sessions.values)
+        }
+        for session in active { session.close() }
+    }
+
+    func heal() {
+        lock.withLock {
+            if running { forwarding = true }
+        }
+    }
+
+    func stop() {
+        let stopped: (Int32, [Session]) = lock.withLock {
+            guard running else { return (-1, []) }
+            running = false
+            forwarding = false
+            let descriptor = listener
+            listener = -1
+            let active = Array(sessions.values)
+            sessions.removeAll()
+            return (descriptor, active)
+        }
+        if stopped.0 >= 0 { Self.close(stopped.0) }
+        for session in stopped.1 { session.close() }
+    }
+
+    func waitForConnections(
+        _ expected: Int,
+        timeout: Duration = .seconds(20)
+    ) async throws {
+        let clock = ContinuousClock()
+        let deadline = clock.now + timeout
+        while clock.now < deadline {
+            let connected = lock.withLock {
+                connectionCount >= expected && !sessions.isEmpty
+            }
+            if connected { return }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        let observed = lock.withLock {
+            "connections=\(connectionCount), active=\(sessions.count)"
+        }
+        throw E2EHTTPError(
+            status: 0,
+            body: "timed out waiting for fault proxy connection; \(observed)"
+        )
+    }
+
+    func waitForNoActiveConnections(
+        timeout: Duration = .seconds(5)
+    ) async throws {
+        let clock = ContinuousClock()
+        let deadline = clock.now + timeout
+        while clock.now < deadline {
+            if lock.withLock({ sessions.isEmpty }) { return }
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        throw E2EHTTPError(
+            status: 0,
+            body: "timed out severing fault proxy connection"
+        )
+    }
+
+    private func acceptConnections(listener: Int32) {
+        while lock.withLock({ running }) {
+            let client = accept(listener, nil, nil)
+            if client < 0 && errno == EINTR { continue }
+            guard client >= 0 else { return }
+            guard lock.withLock({ running && forwarding }),
+                  let upstream = Self.connect(to: targetPort) else {
+                Self.close(client)
+                continue
+            }
+            let session = Session(
+                client: client,
+                upstream: upstream,
+                onClose: { [weak self] id in
+                    self?.removeSession(id)
+                }
+            )
+            let accepted = lock.withLock {
+                guard running && forwarding else { return false }
+                connectionCount += 1
+                sessions[session.id] = session
+                return true
+            }
+            guard accepted else {
+                session.close()
+                continue
+            }
+            session.start()
+        }
+    }
+
+    private func removeSession(_ id: UUID) {
+        _ = lock.withLock {
+            sessions.removeValue(forKey: id)
+        }
+    }
+
+    private static func socket() -> Int32 {
+        #if canImport(Darwin)
+        Darwin.socket(AF_INET, SOCK_STREAM, 0)
+        #else
+        Glibc.socket(AF_INET, Int32(SOCK_STREAM.rawValue), 0)
+        #endif
+    }
+
+    private static func listen(_ descriptor: Int32, port: UInt16) throws {
+        var reuseAddress: Int32 = 1
+        guard withUnsafePointer(to: &reuseAddress, {
+            setsockopt(
+                descriptor,
+                SOL_SOCKET,
+                SO_REUSEADDR,
+                $0,
+                socklen_t(MemoryLayout<Int32>.size)
+            )
+        }) == 0 else {
+            throw E2EHTTPError(status: 0, body: "could not configure fault proxy")
+        }
+        var address = sockaddr_in()
+        #if canImport(Darwin)
+        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        #endif
+        address.sin_family = sa_family_t(AF_INET)
+        address.sin_port = port.bigEndian
+        address.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
+        let bound = withUnsafePointer(to: &address) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                bind(
+                    descriptor,
+                    $0,
+                    socklen_t(MemoryLayout<sockaddr_in>.size)
+                )
+            }
+        }
+        guard bound == 0 else {
+            throw E2EHTTPError(status: 0, body: "could not listen for fault proxy")
+        }
+        #if canImport(Darwin)
+        let listening = Darwin.listen(descriptor, 8)
+        #else
+        let listening = Glibc.listen(descriptor, 8)
+        #endif
+        guard listening == 0 else {
+            throw E2EHTTPError(status: 0, body: "could not listen for fault proxy")
+        }
+    }
+
+    private static func connect(to port: UInt16) -> Int32? {
+        let descriptor = socket()
+        guard descriptor >= 0 else { return nil }
+        var address = sockaddr_in()
+        #if canImport(Darwin)
+        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        #endif
+        address.sin_family = sa_family_t(AF_INET)
+        address.sin_port = port.bigEndian
+        address.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
+        let connected = withUnsafePointer(to: &address) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                #if canImport(Darwin)
+                Darwin.connect(
+                    descriptor,
+                    $0,
+                    socklen_t(MemoryLayout<sockaddr_in>.size)
+                )
+                #else
+                Glibc.connect(
+                    descriptor,
+                    $0,
+                    socklen_t(MemoryLayout<sockaddr_in>.size)
+                )
+                #endif
+            }
+        }
+        guard connected == 0 else {
+            close(descriptor)
+            return nil
+        }
+        return descriptor
+    }
+
+    private static func close(_ descriptor: Int32) {
+        _ = shutdown(descriptor, Int32(SHUT_RDWR))
+        #if canImport(Darwin)
+        _ = Darwin.close(descriptor)
+        #else
+        _ = Glibc.close(descriptor)
+        #endif
+    }
+}
+
 @MainActor
 private final class E2ENode {
     private static let requestTimeout: TimeInterval = 5
@@ -3790,6 +4860,7 @@ private final class E2ENode {
     private let logDirectory: URL
     private var overlayPeers: [OverlayPeer]
     private var process: Process?
+    private var session: URLSession?
     private var logHandles: [FileHandle] = []
     private var launchCount = 0
 
@@ -3800,9 +4871,7 @@ private final class E2ENode {
         overlayPeers = configuration.overlayPeers
     }
 
-    var processPublicKey: String {
-        try! PeerKey(configuration.identity.publicKey).hex
-    }
+    var storageURL: URL { configuration.storage }
 
     func setOverlayPeers(_ peers: [OverlayPeer]) {
         precondition(process?.isRunning != true, "stop a node before changing its peers")
@@ -3812,12 +4881,14 @@ private final class E2ENode {
     func start() throws {
         guard process?.isRunning != true else { return }
         launchCount += 1
+        closeSession()
         try FileManager.default.createDirectory(
             at: configuration.storage,
             withIntermediateDirectories: true
         )
         let stdout = try openLog(named: "\(configuration.name)-\(launchCount).stdout.log")
         let stderr = try openLog(named: "\(configuration.name)-\(launchCount).stderr.log")
+        let nextSession = URLSession(configuration: .ephemeral)
         let next = Process()
         next.executableURL = binary
         next.arguments = launchArguments()
@@ -3828,16 +4899,21 @@ private final class E2ENode {
             try next.run()
         } catch {
             try? E2EPorts.reserve(reservedPorts)
+            nextSession.invalidateAndCancel()
             try? stdout.close()
             try? stderr.close()
             throw error
         }
         process = next
+        session = nextSession
         logHandles = [stdout, stderr]
     }
 
     func stop() async throws {
-        guard let process else { return }
+        guard let process else {
+            closeSession()
+            return
+        }
         var forced = false
         if process.isRunning {
             process.terminate()
@@ -3855,6 +4931,7 @@ private final class E2ENode {
         let reason = process.terminationReason
         let status = process.terminationStatus
         self.process = nil
+        closeSession()
         closeLogs()
         try E2EPorts.reserve(reservedPorts)
         guard !forced, reason == .exit, status == 0 else {
@@ -3867,6 +4944,7 @@ private final class E2ENode {
 
     func forceTerminate() {
         guard let process else {
+            closeSession()
             closeLogs()
             return
         }
@@ -3875,6 +4953,7 @@ private final class E2ENode {
         }
         process.waitUntilExit()
         self.process = nil
+        closeSession()
         closeLogs()
         try? E2EPorts.reserve(reservedPorts)
     }
@@ -3924,6 +5003,7 @@ private final class E2ENode {
         while clock.now < deadline {
             do {
                 let status = try await status()
+                lastError = nil
                 lastStatus = status
                 if predicate(status) { return status }
             } catch {
@@ -3936,15 +5016,20 @@ private final class E2ENode {
             "phase=\($0.phase.rawValue), tip=\($0.tipCID ?? "nil"), height=\($0.height.map(String.init) ?? "nil"), mempool=\($0.mempoolCount)"
         } ?? "no status response"
         let lastFailure = lastError.map { "; last error: \($0.localizedDescription)" } ?? ""
-        let processFailure: String
-        if let process, !process.isRunning {
-            processFailure = "; process exited with status \(process.terminationStatus) (\(process.terminationReason))"
+        let processState: String
+        if let process, process.isRunning {
+            processState = "pid=\(process.processIdentifier), running"
+        } else if let process {
+            processState = "pid=\(process.processIdentifier), exited=\(process.terminationStatus) (\(process.terminationReason))"
         } else {
-            processFailure = ""
+            processState = "no process"
         }
+        let logPrefix = logDirectory.appendingPathComponent(
+            "\(configuration.name)-\(launchCount)"
+        ).path
         throw E2EHTTPError(
             status: 0,
-            body: "timed out waiting for \(configuration.name) status; \(observed)\(lastFailure)\(processFailure)"
+            body: "timed out waiting for \(configuration.name) status; \(observed)\(lastFailure); launch=\(launchCount), \(processState), logs=\(logPrefix).{stdout,stderr}.log"
         )
     }
 
@@ -3988,13 +5073,23 @@ private final class E2ENode {
     ) async throws -> Response {
         var request = request
         request.timeoutInterval = timeout ?? Self.requestTimeout
-        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let session else {
+            throw E2EHTTPError(
+                status: 0,
+                body: "node is not running: \(configuration.name)"
+            )
+        }
+        let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse,
               (200..<300).contains(http.statusCode) else {
             let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            let endpoint = request.url?.path ?? "<unknown endpoint>"
+            let responseBody = String(decoding: data, as: UTF8.self)
             throw E2EHTTPError(
                 status: status,
-                body: String(decoding: data, as: UTF8.self)
+                body: responseBody.isEmpty
+                    ? endpoint
+                    : "\(endpoint): \(responseBody)"
             )
         }
         return try JSONDecoder().decode(Response.self, from: data)
@@ -4030,6 +5125,11 @@ private final class E2ENode {
             try? handle.close()
         }
         logHandles.removeAll()
+    }
+
+    private func closeSession() {
+        session?.invalidateAndCancel()
+        session = nil
     }
 }
 

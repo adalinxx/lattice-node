@@ -77,6 +77,11 @@ to stall mining or RPC. Miner/RPC/reconciliation reads are local-only; remote
 content acquisition is explicit and root-scoped to network admission or a
 targeted retry.
 
+Each network generation receives one immutable handler bundle before either
+listener starts. Candidate acquisition creates an explicit root-bound content
+session and passes that session through service ingress; provider identity,
+cache state, and attribution never depend on ambient task-local state.
+
 Ivy applies bounded transport admission before awaiting the runtime's inbound
 delegate, so peer work is backpressured at the transport boundary. On the
 private hierarchy plane, only the exact configured immediate parent bypasses
@@ -89,8 +94,8 @@ delays local RPC availability.
 
 The planes are deliberately separate:
 
-1. The public overlay admits peers that claim the same Nexus genesis, absolute
-   chain path, and minimum root-work floor. It carries block and transaction
+1. The public overlay admits peers that claim the same Nexus genesis and
+   absolute chain path. It carries block and transaction
    Volume inventories plus content-addressed retrieval.
 2. The private hierarchy plane has no relay role. It carries direct-child
    candidate requests, parent-issued proofs, generic parent work, and genesis links. A
@@ -115,6 +120,30 @@ A parent may request candidates only from authenticated direct children. Slow
 or absent children are omitted within a bounded deadline, so one child cannot
 stall Nexus template creation.
 
+Before replying, a child stores the candidate's complete block and transaction
+Volumes as a bounded speculative offer. The parent does not expose miner work
+until it sends that exact child an authenticated snapshot of every candidate
+referenced by its live template book and receives a durable acknowledgement.
+The child recursively reserves its own descendants, atomically replaces its
+issued set, and then releases every unselected offer. Additions require the
+durable acknowledgement; removals run in order without making parent progress
+wait on a child. On parent-proof receipt, the child first moves the referenced
+candidate into a durable admission handoff, so reservation release cannot race
+proof recovery or garbage collection. Offer churn can evict only offers; it
+cannot evict issued or handoff candidates. Lost acknowledgements can therefore
+over-retain, never under-retain, and the next exact snapshot reconciles the set.
+Every hierarchy level applies the same rule. A reconnecting child is omitted
+from candidate selection until the final page of its durable evidence index is
+ordered into that session. The index resumes from a durable
+`(source, ordinal)` cursor against one fixed cut; a changed parent store source
+restarts at zero. Validated attachments enter a durable,
+VolumeBroker-retained inbox before the cursor advances and leave it only after
+admission owns the same Volume. Evidence published while the index is in flight is
+queued after its final page and before the child's exact reservation replay, so
+neither a page race nor a slow child can stall or under-retain parent work.
+Child timestamps derive from the immutable parent carrier, so an unchanged
+request is CID-stable and refreshes one offer instead of consuming another.
+
 ## Child genesis flow
 
 1. Start the child process with its absolute path and parent fact endpoint. It
@@ -131,28 +160,38 @@ stall Nexus template creation.
    work and an ordered completion marker. Only then does the child become
    `active` and make its fork choice operational.
 
-There is no opaque genesis byte channel. The content-addressed genesis block,
-its CID, and the parent proof are the bootstrap material.
+There is no opaque genesis byte channel. The parent retains the complete Cashew
+Volumes it created for genesis and is the fresh child's preferred source. An
+exact same-chain advertiser may supply the same CID-verified Volumes when the
+parent cannot; parent authentication still supplies authority and consensus.
+The same rule applies after genesis: an `awaitingParent` process keeps
+validating and durably ingesting peer-supplied same-chain history. Its displayed
+tip is only a replaceable local projection. Mining, work publication, and
+descendant consensus remain disabled until the configured parent completes a
+live inherited-work pass.
 
-The process that directly parents an edge retains that edge's exact bounded
-validation package before returning a contextual candidate. Admission stages a
+The process that directly parents an edge retains only its sparse commitment
+proof. Ordinary child validation Volumes remain child-chain data. Admission stages a
 newly authorized child's proof route in the same transaction as its genesis
 link, because that child cannot authenticate before the authorization exists.
 The parent replays durable authorized-genesis availability when the child
 reconnects. An ancestor does not become an implicit archive for packages below
 its direct children.
 
-Parent and child retain the same direct-edge evidence Volume, but acquire it at
-different moments. The parent retains the edge it issued; the child retains the
-edge it validated and may relay signed root attachments to same-chain peers.
+Parent and child retain the same child-evidence proof attachment, but acquire it
+at different moments. The semantic direct edge is indexed in SQLite and derived
+from that proof when read; it is not stored again as a second Volume. The parent
+retains the edge it issued; the child retains the edge it validated and may
+relay signed root attachments to same-chain peers.
 The child never returns topology to its parent. Parent work remains generic and
 child-specific projection remains entirely inside the child process.
 
-An evidence Volume is rooted by a canonical manifest containing the envelope
-and the exact sorted acquisition-member CIDs. The acquisition bytes are direct
-Volume members under their original CIDs—not a JSON archive inside another CAS
-blob—so VolumeBroker deduplicates them with validation content and exact-peer
-retrieval can reject missing or extra membership.
+An evidence Volume is one complete, one-entry Volume whose canonical manifest
+contains the child CID and proof envelope. Parent-created genesis retention
+stores complete Volume root IDs in NodeStore as local metadata; those IDs do
+not affect evidence identity or wire size. Its Ivy request carries a local
+singleton/archive allocation bound even though those limits are not added to
+the wire protocol.
 
 The permanent edge record is the reusable source for later outer-root
 attachments. The bounded prepared-proof store exists only to bridge a crash
@@ -173,10 +212,11 @@ recomputes its CID, and requires it to equal:
 
 `bafyreiayw4z5qz4lt2sljf2enzn7uol3qa6bebadav7qwnqz7agxkiuwhq`
 
-Only then does it bootstrap the root locally. Every genesis transaction has
-empty signers and signatures. The exact genesis CID supplies authorization:
-local configuration for Nexus and a signed parent `GenesisAction` for a child.
-Ordinary post-genesis transactions remain signature-strict. On recovery, store
+Only then does it bootstrap the root locally. Signature and signer fields in
+genesis transactions are non-authoritative and need no special empty shape. The
+exact genesis CID supplies authorization: local configuration for Nexus and a
+parent `GenesisAction` commitment for a child. Ordinary post-genesis
+transactions remain signature-strict. On recovery, store
 metadata and the height-zero fact must name that same CID; no alternate Nexus
 genesis is accepted.
 
@@ -209,6 +249,14 @@ effective search target preserves the hardest deployment barrier recursively.
 Because every intent binds the carrier's entering parent state, sibling chains
 that must launch together are anchored atomically by one transaction.
 
+A child intent carries the exact complete WASM module Volumes named by its
+spec. Validation composes those request-owned bytes over local VolumeBroker
+content; there is no ambient module-upload CAS. After validation, one exact
+`child-intents` retention scope covers every Volume in each live intent closure.
+Replacement, anchoring, and parent-state staleness update that set atomically
+with respect to process eviction, while restart clears it because intents are
+operational state rather than recovery authority.
+
 ## Durability and recovery
 
 Each process directory contains:
@@ -222,12 +270,16 @@ Each process directory contains:
 
 Admission publishes each complete Volume, merge-retains its root, and only then
 commits the protocol fact that references it. A failed fact commit may leave a
-safe retained orphan; live code never exact-replaces the retention set. Under
-the exclusive startup lock, the node materializes protocol constants, derives
-the exact root set from durable facts, verifies every referenced Volume,
-reconciles retention once, audits semantic indexes, and reconstructs the chain
-by replaying staged admission batches. Networking starts afterward. Nexus also
-verifies the exact genesis CID.
+safe retained orphan. Admission and issued hierarchy roots therefore grow
+merge-only while live. Prepared hierarchy evidence is different: it is a
+bounded cache, so one serialized store gate performs its Volume writes, SQLite
+capacity eviction, and exact retained-set advance as a single ordered
+operation. Under the exclusive startup lock, the node materializes protocol
+constants, derives the exact roots for admission, issued hierarchy, and
+prepared hierarchy scopes, verifies every referenced Volume, populates the
+hierarchy scopes before removing legacy ownership, audits semantic indexes,
+and reconstructs the chain by replaying staged admission batches. Networking
+starts afterward. Nexus also verifies the exact genesis CID.
 
 Legacy databases and volume layouts are not migrated in place. Operators must
 remove the entire configured storage directory and resync; keeping only one of

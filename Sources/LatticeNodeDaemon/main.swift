@@ -7,6 +7,32 @@ import Lattice
 import LatticeNode
 import UInt256
 
+/// Match DiskBroker's default storage-age grace: a newly stored orphan that
+/// misses one sweep is old enough to reclaim at the next.
+let volumeMaintenanceIntervalNanoseconds: UInt64 = 600 * 1_000_000_000
+
+func runVolumeMaintenance(
+    everyNanoseconds interval: UInt64 = volumeMaintenanceIntervalNanoseconds,
+    evict: @escaping @Sendable () async throws -> Void
+) async {
+    precondition(interval > 0)
+    while !Task.isCancelled {
+        do {
+            try await Task.sleep(nanoseconds: interval)
+        } catch {
+            return
+        }
+        guard !Task.isCancelled else { return }
+        do {
+            try await evict()
+        } catch {
+            FileHandle.standardError.write(Data(
+                "lattice-node volume maintenance failed: \(error)\n".utf8
+            ))
+        }
+    }
+}
+
 @main
 struct LatticeNodeCommand: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
@@ -51,8 +77,8 @@ struct LatticeNodeCommand: AsyncParsableCommand {
         guard let address = ChainAddress(string: chainPath) else {
             throw ValidationError("--chain-path must be absolute and begin with Nexus")
         }
-        guard let rootWork = UInt256.fromHexString(minimumRootWork), rootWork > .zero else {
-            throw ValidationError("--minimum-root-work must be nonzero hexadecimal")
+        guard let rootWork = UInt256.fromHexString(minimumRootWork) else {
+            throw ValidationError("--minimum-root-work must be hexadecimal")
         }
         guard ["127.0.0.1", "::1", "localhost"].contains(rpcBind.lowercased()) else {
             throw ValidationError("the unauthenticated HTTP API may bind only to loopback")
@@ -79,27 +105,33 @@ struct LatticeNodeCommand: AsyncParsableCommand {
         )
 
         let network = try NodeNetworkRuntime(configuration: configuration)
-        let process = try await ChainProcess.open(
-            configuration: configuration,
-            remoteSource: network.remoteContentSource
-        )
+        let process = try await ChainProcess.open(configuration: configuration)
         let service = ChainService(
             process: process,
             childCandidateProvider: { [weak network] context in
                 guard let network else { return [] }
                 return await network.directChildCandidates(context)
             },
+            childCandidateReservationReconciler: { [weak network] references in
+                guard let network else { return references.isEmpty }
+                return await network.reconcileChildCandidateReservations(
+                    references
+                )
+            },
             childProofPublisher: { [weak network] publication in
                 guard let network else { throw CancellationError() }
                 _ = try await network.publishChildProof(
                     publication.proof,
                     childDirectory: publication.directory,
-                    child: publication.childBlock
+                    childCID: publication.childCID
                 )
             },
             acceptedBlockPublisher: { [weak network] blockCID in
                 guard let network else { throw CancellationError() }
                 try await network.publishAcceptedBlock(blockCID)
+            },
+            securingWorkPublisher: { [weak network] in
+                await network?.publishSecuringWork()
             },
             acceptedTransactionPublisher: { [weak network] rootCID in
                 guard let network else { throw CancellationError() }
@@ -107,46 +139,54 @@ struct LatticeNodeCommand: AsyncParsableCommand {
             }
         )
         try await service.restoreLocalTransactions()
-        await network.installChildCandidateBuilder { [weak service, weak network] context in
-            guard let service, let network else { return nil }
-            return try await service.miningCandidate(
-                parentCarrier: context.parentCarrier,
-                parentContentSource: network.hierarchyContentSource,
-                rewards: context.rewards,
-                mode: context.mode
-            )
-        }
-        await network.installAdmissionHandler {
-            [weak service] header,
-            package,
-            directories in
-            guard let service else { throw CancellationError() }
-            return try await service.admitNetworkCandidate(
-                header,
-                authenticatedChildPackage: package,
-                preparingChildDirectories: directories
-            )
-        }
-        await network.installInheritedWorkHandler { [weak service] snapshot, key in
-            guard let service else { throw CancellationError() }
-            return try await service.applyInheritedWorkSnapshot(
-                snapshot,
-                from: key
-            )
-        }
-        await network.installParentReadinessHandler { [weak service] ready in
-            await service?.setParentConsensusReady(ready)
-        }
-        await network.installTransactionHandler {
-            [weak service] transaction in
-            guard let service else { throw CancellationError() }
-            return try await service.submitNetworkTransaction(transaction)
-        }
-        await network.installTransactionInventoryProvider { [weak service] in
-            guard let service else { return [] }
-            return await service.transactionInventoryRoots()
-        }
-        try await network.start(process: process)
+        let handlers = NodeNetworkHandlers(
+            childCandidateBuilder: { [weak service] context, parentContentSource in
+                guard let service else { return nil }
+                return try await service.miningCandidate(
+                    parentCarrier: context.parentCarrier,
+                    parentContentSource: parentContentSource,
+                    rewards: context.rewards,
+                    mode: context.mode
+                )
+            },
+            candidateReservations: { [weak service] candidateCIDs in
+                guard let service else { return false }
+                return await service.replaceIssuedCandidateReservations(
+                    candidateCIDs
+                )
+            },
+            admission: { [weak service] admission in
+                guard let service else { throw CancellationError() }
+                return try await service.admitNetworkCandidate(
+                    admission.header,
+                    authenticatedChildPackage: admission.authenticatedChildPackage,
+                    preparingChildDirectories: admission.preparingChildDirectories,
+                    contentSource: admission.contentSource
+                )
+            },
+            inheritedWork: {
+                [weak service] snapshot, sourceID, baseRevision, key in
+                guard let service else { throw CancellationError() }
+                return try await service.applyInheritedWorkExport(
+                    snapshot,
+                    sourceID: sourceID,
+                    baseRevision: baseRevision,
+                    from: key
+                )
+            },
+            parentWorkReadiness: { [weak service] ready in
+                await service?.setParentWorkReady(ready)
+            },
+            transaction: { [weak service] transaction in
+                guard let service else { throw CancellationError() }
+                return try await service.submitNetworkTransaction(transaction)
+            },
+            transactionInventory: { [weak service] in
+                guard let service else { return [] }
+                return await service.transactionInventoryRoots()
+            }
+        )
+        try await network.start(process: process, handlers: handlers)
         let app = makeApplication(
             service: service,
             host: rpcBind,
@@ -158,12 +198,21 @@ struct LatticeNodeCommand: AsyncParsableCommand {
         print("  nexus:   \(configuration.nexusGenesisCID)")
         print("  rpc:     http://\(rpcBind):\(rpcPort)")
 
+        let volumeMaintenance = Task {
+            await runVolumeMaintenance {
+                _ = try await process.evictUnretainedVolumes()
+            }
+        }
         do {
             try await app.runService()
         } catch {
+            volumeMaintenance.cancel()
+            await volumeMaintenance.value
             await network.stop()
             throw error
         }
+        volumeMaintenance.cancel()
+        await volumeMaintenance.value
         await network.stop()
     }
 
@@ -284,7 +333,10 @@ func makeApplication(
         }
     }
     router.post("v1/children/intents") { request, context in
-        let input: ChildDeployIntentRequest = try await decode(request, context: context)
+        let input: ChildDeployIntentRequest = try await decode(
+            request,
+            upTo: ChainServiceLimits.maximumChildIntentPayloadBytes
+        )
         return try await serviceCall(request: request, context: context) {
             try await service.createChildDeployIntent(input)
         }
@@ -294,6 +346,21 @@ func makeApplication(
         responder: router.buildResponder(),
         configuration: .init(address: .hostname(host, port: port))
     )
+}
+
+private func decode<Value: Decodable>(
+    _ request: Request,
+    upTo maximumBytes: Int
+) async throws -> Value {
+    do {
+        let buffer = try await request.body.collect(upTo: maximumBytes)
+        return try JSONDecoder().decode(
+            Value.self,
+            from: Data(buffer.readableBytesView)
+        )
+    } catch {
+        throw HTTPError(.badRequest)
+    }
 }
 
 private func decode<Value: Decodable, Context: RequestContext>(

@@ -42,15 +42,13 @@ globally unique chain identity.
 `ChainAddress` accepts a component array or slash-separated string only when:
 
 1. the first and exact root component is `Nexus`;
-2. the path contains at most 65,535 components;
-3. every component is 1–65,535 UTF-8 bytes; and
-4. no component contains `/`.
+2. its child depth fits Lattice's child-proof bound;
+3. every component is 1–64 bytes of visible ASCII; and
+4. no component contains Lattice's directory separator.
 
-Unicode and control text remain valid because Lattice consensus treats a child
-directory as free text. The node adds only the hierarchy wire's 16-bit size
-bounds at setup. Process configuration also requires the complete canonical
-handshake to fit its 64 KiB frame; this is a node transport bound, not a
-consensus restriction on `GenesisAction.directory`.
+`ChainAddress` delegates this grammar to `ChainRuntimeContext`, so node setup,
+transactions, state keys, and child proofs cannot drift. Process configuration
+also requires the complete canonical handshake to fit its wire frame.
 
 Consequently, these are invalid:
 

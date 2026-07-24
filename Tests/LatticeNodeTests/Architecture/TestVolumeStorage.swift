@@ -1,5 +1,4 @@
 import Foundation
-import UInt256
 import VolumeBroker
 
 @testable import LatticeNode
@@ -8,9 +7,9 @@ func testNodeStore(
     databasePath: URL,
     nexusGenesisCID: String,
     chainPath: [String],
-    minimumRootWork: UInt256,
     spawningParentKey: String = "",
-    issuingAuthorityKey: String = String(repeating: "a", count: 64)
+    issuingAuthorityKey: String = String(repeating: "a", count: 64),
+    contextualCandidateOwner: String = "test:contextual-candidates"
 ) throws -> NodeStore {
     let broker = try DiskBroker(
         path: databasePath.deletingLastPathComponent()
@@ -20,10 +19,11 @@ func testNodeStore(
         databasePath: databasePath,
         nexusGenesisCID: nexusGenesisCID,
         chainPath: chainPath,
-        minimumRootWork: minimumRootWork,
         spawningParentKey: spawningParentKey,
         issuingAuthorityKey: issuingAuthorityKey,
-        recoveryVolumeStorer: BrokerStorer(broker: broker),
-        recoveryVolumeBroker: broker
+        recoveryVolumeBroker: broker,
+        issuedRecoveryRetentionScope: "test:issued-hierarchy",
+        preparedRecoveryRetentionScope: "test:prepared-hierarchy",
+        contextualCandidateOwner: contextualCandidateOwner
     )
 }

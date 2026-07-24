@@ -56,11 +56,7 @@ final class MiningTemplateBookTests: XCTestCase {
 
         let child = DirectChildCandidate(
             directory: "Payments",
-            block: fixture.genesis,
-            acquisitionEntries: try await acquisitionEntries(
-                for: fixture.genesis,
-                fetcher: fixture.store
-            )
+            block: fixture.genesis
         )
         await XCTAssertThrowsErrorAsync(
             try await book.build(
@@ -77,29 +73,37 @@ final class MiningTemplateBookTests: XCTestCase {
 
     func testTemplateRecursivelyPropagatesNestedSearchTarget() async throws {
         let hard = try await chainFixture(target: UInt256(4))
-        let easy = try await chainFixture(target: .max)
+        let middleGenesis = try await BlockBuilder.buildChildGenesis(
+            spec: NexusGenesis.spec,
+            parentState: hard.genesis.postState,
+            timestamp: 1,
+            target: UInt256(4),
+            fetcher: hard.store
+        )
+        let leafGenesis = try await BlockBuilder.buildChildGenesis(
+            spec: NexusGenesis.spec,
+            parentState: middleGenesis.postState,
+            timestamp: 1,
+            target: .max,
+            fetcher: hard.store
+        )
+        let leafBlock = try await BlockBuilder.buildBlock(
+            previous: leafGenesis,
+            timestamp: 2,
+            fetcher: hard.store
+        )
         let middleBook = MiningTemplateBook(
             chainPath: ["Nexus", "Middle"],
             minimumRootWork: UInt256(1)
         )
-        let easyBlock = try await BlockBuilder.buildBlock(
-            previous: easy.genesis,
-            timestamp: 1,
-            fetcher: easy.store
-        )
-        let easyEntries = try await acquisitionEntries(
-            for: easyBlock,
-            fetcher: easy.store
-        )
         let middle = try await middleBook.build(
-            previous: hard.genesis,
+            previous: middleGenesis,
             transactions: [],
             children: [DirectChildCandidate(
                 directory: "Leaf",
-                block: easyBlock,
-                acquisitionEntries: easyEntries
+                block: leafBlock
             )],
-            timestamp: 1,
+            timestamp: 2,
             fetcher: hard.store
         )
         XCTAssertEqual(middle.block.target, UInt256(4))
@@ -109,18 +113,14 @@ final class MiningTemplateBookTests: XCTestCase {
             chainPath: ["Nexus"],
             minimumRootWork: UInt256(1)
         )
-        var middleEntries = try await acquisitionEntries(
-            for: middle.block,
-            fetcher: hard.store
-        )
-        middleEntries.merge(easyEntries) { existing, _ in existing }
         let root = try await rootBook.build(
             previous: hard.genesis,
             transactions: [],
             children: [DirectChildCandidate(
                 directory: "Middle",
                 block: middle.block,
-                acquisitionEntries: middleEntries
+                searchWitness: middle.searchWitness,
+                deploymentWitness: middle.deploymentWitness
             )],
             timestamp: 2,
             fetcher: hard.store
@@ -142,11 +142,7 @@ final class MiningTemplateBookTests: XCTestCase {
             transactions: [],
             children: [DirectChildCandidate(
                 directory: "Payments",
-                block: child.genesis,
-                acquisitionEntries: try await acquisitionEntries(
-                    for: child.genesis,
-                    fetcher: child.store
-                )
+                block: child.genesis
             )],
             timestamp: 1,
             fetcher: parent.store
@@ -156,27 +152,39 @@ final class MiningTemplateBookTests: XCTestCase {
         XCTAssertEqual(template.deploymentTarget, UInt256(4))
     }
 
-    func testAncestorPreservesDeploymentBarrierWithoutRequiringItsOwnHit()
+    func testDeploymentBarrierIncludesEveryCarrierOnCommittedPath()
         async throws
     {
         let parent = try await chainFixture(target: UInt256(4))
-        let middle = try await chainFixture(target: UInt256(8))
-        let leaf = try await chainFixture(target: UInt256(16))
-        let leafEntries = try await acquisitionEntries(
-            for: leaf.genesis,
-            fetcher: leaf.store
+        let middleGenesis = try await BlockBuilder.buildChildGenesis(
+            spec: NexusGenesis.spec,
+            parentState: parent.genesis.postState,
+            timestamp: 1,
+            target: UInt256(8),
+            fetcher: parent.store
+        )
+        let leafGenesis = try await BlockBuilder.buildChildGenesis(
+            spec: NexusGenesis.spec,
+            parentState: middleGenesis.postState,
+            timestamp: 1,
+            target: UInt256(16),
+            fetcher: parent.store
         )
         let middleBlock = try await BlockBuilder.buildBlock(
-            previous: middle.genesis,
-            children: ["Leaf": leaf.genesis],
-            timestamp: 1,
-            fetcher: middle.store
+            previous: middleGenesis,
+            children: ["Leaf": leafGenesis],
+            timestamp: 2,
+            fetcher: parent.store
         )
-        var middleEntries = try await acquisitionEntries(
-            for: middleBlock,
-            fetcher: middle.store
+        let leafProof = try await ChildBlockProof.generate(
+            rootHeader: BlockHeader(node: middleBlock),
+            childDirectory: "Leaf",
+            fetcher: parent.store
         )
-        middleEntries.merge(leafEntries) { existing, _ in existing }
+        let leafWitness = ChildSchedulingWitness(
+            proof: leafProof,
+            terminal: leafGenesis
+        )
         let book = MiningTemplateBook(
             chainPath: ["Nexus"],
             minimumRootWork: UInt256(1)
@@ -187,15 +195,16 @@ final class MiningTemplateBookTests: XCTestCase {
             children: [DirectChildCandidate(
                 directory: "Middle",
                 block: middleBlock,
-                acquisitionEntries: middleEntries
+                searchWitness: leafWitness,
+                deploymentWitness: leafWitness
             )],
             timestamp: 1,
             fetcher: parent.store
         )
 
         XCTAssertEqual(template.block.target, UInt256(4))
-        XCTAssertEqual(template.searchTarget, UInt256(8))
-        XCTAssertEqual(template.deploymentTarget, UInt256(8))
+        XCTAssertEqual(template.searchTarget, UInt256(4))
+        XCTAssertEqual(template.deploymentTarget, UInt256(4))
     }
 
     func testStateInvalidTransactionDoesNotSuppressWork() async throws {
@@ -380,67 +389,65 @@ final class MiningTemplateBookTests: XCTestCase {
         XCTAssertEqual(submitted.nonce, 42)
     }
 
+    func testReissuedWorkRefreshesTemplateCapacityOrder() async throws {
+        let fixture = try await chainFixture()
+        let book = MiningTemplateBook(
+            chainPath: ["Nexus"],
+            minimumRootWork: UInt256(1),
+            capacity: 2
+        )
+        func issue(timestamp: Int64) async throws -> MiningTemplate {
+            try await book.build(
+                previous: fixture.genesis,
+                transactions: [],
+                children: [],
+                timestamp: timestamp,
+                fetcher: fixture.store
+            )
+        }
+
+        let first = try await issue(timestamp: 1)
+        let second = try await issue(timestamp: 2)
+        let reissued = try await issue(timestamp: 1)
+        XCTAssertEqual(reissued.workID, first.workID)
+        let third = try await issue(timestamp: 3)
+
+        _ = try await book.candidate(workID: first.workID, nonce: 0)
+        _ = try await book.candidate(workID: third.workID, nonce: 0)
+        await XCTAssertThrowsErrorAsync(
+            try await book.candidate(workID: second.workID, nonce: 0)
+        ) { error in
+            XCTAssertEqual(error as? MiningTemplateError, .unknownWork)
+        }
+    }
+
     func testFirstLiveTemplateWinsWorkIDMetadataCollision() async throws {
         let fixture = try await chainFixture(target: UInt256(1))
         let book = MiningTemplateBook(
             chainPath: ["Nexus"],
             minimumRootWork: UInt256(1)
         )
-        let entries = try await acquisitionEntries(
-            for: fixture.genesis,
-            fetcher: fixture.store
-        )
-        var conflictingEntries = entries
-        conflictingEntries[fixture.genesis.postState.rawCID] = try await fixture.store.fetch(
-            rawCid: fixture.genesis.postState.rawCID
-        )
-        XCTAssertNotEqual(conflictingEntries, entries)
-
-        let firstChild = DirectChildCandidate(
-            directory: "Payments",
-            block: fixture.genesis,
-            acquisitionEntries: entries
-        )
-        let conflictingChild = DirectChildCandidate(
-            directory: "Payments",
-            block: fixture.genesis,
-            acquisitionEntries: conflictingEntries
-        )
         let first = try await book.build(
             previous: fixture.genesis,
             transactions: [],
-            children: [firstChild],
+            children: [],
             timestamp: 1,
             fetcher: fixture.store
         )
-        let conflicting = try await book.preview(
-            previous: fixture.genesis,
-            transactions: [],
-            children: [conflictingChild],
-            timestamp: 1,
-            fetcher: fixture.store
+        let conflicting = MiningTemplate(
+            workID: first.workID,
+            block: first.block,
+            searchTarget: UInt256(7),
+            deploymentTarget: first.deploymentTarget,
+            chainPath: first.chainPath,
+            expiresAt: ContinuousClock.now + .seconds(30),
+            childCandidates: first.childCandidates,
+            searchWitness: nil,
+            deploymentWitness: nil
         )
-        XCTAssertEqual(conflicting.workID, first.workID)
 
         let issued = await book.issue(conflicting)
         XCTAssertEqual(issued.searchTarget, first.searchTarget)
-        XCTAssertEqual(
-            issued.childCandidates.first?.acquisitionEntries,
-            entries
-        )
-
-        let rebuilt = try await book.build(
-            previous: fixture.genesis,
-            transactions: [],
-            children: [conflictingChild],
-            timestamp: 1,
-            fetcher: fixture.store
-        )
-        XCTAssertEqual(rebuilt.searchTarget, first.searchTarget)
-        XCTAssertEqual(
-            rebuilt.childCandidates.first?.acquisitionEntries,
-            entries
-        )
 
         await book.invalidateAll()
         let shortLived = MiningTemplate(
@@ -450,7 +457,9 @@ final class MiningTemplateBookTests: XCTestCase {
             deploymentTarget: first.deploymentTarget,
             chainPath: first.chainPath,
             expiresAt: ContinuousClock.now + .milliseconds(250),
-            childCandidates: first.childCandidates
+            childCandidates: first.childCandidates,
+            searchWitness: first.searchWitness,
+            deploymentWitness: first.deploymentWitness
         )
         _ = await book.issue(shortLived)
         let reused = await book.issue(MiningTemplate(
@@ -460,7 +469,9 @@ final class MiningTemplateBookTests: XCTestCase {
             deploymentTarget: conflicting.deploymentTarget,
             chainPath: conflicting.chainPath,
             expiresAt: ContinuousClock.now + .seconds(30),
-            childCandidates: conflicting.childCandidates
+            childCandidates: conflicting.childCandidates,
+            searchWitness: conflicting.searchWitness,
+            deploymentWitness: conflicting.deploymentWitness
         ))
         let response = MiningTemplateResponse(
             template: reused,
@@ -476,7 +487,9 @@ final class MiningTemplateBookTests: XCTestCase {
             deploymentTarget: first.deploymentTarget,
             chainPath: first.chainPath,
             expiresAt: ContinuousClock.now - .seconds(1),
-            childCandidates: first.childCandidates
+            childCandidates: first.childCandidates,
+            searchWitness: first.searchWitness,
+            deploymentWitness: first.deploymentWitness
         ))
         let replacement = await book.issue(MiningTemplate(
             workID: conflicting.workID,
@@ -485,13 +498,11 @@ final class MiningTemplateBookTests: XCTestCase {
             deploymentTarget: conflicting.deploymentTarget,
             chainPath: conflicting.chainPath,
             expiresAt: ContinuousClock.now + .seconds(30),
-            childCandidates: conflicting.childCandidates
+            childCandidates: conflicting.childCandidates,
+            searchWitness: conflicting.searchWitness,
+            deploymentWitness: conflicting.deploymentWitness
         ))
         XCTAssertEqual(replacement.searchTarget, conflicting.searchTarget)
-        XCTAssertEqual(
-            replacement.childCandidates.first?.acquisitionEntries,
-            conflictingEntries
-        )
     }
 
     private func chainFixture(
@@ -1010,18 +1021,6 @@ final class TransactionPoolArchitectureTests: XCTestCase {
     private func storedSize(of transaction: Transaction) -> Int {
         transaction.toData()!.count + transaction.body.node!.toData()!.count
     }
-}
-
-private func acquisitionEntries(
-    for block: Block,
-    fetcher: any Fetcher
-) async throws -> [String: Data] {
-    let collector = MiningTestStore()
-    try await BlockHeader(node: block).storeBlock(
-        fetcher: fetcher,
-        storer: collector
-    )
-    return await collector.allEntries()
 }
 
 private func signedTransaction(

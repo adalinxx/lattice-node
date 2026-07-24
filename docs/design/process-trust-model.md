@@ -91,8 +91,7 @@ proof publication. The child owns the exact vertical relation used for
 consensus projection.
 ## Genesis authority
 
-Nexus has no parent, so its one unsigned genesis is constructed locally and
-pinned by CID:
+Nexus has no parent, so its genesis is constructed locally and pinned by CID:
 
 `bafyreiayw4z5qz4lt2sljf2enzn7uol3qa6bebadav7qwnqz7agxkiuwhq`
 
@@ -101,15 +100,14 @@ peer-admission signature permit. Every child genesis is ordinary content bound
 to a parent state. A prepared child intent becomes authoritative only after a
 separately signed parent `GenesisAction` transaction is accepted in a carrier
 and the child verifies the resulting parent genesis link. The action and link
-identify only the child directory and exact genesis CID. That CID commits the
-child `ChainSpec.parentWorkAuthorityKey`; before admission, the child requires
-that key to equal its configured immediate parent. The authority is not copied
-into parent consensus state or asserted by the link itself.
+identify only the child directory and exact genesis CID. Parent-process trust
+is local configuration authenticated by Ivy; it is not committed in the child
+`ChainSpec` and can rotate without changing blockchain content.
 
-Every transaction inside a genesis block has empty signers and signatures. The
-exact genesis CID is the authorization: local configuration for Nexus and the
-signed parent action for a child. Ordinary transactions after genesis remain
-signature-strict.
+Signature and signer fields inside a genesis block carry no authority and need
+no special empty shape. The exact genesis CID is the authorization: local
+configuration for Nexus and the parent action commitment for a child. Ordinary
+transactions after genesis remain signature-strict.
 
 ## Inherited work
 
@@ -128,6 +126,10 @@ the parent knows no child topology. The child alone owns the partial function
 `parent block -> child block` and performs an exact join. Parent ancestry never
 invents a child commitment. After the join, ordinary same-chain ancestry makes
 a descendant location contribute to each ancestor's GHOST subtree.
+
+This accounting is orthogonal to data availability. A work fact neither
+transfers a Volume nor claims that its bytes are available; CAS discovery and
+validation proceed independently.
 
 The durable table is keyed uniquely by grind and indexed by parent block. A live
 delta updates only changed grinds and looks up only matching child edges. A new

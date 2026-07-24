@@ -33,11 +33,8 @@ final class MultichainInvariantTests: XCTestCase {
             configuration: parentConfiguration
         )
         let parentGenesis = try await parent!.canonicalTipBlock()
-        let parentAuthority = try XCTUnwrap(
-            ParentWorkAuthorityKey(parentConfiguration.processPublicKey)
-        )
         let childGenesis = try await BlockBuilder.buildChildGenesis(
-            spec: NexusGenesis.spec.withParentWorkAuthorityKey(parentAuthority),
+            spec: NexusGenesis.spec,
             parentState: parentGenesis.postState,
             timestamp: 1,
             target: .max,
@@ -51,7 +48,7 @@ final class MultichainInvariantTests: XCTestCase {
         try await VolumeImpl<Transaction>(node: authorization).storeRecursively(
             storer: parent!
         )
-        let carrier = try await BlockBuilder.buildBlock(
+        let unminedCarrier = try await BlockBuilder.buildBlock(
             previous: parentGenesis,
             transactions: [authorization],
             children: ["Payments": childGenesis],
@@ -59,12 +56,23 @@ final class MultichainInvariantTests: XCTestCase {
             nonce: 0,
             fetcher: parent!
         )
+        let carrier = try XCTUnwrap(BlockBuilder.mine(
+            block: unminedCarrier,
+            target: min(unminedCarrier.target, childGenesis.target)
+        ))
+        _ = try await parent!.prepareChildProofs(
+            for: carrier,
+            capacity: 16
+        )
         let carrierHeader = try BlockHeader(node: carrier)
         let carrierOutcome = try await parent!.admit(
             carrierHeader,
             preparingChildDirectories: ["Payments"]
         )
         XCTAssertTrue(carrierOutcome.decision.isAccepted)
+        _ = try await parent!.retryPendingChildProofs(
+            carrierCID: carrierHeader.rawCID
+        )
 
         XCTAssertEqual(
             carrierOutcome.parentCarrierLink?.carrierCID,
@@ -107,20 +115,23 @@ final class MultichainInvariantTests: XCTestCase {
         )
         XCTAssertEqual(evidence.proof.rootCID, carrierHeader.rawCID)
         XCTAssertEqual(evidence.proof.directoryPath, ["Payments"])
-        XCTAssertEqual(evidence.acquisitionEntries, beforeRestart.acquisitionEntries)
 
         let package = AuthenticatedChildPackage(
             package: ChildValidationPackage(
                 proof: evidence.proof,
                 parentCarrierLink: carrierLink,
                 parentGenesisLink: genesisLink
-            ),
-            acquisitionEntries: evidence.acquisitionEntries
+            )
         )
         let childGenesisHeader = BlockHeader(
             rawCID: childHeader.rawCID,
             node: nil,
             encryptionInfo: nil
+        )
+        let childContent = MultichainContentStore()
+        try await childHeader.storeBlock(
+            fetcher: parent!,
+            storer: childContent
         )
 
         var receipts: ChainProcess? = try await ChainProcess.open(
@@ -129,13 +140,14 @@ final class MultichainInvariantTests: XCTestCase {
         do {
             _ = try await receipts!.admit(
                 childGenesisHeader,
-                authenticatedChildPackage: package
+                authenticatedChildPackage: package,
+                remoteSource: childContent
             )
             XCTFail("an ancestor package must not bootstrap a descendant")
         } catch {
             XCTAssertEqual(
-                error as? ChainProcessError,
-                .parentWorkAuthorityMismatch
+                error as? ChainAdmissionFailure,
+                .providerMalformedEvidence
             )
         }
         let receiptsStatus = await receipts!.status()
@@ -154,7 +166,8 @@ final class MultichainInvariantTests: XCTestCase {
         )
         let accepted = try await payments!.admit(
             childGenesisHeader,
-            authenticatedChildPackage: package
+            authenticatedChildPackage: package,
+            remoteSource: childContent
         )
         XCTAssertTrue(accepted.decision.isAccepted)
         let paymentsStatus = await payments!.status()
@@ -221,5 +234,17 @@ final class MultichainInvariantTests: XCTestCase {
         )
         addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
         return directory
+    }
+}
+
+private actor MultichainContentStore: ContentSource, VolumeStorer {
+    private var entries: [String: Data] = [:]
+
+    func fetch(_ cids: Set<String>) -> [String: Data] {
+        entries.filter { cids.contains($0.key) }
+    }
+
+    func store(volume: SerializedVolume) {
+        entries.merge(volume.entries) { existing, _ in existing }
     }
 }

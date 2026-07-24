@@ -6,15 +6,13 @@ import UInt256
 
 public struct ChainAddress: Hashable, Sendable, CustomStringConvertible {
     public static let nexus = "Nexus"
-    public static let maximumComponents = Int(UInt16.max)
-    public static let maximumComponentBytes = Int(UInt16.max)
 
     public let components: [String]
 
     public init?(_ components: [String]) {
-        guard components.first == Self.nexus,
-              components.count <= Self.maximumComponents,
-              components.allSatisfy(Self.isCanonicalComponent) else {
+        guard (try? ChainRuntimeContext(
+            path: components
+        )) != nil else {
             return nil
         }
         self.components = components
@@ -30,12 +28,6 @@ public struct ChainAddress: Hashable, Sendable, CustomStringConvertible {
     public var isNexus: Bool { components.count == 1 }
     public var description: String { key }
 
-    private static func isCanonicalComponent(_ component: String) -> Bool {
-        let bytes = component.utf8
-        return !bytes.isEmpty
-            && bytes.count <= maximumComponentBytes
-            && !component.contains("/")
-    }
 }
 
 public struct ParentEndpoint: Codable, Hashable, Sendable {
@@ -56,7 +48,6 @@ public struct ParentEndpoint: Codable, Hashable, Sendable {
 
 public enum NodeConfigurationError: Error, Equatable, CustomStringConvertible {
     case invalidChainPath
-    case invalidMinimumRootWork
     case invalidPrivateKey
     case invalidPorts
     case invalidParentEndpoint
@@ -66,8 +57,7 @@ public enum NodeConfigurationError: Error, Equatable, CustomStringConvertible {
     public var description: String {
         switch self {
         case .invalidChainPath:
-            "chain path must be absolute, start with Nexus, and fit the setup wire frame"
-        case .invalidMinimumRootWork: "minimum root work must be nonzero"
+            "chain path must be Nexus-rooted, consensus-valid, and fit the setup wire frame"
         case .invalidPrivateKey: "process private key must be a 32-byte Ed25519 key"
         case .invalidPorts: "overlay, fact-plane, and RPC ports must be nonzero and distinct"
         case .invalidParentEndpoint: "the parent endpoint must have a valid peer key, host, and port"
@@ -90,6 +80,7 @@ public struct NodeConfiguration: Sendable {
     public let bootstrapPeers: [PeerEndpoint]
     public let parentEndpoint: ParentEndpoint?
     public let minPeerKeyBits: Int
+    public let resourcePolicy: NodeResourcePolicy
 
     public init(
         chainPath: [String],
@@ -101,18 +92,15 @@ public struct NodeConfiguration: Sendable {
         rpcPort: UInt16 = 8080,
         bootstrapPeers: [PeerEndpoint] = [],
         parentEndpoint: ParentEndpoint? = nil,
-        minPeerKeyBits: Int = 0
+        minPeerKeyBits: Int = 0,
+        resourcePolicy: NodeResourcePolicy = .default
     ) throws {
         guard let address = ChainAddress(chainPath) else {
             throw NodeConfigurationError.invalidChainPath
         }
-        guard minimumRootWork > .zero else {
-            throw NodeConfigurationError.invalidMinimumRootWork
-        }
         guard (try? ChainHello(
             nexusGenesisCID: NexusGenesis.expectedBlockHash,
-            chainPath: address.components,
-            minimumRootWorkHex: minimumRootWork.toHexString()
+            chainPath: address.components
         ).encode()) != nil else {
             throw NodeConfigurationError.invalidChainPath
         }
@@ -162,6 +150,7 @@ public struct NodeConfiguration: Sendable {
         self.bootstrapPeers = bootstrapPeers
         self.parentEndpoint = normalizedParentEndpoint
         self.minPeerKeyBits = minPeerKeyBits
+        self.resourcePolicy = resourcePolicy
     }
 
     public var chainPath: [String] { address.components }
@@ -171,7 +160,7 @@ public struct NodeConfiguration: Sendable {
     }
     public var runtimeContext: ChainRuntimeContext {
         get throws {
-            try ChainRuntimeContext(path: chainPath, minimumRootWork: minimumRootWork)
+            try ChainRuntimeContext(path: chainPath)
         }
     }
 
