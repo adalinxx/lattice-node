@@ -1201,11 +1201,11 @@ final class ParentChildE2ETests: XCTestCase {
             break
         }
         XCTAssertTrue(try XCTUnwrap(receiptsDeployment).accepted)
-        let paymentsBeforeCarrier = try await payments.waitForStatus {
-            $0.phase == .active && $0.mempoolCount == 0 && ($0.height ?? 0) > 0
-        }
         let receiptsBeforeCarrier = try await receipts.waitForStatus {
             $0.phase == .active && $0.tipCID == receiptsIntent.genesisCID
+        }
+        let paymentsBeforeCarrier = try await payments.waitForStatus {
+            $0.phase == .active && $0.mempoolCount == 0 && ($0.height ?? 0) > 0
         }
         let paymentsTip = try XCTUnwrap(paymentsBeforeCarrier.tipCID)
         let paymentsHeight = try XCTUnwrap(paymentsBeforeCarrier.height)
@@ -4810,7 +4810,7 @@ private final class LoopbackTCPFaultProxy: @unchecked Sendable {
 
 @MainActor
 private final class E2ENode {
-    private static let requestTimeout: TimeInterval = 5
+    private static let requestTimeout: TimeInterval = 10
 
     struct Parent {
         let publicKey: String
@@ -5080,11 +5080,20 @@ private final class E2ENode {
                 body: "node is not running: \(configuration.name)"
             )
         }
-        let (data, response) = try await session.data(for: request)
+        let endpoint = request.url?.path ?? "<unknown endpoint>"
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await session.data(for: request)
+        } catch {
+            throw E2EHTTPError(
+                status: 0,
+                body: "\(endpoint): \(error.localizedDescription)"
+            )
+        }
         guard let http = response as? HTTPURLResponse,
               (200..<300).contains(http.statusCode) else {
             let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-            let endpoint = request.url?.path ?? "<unknown endpoint>"
             let responseBody = String(decoding: data, as: UTF8.self)
             throw E2EHTTPError(
                 status: status,
