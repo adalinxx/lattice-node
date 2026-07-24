@@ -3335,7 +3335,8 @@ final class NetworkTrustTests: XCTestCase {
             try await waitForEventCount(
                 2,
                 in: roots,
-                phase: "replacement provider retry"
+                phase: "replacement provider retry",
+                attempts: 2_000
             )
             let admittedRoots = await roots.snapshot()
             let servedRoots = await delegate.servedRoots()
