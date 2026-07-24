@@ -194,6 +194,38 @@ final class CandidateAcquirerTests: XCTestCase {
         XCTAssertEqual(retry.providers, [replacement])
     }
 
+    func testProviderArrivingDuringOneRootRemainsForTheNextRoot() throws {
+        let first = provider("provider-a", session: 1)
+        let replacement = provider("provider-b", session: 2)
+        var acquirer = CandidateAcquirer()
+        XCTAssertTrue(acquirer.observe(.init(
+            blockCID: "block",
+            package: nil,
+            recoveryRootCID: "root-a",
+            provider: first
+        )).accepted)
+        XCTAssertTrue(acquirer.observe(.init(
+            blockCID: "block",
+            package: nil,
+            recoveryRootCID: "root-b"
+        )).accepted)
+        let active = try XCTUnwrap(acquirer.next())
+
+        acquirer.disconnect(first)
+        XCTAssertTrue(acquirer.observe(.init(
+            blockCID: "block",
+            package: nil,
+            provider: replacement
+        )).accepted)
+        XCTAssertTrue(acquirer.complete(
+            active.ticket,
+            resolution: .connected
+        ))
+
+        let nextRoot = try XCTUnwrap(acquirer.next())
+        XCTAssertEqual(nextRoot.providers, [replacement])
+    }
+
     func testProviderLossDoesNotCreateAFalseImmediateRetry() throws {
         let exact = provider("provider", session: 1)
         var acquirer = CandidateAcquirer()

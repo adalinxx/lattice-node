@@ -3224,12 +3224,10 @@ final class NetworkTrustTests: XCTestCase {
             healthConfig: PeerHealthConfig(enabled: false),
             mode: .overlay
         ))
-        let blockDelegate = PortableAttachmentQueuePeer(
-            attachments: [],
-            firstAdmissionGate: firstAdmissionGate
-        )
+        let blockDelegate = OverlayInventoryPeer(leaves: [])
+        let replacementDelegate = OverlayInventoryPeer(leaves: [])
         await blockAdvertiser.installTestDelegate(blockDelegate)
-        await replacement.installTestDelegate(blockDelegate)
+        await replacement.installTestDelegate(replacementDelegate)
         await blockAdvertiser.setContentSource(
             NetworkTestVolumeSource(value: leafSerializedVolume)
         )
@@ -3368,6 +3366,15 @@ final class NetworkTrustTests: XCTestCase {
                     chainPath: targetConfiguration.chainPath
                 ).encode()
             )
+            for _ in 0..<300 {
+                if await replacementDelegate.requestCount() > 0 { break }
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            guard await replacementDelegate.requestCount() > 0 else {
+                throw NetworkTestError.failedPhase(
+                    "replacement overlay authorization"
+                )
+            }
             guard case .enqueued = await replacement.sendMessage(
                 to: PeerID(publicKey: targetConfiguration.processPublicKey),
                 topic: NodeNetworkTopic.blockAnnouncement,
