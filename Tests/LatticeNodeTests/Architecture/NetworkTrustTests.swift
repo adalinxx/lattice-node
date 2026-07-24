@@ -3218,7 +3218,7 @@ final class NetworkTrustTests: XCTestCase {
             mode: .overlay
         ))
         let replacement = Ivy(config: IvyConfig(
-            signingKey: blockKey,
+            signingKey: signingKey(0x78),
             listenPort: 0,
             stunServers: [],
             healthConfig: PeerHealthConfig(enabled: false),
