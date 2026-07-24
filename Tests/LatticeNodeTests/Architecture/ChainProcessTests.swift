@@ -74,7 +74,6 @@ final class ChainProcessTests: XCTestCase {
             databasePath: directory.appendingPathComponent("state.db"),
             nexusGenesisCID: config.nexusGenesisCID,
             chainPath: config.chainPath,
-            minimumRootWork: config.minimumRootWork,
             issuingAuthorityKey: config.processPublicKey
         )
         try await store.persistLocalMempoolTransaction(
@@ -91,6 +90,137 @@ final class ChainProcessTests: XCTestCase {
                 .missingMaterializedVolume(transactionCID)
             )
         }
+    }
+
+    func testOpenDropsContextualPinsWhoseStatePublicationNeverCommitted()
+        async throws {
+        let directory = temporaryDirectory()
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        let config = try configuration(path: ["Nexus"], storage: directory)
+        let owner = [config.nexusGenesisCID, config.address.key]
+            .joined(separator: ":") + ":contextual-candidates"
+        let broker = try DiskBroker(
+            path: directory.appendingPathComponent("volumes.db").path
+        )
+        let volumes = try ["kept", "orphan", "shared"].map {
+            try VolumeImpl<PublicKey>(node: PublicKey(key: $0))
+        }
+        for volume in volumes {
+            try await volume.store(storer: broker)
+        }
+        let kept = volumes[0].rawCID
+        let orphan = volumes[1].rawCID
+        let shared = volumes[2].rawCID
+
+        var store: NodeStore? = try testNodeStore(
+            databasePath: directory.appendingPathComponent("state.db"),
+            nexusGenesisCID: config.nexusGenesisCID,
+            chainPath: config.chainPath,
+            issuingAuthorityKey: config.processPublicKey,
+            contextualCandidateOwner: owner
+        )
+        try await store!.persistContextualCandidateRoots(
+            candidateCID: kept,
+            roots: [kept, shared],
+            capacity: 2
+        )
+        // Crash after the VolumeBroker transaction but before state.db.
+        try await broker.pinBatch(roots: [orphan, shared], owner: owner)
+        let stateRoots = try await store!.contextualCandidateVolumeRoots()
+        XCTAssertEqual(Set(stateRoots), Set([kept, shared]))
+        store = nil
+
+        let process = try await ChainProcess.open(configuration: config)
+        let recoveredPins = await broker.pinnedRoots(owners: [owner])
+        XCTAssertEqual(Set(recoveredPins), Set([kept, shared]))
+        _ = try await broker.evictUnpinned(graceSeconds: 0)
+        let evictedOrphan = await broker.fetchVolumeLocal(root: orphan)
+        let retainedKept = await broker.fetchVolumeLocal(root: kept)
+        let retainedShared = await broker.fetchVolumeLocal(root: shared)
+        XCTAssertNil(evictedOrphan)
+        XCTAssertNotNil(retainedKept)
+        XCTAssertNotNil(retainedShared)
+        try await broker.unpin(root: shared, owner: owner, count: 1)
+        _ = try await broker.evictUnpinned(graceSeconds: 0)
+        let releasedShared = await broker.fetchVolumeLocal(root: shared)
+        XCTAssertNil(releasedShared)
+        _ = process
+    }
+
+    func testOpenDropsContextualPinsLeftAfterStateEvictionCommitted()
+        async throws {
+        let directory = temporaryDirectory()
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        let config = try configuration(path: ["Nexus"], storage: directory)
+        let owner = [config.nexusGenesisCID, config.address.key]
+            .joined(separator: ":") + ":contextual-candidates"
+        let broker = try DiskBroker(
+            path: directory.appendingPathComponent("volumes.db").path
+        )
+        let volumes = try ["old", "kept", "newest", "shared"].map {
+            try VolumeImpl<PublicKey>(node: PublicKey(key: $0))
+        }
+        for volume in volumes {
+            try await volume.store(storer: broker)
+        }
+        let old = volumes[0].rawCID
+        let kept = volumes[1].rawCID
+        let newest = volumes[2].rawCID
+        let shared = volumes[3].rawCID
+
+        var store: NodeStore? = try testNodeStore(
+            databasePath: directory.appendingPathComponent("state.db"),
+            nexusGenesisCID: config.nexusGenesisCID,
+            chainPath: config.chainPath,
+            issuingAuthorityKey: config.processPublicKey,
+            contextualCandidateOwner: owner
+        )
+        try await store!.persistContextualCandidateRoots(
+            candidateCID: old,
+            roots: [old, shared],
+            capacity: 2
+        )
+        try await store!.persistContextualCandidateRoots(
+            candidateCID: kept,
+            roots: [kept, shared],
+            capacity: 2
+        )
+        try await store!.persistContextualCandidateRoots(
+            candidateCID: newest,
+            roots: [newest, shared],
+            capacity: 2
+        )
+        // Crash after state.db eviction but before the old pin delta.
+        try await broker.pinBatch(roots: [old, shared], owner: owner)
+        store = nil
+
+        let process = try await ChainProcess.open(configuration: config)
+        let recoveredPins = await broker.pinnedRoots(owners: [owner])
+        XCTAssertEqual(Set(recoveredPins), Set([kept, newest, shared]))
+        _ = try await broker.evictUnpinned(graceSeconds: 0)
+        let evictedOld = await broker.fetchVolumeLocal(root: old)
+        let retainedKept = await broker.fetchVolumeLocal(root: kept)
+        let retainedNewest = await broker.fetchVolumeLocal(root: newest)
+        let retainedShared = await broker.fetchVolumeLocal(root: shared)
+        XCTAssertNil(evictedOld)
+        XCTAssertNotNil(retainedKept)
+        XCTAssertNotNil(retainedNewest)
+        XCTAssertNotNil(retainedShared)
+        try await broker.unpin(root: shared, owner: owner, count: 1)
+        _ = try await broker.evictUnpinned(graceSeconds: 0)
+        let sharedAfterOneRelease = await broker.fetchVolumeLocal(root: shared)
+        XCTAssertNotNil(sharedAfterOneRelease)
+        try await broker.unpin(root: shared, owner: owner, count: 1)
+        _ = try await broker.evictUnpinned(graceSeconds: 0)
+        let sharedAfterTwoReleases = await broker.fetchVolumeLocal(root: shared)
+        XCTAssertNil(sharedAfterTwoReleases)
+        _ = process
     }
 
     func testLiveMempoolPinsTrackCurrentRootsAndClearOnRestart() async throws {
@@ -163,7 +293,7 @@ final class ChainProcessTests: XCTestCase {
         let broker = try DiskBroker(
             path: directory.appendingPathComponent("volumes.db").path
         )
-        try await BrokerStorer(broker: broker).store(volume: SerializedVolume(
+        try await broker.store(volume: SerializedVolume(
             root: durableHeader.rawCID,
             entries: [durableHeader.rawCID: durable]
         ))
@@ -233,20 +363,6 @@ final class ChainProcessTests: XCTestCase {
         XCTAssertEqual(status.tipCID, NexusGenesis.expectedBlockHash)
     }
 
-    func testNexusBootstrapNeverFetchesRemoteContent() async throws {
-        let remote = BatchRecordingContentSource(entries: [:])
-        _ = try await ChainProcess.open(
-            configuration: try configuration(
-                path: ["Nexus"],
-                storage: temporaryDirectory()
-            ),
-            remoteSource: remote
-        )
-
-        let requests = await remote.requests()
-        XCTAssertTrue(requests.isEmpty)
-    }
-
     func testAuthenticatedPackageUsesOneBatchedFallbackWave() async throws {
         let fixture = try await childBootstrapFixture()
         let proofEntry = try XCTUnwrap(
@@ -287,39 +403,6 @@ final class ChainProcessTests: XCTestCase {
         XCTAssertFalse(first === second)
     }
 
-    func testAttemptContentSourceRejectsUnauthenticatedOrConflictingBytes()
-        async throws {
-        let fixture = try await childBootstrapFixture()
-        let proofEntry = try XCTUnwrap(
-            fixture.package.package.proof.entries.first
-        )
-        let fallback = BatchRecordingContentSource(entries: [:])
-
-        XCTAssertThrowsError(try ChainProcess.attemptContentSource(
-            package: nil,
-            acquisitionEntries: ["unexpected": Data()],
-            fallback: fallback
-        )) { error in
-            XCTAssertEqual(
-                error as? ChainProcessError,
-                .malformedAuthenticatedChildProof
-            )
-        }
-
-        XCTAssertThrowsError(try ChainProcess.attemptContentSource(
-            package: fixture.package.package,
-            acquisitionEntries: [
-                proofEntry.cid: proofEntry.data + Data([0x00]),
-            ],
-            fallback: fallback
-        )) { error in
-            XCTAssertEqual(
-                error as? ChainProcessError,
-                .malformedAuthenticatedChildProof
-            )
-        }
-    }
-
     func testRemoteAdmissionRequiresExplicitPermission() async throws {
         let producer = try await ChainProcess.open(
             configuration: try configuration(
@@ -342,8 +425,7 @@ final class ChainProcessTests: XCTestCase {
             configuration: try configuration(
                 path: ["Nexus"],
                 storage: temporaryDirectory()
-            ),
-            remoteSource: remote
+            )
         )
         let unresolved = BlockHeader(
             rawCID: header.rawCID,
@@ -357,7 +439,7 @@ final class ChainProcessTests: XCTestCase {
 
         let outcome = try await consumer.admit(
             unresolved,
-            allowsRemoteAcquisition: true
+            remoteSource: remote
         )
         XCTAssertTrue(outcome.decision.isAccepted)
         let remoteRequests = await remote.requests()
@@ -367,13 +449,10 @@ final class ChainProcessTests: XCTestCase {
     func testAdmissionStagesHierarchyArtifactsAcrossReopen() async throws {
         let directory = temporaryDirectory()
         let config = try configuration(path: ["Nexus"], storage: directory)
-        let parentAuthority = try XCTUnwrap(
-            ParentWorkAuthorityKey(config.processPublicKey)
-        )
         var process: ChainProcess? = try await ChainProcess.open(configuration: config)
         let genesis = try await process!.canonicalTipBlock()
         let child = try await BlockBuilder.buildChildGenesis(
-            spec: NexusGenesis.spec.withParentWorkAuthorityKey(parentAuthority),
+            spec: NexusGenesis.spec,
             parentState: genesis.postState,
             timestamp: 1,
             target: UInt256.max,
@@ -421,9 +500,6 @@ final class ChainProcessTests: XCTestCase {
         async throws {
         let directory = temporaryDirectory()
         let config = try configuration(path: ["Nexus"], storage: directory)
-        let parentAuthority = try XCTUnwrap(
-            ParentWorkAuthorityKey(config.processPublicKey)
-        )
         var process: ChainProcess? = try await ChainProcess.open(configuration: config)
         let genesis = try await process!.canonicalTipBlock()
         let predecessor = try await BlockBuilder.buildBlock(
@@ -437,7 +513,7 @@ final class ChainProcessTests: XCTestCase {
         try await predecessorHeader.storeBlock(fetcher: process!, storer: process!)
 
         let child = try await BlockBuilder.buildChildGenesis(
-            spec: NexusGenesis.spec.withParentWorkAuthorityKey(parentAuthority),
+            spec: NexusGenesis.spec,
             parentState: predecessor.postState,
             timestamp: 2,
             target: UInt256.max,
@@ -524,7 +600,6 @@ final class ChainProcessTests: XCTestCase {
             databasePath: directory.appendingPathComponent("state.db"),
             nexusGenesisCID: config.nexusGenesisCID,
             chainPath: config.chainPath,
-            minimumRootWork: config.minimumRootWork,
             issuingAuthorityKey: config.processPublicKey
         )
         let staged = try await store!.stagedAdmissions()
@@ -550,14 +625,11 @@ final class ChainProcessTests: XCTestCase {
         XCTAssertEqual(reopenedExport, exported)
     }
 
-    func testPureParentDescendantsDoNotReweightChildBeforeOrAfterRestart()
+    func testParentDescendantsWithoutDirectCommitmentsDoNotReweightChildAcrossRestart()
         async throws {
         let parentConfiguration = try configuration(
             path: ["Nexus"],
             storage: temporaryDirectory()
-        )
-        let parentAuthority = try XCTUnwrap(
-            ParentWorkAuthorityKey(parentConfiguration.processPublicKey)
         )
         let parent = try await ChainProcess.open(
             configuration: parentConfiguration
@@ -565,7 +637,7 @@ final class ChainProcessTests: XCTestCase {
         let parentGenesis = try await parent.canonicalTipBlock()
 
         let competingChild = try await BlockBuilder.buildChildGenesis(
-            spec: NexusGenesis.spec.withParentWorkAuthorityKey(parentAuthority),
+            spec: NexusGenesis.spec,
             parentState: parentGenesis.postState,
             timestamp: 3_600_000,
             target: UInt256.max / UInt256(2),
@@ -621,7 +693,7 @@ final class ChainProcessTests: XCTestCase {
         try await predecessorHeader.storeBlock(fetcher: parent, storer: parent)
 
         let sideChild = try await BlockBuilder.buildChildGenesis(
-            spec: NexusGenesis.spec.withParentWorkAuthorityKey(parentAuthority),
+            spec: NexusGenesis.spec,
             parentState: predecessor.postState,
             timestamp: 7_200_000,
             target: UInt256.max,
@@ -668,7 +740,10 @@ final class ChainProcessTests: XCTestCase {
         XCTAssertTrue(predecessorOutcome.decision.isAccepted)
         // NodeNetworkRuntime performs this durable-descendant retry live when
         // the predecessor arrives; it must resolve as a duplicate, not a side admission.
-        let retry = try await parent.admit(carrierHeader)
+        let retry = try await parent.admit(
+            carrierHeader,
+            preparingChildDirectories: ["Payments"]
+        )
         XCTAssertEqual(retry.decision, .duplicate)
         let carrierLink = try XCTUnwrap(retry.parentCarrierLink)
         XCTAssertEqual(carrierLink.carrierCID, carrierHeader.rawCID)
@@ -705,6 +780,9 @@ final class ChainProcessTests: XCTestCase {
         let parentStatus = await parent.status()
         XCTAssertEqual(parentStatus.tipCID, canonicalCID)
 
+        _ = try await parent.retryPendingChildProofs(
+            carrierCID: carrierHeader.rawCID
+        )
         let durableProofs = try await parent.durableDirectChildProofs(
             carrierCID: carrierHeader.rawCID,
             rootCID: carrierHeader.rawCID
@@ -747,10 +825,6 @@ final class ChainProcessTests: XCTestCase {
                 proof: competingProof,
                 parentCarrierLink: try XCTUnwrap(competingCarrierLink),
                 parentGenesisLink: try XCTUnwrap(competingGenesisLink)
-            ),
-            acquisitionEntries: try await blockContentEntries(
-                competingChildHeader,
-                fetcher: parent
             )
         )
         let genesisLink = try await parent.issuedParentGenesisLink(
@@ -762,9 +836,17 @@ final class ChainProcessTests: XCTestCase {
                 proof: durable.proof,
                 parentCarrierLink: carrierLink,
                 parentGenesisLink: try XCTUnwrap(genesisLink)
-            ),
-            acquisitionEntries: durable.acquisitionEntries
+            )
         )
+        let childSource = ChainProcessTestContentStore()
+        await childSource.store(entries: try await blockContentEntries(
+            competingChildHeader,
+            fetcher: parent
+        ))
+        await childSource.store(entries: try await blockContentEntries(
+            sideChildHeader,
+            fetcher: parent
+        ))
 
         let childConfiguration = try NodeConfiguration(
             chainPath: ["Nexus", "Payments"],
@@ -782,12 +864,14 @@ final class ChainProcessTests: XCTestCase {
         )
         let competingAdmission = try await child!.admit(
             competingChildHeader,
-            authenticatedChildPackage: competingPackage
+            authenticatedChildPackage: competingPackage,
+            remoteSource: childSource
         )
         XCTAssertTrue(competingAdmission.decision.isAccepted)
         let sideAdmission = try await child!.admit(
             sideChildHeader,
-            authenticatedChildPackage: sidePackage
+            authenticatedChildPackage: sidePackage,
+            remoteSource: childSource
         )
         XCTAssertTrue(sideAdmission.decision.isAccepted)
         let beforeReorg = await child!.status()
@@ -825,7 +909,8 @@ final class ChainProcessTests: XCTestCase {
         try await admitProjectionIncumbent(fixture, to: child!)
         let competing = try await child!.admit(
             fixture.competingHeader,
-            authenticatedChildPackage: fixture.acceptingPackage
+            authenticatedChildPackage: fixture.acceptingPackage,
+            remoteSource: fixture.source
         )
         XCTAssertTrue(competing.decision.isAccepted)
         var status = await child!.status()
@@ -841,7 +926,8 @@ final class ChainProcessTests: XCTestCase {
 
         let lateEdge = try await child!.admit(
             fixture.competingHeader,
-            authenticatedChildPackage: fixture.targetMissPackage
+            authenticatedChildPackage: fixture.targetMissPackage,
+            remoteSource: fixture.source
         )
         XCTAssertEqual(lateEdge.decision, .carrier)
         XCTAssertTrue(lateEdge.inheritedWorkChanged)
@@ -863,7 +949,8 @@ final class ChainProcessTests: XCTestCase {
         try await admitProjectionIncumbent(fixture, to: child!)
         let competing = try await child!.admit(
             fixture.competingHeader,
-            authenticatedChildPackage: fixture.acceptingPackage
+            authenticatedChildPackage: fixture.acceptingPackage,
+            remoteSource: fixture.source
         )
         XCTAssertTrue(competing.decision.isAccepted)
 
@@ -887,7 +974,8 @@ final class ChainProcessTests: XCTestCase {
         do {
             _ = try await child!.admit(
                 fixture.competingHeader,
-                authenticatedChildPackage: fixture.targetMissPackage
+                authenticatedChildPackage: fixture.targetMissPackage,
+                remoteSource: fixture.source
             )
             XCTFail("accepted an exact edge that relocates an existing grind")
         } catch {
@@ -905,7 +993,6 @@ final class ChainProcessTests: XCTestCase {
                 .appendingPathComponent("state.db"),
             nexusGenesisCID: fixture.configuration.nexusGenesisCID,
             chainPath: fixture.configuration.chainPath,
-            minimumRootWork: fixture.configuration.minimumRootWork,
             spawningParentKey: fixture.parentAuthority.value,
             issuingAuthorityKey: fixture.configuration.processPublicKey
         )
@@ -935,7 +1022,8 @@ final class ChainProcessTests: XCTestCase {
         XCTAssertNil(stored)
         let earlyEdge = try await child!.admit(
             fixture.competingHeader,
-            authenticatedChildPackage: fixture.targetMissPackage
+            authenticatedChildPackage: fixture.targetMissPackage,
+            remoteSource: fixture.source
         )
         XCTAssertEqual(earlyEdge.decision, .carrier)
         var status = await child!.status()
@@ -943,7 +1031,8 @@ final class ChainProcessTests: XCTestCase {
 
         let competing = try await child!.admit(
             fixture.competingHeader,
-            authenticatedChildPackage: fixture.acceptingPackage
+            authenticatedChildPackage: fixture.acceptingPackage,
+            remoteSource: fixture.source
         )
         XCTAssertTrue(competing.decision.isAccepted)
         status = await child!.status()
@@ -972,7 +1061,7 @@ final class ChainProcessTests: XCTestCase {
         let fixture = try await childBootstrapFixture()
         let parentAuthority = try XCTUnwrap(
             fixture.configuration.parentEndpoint.flatMap {
-                ParentWorkAuthorityKey($0.publicKey)
+                ParentProcessKey($0.publicKey)
             }
         )
         var child: ChainProcess? = try await ChainProcess.open(
@@ -980,7 +1069,8 @@ final class ChainProcessTests: XCTestCase {
         )
         let bootstrap = try await child!.admit(
             fixture.childHeader,
-            authenticatedChildPackage: fixture.package
+            authenticatedChildPackage: fixture.package,
+            remoteSource: fixture.source
         )
         XCTAssertTrue(bootstrap.decision.isAccepted)
         let genesis = try await child!.canonicalTipBlock()
@@ -1005,17 +1095,25 @@ final class ChainProcessTests: XCTestCase {
             for block: Block,
             header: BlockHeader,
             timestamp: Int64
-        ) async throws -> (AuthenticatedChildPackage, String) {
+        ) async throws -> (
+            AuthenticatedChildPackage,
+            String,
+            ChainProcessTestContentStore
+        ) {
             let source = ChainProcessTestContentStore()
             try await LatticeState.emptyHeader.storeRecursively(storer: source)
             try await header.storeBlock(fetcher: child!, storer: source)
-            let carrier = try await BlockBuilder.buildGenesis(
+            let unminedCarrier = try await BlockBuilder.buildGenesis(
                 spec: NexusGenesis.spec,
                 children: ["Payments": block],
                 timestamp: timestamp,
                 target: UInt256.max,
                 fetcher: source
             )
+            let carrier = try XCTUnwrap(BlockBuilder.mine(
+                block: unminedCarrier,
+                target: min(unminedCarrier.target, block.target)
+            ))
             let carrierHeader = try BlockHeader(node: carrier)
             await source.store(entries: [
                 carrierHeader.rawCID: try XCTUnwrap(carrier.toData()),
@@ -1025,8 +1123,6 @@ final class ChainProcessTests: XCTestCase {
                 childDirectory: "Payments",
                 fetcher: source
             )
-            var entries = try await blockContentEntries(header, fetcher: child!)
-            entries[carrierHeader.rawCID] = try XCTUnwrap(carrier.toData())
             return (
                 AuthenticatedChildPackage(
                     package: ChildValidationPackage(
@@ -1035,19 +1131,19 @@ final class ChainProcessTests: XCTestCase {
                             {"parentPath":["Nexus"],"carrierCID":"\(carrierHeader.rawCID)","rootCID":"\(carrierHeader.rawCID)"}
                             """),
                         parentGenesisLink: nil
-                    ),
-                    acquisitionEntries: entries
+                    )
                 ),
-                carrierHeader.rawCID
+                carrierHeader.rawCID,
+                source
             )
         }
 
-        let (predecessorPackage, _) = try await package(
+        let (predecessorPackage, _, predecessorSource) = try await package(
             for: predecessor,
             header: predecessorHeader,
             timestamp: 10
         )
-        let (orphanPackage, orphanCarrierCID) = try await package(
+        let (orphanPackage, orphanCarrierCID, orphanSource) = try await package(
             for: orphan,
             header: orphanHeader,
             timestamp: 11
@@ -1069,7 +1165,8 @@ final class ChainProcessTests: XCTestCase {
 
         let first = try await child!.admit(
             orphanHeader,
-            authenticatedChildPackage: orphanPackage
+            authenticatedChildPackage: orphanPackage,
+            remoteSource: orphanSource
         )
         guard case .acceptedSide = first.decision else {
             return XCTFail("expected accepted child orphan, got \(first.decision)")
@@ -1084,7 +1181,8 @@ final class ChainProcessTests: XCTestCase {
         child = try await ChainProcess.open(configuration: fixture.configuration)
         let predecessorOutcome = try await child!.admit(
             predecessorHeader,
-            authenticatedChildPackage: predecessorPackage
+            authenticatedChildPackage: predecessorPackage,
+            remoteSource: predecessorSource
         )
         XCTAssertTrue(predecessorOutcome.decision.isAccepted)
 
@@ -1155,38 +1253,36 @@ final class ChainProcessTests: XCTestCase {
 
     func testSuccessorAttachmentWaitsForChildGenesis() async throws {
         let fixture = try await childBootstrapFixture()
-        let source = ChainProcessTestContentStore()
-        try await LatticeState.emptyHeader.storeRecursively(storer: source)
-        await source.store(entries: fixture.package.acquisitionEntries)
-        try await fixture.childHeader.storeRecursively(storer: source as any Storer)
+        let parentSource = fixture.source
+        let sameChainSource = ChainProcessTestContentStore()
         let genesis = try XCTUnwrap(fixture.childHeader.node)
         let successor = try await BlockBuilder.buildBlock(
             previous: genesis,
             timestamp: 2,
             nonce: 1,
-            fetcher: source
+            fetcher: parentSource
         )
         let successorHeader = try BlockHeader(node: successor)
-        try await successorHeader.storeBlock(fetcher: source, storer: source)
+        try await successorHeader.storeBlock(
+            fetcher: parentSource,
+            storer: parentSource
+        )
+        try await successorHeader.storeBlock(
+            fetcher: parentSource,
+            storer: sameChainSource
+        )
         let parentCarrier = try await BlockBuilder.buildGenesis(
             spec: NexusGenesis.spec,
             children: ["Payments": successor],
             timestamp: 3,
             target: UInt256.max,
-            fetcher: source
+            fetcher: parentSource
         )
         let parentCarrierHeader = try BlockHeader(node: parentCarrier)
         let proof = try await ChildBlockProof.generate(
             rootHeader: parentCarrierHeader,
             childDirectory: "Payments",
-            fetcher: source
-        )
-        var entries = try await blockContentEntries(
-            successorHeader,
-            fetcher: source
-        )
-        entries[parentCarrierHeader.rawCID] = try XCTUnwrap(
-            parentCarrier.toData()
+            fetcher: parentSource
         )
         let successorPackage = AuthenticatedChildPackage(
             package: ChildValidationPackage(
@@ -1195,8 +1291,7 @@ final class ChainProcessTests: XCTestCase {
                     {"parentPath":["Nexus"],"carrierCID":"\(parentCarrierHeader.rawCID)","rootCID":"\(parentCarrierHeader.rawCID)"}
                     """),
                 parentGenesisLink: nil
-            ),
-            acquisitionEntries: entries
+            )
         )
         let process = try await ChainProcess.open(
             configuration: fixture.configuration
@@ -1204,7 +1299,8 @@ final class ChainProcessTests: XCTestCase {
 
         let early = try await process.admit(
             successorHeader,
-            authenticatedChildPackage: successorPackage
+            authenticatedChildPackage: successorPackage,
+            remoteSource: sameChainSource
         )
         XCTAssertEqual(early.decision, .unavailable(nil))
         XCTAssertEqual(
@@ -1217,12 +1313,14 @@ final class ChainProcessTests: XCTestCase {
 
         let bootstrap = try await process.admit(
             fixture.childHeader,
-            authenticatedChildPackage: fixture.package
+            authenticatedChildPackage: fixture.package,
+            remoteSource: fixture.source
         )
         XCTAssertTrue(bootstrap.decision.isAccepted)
         let retry = try await process.admit(
             successorHeader,
-            authenticatedChildPackage: successorPackage
+            authenticatedChildPackage: successorPackage,
+            remoteSource: sameChainSource
         )
         XCTAssertTrue(retry.decision.isAccepted)
         XCTAssertNil(retry.sameChainPredecessor)
@@ -1233,13 +1331,13 @@ final class ChainProcessTests: XCTestCase {
         let fixture = try await childBootstrapFixture()
         let parentAuthority = try XCTUnwrap(
             fixture.configuration.parentEndpoint.flatMap {
-                ParentWorkAuthorityKey($0.publicKey)
+                ParentProcessKey($0.publicKey)
             }
         )
         let source = ChainProcessTestContentStore()
         try await LatticeState.emptyHeader.storeRecursively(storer: source)
         let sibling = try await BlockBuilder.buildChildGenesis(
-            spec: NexusGenesis.spec.withParentWorkAuthorityKey(parentAuthority),
+            spec: NexusGenesis.spec,
             parentState: LatticeState.emptyHeader,
             timestamp: 3,
             target: UInt256.max,
@@ -1260,13 +1358,6 @@ final class ChainProcessTests: XCTestCase {
             childDirectory: "Payments",
             fetcher: source
         )
-        var siblingEntries = try await blockContentEntries(
-            siblingHeader,
-            fetcher: source
-        )
-        siblingEntries[parentCarrierHeader.rawCID] = try XCTUnwrap(
-            parentCarrier.toData()
-        )
         let siblingPackage = AuthenticatedChildPackage(
             package: ChildValidationPackage(
                 proof: siblingProof,
@@ -1276,8 +1367,7 @@ final class ChainProcessTests: XCTestCase {
                 parentGenesisLink: try decode(ParentGenesisLink.self, json: """
                     {"parentPath":["Nexus"],"directory":"Payments","childGenesisCID":"\(siblingHeader.rawCID)"}
                     """)
-            ),
-            acquisitionEntries: siblingEntries
+            )
         )
         let inherited = InheritedWorkSnapshot(
             revision: 1,
@@ -1295,7 +1385,7 @@ final class ChainProcessTests: XCTestCase {
         do {
             _ = try await process!.applyInheritedWorkSnapshot(
                 inherited,
-                from: String(repeating: "0", count: ParentWorkAuthorityKey.encodedByteCount)
+                from: String(repeating: "0", count: ParentProcessKey.encodedByteCount)
             )
             XCTFail("unconfigured parent authority unexpectedly updated work")
         } catch let error as NodeStoreError {
@@ -1315,7 +1405,8 @@ final class ChainProcessTests: XCTestCase {
                 node: nil,
                 encryptionInfo: nil
             ),
-            authenticatedChildPackage: fixture.package
+            authenticatedChildPackage: fixture.package,
+            remoteSource: fixture.source
         )
         XCTAssertTrue(first.decision.isAccepted)
         let firstStatus = await process!.status()
@@ -1327,7 +1418,8 @@ final class ChainProcessTests: XCTestCase {
                 node: nil,
                 encryptionInfo: nil
             ),
-            authenticatedChildPackage: siblingPackage
+            authenticatedChildPackage: siblingPackage,
+            remoteSource: source
         )
         XCTAssertTrue(second.decision.isAccepted)
         let secondStatus = await process!.status()
@@ -1345,7 +1437,7 @@ final class ChainProcessTests: XCTestCase {
         let configuration = fixture.configuration
         let parentAuthority = try XCTUnwrap(
             configuration.parentEndpoint.flatMap {
-                ParentWorkAuthorityKey($0.publicKey)
+                ParentProcessKey($0.publicKey)
             }
         )
         var process: ChainProcess? = try await ChainProcess.open(
@@ -1353,14 +1445,15 @@ final class ChainProcessTests: XCTestCase {
         )
         let bootstrap = try await process!.admit(
             fixture.childHeader,
-            authenticatedChildPackage: fixture.package
+            authenticatedChildPackage: fixture.package,
+            remoteSource: fixture.source
         )
         XCTAssertTrue(bootstrap.decision.isAccepted)
 
         let source = ChainProcessTestContentStore()
         try await LatticeState.emptyHeader.storeRecursively(storer: source)
         let sibling = try await BlockBuilder.buildChildGenesis(
-            spec: NexusGenesis.spec.withParentWorkAuthorityKey(parentAuthority),
+            spec: NexusGenesis.spec,
             parentState: LatticeState.emptyHeader,
             timestamp: 3,
             target: UInt256.max,
@@ -1382,13 +1475,6 @@ final class ChainProcessTests: XCTestCase {
             childDirectory: "Payments",
             fetcher: source
         )
-        var siblingEntries = try await blockContentEntries(
-            secondHeader,
-            fetcher: source
-        )
-        siblingEntries[siblingCarrierHeader.rawCID] = try XCTUnwrap(
-            siblingCarrier.toData()
-        )
         let siblingPackage = AuthenticatedChildPackage(
             package: ChildValidationPackage(
                 proof: siblingProof,
@@ -1398,12 +1484,12 @@ final class ChainProcessTests: XCTestCase {
                 parentGenesisLink: try decode(ParentGenesisLink.self, json: """
                     {"parentPath":["Nexus"],"directory":"Payments","childGenesisCID":"\(secondHeader.rawCID)"}
                     """)
-            ),
-            acquisitionEntries: siblingEntries
+            )
         )
         let secondAdmission = try await process!.admit(
             BlockHeader(rawCID: secondHeader.rawCID, node: nil, encryptionInfo: nil),
-            authenticatedChildPackage: siblingPackage
+            authenticatedChildPackage: siblingPackage,
+            remoteSource: source
         )
         XCTAssertTrue(secondAdmission.decision.isAccepted)
 
@@ -1438,7 +1524,6 @@ final class ChainProcessTests: XCTestCase {
             databasePath: configuration.storagePath.appendingPathComponent("state.db"),
             nexusGenesisCID: configuration.nexusGenesisCID,
             chainPath: configuration.chainPath,
-            minimumRootWork: configuration.minimumRootWork,
             spawningParentKey: parentAuthority.value,
             issuingAuthorityKey: configuration.processPublicKey
         )
@@ -1527,7 +1612,6 @@ final class ChainProcessTests: XCTestCase {
             databasePath: configuration.storagePath.appendingPathComponent("state.db"),
             nexusGenesisCID: configuration.nexusGenesisCID,
             chainPath: configuration.chainPath,
-            minimumRootWork: configuration.minimumRootWork,
             spawningParentKey: parentAuthority.value,
             issuingAuthorityKey: configuration.processPublicKey
         )
@@ -1586,7 +1670,6 @@ final class ChainProcessTests: XCTestCase {
             databasePath: configuration.storagePath.appendingPathComponent("state.db"),
             nexusGenesisCID: configuration.nexusGenesisCID,
             chainPath: configuration.chainPath,
-            minimumRootWork: configuration.minimumRootWork,
             spawningParentKey: parentAuthority.value,
             issuingAuthorityKey: configuration.processPublicKey
         )
@@ -1634,7 +1717,6 @@ final class ChainProcessTests: XCTestCase {
             databasePath: directory.appendingPathComponent("state.db"),
             nexusGenesisCID: config.nexusGenesisCID,
             chainPath: config.chainPath,
-            minimumRootWork: config.minimumRootWork,
             issuingAuthorityKey: config.processPublicKey
         )
         try await store.stage(
@@ -1672,7 +1754,6 @@ final class ChainProcessTests: XCTestCase {
             databasePath: directory.appendingPathComponent("state.db"),
             nexusGenesisCID: config.nexusGenesisCID,
             chainPath: config.chainPath,
-            minimumRootWork: config.minimumRootWork,
             issuingAuthorityKey: config.processPublicKey
         )
         let broker = try DiskBroker(
@@ -1682,7 +1763,7 @@ final class ChainProcessTests: XCTestCase {
             directory: "Payments",
             childGenesisCID: NexusGenesis.expectedBlockHash
         ))
-        try await volume.store(storer: BrokerStorer(broker: broker))
+        try await volume.store(storer: broker)
         let root = volume.rawCID
         func genesis(_ hash: String) -> ChainAdmissionFact {
             .block(ChainBlockFact(
@@ -1724,8 +1805,7 @@ final class ChainProcessTests: XCTestCase {
 
         do {
             let process = try await ChainProcess.open(
-                configuration: config,
-                remoteSource: source
+                configuration: config
             )
             let genesis = try await process.canonicalTipBlock()
             let candidate = try await BlockBuilder.buildBlock(
@@ -1748,7 +1828,8 @@ final class ChainProcessTests: XCTestCase {
                         node: nil,
                         encryptionInfo: nil
                     ),
-                    directories: ["Payments"]
+                    directories: ["Payments"],
+                    remoteSource: source
                 )
             }
             await source.waitForBlockedFetch()
@@ -1780,7 +1861,6 @@ final class ChainProcessTests: XCTestCase {
             databasePath: directory.appendingPathComponent("state.db"),
             nexusGenesisCID: config.nexusGenesisCID,
             chainPath: config.chainPath,
-            minimumRootWork: config.minimumRootWork,
             issuingAuthorityKey: config.processPublicKey
         )
         let staged = try await store.stagedAdmissions()
@@ -1805,7 +1885,6 @@ final class ChainProcessTests: XCTestCase {
             databasePath: directory.appendingPathComponent("state.db"),
             nexusGenesisCID: config.nexusGenesisCID,
             chainPath: config.chainPath,
-            minimumRootWork: config.minimumRootWork,
             issuingAuthorityKey: config.processPublicKey
         )
         let broker = try DiskBroker(
@@ -1813,7 +1892,7 @@ final class ChainProcessTests: XCTestCase {
             evictUnpinnedGraceSeconds: 0
         )
         let admissionStorage = NodeAdmissionStorage(
-            storage: BrokerStorer(broker: broker)
+            storage: broker
         )
         let transaction = try signedGenesisAnchorTransaction(
             directory: "Payments",
@@ -1884,7 +1963,6 @@ final class ChainProcessTests: XCTestCase {
             databasePath: directory.appendingPathComponent("state.db"),
             nexusGenesisCID: config.nexusGenesisCID,
             chainPath: config.chainPath,
-            minimumRootWork: config.minimumRootWork,
             issuingAuthorityKey: config.processPublicKey
         )
         let broker = try DiskBroker(
@@ -1892,7 +1970,7 @@ final class ChainProcessTests: XCTestCase {
             evictUnpinnedGraceSeconds: 0
         )
         let admissionStorage = NodeAdmissionStorage(
-            storage: BrokerStorer(broker: broker)
+            storage: broker
         )
         func batch(for root: String) -> ChainAdmissionBatch {
             ChainAdmissionBatch(facts: [
@@ -1988,7 +2066,7 @@ final class ChainProcessTests: XCTestCase {
             directory: "Orphan",
             childGenesisCID: NexusGenesis.expectedBlockHash
         ))
-        try await orphan.store(storer: BrokerStorer(broker: broker))
+        try await orphan.store(storer: broker)
         let orphanRoot = orphan.rawCID
         try await broker.mergeRetainedRoots(scope: scope, roots: [orphanRoot])
         let retainedBeforeReopen = try await broker.retainedRoots(scope: scope)
@@ -2008,14 +2086,14 @@ final class ChainProcessTests: XCTestCase {
         XCTAssertNil(orphanStored)
     }
 
-    func testChildBootstrapsFromHierarchyProofWithoutOverlaySupplier() async throws {
+    func testParentProofDoesNotSubstituteForMissingTerminalChildVolume()
+        async throws {
         let fixture = try await childBootstrapFixture()
-        XCTAssertTrue(fixture.proof.entries.contains { $0.cid == fixture.childHeader.rawCID })
-        var process: ChainProcess? = try await ChainProcess.open(
+        let process = try await ChainProcess.open(
             configuration: fixture.configuration
         )
 
-        let outcome = try await process!.admit(
+        let outcome = try await process.admit(
             BlockHeader(
                 rawCID: fixture.childHeader.rawCID,
                 node: nil,
@@ -2023,48 +2101,22 @@ final class ChainProcessTests: XCTestCase {
             ),
             authenticatedChildPackage: fixture.package
         )
-
-        XCTAssertTrue(
-            outcome.decision.isAccepted,
-            "unexpected admission outcome: \(outcome.decision)"
-        )
-        let status = await process!.status()
-        XCTAssertEqual(status.phase, .active)
-        process = nil
-
-        let store = try testNodeStore(
-            databasePath: fixture.configuration.storagePath.appendingPathComponent("state.db"),
-            nexusGenesisCID: fixture.configuration.nexusGenesisCID,
-            chainPath: fixture.configuration.chainPath,
-            minimumRootWork: fixture.configuration.minimumRootWork,
-            spawningParentKey: try XCTUnwrap(
-                fixture.configuration.parentEndpoint?.publicKey
-            ),
-            issuingAuthorityKey: fixture.configuration.processPublicKey
-        )
-        let persisted = try await store.incomingCarrierEvidence(
-            childCID: fixture.childHeader.rawCID,
-            directory: "Payments",
-            rootCID: fixture.rootCID
-        )
-        let evidence = try XCTUnwrap(persisted)
-        XCTAssertEqual(try evidence.proof.serialize(), try fixture.proof.serialize())
-        XCTAssertEqual(evidence.acquisitionEntries, fixture.canonicalEntries)
+        let status = await process.status()
+        XCTAssertEqual(outcome.decision, .unavailable(nil))
+        XCTAssertEqual(status.phase, .awaitingGenesis)
+        XCTAssertNil(status.tipCID)
     }
 
     func testPreparedProofRetryDoesNotRefetchOrEvictPendingCarriers() async throws {
         let directory = temporaryDirectory()
         let config = try configuration(path: ["Nexus"], storage: directory)
-        let parentAuthority = try XCTUnwrap(
-            ParentWorkAuthorityKey(config.processPublicKey)
-        )
         var process: ChainProcess? = try await ChainProcess.open(configuration: config)
         process = nil
 
         let source = ChainProcessTestContentStore()
         try await LatticeState.emptyHeader.storeRecursively(storer: source)
         let child = try await BlockBuilder.buildChildGenesis(
-            spec: NexusGenesis.spec.withParentWorkAuthorityKey(parentAuthority),
+            spec: NexusGenesis.spec,
             parentState: LatticeState.emptyHeader,
             timestamp: 1,
             target: UInt256.max,
@@ -2089,7 +2141,6 @@ final class ChainProcessTests: XCTestCase {
             databasePath: directory.appendingPathComponent("state.db"),
             nexusGenesisCID: config.nexusGenesisCID,
             chainPath: config.chainPath,
-            minimumRootWork: config.minimumRootWork,
             issuingAuthorityKey: config.processPublicKey
         )
         try await store!.persistPendingChildProofRoutes(
@@ -2101,12 +2152,9 @@ final class ChainProcessTests: XCTestCase {
             carrierCID: carrierHeader.rawCID,
             proofs: [try PreparedChildProof(
                 directory: "Payments",
-                child: child,
-                proof: hop,
-                acquisitionEntries: try await blockContentEntries(
-                    BlockHeader(node: child),
-                    fetcher: source
-                )
+                childCID: try BlockHeader(node: child).rawCID,
+                isChildGenesis: true,
+                proof: hop
             )],
             capacity: 16
         )
@@ -2125,8 +2173,7 @@ final class ChainProcessTests: XCTestCase {
 
         let remote = BatchRecordingContentSource(entries: [:])
         process = try await ChainProcess.open(
-            configuration: config,
-            remoteSource: remote
+            configuration: config
         )
         let retriedDirectories = try await process!.retryPendingChildProofs(
             carrierCID: carrierHeader.rawCID
@@ -2177,18 +2224,15 @@ final class ChainProcessTests: XCTestCase {
         XCTAssertEqual(recovered.first?.proof.rootCID, carrierHeader.rawCID)
     }
 
-    func testPreparedProofEvictedDuringBlockedRetryStaysPending() async throws {
+    func testPreparedProofSurvivesCachePressureDuringBlockedRetry() async throws {
         let directory = temporaryDirectory()
         let config = try configuration(path: ["Nexus"], storage: directory)
-        let parentAuthority = try XCTUnwrap(
-            ParentWorkAuthorityKey(config.processPublicKey)
-        )
         _ = try await ChainProcess.open(configuration: config)
 
         let source = ChainProcessTestContentStore()
         try await LatticeState.emptyHeader.storeRecursively(storer: source)
         let child = try await BlockBuilder.buildChildGenesis(
-            spec: NexusGenesis.spec.withParentWorkAuthorityKey(parentAuthority),
+            spec: NexusGenesis.spec,
             parentState: LatticeState.emptyHeader,
             timestamp: 1,
             target: UInt256.max,
@@ -2213,7 +2257,6 @@ final class ChainProcessTests: XCTestCase {
             databasePath: directory.appendingPathComponent("state.db"),
             nexusGenesisCID: config.nexusGenesisCID,
             chainPath: config.chainPath,
-            minimumRootWork: config.minimumRootWork,
             issuingAuthorityKey: config.processPublicKey
         )
         try await store!.persistPendingChildProofRoutes(
@@ -2225,12 +2268,9 @@ final class ChainProcessTests: XCTestCase {
             carrierCID: carrierHeader.rawCID,
             proofs: [try PreparedChildProof(
                 directory: "Prepared",
-                child: child,
-                proof: hop,
-                acquisitionEntries: try await blockContentEntries(
-                    BlockHeader(node: child),
-                    fetcher: source
-                )
+                childCID: try BlockHeader(node: child).rawCID,
+                isChildGenesis: true,
+                proof: hop
             )],
             capacity: 16
         )
@@ -2239,8 +2279,7 @@ final class ChainProcessTests: XCTestCase {
         let remote = BlockingContentSource(blockedCID: carrierHeader.rawCID)
         await remote.setEntries(await source.allEntries())
         let liveProcess = try await ChainProcess.open(
-            configuration: config,
-            remoteSource: remote
+            configuration: config
         )
 
         var evictionCarriers: [Block] = []
@@ -2264,7 +2303,8 @@ final class ChainProcessTests: XCTestCase {
 
         let retry = Task {
             try await liveProcess.retryPendingChildProofs(
-                carrierCID: carrierHeader.rawCID
+                carrierCID: carrierHeader.rawCID,
+                remoteSource: remote
             )
         }
         await remote.waitForBlockedFetch()
@@ -2280,17 +2320,23 @@ final class ChainProcessTests: XCTestCase {
         let pending = try await liveProcess.pendingChildProofCarrierCIDs()
         let issued = try await liveProcess.issuedChildEvidenceSummaries(
             directory: "Prepared",
-            after: nil,
+            afterOrdinal: 0,
+            throughOrdinal: UInt64(Int64.max),
             limit: 1
         )
-        let durable = try await liveProcess.durableDirectChildProofs(
-            carrierCID: carrierHeader.rawCID,
-            rootCID: carrierHeader.rawCID
+        let inspection = try testNodeStore(
+            databasePath: directory.appendingPathComponent("state.db"),
+            nexusGenesisCID: config.nexusGenesisCID,
+            chainPath: config.chainPath,
+            issuingAuthorityKey: config.processPublicKey
+        )
+        let prepared = try await inspection.preparedChildProofs(
+            carrierCID: carrierHeader.rawCID
         )
         XCTAssertEqual(completed, ["Waiting"])
         XCTAssertEqual(pending, [carrierHeader.rawCID])
         XCTAssertTrue(issued.isEmpty)
-        XCTAssertTrue(durable.isEmpty)
+        XCTAssertEqual(prepared.map(\.directory), ["Prepared"])
     }
 
     func testRestartRetriesPendingProofForNonTipCarrier() async throws {
@@ -2302,12 +2348,9 @@ final class ChainProcessTests: XCTestCase {
             withIntermediateDirectories: true
         )
         let config = try configuration(path: ["Nexus"], storage: directory)
-        let parentAuthority = try XCTUnwrap(
-            ParentWorkAuthorityKey(config.processPublicKey)
-        )
         try await LatticeState.emptyHeader.storeRecursively(storer: source)
         let child = try await BlockBuilder.buildChildGenesis(
-            spec: NexusGenesis.spec.withParentWorkAuthorityKey(parentAuthority),
+            spec: NexusGenesis.spec,
             parentState: LatticeState.emptyHeader,
             timestamp: 1,
             target: UInt256.max,
@@ -2328,7 +2371,6 @@ final class ChainProcessTests: XCTestCase {
             databasePath: directory.appendingPathComponent("state.db"),
             nexusGenesisCID: config.nexusGenesisCID,
             chainPath: config.chainPath,
-            minimumRootWork: config.minimumRootWork,
             issuingAuthorityKey: config.processPublicKey
         )
         try await store!.persistPendingChildProofRoutes(
@@ -2350,8 +2392,7 @@ final class ChainProcessTests: XCTestCase {
         store = nil
 
         let process = try await ChainProcess.open(
-            configuration: config,
-            remoteSource: remote
+            configuration: config
         )
         let status = await process.status()
         XCTAssertNotEqual(status.tipCID, carrierHeader.rawCID)
@@ -2360,7 +2401,8 @@ final class ChainProcessTests: XCTestCase {
 
         await remote.store(entries: await source.allEntries())
         let retriedDirectories = try await process.retryPendingChildProofs(
-            carrierCID: carrierHeader.rawCID
+            carrierCID: carrierHeader.rawCID,
+            remoteSource: remote
         )
         XCTAssertEqual(retriedDirectories, ["Leaf"])
         let pendingAfter = try await process.pendingChildProofCarrierCIDs()
@@ -2396,7 +2438,7 @@ final class ChainProcessTests: XCTestCase {
 
     private struct DirectProjectionArrivalFixture {
         let configuration: NodeConfiguration
-        let parentAuthority: ParentWorkAuthorityKey
+        let parentAuthority: ParentProcessKey
         let incumbentHeader: BlockHeader
         let competingHeader: BlockHeader
         let incumbentPackage: AuthenticatedChildPackage
@@ -2406,6 +2448,7 @@ final class ChainProcessTests: XCTestCase {
         let targetMissCarrierCID: String
         let acceptingGrind: String
         let lateGrind: String
+        let source: ChainProcessTestContentStore
 
         func parentWork(
             revision: UInt64,
@@ -2436,20 +2479,20 @@ final class ChainProcessTests: XCTestCase {
         )
         let parentAuthority = try XCTUnwrap(
             configuration.parentEndpoint.flatMap {
-                ParentWorkAuthorityKey($0.publicKey)
+                ParentProcessKey($0.publicKey)
             }
         )
         let source = ChainProcessTestContentStore()
         try await LatticeState.emptyHeader.storeRecursively(storer: source)
         let incumbent = try await BlockBuilder.buildChildGenesis(
-            spec: NexusGenesis.spec.withParentWorkAuthorityKey(parentAuthority),
+            spec: NexusGenesis.spec,
             parentState: LatticeState.emptyHeader,
             timestamp: 1,
             target: UInt256.max / UInt256(8),
             fetcher: source
         )
         let competing = try await BlockBuilder.buildChildGenesis(
-            spec: NexusGenesis.spec.withParentWorkAuthorityKey(parentAuthority),
+            spec: NexusGenesis.spec,
             parentState: LatticeState.emptyHeader,
             timestamp: 2,
             target: UInt256.max / UInt256(4),
@@ -2502,7 +2545,6 @@ final class ChainProcessTests: XCTestCase {
         let missedCarrier = try XCTUnwrap(targetMissCarrier)
 
         func package(
-            childHeader: BlockHeader,
             childCID: String,
             carrier: Block
         ) async throws -> AuthenticatedChildPackage {
@@ -2513,11 +2555,6 @@ final class ChainProcessTests: XCTestCase {
                 childDirectory: "Payments",
                 fetcher: source
             )
-            var entries = try await blockContentEntries(
-                childHeader,
-                fetcher: source
-            )
-            entries[carrierHeader.rawCID] = try XCTUnwrap(carrier.toData())
             return AuthenticatedChildPackage(
                 package: ChildValidationPackage(
                     proof: proof,
@@ -2527,23 +2564,19 @@ final class ChainProcessTests: XCTestCase {
                     parentGenesisLink: try decode(ParentGenesisLink.self, json: """
                         {"parentPath":["Nexus"],"directory":"Payments","childGenesisCID":"\(childCID)"}
                         """)
-                ),
-                acquisitionEntries: entries
+                )
             )
         }
 
         let incumbentPackage = try await package(
-            childHeader: incumbentHeader,
             childCID: incumbentHeader.rawCID,
             carrier: incumbentCarrier
         )
         let acceptingPackage = try await package(
-            childHeader: competingHeader,
             childCID: competingHeader.rawCID,
             carrier: acceptingCarrier
         )
         let targetMissPackage = try await package(
-            childHeader: competingHeader,
             childCID: competingHeader.rawCID,
             carrier: missedCarrier
         )
@@ -2570,7 +2603,8 @@ final class ChainProcessTests: XCTestCase {
             acceptingCarrierCID: acceptingCarrierCID,
             targetMissCarrierCID: targetMissCarrierCID,
             acceptingGrind: acceptingGrind,
-            lateGrind: lateGrind
+            lateGrind: lateGrind,
+            source: source
         )
     }
 
@@ -2580,7 +2614,8 @@ final class ChainProcessTests: XCTestCase {
     ) async throws {
         let admitted = try await process.admit(
             fixture.incumbentHeader,
-            authenticatedChildPackage: fixture.incumbentPackage
+            authenticatedChildPackage: fixture.incumbentPackage,
+            remoteSource: fixture.source
         )
         XCTAssertTrue(admitted.decision.isAccepted)
         let status = await process.status()
@@ -2592,8 +2627,8 @@ final class ChainProcessTests: XCTestCase {
         let childHeader: BlockHeader
         let rootCID: String
         let proof: ChildBlockProof
-        let canonicalEntries: [String: Data]
         let package: AuthenticatedChildPackage
+        let source: ChainProcessTestContentStore
     }
 
     private func childBootstrapFixture() async throws -> ChildBootstrapFixture {
@@ -2601,26 +2636,27 @@ final class ChainProcessTests: XCTestCase {
             path: ["Nexus", "Payments"],
             storage: temporaryDirectory()
         )
-        let parentAuthority = try XCTUnwrap(
-            configuration.parentEndpoint.flatMap { ParentWorkAuthorityKey($0.publicKey) }
-        )
         let source = ChainProcessTestContentStore()
         try await LatticeState.emptyHeader.storeRecursively(storer: source)
         let child = try await BlockBuilder.buildChildGenesis(
-            spec: NexusGenesis.spec.withParentWorkAuthorityKey(parentAuthority),
+            spec: NexusGenesis.spec,
             parentState: LatticeState.emptyHeader,
             timestamp: 1,
             target: UInt256.max,
             fetcher: source
         )
         let childHeader = try BlockHeader(node: child)
-        let root = try await BlockBuilder.buildGenesis(
+        let unminedRoot = try await BlockBuilder.buildGenesis(
             spec: NexusGenesis.spec,
             children: ["Payments": child],
             timestamp: 2,
             target: UInt256.max,
             fetcher: source
         )
+        let root = try XCTUnwrap(BlockBuilder.mine(
+            block: unminedRoot,
+            target: min(unminedRoot.target, child.target)
+        ))
         let rootHeader = try BlockHeader(node: root)
         try await rootHeader.storeRecursively(storer: source as any Storer)
         let proof = try await ChildBlockProof.generate(
@@ -2628,12 +2664,6 @@ final class ChainProcessTests: XCTestCase {
             childDirectory: "Payments",
             fetcher: source
         )
-        let canonicalEntries = try await blockContentEntries(
-            childHeader,
-            fetcher: source
-        )
-        var acquisitionEntries = canonicalEntries
-        acquisitionEntries[rootHeader.rawCID] = try XCTUnwrap(root.toData())
         let package = AuthenticatedChildPackage(
             package: ChildValidationPackage(
                 proof: proof,
@@ -2643,16 +2673,15 @@ final class ChainProcessTests: XCTestCase {
                 parentGenesisLink: try decode(ParentGenesisLink.self, json: """
                     {"parentPath":["Nexus"],"directory":"Payments","childGenesisCID":"\(childHeader.rawCID)"}
                     """)
-            ),
-            acquisitionEntries: acquisitionEntries
+            )
         )
         return ChildBootstrapFixture(
             configuration: configuration,
             childHeader: childHeader,
             rootCID: rootHeader.rawCID,
             proof: proof,
-            canonicalEntries: canonicalEntries,
-            package: package
+            package: package,
+            source: source
         )
     }
 

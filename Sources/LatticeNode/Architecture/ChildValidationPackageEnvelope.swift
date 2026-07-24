@@ -12,18 +12,15 @@ public enum ChildValidationPackageEnvelopeError: Error, Equatable, Sendable {
 /// portable parent-certificate verification.
 public struct AuthenticatedChildPackage: Sendable {
     let package: ChildValidationPackage
-    let acquisitionEntries: [String: Data]
     let parentCarrierCertificate: ParentCarrierCertificateV1?
     let parentGenesisCertificate: ParentGenesisCertificateV1?
 
     init(
         package: ChildValidationPackage,
-        acquisitionEntries: [String: Data] = [:],
         parentCarrierCertificate: ParentCarrierCertificateV1? = nil,
         parentGenesisCertificate: ParentGenesisCertificateV1? = nil
     ) {
         self.package = package
-        self.acquisitionEntries = acquisitionEntries
         self.parentCarrierCertificate = parentCarrierCertificate
         self.parentGenesisCertificate = parentGenesisCertificate
     }
@@ -33,9 +30,9 @@ public struct AuthenticatedChildPackage: Sendable {
 /// meaning remains in Lattice; this type only frames canonical proof bytes and
 /// the authenticated parent facts that accompany them.
 public struct ChildValidationPackageEnvelope: Sendable {
-    // Leave room for the retained availability package and Ivy framing.
+    // Leave room for Ivy framing.
     public static let maximumEncodedSize = Int(IvyConfig.protocolMaxFrameSize)
-        - ChildAcquisitionPackage.maximumBytes - 1024
+        - 1024
 
     private static let magic = Data("LNCPKG03".utf8)
 
@@ -135,8 +132,12 @@ public struct ChildValidationPackageEnvelope: Sendable {
         return data
     }
 
-    public static func decode(_ data: Data) throws -> ChildValidationPackageEnvelope {
-        guard data.count <= maximumEncodedSize else {
+    public static func decode(
+        _ data: Data,
+        maximumEncodedSize localMaximumEncodedSize: Int = maximumEncodedSize
+    ) throws -> ChildValidationPackageEnvelope {
+        guard localMaximumEncodedSize > 0,
+              data.count <= min(maximumEncodedSize, localMaximumEncodedSize) else {
             throw ChildValidationPackageEnvelopeError.oversized
         }
         guard data.count >= magic.count + 20, data.prefix(magic.count) == magic else {
@@ -214,9 +215,7 @@ public struct ChildValidationPackageEnvelope: Sendable {
               let proof = ChildBlockProof.deserialize(proofBytes),
               (try? proof.serialize()) == proofBytes,
               _isBoundedWireAtom(proof.rootCID),
-              proof.directoryPath.allSatisfy({
-                  !$0.isEmpty && $0.utf8.count <= Int(UInt16.max)
-              }),
+              proof.directoryPath.allSatisfy(StateAtomLimits.isDirectory),
               parentCarrierLink.map({
                   _isAbsoluteChainPath($0.parentPath)
                       && _isBoundedWireAtom($0.carrierCID)
@@ -224,8 +223,7 @@ public struct ChildValidationPackageEnvelope: Sendable {
               }) ?? true,
               parentGenesisLink.map({
                   _isAbsoluteChainPath($0.parentPath)
-                      && !$0.directory.isEmpty
-                      && $0.directory.utf8.count <= Int(UInt16.max)
+                      && StateAtomLimits.isDirectory($0.directory)
                       && _isBoundedWireAtom($0.childGenesisCID)
               }) ?? true,
               parentCarrierCertificate == nil
@@ -286,7 +284,7 @@ public struct AuthenticatedParentFactGate: Sendable {
               envelope.parentGenesisLink.map({ $0.parentPath == parentPath }) ?? true else {
             throw AuthenticatedParentFactGateError.wrongParentPath
         }
-        let authority = ParentWorkAuthorityKey(configuredParentIvyPeerKey)!
+        let authority = ParentProcessKey(configuredParentIvyPeerKey)!
         try verifyCertificates(
             in: envelope,
             authorityKey: authority,
@@ -294,7 +292,6 @@ public struct AuthenticatedParentFactGate: Sendable {
         )
         return AuthenticatedChildPackage(
             package: try envelope.makeValidationPackage(),
-            acquisitionEntries: [:],
             parentCarrierCertificate: envelope.parentCarrierCertificate,
             parentGenesisCertificate: envelope.parentGenesisCertificate
         )
@@ -305,9 +302,9 @@ public struct AuthenticatedParentFactGate: Sendable {
     /// the relaying peer itself receives no parent-fact authority.
     public func acceptPortable(
         _ envelope: ChildValidationPackageEnvelope,
-        durableParentWorkAuthorityKey: ParentWorkAuthorityKey
+        durableParentProcessKey: ParentProcessKey
     ) throws -> AuthenticatedChildPackage {
-        guard durableParentWorkAuthorityKey.value == configuredParentIvyPeerKey else {
+        guard durableParentProcessKey.value == configuredParentIvyPeerKey else {
             throw AuthenticatedParentFactGateError.wrongParentAuthority
         }
         let parentPath = Array(childPath.dropLast())
@@ -317,12 +314,11 @@ public struct AuthenticatedParentFactGate: Sendable {
         }
         try verifyCertificates(
             in: envelope,
-            authorityKey: durableParentWorkAuthorityKey,
+            authorityKey: durableParentProcessKey,
             requirePortable: true
         )
         return AuthenticatedChildPackage(
             package: try envelope.makeValidationPackage(),
-            acquisitionEntries: [:],
             parentCarrierCertificate: envelope.parentCarrierCertificate,
             parentGenesisCertificate: envelope.parentGenesisCertificate
         )
@@ -330,7 +326,7 @@ public struct AuthenticatedParentFactGate: Sendable {
 
     private func verifyCertificates(
         in envelope: ChildValidationPackageEnvelope,
-        authorityKey: ParentWorkAuthorityKey,
+        authorityKey: ParentProcessKey,
         requirePortable: Bool
     ) throws {
         let parentPath = Array(childPath.dropLast())

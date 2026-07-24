@@ -63,15 +63,12 @@ final class NexusGenesisArchitectureTests: XCTestCase {
         XCTAssertTrue(strict.0)
 
         let bootstrap = try await ChainLevel.bootstrap(
-            context: try ChainRuntimeContext(
-                path: ["Nexus"],
-                minimumRootWork: UInt256(1)
-            ),
+            context: try ChainRuntimeContext(path: ["Nexus"]),
             genesisHeader: header,
             fetcher: store,
             validationContentStorer: store,
             materializedVolumeStorer: store,
-            staging: { _ in }
+            stage: { _ in }
         )
         let tip = await bootstrap.level.chain.getMainChainTip()
         XCTAssertEqual(tip, genesis.blockHash)

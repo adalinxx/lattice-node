@@ -56,7 +56,7 @@ public struct ParentCarrierCertificateV1: Equatable, Sendable {
 
     public func verifies(
         link: ParentCarrierLink,
-        authorityKey: ParentWorkAuthorityKey,
+        authorityKey: ParentProcessKey,
         expectedNexusGenesisCID: String,
         expectedParentPath: [String]
     ) -> Bool {
@@ -140,7 +140,7 @@ public struct ParentGenesisCertificateV1: Equatable, Sendable {
 
     public func verifies(
         link: ParentGenesisLink,
-        authorityKey: ParentWorkAuthorityKey,
+        authorityKey: ParentProcessKey,
         expectedNexusGenesisCID: String,
         expectedParentPath: [String]
     ) -> Bool {
@@ -165,9 +165,7 @@ public struct ParentGenesisCertificateV1: Equatable, Sendable {
         guard _isBoundedWireAtom(nexusGenesisCID),
               CIDIdentity.isCanonical(nexusGenesisCID),
               _isAbsoluteChainPath(link.parentPath),
-              !link.directory.isEmpty,
-              !link.directory.contains("/"),
-              link.directory.utf8.count <= Int(UInt16.max),
+              StateAtomLimits.isDirectory(link.directory),
               _isBoundedWireAtom(link.childGenesisCID),
               CIDIdentity.isCanonical(link.childGenesisCID) else {
             throw ParentFactCertificateError.malformed

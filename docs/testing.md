@@ -22,16 +22,19 @@ The suites are grouped by the boundary they actually cross:
 - `LatticeNodeE2ETests`: black-box independent node processes. Tests may only
   start, stop, suspend, and configure shipped processes; call public HTTP
   endpoints; run the shipped miner/coordinator; or participate as a real Ivy
-  peer. They never instantiate `ChainProcess`, mutate stores, install runtime
-  callbacks, or seed internal consensus state. They exercise direct-child
+  peer. A transparent TCP fault proxy may cut and heal a real node link without
+  inspecting or altering its protocol bytes. Tests never instantiate
+  `ChainProcess`, mutate stores, install runtime callbacks, or seed internal
+  consensus state. They exercise direct-child
   bootstrap/restart, same-chain portable genesis and continuity recovery with
   the parent offline while consensus remains unavailable, reopen with every source
   offline, three-level late join, a suspended
   non-responsive authenticated sibling, durable side-branch bootstrap after a
   reorg, same-path higher-work and segment-base-tie convergence, and a live competing-genesis
-  reorg driven by noncanonical parent work without a restart; a second
-  same-path replica then reconnects late and reaches the same result from the
-  complete parent snapshot. The exchange
+  reorg followed by noncanonical parent descendants that must remain at their
+  own locations instead of flowing through an ancestor carrier; a second
+  same-path replica reconnects late and reaches the same result from its
+  durable cursor and the parent's current export. The exchange
   scenarios run real Nexus and child
   daemons: one pits wrong-withdrawer, replay, and overclaim withdrawals against
   a fee-prioritized valid variable-rate claim, while another settles two child
@@ -49,6 +52,9 @@ cross-component invariants:
 
 - only traced network admission may acquire remote content; RPC, mining, and
   reconciliation fail locally rather than fetching peers;
+- parent-work readiness gates operational consensus, not validity or
+  availability: an offline child may ingest verified same-chain history while
+  remaining unable to mine, publish work, or activate descendants;
 - each root-scoped acquisition gets an independent cashew coalescer, so one
   candidate cannot inherit another candidate's Ivy attribution;
 - a hierarchy connection cannot read CAS content before its own compatible
@@ -65,7 +71,7 @@ cross-component invariants:
 - an outbound inherited-work cursor advances only after every frame is locally
   queued; transient Ivy/Tally or transport pressure retries the same frame in
   order without inventing a receiver acknowledgement protocol;
-- evidence and direct-edge inventories retain their exact cursor across
+- evidence inventories retain their exact cursor across
   transient Ivy/Tally pressure on a live parent session;
 - a failed hierarchy hello or durable evidence hint recycles only that exact
   session; reconnect repeats authorization and the complete evidence index;
@@ -73,6 +79,10 @@ cross-component invariants:
   already-completed empty index without changing the parent's canonical tip;
 - a parent remains child-agnostic: child topology and derived weight stay in
   the child process and are never returned upstream;
+- a child restarted after acknowledging a contextual candidate reservation
+  still serves that exact old parent work from durable Volumes; more than one
+  offer window of abandoned parent carriers cannot evict an issued candidate,
+  and a later exact snapshot releases obsolete offers and reservations;
 - successor attachments received before child genesis wait on their exact
   same-chain predecessor instead of being misclassified as malformed genesis;
 - a suspended authenticated direct child cannot block a healthy sibling's

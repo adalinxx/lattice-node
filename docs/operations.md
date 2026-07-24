@@ -169,8 +169,9 @@ matched backup pair or wipe the entire process directory and resync.
 - If `--minimum-peer-key-bits` is nonzero, confirm every required peer identity
   deliberately satisfies it. Generated process keys are accepted by the default
   value `0`.
-- Confirm both peers advertise the same Nexus genesis CID, absolute chain path,
-  and minimum root-work floor.
+- Confirm both peers advertise the same Nexus genesis CID and absolute chain
+  path. Root-work floors are independent local policy and are not exchanged in
+  the hello.
 
 ## Security
 

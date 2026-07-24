@@ -1,4 +1,5 @@
 import Foundation
+import Ivy
 import XCTest
 import UInt256
 import VolumeBroker
@@ -12,9 +13,9 @@ private func inheritedWorkCID(_ seed: String) -> String {
 
 final class NodeStoreTests: XCTestCase {
     private let genesisCID = NexusGenesis.expectedBlockHash
-    private let parentAuthorityKey = String(
+    private let parentProcessKey = String(
         repeating: "a",
-        count: ParentWorkAuthorityKey.encodedByteCount
+        count: ParentProcessKey.encodedByteCount
     )
 
     func testLegacyDatabaseFailsBeforeNewDDL() throws {
@@ -70,7 +71,6 @@ final class NodeStoreTests: XCTestCase {
         for attempt in [
             { try self.makeStore(path: path, genesisCID: "different-root") },
             { try self.makeStore(path: path, chainPath: ["Nexus", "Payments"]) },
-            { try self.makeStore(path: path, minimumRootWork: UInt256(2)) },
             { try self.makeStore(
                 path: path,
                 issuingAuthorityKey: String(repeating: "b", count: 64)
@@ -134,7 +134,7 @@ final class NodeStoreTests: XCTestCase {
         var store: NodeStore? = try makeStore(
             path: path,
             chainPath: ["Nexus", "Payments"],
-            spawningParentKey: parentAuthorityKey
+            spawningParentKey: parentProcessKey
         )
         let first = InheritedWorkSnapshot(
             revision: 8,
@@ -158,14 +158,14 @@ final class NodeStoreTests: XCTestCase {
 
         let firstMerge = try await store!.mergeInheritedWorkSnapshot(
             first,
-            from: parentAuthorityKey
+            from: parentProcessKey
         )
         XCTAssertEqual(firstMerge, first)
         let firstRecovered = try await store!.inheritedWorkSnapshot()
         XCTAssertEqual(firstRecovered, first)
         let secondMerge = try await store!.mergeInheritedWorkSnapshot(
             olderButStronger,
-            from: parentAuthorityKey
+            from: parentProcessKey
         )
         XCTAssertEqual(
             secondMerge,
@@ -187,7 +187,7 @@ final class NodeStoreTests: XCTestCase {
         )
         let olderCoverageMerge = try await store!.mergeInheritedWorkSnapshot(
             olderCoverage,
-            from: parentAuthorityKey
+            from: parentProcessKey
         )
         XCTAssertEqual(
             olderCoverageMerge,
@@ -200,7 +200,7 @@ final class NodeStoreTests: XCTestCase {
         )
         let olderCoverageReplay = try await store!.mergeInheritedWorkSnapshot(
             olderCoverage,
-            from: parentAuthorityKey
+            from: parentProcessKey
         )
         XCTAssertNil(olderCoverageReplay)
         let dominatedRawStrengthening = InheritedWorkSnapshot(
@@ -213,18 +213,18 @@ final class NodeStoreTests: XCTestCase {
         )
         let dominatedRawMerge = try await store!.mergeInheritedWorkSnapshot(
             dominatedRawStrengthening,
-            from: parentAuthorityKey
+            from: parentProcessKey
         )
         XCTAssertNil(dominatedRawMerge)
         let revisionOnly = InheritedWorkSnapshot(revision: 9, workByBlock: [:])
         let revisionMerge = try await store!.mergeInheritedWorkSnapshot(
             revisionOnly,
-            from: parentAuthorityKey
+            from: parentProcessKey
         )
         XCTAssertEqual(revisionMerge, revisionOnly)
         let revisionReplay = try await store!.mergeInheritedWorkSnapshot(
             revisionOnly,
-            from: parentAuthorityKey
+            from: parentProcessKey
         )
         XCTAssertNil(revisionReplay)
         let expected = first
@@ -242,7 +242,10 @@ final class NodeStoreTests: XCTestCase {
         let database = try NodeSQLite(path: path.path)
         let sourceColumns = try database.query("PRAGMA table_info(parent_work_source)")
             .compactMap { $0["name"]?.textValue }
-        XCTAssertEqual(Set(sourceColumns), Set(["singleton", "revision", "fact_count"]))
+        XCTAssertEqual(
+            Set(sourceColumns),
+            Set(["singleton", "source_id", "revision", "fact_count"])
+        )
         let source = try database.query(
             "SELECT revision, fact_count FROM parent_work_source WHERE singleton = 1"
         ).first
@@ -268,7 +271,7 @@ final class NodeStoreTests: XCTestCase {
         await XCTAssertThrowsErrorAsync(
             try await store!.mergeInheritedWorkSnapshot(
                 first,
-                from: String(repeating: "b", count: ParentWorkAuthorityKey.encodedByteCount)
+                from: String(repeating: "b", count: ParentProcessKey.encodedByteCount)
             )
         ) { error in
             guard case NodeStoreError.invalidConfiguration = error else {
@@ -280,22 +283,163 @@ final class NodeStoreTests: XCTestCase {
         store = try makeStore(
             path: path,
             chainPath: ["Nexus", "Payments"],
-            spawningParentKey: parentAuthorityKey
+            spawningParentKey: parentProcessKey
         )
         let recovered = try await store!.inheritedWorkSnapshot()
         XCTAssertEqual(recovered, expected)
-        XCTAssertThrowsError(try makeStore(
+        store = nil
+        XCTAssertNoThrow(try makeStore(
             path: path,
             chainPath: ["Nexus", "Payments"],
             spawningParentKey: String(
                 repeating: "b",
-                count: ParentWorkAuthorityKey.encodedByteCount
+                count: ParentProcessKey.encodedByteCount
             )
-        )) { error in
-            guard case NodeStoreError.wipeRequired = error else {
-                return XCTFail("expected parent-authority wipe requirement, got \(error)")
+        ))
+    }
+
+    func testInheritedFactsAndConsensusRevisionFloorSurviveImmediateReopen()
+        async throws {
+        let path = temporaryDirectory().appendingPathComponent("state.db")
+        let block = inheritedWorkCID("revision-floor-block")
+        let grind = inheritedWorkCID("revision-floor-grind")
+        let snapshot = InheritedWorkSnapshot(
+            revision: 1,
+            workByBlock: [
+                block: WorkMeasure(contribution(id: grind, work: 3)),
+            ]
+        )
+
+        var store: NodeStore? = try makeStore(
+            path: path,
+            chainPath: ["Nexus", "Child"]
+        )
+        _ = try await store?.mergeInheritedWorkSnapshot(
+            snapshot,
+            from: parentProcessKey,
+            consensusRevisionFloor: 77
+        )
+        store = nil
+
+        let reopened = try makeStore(
+            path: path,
+            chainPath: ["Nexus", "Child"]
+        )
+        let recoveredFloor = try await reopened.consensusRevisionFloor()
+        let recoveredWork = try await reopened.inheritedWorkSnapshot()
+        XCTAssertEqual(recoveredFloor, 77)
+        XCTAssertEqual(recoveredWork, snapshot)
+    }
+
+    func testInheritedWorkCursorAppliesExactDeltaAndFullResetAtomically()
+        async throws {
+        let path = temporaryDirectory().appendingPathComponent("state.db")
+        let sourceA = UUID().uuidString.lowercased()
+        let sourceB = UUID().uuidString.lowercased()
+        let block = inheritedWorkCID("cursor-block")
+        let firstGrind = inheritedWorkCID("cursor-first")
+        let secondGrind = inheritedWorkCID("cursor-second")
+        var store: NodeStore? = try makeStore(
+            path: path,
+            chainPath: ["Nexus", "Payments"],
+            spawningParentKey: parentProcessKey
+        )
+
+        _ = try await store!.mergeInheritedWorkSnapshot(
+            InheritedWorkSnapshot(
+                revision: 10,
+                workByBlock: [
+                    block: WorkMeasure(contribution(id: firstGrind, work: 5)),
+                ]
+            ),
+            from: parentProcessKey,
+            sourceID: sourceA
+        )
+        var cursor = try await store!.inheritedWorkCursor()
+        XCTAssertEqual(cursor, ParentWorkCursor(sourceID: sourceA, revision: 10))
+
+        await XCTAssertThrowsErrorAsync(
+            try await store!.mergeInheritedWorkSnapshot(
+                InheritedWorkSnapshot(
+                    revision: 11,
+                    workByBlock: [
+                        block: WorkMeasure(contribution(id: secondGrind, work: 7)),
+                    ]
+                ),
+                from: parentProcessKey,
+                sourceID: sourceA,
+                baseRevision: 9
+            )
+        ) { error in
+            guard case NodeStoreError.invalidConfiguration = error else {
+                return XCTFail("expected exact-base rejection, got \(error)")
             }
         }
+        var durable = try await store!.inheritedWorkSnapshot()
+        XCTAssertNil(
+            durable?.sourceWork(forBlock: block).work(forGrind: secondGrind)
+        )
+
+        _ = try await store!.mergeInheritedWorkSnapshot(
+            InheritedWorkSnapshot(
+                revision: 11,
+                workByBlock: [
+                    block: WorkMeasure(contribution(id: secondGrind, work: 7)),
+                ]
+            ),
+            from: parentProcessKey,
+            sourceID: sourceA,
+            baseRevision: 10
+        )
+        cursor = try await store!.inheritedWorkCursor()
+        XCTAssertEqual(cursor, ParentWorkCursor(sourceID: sourceA, revision: 11))
+
+        _ = try await store!.mergeInheritedWorkSnapshot(
+            InheritedWorkSnapshot(
+                revision: 2,
+                workByBlock: [
+                    block: WorkMeasure(contribution(id: firstGrind, work: 3)),
+                ]
+            ),
+            from: parentProcessKey,
+            sourceID: sourceB
+        )
+        cursor = try await store!.inheritedWorkCursor()
+        XCTAssertEqual(cursor, ParentWorkCursor(sourceID: sourceB, revision: 2))
+        durable = try await store!.inheritedWorkSnapshot()
+        XCTAssertEqual(
+            durable?.sourceWork(forBlock: block).work(forGrind: firstGrind),
+            UInt256(5)
+        )
+
+        _ = try await store!.mergeInheritedWorkSnapshot(
+            InheritedWorkSnapshot(revision: 1, facts: []),
+            from: parentProcessKey,
+            sourceID: sourceB
+        )
+        cursor = try await store!.inheritedWorkCursor()
+        XCTAssertEqual(cursor, ParentWorkCursor(sourceID: sourceB, revision: 1))
+
+        store = nil
+        store = try makeStore(
+            path: path,
+            chainPath: ["Nexus", "Payments"],
+            spawningParentKey: parentProcessKey
+        )
+        cursor = try await store!.inheritedWorkCursor()
+        XCTAssertEqual(cursor, ParentWorkCursor(sourceID: sourceB, revision: 1))
+        durable = try await store!.inheritedWorkSnapshot()
+        XCTAssertEqual(
+            durable?.sourceWork(forBlock: block).work(forGrind: firstGrind),
+            UInt256(5)
+        )
+        let onceOnly = try await store!.mergeInheritedWorkSnapshot(
+            InheritedWorkSnapshot(revision: 1, facts: []),
+            from: parentProcessKey,
+            sourceID: sourceB,
+            baseRevision: 1
+        )
+        XCTAssertNil(onceOnly)
     }
 
     func testInheritedWorkFactCountAllowsRevisionOnlyAndRejectsLostFacts()
@@ -306,19 +450,19 @@ final class NodeStoreTests: XCTestCase {
         var revisionOnlyStore: NodeStore? = try makeStore(
             path: revisionOnlyPath,
             chainPath: ["Nexus", "Payments"],
-            spawningParentKey: parentAuthorityKey
+            spawningParentKey: parentProcessKey
         )
         let revisionOnly = InheritedWorkSnapshot(revision: 8, workByBlock: [:])
         let revisionOnlyMerge = try await revisionOnlyStore!.mergeInheritedWorkSnapshot(
             revisionOnly,
-            from: parentAuthorityKey
+            from: parentProcessKey
         )
         XCTAssertNotNil(revisionOnlyMerge)
         revisionOnlyStore = nil
         revisionOnlyStore = try makeStore(
             path: revisionOnlyPath,
             chainPath: ["Nexus", "Payments"],
-            spawningParentKey: parentAuthorityKey
+            spawningParentKey: parentProcessKey
         )
         let recoveredRevisionOnly = try await revisionOnlyStore!.inheritedWorkSnapshot()
         XCTAssertEqual(recoveredRevisionOnly, revisionOnly)
@@ -327,7 +471,7 @@ final class NodeStoreTests: XCTestCase {
         let factStore = try makeStore(
             path: factPath,
             chainPath: ["Nexus", "Payments"],
-            spawningParentKey: parentAuthorityKey
+            spawningParentKey: parentProcessKey
         )
         let factMerge = try await factStore.mergeInheritedWorkSnapshot(
             InheritedWorkSnapshot(
@@ -336,7 +480,7 @@ final class NodeStoreTests: XCTestCase {
                     child: WorkMeasure(contribution(id: grind, work: 1)),
                 ]
             ),
-            from: parentAuthorityKey
+            from: parentProcessKey
         )
         XCTAssertNotNil(factMerge)
         try NodeSQLite(path: factPath.path).execute("DELETE FROM parent_work_facts")
@@ -355,7 +499,7 @@ final class NodeStoreTests: XCTestCase {
         var store: NodeStore? = try makeStore(
             path: path,
             chainPath: ["Nexus", "Payments"],
-            spawningParentKey: parentAuthorityKey
+            spawningParentKey: parentProcessKey
         )
         let initial = InheritedWorkSnapshot(
             revision: 10,
@@ -365,7 +509,7 @@ final class NodeStoreTests: XCTestCase {
         )
         let initialMerge = try await store!.mergeInheritedWorkSnapshot(
             initial,
-            from: parentAuthorityKey
+            from: parentProcessKey
         )
         XCTAssertNotNil(initialMerge)
 
@@ -373,7 +517,7 @@ final class NodeStoreTests: XCTestCase {
         store = try makeStore(
             path: path,
             chainPath: ["Nexus", "Payments"],
-            spawningParentKey: parentAuthorityKey
+            spawningParentKey: parentProcessKey
         )
         let dominatedPairStrengthening = InheritedWorkSnapshot(
             revision: 2,
@@ -383,7 +527,7 @@ final class NodeStoreTests: XCTestCase {
         )
         let dominatedMerge = try await store!.mergeInheritedWorkSnapshot(
             dominatedPairStrengthening,
-            from: parentAuthorityKey
+            from: parentProcessKey
         )
         XCTAssertNotNil(dominatedMerge)
 
@@ -391,7 +535,7 @@ final class NodeStoreTests: XCTestCase {
         store = try makeStore(
             path: path,
             chainPath: ["Nexus", "Payments"],
-            spawningParentKey: parentAuthorityKey
+            spawningParentKey: parentProcessKey
         )
         let laterStrengthening = InheritedWorkSnapshot(
             revision: 11,
@@ -401,7 +545,7 @@ final class NodeStoreTests: XCTestCase {
         )
         let globalMerge = try await store!.mergeInheritedWorkSnapshot(
             laterStrengthening,
-            from: parentAuthorityKey
+            from: parentProcessKey
         )
         XCTAssertNotNil(globalMerge)
 
@@ -437,7 +581,7 @@ final class NodeStoreTests: XCTestCase {
         let canonicalCID = try XCTUnwrap(CIDIdentity.canonicalString(alternateCID))
         let store = try makeStore(
             chainPath: ["Nexus", "Payments"],
-            spawningParentKey: parentAuthorityKey
+            spawningParentKey: parentProcessKey
         )
         let emptyBlock = InheritedWorkSnapshot(
             revision: 1,
@@ -479,13 +623,11 @@ final class NodeStoreTests: XCTestCase {
             emptyGrind,
             emptyMeasure,
             zeroWork,
-            alternateCIDSpelling,
-            alternateBlockCIDSpelling,
         ] {
             await XCTAssertThrowsErrorAsync(
                 try await store.mergeInheritedWorkSnapshot(
                     snapshot,
-                    from: parentAuthorityKey
+                    from: parentProcessKey
                 )
             ) { error in
                 guard case NodeStoreError.invalidConfiguration = error else {
@@ -495,22 +637,39 @@ final class NodeStoreTests: XCTestCase {
         }
         let recovered = try await store.inheritedWorkSnapshot()
         XCTAssertNil(recovered)
+
+        let normalizedGrind = try await store.mergeInheritedWorkSnapshot(
+            alternateCIDSpelling,
+            from: parentProcessKey
+        )
+        XCTAssertNotNil(normalizedGrind)
+        let normalizedBlock = try await store.mergeInheritedWorkSnapshot(
+            alternateBlockCIDSpelling,
+            from: parentProcessKey
+        )
+        XCTAssertNotNil(normalizedBlock)
+        let recoveredAliases = try await store.inheritedWorkSnapshot()
+        let normalized = try XCTUnwrap(recoveredAliases)
+        XCTAssertEqual(normalized.blockCIDs, [canonicalCID])
+        XCTAssertEqual(
+            normalized.work(forBlock: alternateCID).total,
+            WorkSum(UInt256(2))
+        )
     }
 
     func testOutgoingChildEvidenceRequiresItsAcceptedLocalCarrier()
         async throws {
         let content = TestContentStore()
-        let authority = try XCTUnwrap(ParentWorkAuthorityKey(parentAuthorityKey))
         try await LatticeState.emptyHeader.storeRecursively(storer: content)
         let leaf = try await BlockBuilder.buildChildGenesis(
-            spec: NexusGenesis.spec.withParentWorkAuthorityKey(authority),
+            spec: NexusGenesis.spec,
             parentState: LatticeState.emptyHeader,
             timestamp: 1,
             target: UInt256.max,
             fetcher: content
         )
         let carrier = try await BlockBuilder.buildChildGenesis(
-            spec: NexusGenesis.spec.withParentWorkAuthorityKey(authority),
+            spec: NexusGenesis.spec,
             parentState: LatticeState.emptyHeader,
             children: ["Leaf": leaf],
             timestamp: 2,
@@ -539,8 +698,6 @@ final class NodeStoreTests: XCTestCase {
             fetcher: content
         )
         let proof = upstream.composing(hop: direct)
-        let entries = try await acquisitionEntries(for: leaf, fetcher: content)
-
         let store = try makeStore(chainPath: ["Nexus", "Middle"])
         try await store.stage(
             blockBatch(
@@ -554,16 +711,14 @@ final class NodeStoreTests: XCTestCase {
         try await persistIssuedChildProof(
             in: store,
             proof,
-            child: leaf,
-            acquisitionEntries: entries,
+            childCID: leafHeader.rawCID,
             parentCarrierCID: carrierHeader.rawCID
         )
         await XCTAssertThrowsErrorAsync(
             try await persistIssuedChildProof(
                 in: store,
                 proof,
-                child: leaf,
-                acquisitionEntries: entries,
+                childCID: leafHeader.rawCID,
                 parentCarrierCID: rootHeader.rawCID
             )
         ) { error in
@@ -577,8 +732,7 @@ final class NodeStoreTests: XCTestCase {
         try await persistIssuedChildProof(
             in: unacceptedStore,
             proof,
-            child: leaf,
-            acquisitionEntries: entries,
+            childCID: leafHeader.rawCID,
             parentCarrierCID: carrierHeader.rawCID
         )
         let unacceptedEvidence = try await unacceptedStore.issuedChildEvidence(
@@ -908,14 +1062,12 @@ final class NodeStoreTests: XCTestCase {
         try await persistIssuedChildProof(
             in: store!,
             fixture.first,
-            child: fixture.child,
-            acquisitionEntries: fixture.acquisitionEntries
+            childCID: fixture.childCID
         )
         try await persistIssuedChildProof(
             in: store!,
             fixture.second,
-            child: fixture.child,
-            acquisitionEntries: fixture.acquisitionEntries
+            childCID: fixture.childCID
         )
 
         let selectedValue = try await store!.issuedChildEvidence(
@@ -967,41 +1119,12 @@ final class NodeStoreTests: XCTestCase {
         )
         let recovered = try XCTUnwrap(recoveredValue).proof
         XCTAssertEqual(try recovered.serialize(), try fixture.first.serialize())
-        let recoveredEvidenceValue = try await store!.issuedChildEvidence(
-            childCID: fixture.childCID,
-            directory: "Child",
-            rootCID: fixture.first.rootCID
-        )
-        let recoveredEvidence = try XCTUnwrap(recoveredEvidenceValue)
-        XCTAssertEqual(recoveredEvidence.child.toData(), fixture.child.toData())
-
-        let otherChild = Block(
-            version: fixture.child.version,
-            parent: fixture.child.parent,
-            transactions: fixture.child.transactions,
-            target: fixture.child.target,
-            nextTarget: fixture.child.nextTarget,
-            spec: fixture.child.spec,
-            parentState: fixture.child.parentState,
-            prevState: fixture.child.prevState,
-            postState: fixture.child.postState,
-            children: fixture.child.children,
-            height: fixture.child.height,
-            timestamp: fixture.child.timestamp,
-            nonce: fixture.child.nonce + 1
-        )
-        let otherChildCID = try BlockHeader(node: otherChild).rawCID
-
+        let otherChildCID = inheritedWorkCID("other-child")
         await XCTAssertThrowsErrorAsync(
             try await persistIssuedChildProof(
                 in: store!,
                 fixture.first,
-                child: otherChild,
-                acquisitionEntries: try replacingRoot(
-                    fixture.acquisitionEntries,
-                    oldCID: fixture.childCID,
-                    with: otherChild
-                )
+                childCID: otherChildCID
             )
         ) { error in
             XCTAssertEqual(
@@ -1009,6 +1132,112 @@ final class NodeStoreTests: XCTestCase {
                 .invalidIssuedChildProof(otherChildCID)
             )
         }
+    }
+
+    func testBootstrapRootsStayLocalAndRetainedOutsideEvidenceVolume()
+        async throws {
+        let directory = temporaryDirectory()
+        let path = directory.appendingPathComponent("state.db")
+        let broker = try DiskBroker(
+            path: directory.appendingPathComponent("volumes.db").path,
+            evictUnpinnedGraceSeconds: 0
+        )
+        let fixture = try await childProofFixture()
+        var bootstrapVolumes = [fixture.childVolume]
+        for index in 0..<48 {
+            let header = try HeaderImpl<PublicKey>(
+                node: PublicKey(key: "bootstrap-root-\(index)")
+            )
+            bootstrapVolumes.append(SerializedVolume(
+                root: header.rawCID,
+                entries: [header.rawCID: try header.mapToData()]
+            ))
+        }
+        let bootstrapRoots = bootstrapVolumes.map(\.root)
+        XCTAssertGreaterThan(
+            try JSONEncoder().encode(bootstrapRoots).count,
+            1_024
+        )
+        for volume in bootstrapVolumes {
+            try await broker.store(volume: volume)
+        }
+
+        var store: NodeStore? = try makeStore(
+            path: path,
+            broker: broker
+        )
+        try await persistIssuedChildProof(
+            in: store!,
+            fixture.first,
+            childCID: fixture.childCID,
+            bootstrapRoots: bootstrapRoots
+        )
+        try await store!.persistPreparedChildProofs(
+            carrierCID: fixture.first.rootCID,
+            proofs: [try PreparedChildProof(
+                directory: "Child",
+                childCID: fixture.childCID,
+                isChildGenesis: true,
+                bootstrapRoots: bootstrapRoots,
+                proof: fixture.first
+            )],
+            capacity: 1
+        )
+
+        let storedEvidence = try await store!.issuedChildEvidence(
+            childCID: fixture.childCID,
+            directory: "Child",
+            rootCID: fixture.first.rootCID
+        )
+        let evidence = try XCTUnwrap(storedEvidence)
+        let expectedEnvelope = try ChildValidationPackageEnvelope(
+            ChildValidationPackage(
+                proof: evidence.proof,
+                parentCarrierLink: evidence.parentCarrierLink,
+                parentGenesisLink: evidence.parentGenesisLink
+            ),
+            parentCarrierCertificate: evidence.parentCarrierCertificate,
+            parentGenesisCertificate: evidence.parentGenesisCertificate
+        )
+        let expectedVolume = try ChildEvidenceVolume(
+            envelopeBytes: try expectedEnvelope.encode(),
+            childCID: fixture.childCID
+        )
+        XCTAssertEqual(evidence.attachmentCID, expectedVolume.rawCID)
+
+        let storedEvidenceVolume = await broker.fetchVolumeLocal(
+            root: evidence.attachmentCID
+        )
+        let evidenceVolume = try XCTUnwrap(storedEvidenceVolume)
+        XCTAssertEqual(evidenceVolume.entries.count, 1)
+        let evidenceFramedBytes = evidenceVolume.entries.reduce(0) {
+            $0 + 6 + $1.key.utf8.count + $1.value.count
+        }
+        XCTAssertLessThanOrEqual(
+            evidenceFramedBytes,
+            ChildValidationPackageEnvelope.maximumEncodedSize + 1_024
+        )
+
+        _ = try await broker.evictUnpinned()
+        for root in bootstrapRoots {
+            let retained = await broker.fetchVolumeLocal(root: root)
+            XCTAssertNotNil(retained)
+        }
+
+        store = nil
+        store = try makeStore(
+            path: path,
+            broker: broker
+        )
+        let recoveredPrepared = try await store!.preparedChildProofs(
+            carrierCID: fixture.first.rootCID
+        )
+        XCTAssertEqual(
+            recoveredPrepared.first?.bootstrapRoots,
+            bootstrapRoots.sorted()
+        )
+        let recoveredRoots = try await store!.recoveryVolumeRoots()
+        XCTAssertTrue(Set(bootstrapRoots).isSubset(of: Set(recoveredRoots)))
     }
 
     func testIssuedChildProofsKeepSameChildDistinctAcrossDirectories() async throws {
@@ -1041,23 +1270,17 @@ final class NodeStoreTests: XCTestCase {
             childDirectory: "Beta",
             fetcher: content
         )
-        let acquisitionEntries = try await acquisitionEntries(
-            for: child,
-            fetcher: content
-        )
         let store = try makeStore()
 
         try await persistIssuedChildProof(
             in: store,
             alpha,
-            child: child,
-            acquisitionEntries: acquisitionEntries
+            childCID: childCID
         )
         try await persistIssuedChildProof(
             in: store,
             beta,
-            child: child,
-            acquisitionEntries: acquisitionEntries
+            childCID: childCID
         )
 
         let alphaValue = try await store.issuedChildEvidence(
@@ -1099,7 +1322,8 @@ final class NodeStoreTests: XCTestCase {
         )
         let alphaSummaries = try await store.issuedChildEvidenceSummaries(
             directory: "Alpha",
-            after: nil,
+            afterOrdinal: 0,
+            throughOrdinal: UInt64(Int64.max),
             limit: 2
         )
         XCTAssertEqual(alphaSummaries.count, 1)
@@ -1110,7 +1334,8 @@ final class NodeStoreTests: XCTestCase {
         } ?? false)
         let betaSummaries = try await store.issuedChildEvidenceSummaries(
             directory: "Beta",
-            after: nil,
+            afterOrdinal: 0,
+            throughOrdinal: UInt64(Int64.max),
             limit: 2
         )
         XCTAssertTrue(betaSummaries.isEmpty)
@@ -1129,8 +1354,8 @@ final class NodeStoreTests: XCTestCase {
                 carrierLink: link,
                 carrierEvidence: AdmissionCarrierEvidence(
                     proof: fixture.first,
-                    child: fixture.child,
-                    acquisitionEntries: fixture.acquisitionEntries
+                    childCID: fixture.childCID,
+                    isChildGenesis: true
                 ),
                 parentGenesisLinks: []
             )
@@ -1164,8 +1389,8 @@ final class NodeStoreTests: XCTestCase {
                         """),
                     carrierEvidence: AdmissionCarrierEvidence(
                         proof: proof,
-                        child: fixture.child,
-                        acquisitionEntries: fixture.acquisitionEntries
+                        childCID: fixture.childCID,
+                        isChildGenesis: true
                     ),
                     parentGenesisLinks: []
                 )
@@ -1241,9 +1466,14 @@ final class NodeStoreTests: XCTestCase {
         }
 
         let parentPath = temporaryDirectory().appendingPathComponent("state.db")
+        let parentBroker = try DiskBroker(
+            path: parentPath.deletingLastPathComponent()
+                .appendingPathComponent("volumes.db").path
+        )
         let parent = try makeStore(
             path: parentPath,
-            chainPath: ["Nexus", "A"]
+            chainPath: ["Nexus", "A"],
+            broker: parentBroker
         )
         let child = try makeStore(chainPath: ["Nexus", "A", "A"])
         try await parent.stage(
@@ -1253,13 +1483,11 @@ final class NodeStoreTests: XCTestCase {
             ),
             volumeRoots: []
         )
-        let entries = try await acquisitionEntries(for: leaf, fetcher: content)
         for proof in absoluteProofs {
             try await persistIssuedChildProof(
                 in: parent,
                 proof,
-                child: leaf,
-                acquisitionEntries: entries,
+                childCID: leafCID,
                 parentCarrierCID: carrierHeader.rawCID
             )
             try await child.persistIssuedHierarchyArtifacts(
@@ -1269,8 +1497,8 @@ final class NodeStoreTests: XCTestCase {
                         """),
                     carrierEvidence: AdmissionCarrierEvidence(
                         proof: proof,
-                        child: leaf,
-                        acquisitionEntries: entries
+                        childCID: leafCID,
+                        isChildGenesis: true
                     ),
                     parentGenesisLinks: []
                 )
@@ -1327,9 +1555,12 @@ final class NodeStoreTests: XCTestCase {
         XCTAssertEqual(edge.childCID, leafCID)
         XCTAssertEqual(edge.directory, "A")
         XCTAssertEqual(edge.proofBytes, try direct.serialize())
+        let edgeCID = try XCTUnwrap(edge.edgeCID)
+        let fetchedEdgeVolume = await parentBroker.fetchVolumeLocal(root: edgeCID)
+        XCTAssertNil(fetchedEdgeVolume)
         let attachment = try await child.issuedChildEvidence(
             scope: .incomingCarrier,
-            edgeCID: try XCTUnwrap(edge.edgeCID),
+            edgeCID: edgeCID,
             rootCID: absoluteProofs[1].rootCID
         )
         XCTAssertEqual(attachment?.edgeCID, edge.edgeCID)
@@ -1346,7 +1577,6 @@ final class NodeStoreTests: XCTestCase {
                 .compactMap { $0["name"]?.textValue }),
             Set([
                 "edge_cid", "parent_carrier_cid", "directory", "child_cid",
-                "direct_attachment_cid",
             ])
         )
         XCTAssertEqual(
@@ -1354,7 +1584,7 @@ final class NodeStoreTests: XCTestCase {
                 .compactMap { $0["name"]?.textValue }),
             Set([
                 "scope", "edge_cid", "root_cid", "is_portable",
-                "attachment_cid",
+                "attachment_cid", "ordinal",
             ])
         )
 
@@ -1375,6 +1605,32 @@ final class NodeStoreTests: XCTestCase {
                 .text(try XCTUnwrap(proofRow["edge_cid"]?.textValue)),
                 .text(try XCTUnwrap(proofRow["root_cid"]?.textValue)),
             ]
+        )
+        let missingRootCID = try XCTUnwrap(proofRow["root_cid"]?.textValue)
+        let indexedAttachments = try await parent.childRootAttachmentSummaries(
+            scope: .outgoingDirectChild,
+            directory: "A",
+            after: nil,
+            limit: 3
+        )
+        XCTAssertEqual(
+            indexedAttachments.first { $0.rootCID == missingRootCID }?
+                .attachmentCID,
+            missingAttachmentCID
+        )
+        let indexedRoots = try await parent.issuedChildProofRoots(
+            childCID: leafCID,
+            directory: "A",
+            afterRootCID: nil,
+            limit: 3
+        )
+        XCTAssertTrue(indexedRoots.contains(missingRootCID))
+        await XCTAssertThrowsErrorAsync(
+            try await parent.issuedChildEvidence(
+                scope: .outgoingDirectChild,
+                edgeCID: edgeCID,
+                rootCID: missingRootCID
+            )
         )
         await XCTAssertThrowsErrorAsync(
             try await parent.auditNormalizedIndexes()
@@ -1449,11 +1705,8 @@ final class NodeStoreTests: XCTestCase {
                     """),
                 carrierEvidence: AdmissionCarrierEvidence(
                     proof: incoming,
-                    child: carrier,
-                    acquisitionEntries: try await acquisitionEntries(
-                        for: carrier,
-                        fetcher: content
-                    )
+                    childCID: carrierHeader.rawCID,
+                    isChildGenesis: true
                 ),
                 parentGenesisLinks: [try decode(ParentGenesisLink.self, json: """
                     {"parentPath":["Nexus","A"],"directory":"A","childGenesisCID":"\(leafCID)"}
@@ -1463,11 +1716,7 @@ final class NodeStoreTests: XCTestCase {
         try await persistIssuedChildProof(
             in: store,
             outgoing,
-            child: leaf,
-            acquisitionEntries: try await acquisitionEntries(
-                for: leaf,
-                fetcher: content
-            )
+            childCID: leafCID
         )
         let carrierRoots = try await store.incomingCarrierProofRoots(
             childCID: carrierHeader.rawCID,
@@ -1491,7 +1740,8 @@ final class NodeStoreTests: XCTestCase {
         XCTAssertNotNil(incomingCarrierEvidence)
         let summaries = try await store.issuedChildEvidenceSummaries(
             directory: "A",
-            after: nil,
+            afterOrdinal: 0,
+            throughOrdinal: UInt64(Int64.max),
             limit: 2
         )
         XCTAssertEqual(summaries.count, 1)
@@ -1510,8 +1760,7 @@ final class NodeStoreTests: XCTestCase {
         try await persistIssuedChildProof(
             in: store,
             fixture.first,
-            child: fixture.child,
-            acquisitionEntries: fixture.acquisitionEntries
+            childCID: fixture.childCID
         )
         let storedEvidence = try await store.issuedChildEvidence(
             childCID: fixture.childCID,
@@ -1536,13 +1785,12 @@ final class NodeStoreTests: XCTestCase {
         )
         let invalidAttachment = try ChildEvidenceVolume(
             envelopeBytes: try envelope.encode(),
-            acquisitionEntries: evidence.acquisitionEntries,
             childCID: fixture.childCID
         )
         let broker = try DiskBroker(
             path: directory.appendingPathComponent("volumes.db").path
         )
-        try await invalidAttachment.store(storer: BrokerStorer(broker: broker))
+        try await invalidAttachment.store(storer: broker)
         try NodeSQLite(path: path.path).execute(
             "UPDATE issued_child_proofs SET attachment_cid = ?1 WHERE scope = ?2 AND edge_cid = ?3 AND root_cid = ?4",
             params: [
@@ -1567,15 +1815,15 @@ final class NodeStoreTests: XCTestCase {
         let fixture = try await childProofFixture()
         let first = try PreparedChildProof(
             directory: "Child",
-            child: fixture.child,
-            proof: fixture.first,
-            acquisitionEntries: fixture.acquisitionEntries
+            childCID: fixture.childCID,
+            isChildGenesis: true,
+            proof: fixture.first
         )
         let second = try PreparedChildProof(
             directory: "Child",
-            child: fixture.child,
-            proof: fixture.second,
-            acquisitionEntries: fixture.acquisitionEntries
+            childCID: fixture.childCID,
+            isChildGenesis: true,
+            proof: fixture.second
         )
 
         try await store!.persistPreparedChildProofs(
@@ -1600,31 +1848,7 @@ final class NodeStoreTests: XCTestCase {
             try recovered.first?.proof.serialize(),
             try fixture.first.serialize()
         )
-        XCTAssertEqual(
-            recovered.first?.acquisitionEntries,
-            fixture.acquisitionEntries
-        )
-
-        var conflictingEntries = fixture.acquisitionEntries
-        let extra = try HeaderImpl<PublicKey>(
-            node: PublicKey(key: "different-prepared-child-proof")
-        )
-        conflictingEntries[extra.rawCID] = try extra.mapToData()
-        await XCTAssertThrowsErrorAsync(try await store!.persistPreparedChildProofs(
-            carrierCID: fixture.first.rootCID,
-            proofs: [try PreparedChildProof(
-                directory: "Child",
-                child: fixture.child,
-                proof: fixture.first,
-                acquisitionEntries: conflictingEntries
-            )],
-            capacity: 1
-        )) { error in
-            XCTAssertEqual(
-                error as? NodeStoreError,
-                .conflictingIssuedChildProof
-            )
-        }
+        XCTAssertEqual(recovered.first?.bootstrapRoots, [])
 
         try await store!.persistPreparedChildProofs(
             carrierCID: fixture.second.rootCID,
@@ -1637,6 +1861,200 @@ final class NodeStoreTests: XCTestCase {
         let carriers = try await store!.preparedChildProofCarrierCIDs()
         XCTAssertTrue(evicted.isEmpty)
         XCTAssertEqual(carriers, [fixture.second.rootCID])
+    }
+
+    func testEvictedPreparedGenesisDropsUnownedBootstrapRoots() async throws {
+        let directory = temporaryDirectory()
+        let broker = try DiskBroker(
+            path: directory.appendingPathComponent("volumes.db").path
+        )
+        let store = try makeStore(
+            path: directory.appendingPathComponent("state.db"),
+            broker: broker
+        )
+        let first = try await childProofFixture(childTimestamp: 1)
+        let second = try await childProofFixture(childTimestamp: 10)
+        let firstAttachment = try ChildEvidenceVolume(
+            envelopeBytes: try ChildValidationPackageEnvelope(
+                ChildValidationPackage(proof: first.first)
+            ).encode(),
+            childCID: first.childCID
+        )
+        let secondAttachment = try ChildEvidenceVolume(
+            envelopeBytes: try ChildValidationPackageEnvelope(
+                ChildValidationPackage(proof: second.first)
+            ).encode(),
+            childCID: second.childCID
+        )
+        for volume in [first.childVolume, second.childVolume] {
+            try await broker.store(volume: volume)
+        }
+
+        try await store.persistPreparedChildProofs(
+            carrierCID: first.first.rootCID,
+            proofs: [try PreparedChildProof(
+                directory: "Child",
+                childCID: first.childCID,
+                isChildGenesis: true,
+                bootstrapRoots: [first.childCID],
+                proof: first.first
+            )],
+            capacity: 1
+        )
+        try await store.persistPreparedChildProofs(
+            carrierCID: second.first.rootCID,
+            proofs: [try PreparedChildProof(
+                directory: "Child",
+                childCID: second.childCID,
+                isChildGenesis: true,
+                bootstrapRoots: [second.childCID],
+                proof: second.first
+            )],
+            capacity: 1
+        )
+
+        let roots = try await store.recoveryVolumeRoots()
+        XCTAssertFalse(roots.contains(first.childCID))
+        XCTAssertTrue(roots.contains(second.childCID))
+        _ = try await broker.evictUnpinned(graceSeconds: 0)
+        let evictedChild = await broker.fetchVolumeLocal(root: first.childCID)
+        let evictedAttachment = await broker.fetchVolumeLocal(
+            root: firstAttachment.rawCID
+        )
+        let retainedChild = await broker.fetchVolumeLocal(root: second.childCID)
+        let retainedAttachment = await broker.fetchVolumeLocal(
+            root: secondAttachment.rawCID
+        )
+        XCTAssertNil(evictedChild)
+        XCTAssertNil(evictedAttachment)
+        XCTAssertNotNil(retainedChild)
+        XCTAssertNotNil(retainedAttachment)
+    }
+
+    func testPreparedRetentionMutationIsSerializedThroughExactReconciliation()
+        async throws {
+        let directory = temporaryDirectory()
+        let broker = try DiskBroker(
+            path: directory.appendingPathComponent("volumes.db").path
+        )
+        let blockingBroker = BlockingVolumeBroker(broker: broker)
+        let store = try makeStore(
+            path: directory.appendingPathComponent("state.db"),
+            broker: blockingBroker
+        )
+        let first = try await childProofFixture(childTimestamp: 1)
+        let second = try await childProofFixture(childTimestamp: 10)
+        let firstPrepared = try PreparedChildProof(
+            directory: "Child",
+            childCID: first.childCID,
+            isChildGenesis: false,
+            proof: first.first
+        )
+        let secondPrepared = try PreparedChildProof(
+            directory: "Child",
+            childCID: second.childCID,
+            isChildGenesis: false,
+            proof: second.first
+        )
+        let firstAttachment = try ChildEvidenceVolume(
+            envelopeBytes: try ChildValidationPackageEnvelope(
+                ChildValidationPackage(proof: first.first)
+            ).encode(),
+            childCID: first.childCID
+        )
+        let secondAttachment = try ChildEvidenceVolume(
+            envelopeBytes: try ChildValidationPackageEnvelope(
+                ChildValidationPackage(proof: second.first)
+            ).encode(),
+            childCID: second.childCID
+        )
+
+        let firstTask = Task {
+            try await store.persistPreparedChildProofs(
+                carrierCID: first.first.rootCID,
+                proofs: [firstPrepared],
+                capacity: 1
+            )
+        }
+        await blockingBroker.waitUntilFirstStore()
+        let secondTask = Task {
+            try await store.persistPreparedChildProofs(
+                carrierCID: second.first.rootCID,
+                proofs: [secondPrepared],
+                capacity: 1
+            )
+        }
+        for _ in 0..<20 {
+            await Task.yield()
+        }
+        let storesWhileBlocked = await blockingBroker.storeCount()
+        XCTAssertEqual(storesWhileBlocked, 1)
+
+        await blockingBroker.releaseFirstStore()
+        try await firstTask.value
+        try await secondTask.value
+        let retainedCarriers = try await store.preparedChildProofCarrierCIDs()
+        XCTAssertEqual(retainedCarriers, [second.first.rootCID])
+
+        _ = try await broker.evictUnpinned(graceSeconds: 0)
+        let evicted = await broker.fetchVolumeLocal(root: firstAttachment.rawCID)
+        let retained = await broker.fetchVolumeLocal(root: secondAttachment.rawCID)
+        XCTAssertNil(evicted)
+        XCTAssertNotNil(retained)
+    }
+
+    func testIssuedGenesisKeepsBootstrapRootsAfterPreparationRemoval()
+        async throws {
+        let directory = temporaryDirectory()
+        let broker = try DiskBroker(
+            path: directory.appendingPathComponent("volumes.db").path
+        )
+        let store = try makeStore(
+            path: directory.appendingPathComponent("state.db"),
+            broker: broker
+        )
+        let fixture = try await childProofFixture()
+        try await broker.store(
+            volume: fixture.childVolume
+        )
+        let prepared = try PreparedChildProof(
+            directory: "Child",
+            childCID: fixture.childCID,
+            isChildGenesis: true,
+            bootstrapRoots: [fixture.childCID],
+            proof: fixture.first
+        )
+        try await store.persistPreparedChildProofs(
+            carrierCID: fixture.first.rootCID,
+            proofs: [prepared],
+            capacity: 1
+        )
+        try await persistIssuedChildProof(
+            in: store,
+            fixture.first,
+            childCID: fixture.childCID,
+            bootstrapRoots: [fixture.childCID]
+        )
+        try await store.removePreparedChildProof(
+            carrierCID: fixture.first.rootCID,
+            directory: "Child"
+        )
+
+        let roots = try await store.recoveryVolumeRoots()
+        XCTAssertTrue(roots.contains(fixture.childCID))
+        let storedEvidence = try await store.issuedChildEvidence(
+            childCID: fixture.childCID,
+            directory: "Child",
+            rootCID: fixture.first.rootCID
+        )
+        let evidence = try XCTUnwrap(storedEvidence)
+        _ = try await broker.evictUnpinned(graceSeconds: 0)
+        let retainedChild = await broker.fetchVolumeLocal(root: fixture.childCID)
+        let retainedEvidence = await broker.fetchVolumeLocal(
+            root: evidence.attachmentCID
+        )
+        XCTAssertNotNil(retainedChild)
+        XCTAssertNotNil(retainedEvidence)
     }
 
     func testPendingChildProofRoutesUnionRecoverAndEvictByCarrier() async throws {
@@ -1680,6 +2098,90 @@ final class NodeStoreTests: XCTestCase {
         )
     }
 
+    func testPendingRouteCapacityOnlyEvictsSpeculativeCarriers() async throws {
+        let store = try makeStore()
+        try await store.stage(
+            blockBatch(postStateCID: "state", blockHash: "accepted"),
+            volumeRoots: [],
+            pendingChildProofRoutes: [PendingChildProofRoute(
+                carrierCID: "accepted",
+                directory: "AcceptedChild"
+            )],
+            pendingChildProofCapacity: 1
+        )
+        try await store.persistIssuedHierarchyArtifacts(
+            AdmissionHierarchyArtifacts(
+                carrierLink: try decode(ParentCarrierLink.self, json: """
+                    {"parentPath":["Nexus"],"carrierCID":"issued","rootCID":"issued"}
+                    """),
+                carrierEvidence: nil,
+                parentGenesisLinks: []
+            ),
+            pendingChildProofRoutes: [PendingChildProofRoute(
+                carrierCID: "issued",
+                directory: "IssuedChild"
+            )],
+            pendingChildProofCapacity: 1
+        )
+        try await store.persistPendingChildProofRoutes(
+            carrierCID: "speculative-a",
+            directories: ["A"],
+            capacity: 1
+        )
+        try await store.persistPendingChildProofRoutes(
+            carrierCID: "speculative-b",
+            directories: ["B"],
+            capacity: 1
+        )
+
+        let routes = try await store.pendingChildProofRoutes()
+        XCTAssertEqual(Set(routes), [
+            PendingChildProofRoute(
+                carrierCID: "accepted",
+                directory: "AcceptedChild"
+            ),
+            PendingChildProofRoute(
+                carrierCID: "issued",
+                directory: "IssuedChild"
+            ),
+            PendingChildProofRoute(
+                carrierCID: "speculative-b",
+                directory: "B"
+            ),
+        ])
+    }
+
+    func testPreparedProofDoesNotSuppressPendingPublicationRoute() async throws {
+        let store = try makeStore()
+        let fixture = try await childProofFixture()
+        try await store.persistPreparedChildProofs(
+            carrierCID: fixture.first.rootCID,
+            proofs: [try PreparedChildProof(
+                directory: "Child",
+                childCID: fixture.childCID,
+                isChildGenesis: true,
+                proof: fixture.first
+            )],
+            capacity: 1
+        )
+
+        try await store.stage(
+            blockBatch(
+                postStateCID: "state",
+                blockHash: fixture.first.rootCID
+            ),
+            volumeRoots: [],
+            pendingChildProofRoutes: [],
+            pendingChildProofCapacity: 1
+        )
+
+        let routes = try await store.pendingChildProofRoutes()
+        XCTAssertEqual(routes, [PendingChildProofRoute(
+            carrierCID: fixture.first.rootCID,
+            directory: "Child"
+        )])
+    }
+
     func testPreparedChildProofRoutesGrowByImmutableDirectory() async throws {
         let content = TestContentStore()
         try await LatticeState.emptyHeader.storeRecursively(storer: content)
@@ -1716,17 +2218,16 @@ final class NodeStoreTests: XCTestCase {
             childDirectory: "Beta",
             fetcher: content
         )
+        let alphaCID = try BlockHeader(node: alpha).rawCID
+        let betaCID = try BlockHeader(node: beta).rawCID
         let store = try makeStore()
         try await store.persistPreparedChildProofs(
             carrierCID: carrierHeader.rawCID,
             proofs: [try PreparedChildProof(
                 directory: "Alpha",
-                child: alpha,
-                proof: alphaProof,
-                acquisitionEntries: try await acquisitionEntries(
-                    for: alpha,
-                    fetcher: content
-                )
+                childCID: alphaCID,
+                isChildGenesis: true,
+                proof: alphaProof
             )],
             capacity: 2
         )
@@ -1734,12 +2235,9 @@ final class NodeStoreTests: XCTestCase {
             carrierCID: carrierHeader.rawCID,
             proofs: [try PreparedChildProof(
                 directory: "Beta",
-                child: beta,
-                proof: betaProof,
-                acquisitionEntries: try await acquisitionEntries(
-                    for: beta,
-                    fetcher: content
-                )
+                childCID: betaCID,
+                isChildGenesis: true,
+                proof: betaProof
             )],
             capacity: 2
         )
@@ -1752,7 +2250,7 @@ final class NodeStoreTests: XCTestCase {
 
     func testAdmissionStorageRecordsOnlyActualVolumeRoots() async throws {
         let broker = MemoryBroker()
-        let admission = NodeAdmissionStorage(storage: BrokerStorer(broker: broker))
+        let admission = NodeAdmissionStorage(storage: broker)
         let node = PublicKey(key: "actual-volume")
         let header = try HeaderImpl<PublicKey>(node: node)
         let root = header.rawCID
@@ -1769,19 +2267,690 @@ final class NodeStoreTests: XCTestCase {
         XCTAssertTrue(hasVolume)
     }
 
+    func testContextualCandidateRootsUseDurableLRUReplacement()
+        async throws
+    {
+        let directory = temporaryDirectory()
+        let path = directory.appendingPathComponent("state.db")
+        let broker = try DiskBroker(
+            path: directory.appendingPathComponent("volumes.db").path
+        )
+        let storer = broker
+        let volumes = try ["a", "b", "c", "d", "shared"].map { seed in
+            try VolumeImpl<PublicKey>(node: PublicKey(key: seed))
+        }
+        for volume in volumes { try await volume.store(storer: storer) }
+        let a = volumes[0].rawCID
+        let b = volumes[1].rawCID
+        let c = volumes[2].rawCID
+        let d = volumes[3].rawCID
+        let shared = volumes[4].rawCID
+
+        var store: NodeStore? = try makeStore(path: path, broker: broker)
+        try await store!.persistContextualCandidateRoots(
+            candidateCID: a,
+            roots: [shared, a],
+            capacity: 2
+        )
+        try await store!.persistContextualCandidateRoots(
+            candidateCID: b,
+            roots: [b, shared],
+            capacity: 2
+        )
+        // A reused child CID remains as recent as the newest parent template
+        // that references it without duplicating its retained roots.
+        try await store!.persistContextualCandidateRoots(
+            candidateCID: a,
+            roots: [a, shared],
+            capacity: 2
+        )
+        try await store!.persistContextualCandidateRoots(
+            candidateCID: c,
+            roots: [c, shared],
+            capacity: 2
+        )
+        let retainedBeforeReopen = try await store!
+            .contextualCandidateVolumeRoots()
+        XCTAssertEqual(Set(retainedBeforeReopen), Set([a, c, shared]))
+
+        store = nil
+        store = try makeStore(path: path, broker: broker)
+        let recoveredRoots = try await store!.contextualCandidateVolumeRoots()
+        try await broker.unpinAll(owner: "test:contextual-candidates")
+        try await broker.pinBatch(
+            roots: recoveredRoots,
+            owner: "test:contextual-candidates"
+        )
+        try await store!.persistContextualCandidateRoots(
+            candidateCID: d,
+            roots: [d],
+            capacity: 2
+        )
+        let retainedAfterReopen = try await store!
+            .contextualCandidateVolumeRoots()
+        XCTAssertEqual(Set(retainedAfterReopen), Set([c, d, shared]))
+        _ = try await broker.evictUnpinned(graceSeconds: 0)
+        let volumeA = await broker.fetchVolumeLocal(root: a)
+        let volumeB = await broker.fetchVolumeLocal(root: b)
+        let volumeC = await broker.fetchVolumeLocal(root: c)
+        let volumeD = await broker.fetchVolumeLocal(root: d)
+        let sharedVolume = await broker.fetchVolumeLocal(root: shared)
+        XCTAssertNil(volumeA)
+        XCTAssertNil(volumeB)
+        XCTAssertNotNil(volumeC)
+        XCTAssertNotNil(volumeD)
+        XCTAssertNotNil(sharedVolume)
+
+        let removedWithoutAdmission = try await store!
+            .removeContextualCandidateIfAdmitted(candidateCID: c)
+        XCTAssertFalse(removedWithoutAdmission)
+        try await store!.stage(
+            blockBatch(postStateCID: "state-c", blockHash: c),
+            volumeRoots: [c, shared]
+        )
+        let removedAfterAdmission = try await store!
+            .removeContextualCandidateIfAdmitted(candidateCID: c)
+        XCTAssertTrue(removedAfterAdmission)
+        let rootsAfterAdmission = try await store!
+            .contextualCandidateVolumeRoots()
+        XCTAssertEqual(Set(rootsAfterAdmission), Set([d]))
+        _ = try await broker.evictUnpinned(graceSeconds: 0)
+        let retainedD = await broker.fetchVolumeLocal(root: d)
+        let retainedShared = await broker.fetchVolumeLocal(root: shared)
+        XCTAssertNotNil(retainedD)
+        XCTAssertNil(retainedShared)
+    }
+
+    func testContextualOffersCannotEvictIssuedReservations() async throws {
+        let directory = temporaryDirectory()
+        let broker = try DiskBroker(
+            path: directory.appendingPathComponent("volumes.db").path
+        )
+        let store = try makeStore(
+            path: directory.appendingPathComponent("state.db"),
+            broker: broker
+        )
+        let volumes = try ["issued", "old-offer", "new-offer"].map {
+            try VolumeImpl<PublicKey>(node: PublicKey(key: $0))
+        }
+        for volume in volumes {
+            try await volume.store(storer: broker)
+        }
+        let issued = volumes[0].rawCID
+        let oldOffer = volumes[1].rawCID
+        let newOffer = volumes[2].rawCID
+        let child = ChildCandidateReservationReference(
+            peerKey: try PeerKey(
+                rawRepresentation: Data(repeating: 0xaa, count: PeerKey.byteCount)
+            ),
+            candidateCID: oldOffer
+        )
+        try await store.persistContextualCandidateRoots(
+            candidateCID: issued,
+            roots: [issued],
+            children: [child],
+            capacity: 1
+        )
+        let firstReplacement = try await store.replaceIssuedContextualCandidates(
+            [issued],
+            capacity: 1
+        )
+        XCTAssertTrue(firstReplacement)
+        try await store.persistContextualCandidateRoots(
+            candidateCID: oldOffer,
+            roots: [oldOffer],
+            capacity: 1
+        )
+        try await store.persistContextualCandidateRoots(
+            candidateCID: newOffer,
+            roots: [newOffer],
+            capacity: 1
+        )
+        let retainedRoots = try await store.contextualCandidateVolumeRoots()
+        XCTAssertEqual(Set(retainedRoots), Set([issued, newOffer]))
+        let retainedChildren = try await store.contextualCandidateChildren(
+            candidateCIDs: [issued]
+        )
+        XCTAssertEqual(retainedChildren, [child])
+        _ = try await broker.evictUnpinned(graceSeconds: 0)
+        let retainedIssued = await broker.fetchVolumeLocal(root: issued)
+        let evictedOldOffer = await broker.fetchVolumeLocal(root: oldOffer)
+        let retainedNewOffer = await broker.fetchVolumeLocal(root: newOffer)
+        XCTAssertNotNil(retainedIssued)
+        XCTAssertNil(evictedOldOffer)
+        XCTAssertNotNil(retainedNewOffer)
+
+        let secondReplacement = try await store.replaceIssuedContextualCandidates(
+            [newOffer],
+            capacity: 1
+        )
+        XCTAssertTrue(secondReplacement)
+        _ = try await broker.evictUnpinned(graceSeconds: 0)
+        let releasedIssued = await broker.fetchVolumeLocal(root: issued)
+        let promotedOffer = await broker.fetchVolumeLocal(root: newOffer)
+        XCTAssertNil(releasedIssued)
+        XCTAssertNotNil(promotedOffer)
+    }
+
+    func testParentEvidenceHandoffSurvivesReleaseUntilAdmissionOwnsRoots()
+        async throws
+    {
+        let directory = temporaryDirectory()
+        let broker = try DiskBroker(
+            path: directory.appendingPathComponent("volumes.db").path
+        )
+        let store = try makeStore(
+            path: directory.appendingPathComponent("state.db"),
+            broker: broker
+        )
+        let candidate = try VolumeImpl<PublicKey>(
+            node: PublicKey(key: "handoff-candidate")
+        )
+        let shared = try VolumeImpl<PublicKey>(
+            node: PublicKey(key: "handoff-shared")
+        )
+        let storer = broker
+        try await candidate.store(storer: storer)
+        try await shared.store(storer: storer)
+        let descendant = ChildCandidateReservationReference(
+            peerKey: try PeerKey(
+                rawRepresentation: Data(
+                    repeating: 0xbb,
+                    count: PeerKey.byteCount
+                )
+            ),
+            candidateCID: shared.rawCID
+        )
+        try await store.persistContextualCandidateRoots(
+            candidateCID: candidate.rawCID,
+            roots: [candidate.rawCID, shared.rawCID],
+            children: [descendant],
+            capacity: 16
+        )
+        let issuedReplacement = try await store.replaceIssuedContextualCandidates(
+            [candidate.rawCID],
+            capacity: 16
+        )
+        XCTAssertTrue(issuedReplacement)
+        let beganHandoff = try await store.beginContextualCandidateHandoff(
+            candidateCID: candidate.rawCID
+        )
+        XCTAssertTrue(beganHandoff)
+
+        let releasedReservation = try await store
+            .replaceIssuedContextualCandidates(
+            [],
+            capacity: 16
+        )
+        XCTAssertTrue(releasedReservation)
+        let issued = try await store.issuedContextualCandidateCIDs()
+        XCTAssertTrue(issued.isEmpty)
+        let retainedDescendants = try await store
+            .contextualCandidateChildren(candidateCIDs: [])
+        XCTAssertEqual(retainedDescendants, [descendant])
+        _ = try await broker.evictUnpinned(graceSeconds: 0)
+        let retainedCandidate = await broker.fetchVolumeLocal(
+            root: candidate.rawCID
+        )
+        let retainedShared = await broker.fetchVolumeLocal(root: shared.rawCID)
+        XCTAssertNotNil(retainedCandidate)
+        XCTAssertNotNil(retainedShared)
+
+        try await store.stage(
+            blockBatch(
+                postStateCID: "handoff-state",
+                blockHash: candidate.rawCID
+            ),
+            volumeRoots: [candidate.rawCID, shared.rawCID]
+        )
+        let removedAfterAdmission = try await store
+            .removeContextualCandidateIfAdmitted(
+            candidateCID: candidate.rawCID
+        )
+        XCTAssertTrue(removedAfterAdmission)
+        let releasedDescendants = try await store
+            .currentContextualCandidateChildren()
+        XCTAssertTrue(releasedDescendants.isEmpty)
+        _ = try await broker.evictUnpinned(graceSeconds: 0)
+        let releasedCandidate = await broker.fetchVolumeLocal(
+            root: candidate.rawCID
+        )
+        let releasedShared = await broker.fetchVolumeLocal(root: shared.rawCID)
+        XCTAssertNil(releasedCandidate)
+        XCTAssertNil(releasedShared)
+    }
+
+    func testParentEvidenceScanAndInboxSurviveCrashUntilAdmissionOwnsVolume()
+        async throws
+    {
+        let directory = temporaryDirectory()
+        let parentBroker = try DiskBroker(
+            path: directory.appendingPathComponent("parent-volumes.db").path
+        )
+        let childBroker = try DiskBroker(
+            path: directory.appendingPathComponent("child-volumes.db").path
+        )
+        let parentIdentity = try NodeConfiguration(
+            chainPath: ["Nexus"],
+            minimumRootWork: UInt256(1),
+            storagePath: temporaryDirectory(),
+            privateKeyHex: String(repeating: "7a", count: 32)
+        )
+        let parent = try makeStore(
+            path: directory.appendingPathComponent("parent.db"),
+            broker: parentBroker
+        )
+        let fixture = try await childProofFixture()
+        try await persistIssuedChildProof(
+            in: parent,
+            fixture.first,
+            childCID: fixture.childCID
+        )
+        try await parent.persistIssuedHierarchyArtifacts(
+            AdmissionHierarchyArtifacts(
+                carrierLink: try decode(ParentCarrierLink.self, json: """
+                    {"parentPath":["Nexus"],"carrierCID":"\(fixture.first.rootCID)","rootCID":"\(fixture.first.rootCID)"}
+                    """),
+                carrierEvidence: nil,
+                parentGenesisLinks: [
+                    try decode(ParentGenesisLink.self, json: """
+                        {"parentPath":["Nexus"],"directory":"Child","childGenesisCID":"\(fixture.childCID)"}
+                        """)
+                ]
+            )
+        )
+        let scan = try await parent.issuedChildEvidenceScanHead(
+            directory: "Child"
+        )
+        try await persistIssuedChildProof(
+            in: parent,
+            fixture.second,
+            childCID: fixture.childCID
+        )
+        let page = try await parent.issuedChildEvidenceSummaries(
+            directory: "Child",
+            afterOrdinal: 0,
+            throughOrdinal: scan.throughOrdinal,
+            limit: 2
+        )
+        let summary = try XCTUnwrap(page.first)
+        XCTAssertEqual(summary.ordinal, scan.throughOrdinal)
+        XCTAssertEqual(page.count, 1)
+        let advancedScan = try await parent.issuedChildEvidenceScanHead(
+            directory: "Child"
+        )
+        XCTAssertGreaterThan(advancedScan.throughOrdinal, scan.throughOrdinal)
+
+        let storedIssued = try await parent.issuedChildEvidence(
+            childCID: fixture.childCID,
+            directory: "Child",
+            rootCID: fixture.first.rootCID
+        )
+        let issued = try XCTUnwrap(storedIssued)
+        let package = AuthenticatedChildPackage(
+            package: ChildValidationPackage(
+                proof: issued.proof,
+                parentCarrierLink: issued.parentCarrierLink,
+                parentGenesisLink: issued.parentGenesisLink
+            ),
+            parentCarrierCertificate: issued.parentCarrierCertificate,
+            parentGenesisCertificate: issued.parentGenesisCertificate
+        )
+        let attachment = try ChildEvidenceVolume(
+            envelopeBytes: try ChildValidationPackageEnvelope(
+                package.package,
+                parentCarrierCertificate: package.parentCarrierCertificate,
+                parentGenesisCertificate: package.parentGenesisCertificate
+            ).encode(),
+            childCID: fixture.childCID
+        )
+        let storedSecondIssued = try await parent.issuedChildEvidence(
+            childCID: fixture.childCID,
+            directory: "Child",
+            rootCID: fixture.second.rootCID
+        )
+        let secondIssued = try XCTUnwrap(storedSecondIssued)
+        let secondPackage = AuthenticatedChildPackage(
+            package: ChildValidationPackage(
+                proof: secondIssued.proof,
+                parentCarrierLink: secondIssued.parentCarrierLink,
+                parentGenesisLink: secondIssued.parentGenesisLink
+            ),
+            parentCarrierCertificate: secondIssued.parentCarrierCertificate,
+            parentGenesisCertificate: secondIssued.parentGenesisCertificate
+        )
+        let secondAttachment = try ChildEvidenceVolume(
+            envelopeBytes: try ChildValidationPackageEnvelope(
+                secondPackage.package,
+                parentCarrierCertificate:
+                    secondPackage.parentCarrierCertificate,
+                parentGenesisCertificate:
+                    secondPackage.parentGenesisCertificate
+            ).encode(),
+            childCID: fixture.childCID
+        )
+        let childPath = directory.appendingPathComponent("child.db")
+        var child: NodeStore? = try makeStore(
+            path: childPath,
+            chainPath: ["Nexus", "Child"],
+            spawningParentKey: parentIdentity.processPublicKey,
+            broker: childBroker
+        )
+        try await child!.storeParentEvidenceInbox(
+            sourceID: scan.sourceID,
+            ordinal: summary.ordinal,
+            attachment: attachment,
+            package: package,
+            advanceScan: false
+        )
+        let liveCursor = try await child!.parentEvidenceScanCursor()
+        XCTAssertEqual(
+            liveCursor,
+            ParentEvidenceScanCursor(sourceID: nil, ordinal: 0)
+        )
+        try await child!.storeParentEvidenceInbox(
+            sourceID: scan.sourceID,
+            ordinal: summary.ordinal,
+            attachment: attachment,
+            package: package,
+            advanceScan: true
+        )
+        let scannedCursor = try await child!.parentEvidenceScanCursor()
+        XCTAssertEqual(
+            scannedCursor,
+            ParentEvidenceScanCursor(
+                sourceID: scan.sourceID,
+                ordinal: summary.ordinal
+            )
+        )
+
+        child = nil
+        child = try makeStore(
+            path: childPath,
+            chainPath: ["Nexus", "Child"],
+            spawningParentKey: parentIdentity.processPublicKey,
+            broker: childBroker
+        )
+        let recoveredInbox = try await child!.parentEvidenceInbox()
+        XCTAssertEqual(recoveredInbox.count, 1)
+        let retainedBeforeAdmission = try await childBroker.retainedRoots(
+            scope: "parent-evidence-inbox"
+        )
+        XCTAssertEqual(
+            retainedBeforeAdmission,
+            [attachment.rawCID]
+        )
+
+        try await child!.stage(
+            blockBatch(
+                postStateCID: inheritedWorkCID("child-post-state"),
+                blockHash: fixture.childCID
+            ),
+            volumeRoots: [],
+            incomingCarrierEvidence: AdmissionCarrierEvidence(
+                proof: package.package.proof,
+                childCID: fixture.childCID,
+                isChildGenesis: true,
+                parentCarrierLink: package.package.parentCarrierLink,
+                parentGenesisLink: package.package.parentGenesisLink,
+                parentCarrierCertificate: package.parentCarrierCertificate,
+                parentGenesisCertificate: package.parentGenesisCertificate
+            )
+        )
+        let admittedInbox = try await child!.parentEvidenceInbox()
+        XCTAssertTrue(admittedInbox.isEmpty)
+        let retainedAfterAdmission = try await childBroker.retainedRoots(
+            scope: "parent-evidence-inbox"
+        )
+        XCTAssertTrue(retainedAfterAdmission.isEmpty)
+        let admittedVolume = await childBroker.fetchVolumeLocal(
+            root: attachment.rawCID
+        )
+        XCTAssertNotNil(admittedVolume)
+
+        let rebuiltParentSourceID =
+            "00000000-0000-4000-8000-000000000002"
+        try await child!.storeParentEvidenceInbox(
+            sourceID: rebuiltParentSourceID,
+            ordinal: summary.ordinal,
+            attachment: attachment,
+            package: package,
+            advanceScan: true
+        )
+        let rebuiltParentCursor =
+            try await child!.parentEvidenceScanCursor()
+        XCTAssertEqual(
+            rebuiltParentCursor,
+            ParentEvidenceScanCursor(
+                sourceID: rebuiltParentSourceID,
+                ordinal: summary.ordinal
+            )
+        )
+        let replayedInbox = try await child!.parentEvidenceInbox()
+        XCTAssertTrue(replayedInbox.isEmpty)
+        let replayedInboxRoots = try await childBroker.retainedRoots(
+            scope: "parent-evidence-inbox"
+        )
+        XCTAssertTrue(replayedInboxRoots.isEmpty)
+
+        try await child!.storeParentEvidenceInbox(
+            sourceID: rebuiltParentSourceID,
+            ordinal: advancedScan.throughOrdinal,
+            attachment: secondAttachment,
+            package: secondPackage,
+            advanceScan: true
+        )
+        let pendingSecondInbox = try await child!.parentEvidenceInbox()
+        let retainedSecondInbox = try await childBroker.retainedRoots(
+            scope: "parent-evidence-inbox"
+        )
+        XCTAssertEqual(pendingSecondInbox.count, 1)
+        XCTAssertEqual(
+            retainedSecondInbox,
+            [secondAttachment.rawCID]
+        )
+
+        let childCarrierLink = try decode(ParentCarrierLink.self, json: """
+            {"parentPath":["Nexus","Child"],"carrierCID":"\(fixture.childCID)","rootCID":"\(fixture.second.rootCID)"}
+            """)
+        try await child!.persistIssuedHierarchyArtifacts(
+            AdmissionHierarchyArtifacts(
+                carrierLink: childCarrierLink,
+                carrierEvidence: AdmissionCarrierEvidence(
+                    proof: secondPackage.package.proof,
+                    childCID: fixture.childCID,
+                    isChildGenesis: true,
+                    parentCarrierLink:
+                        secondPackage.package.parentCarrierLink,
+                    parentGenesisLink:
+                        secondPackage.package.parentGenesisLink,
+                    parentCarrierCertificate:
+                        secondPackage.parentCarrierCertificate,
+                    parentGenesisCertificate:
+                        secondPackage.parentGenesisCertificate
+                ),
+                parentGenesisLinks: []
+            )
+        )
+
+        let issuedSecondInbox = try await child!.parentEvidenceInbox()
+        let retainedIssuedSecondInbox = try await childBroker.retainedRoots(
+            scope: "parent-evidence-inbox"
+        )
+        let incomingSecondEvidence =
+            try await child!.incomingCarrierEvidence(
+                childCID: fixture.childCID,
+                directory: "Child",
+                rootCID: fixture.second.rootCID
+            )
+        let retainedSecondVolume = await childBroker.fetchVolumeLocal(
+            root: secondAttachment.rawCID
+        )
+        XCTAssertTrue(issuedSecondInbox.isEmpty)
+        XCTAssertTrue(retainedIssuedSecondInbox.isEmpty)
+        XCTAssertEqual(
+            incomingSecondEvidence?.attachmentCID,
+            secondAttachment.rawCID
+        )
+        XCTAssertNotNil(retainedSecondVolume)
+    }
+
+    func testContextualCandidateProtectsPreparedDescendantProofAtCapacity()
+        async throws
+    {
+        let directory = temporaryDirectory()
+        let broker = try DiskBroker(
+            path: directory.appendingPathComponent("volumes.db").path
+        )
+        var store: NodeStore? = try makeStore(
+            path: directory.appendingPathComponent("state.db"),
+            broker: broker
+        )
+        let fixture = try await childProofFixture()
+        let first = try PreparedChildProof(
+            directory: "Child",
+            childCID: fixture.childCID,
+            isChildGenesis: true,
+            proof: fixture.first
+        )
+        let second = try PreparedChildProof(
+            directory: "Child",
+            childCID: fixture.childCID,
+            isChildGenesis: true,
+            proof: fixture.second
+        )
+        for volume in fixture.rootVolumes {
+            try await broker.store(volume: volume)
+        }
+
+        try await store!.persistContextualCandidateRoots(
+            candidateCID: fixture.first.rootCID,
+            roots: [fixture.first.rootCID],
+            capacity: 1
+        )
+        try await store!.persistPreparedChildProofs(
+            carrierCID: fixture.first.rootCID,
+            proofs: [first],
+            capacity: 1
+        )
+        try await store!.persistContextualCandidateRoots(
+            candidateCID: fixture.second.rootCID,
+            roots: [fixture.second.rootCID],
+            capacity: 1
+        )
+        try await store!.persistPreparedChildProofs(
+            carrierCID: fixture.second.rootCID,
+            proofs: [second],
+            capacity: 1
+        )
+        store = nil
+        store = try makeStore(
+            path: directory.appendingPathComponent("state.db"),
+            broker: broker
+        )
+        let evicted = try await store!.preparedChildProofs(
+            carrierCID: fixture.first.rootCID
+        )
+        XCTAssertTrue(evicted.isEmpty)
+        let retained = try await store!.preparedChildProofs(
+            carrierCID: fixture.second.rootCID
+        )
+        XCTAssertEqual(retained.map(\.directory), ["Child"])
+    }
+
+    func testAcceptedPendingCarrierProtectsPreparedProofAtCapacity()
+        async throws
+    {
+        let directory = temporaryDirectory()
+        let broker = try DiskBroker(
+            path: directory.appendingPathComponent("volumes.db").path
+        )
+        let path = directory.appendingPathComponent("state.db")
+        var store: NodeStore? = try makeStore(path: path, broker: broker)
+        let candidate = try await childProofFixture(childTimestamp: 1)
+        let admitted = try await childProofFixture(childTimestamp: 10)
+        for volume in candidate.rootVolumes + admitted.rootVolumes
+            + [candidate.childVolume, admitted.childVolume] {
+            try await broker.store(volume: volume)
+        }
+
+        try await store!.persistPreparedChildProofs(
+            carrierCID: candidate.first.rootCID,
+            proofs: [try PreparedChildProof(
+                directory: "Child",
+                childCID: candidate.childCID,
+                isChildGenesis: true,
+                bootstrapRoots: [candidate.childCID],
+                proof: candidate.first
+            )],
+            capacity: 1
+        )
+        try await store!.persistContextualCandidateRoots(
+            candidateCID: candidate.first.rootCID,
+            roots: [candidate.first.rootCID],
+            capacity: 1
+        )
+
+        try await store!.stage(
+            blockBatch(
+                postStateCID: "admitted-state",
+                blockHash: admitted.first.rootCID
+            ),
+            volumeRoots: [admitted.first.rootCID],
+            pendingChildProofRoutes: [PendingChildProofRoute(
+                carrierCID: admitted.first.rootCID,
+                directory: "Child"
+            )]
+        )
+        try await store!.persistPreparedChildProofs(
+            carrierCID: admitted.first.rootCID,
+            proofs: [try PreparedChildProof(
+                directory: "Child",
+                childCID: admitted.childCID,
+                isChildGenesis: true,
+                bootstrapRoots: [admitted.childCID],
+                proof: admitted.first
+            )],
+            capacity: 1
+        )
+
+        store = nil
+        store = try makeStore(path: path, broker: broker)
+        let candidateProofs = try await store!.preparedChildProofs(
+            carrierCID: candidate.first.rootCID
+        )
+        let admittedProofs = try await store!.preparedChildProofs(
+            carrierCID: admitted.first.rootCID
+        )
+        XCTAssertEqual(candidateProofs.map(\.directory), ["Child"])
+        XCTAssertEqual(admittedProofs.map(\.directory), ["Child"])
+        XCTAssertEqual(admittedProofs.first?.bootstrapRoots, [admitted.childCID])
+
+        _ = try await broker.evictUnpinned(graceSeconds: 0)
+        let admittedChild = await broker.fetchVolumeLocal(
+            root: admitted.childCID
+        )
+        XCTAssertNotNil(admittedChild)
+    }
+
     private func makeStore(
         path: URL? = nil,
         genesisCID: String? = nil,
         chainPath: [String] = ["Nexus"],
-        minimumRootWork: UInt256 = UInt256(1),
         spawningParentKey: String? = nil,
-        issuingAuthorityKey: String? = nil
+        issuingAuthorityKey: String? = nil,
+        broker suppliedBroker: (any RetainedRootMergeBroker)? = nil
     ) throws -> NodeStore {
         let path = path ?? temporaryDirectory().appendingPathComponent("state.db")
-        let broker = try DiskBroker(
-            path: path.deletingLastPathComponent()
-                .appendingPathComponent("volumes.db").path
-        )
+        let broker: any RetainedRootMergeBroker
+        if let suppliedBroker {
+            broker = suppliedBroker
+        } else {
+            broker = try DiskBroker(
+                path: path.deletingLastPathComponent()
+                    .appendingPathComponent("volumes.db").path
+            )
+        }
         let issuer = try NodeConfiguration(
             chainPath: ["Nexus"],
             minimumRootWork: UInt256(1),
@@ -1792,21 +2961,23 @@ final class NodeStoreTests: XCTestCase {
             databasePath: path,
             nexusGenesisCID: genesisCID ?? self.genesisCID,
             chainPath: chainPath,
-            minimumRootWork: minimumRootWork,
             spawningParentKey: spawningParentKey ?? (chainPath.count == 1
                 ? ""
-                : String(repeating: "a", count: ParentWorkAuthorityKey.encodedByteCount)),
+                : String(repeating: "a", count: ParentProcessKey.encodedByteCount)),
             issuingAuthorityKey: issuingAuthorityKey ?? issuer.processPublicKey,
-            recoveryVolumeStorer: BrokerStorer(broker: broker),
-            recoveryVolumeBroker: broker
+            recoveryVolumeBroker: broker,
+            issuedRecoveryRetentionScope: "test:issued-hierarchy",
+            preparedRecoveryRetentionScope: "test:prepared-hierarchy",
+            contextualCandidateOwner: "test:contextual-candidates"
         )
     }
 
     private func persistIssuedChildProof(
         in store: NodeStore,
         _ proof: ChildBlockProof,
-        child: Block,
-        acquisitionEntries: [String: Data],
+        childCID: String,
+        isChildGenesis: Bool = true,
+        bootstrapRoots: [String]? = nil,
         parentCarrierCID: String? = nil
     ) async throws {
         let chainPath = ["Nexus"] + Array(proof.directoryPath.dropLast())
@@ -1836,9 +3007,8 @@ final class NodeStoreTests: XCTestCase {
         let carrierLink = try decode(ParentCarrierLink.self, json: """
             {"parentPath":\(pathJSON),"carrierCID":"\(edge.parentCarrierCID)","rootCID":"\(proof.rootCID)"}
             """)
-        let childCID = try BlockHeader(node: child).rawCID
         let genesisLink: ParentGenesisLink?
-        if child.parent == nil {
+        if isChildGenesis {
             genesisLink = try decode(ParentGenesisLink.self, json: """
                 {"parentPath":\(pathJSON),"directory":"\(edge.directory)","childGenesisCID":"\(childCID)"}
                 """)
@@ -1855,11 +3025,12 @@ final class NodeStoreTests: XCTestCase {
         )
         try await store.persistIssuedChildProof(
             proof,
-            child: child,
-            acquisitionEntries: acquisitionEntries,
+            childCID: childCID,
+            isChildGenesis: isChildGenesis,
+            bootstrapRoots: bootstrapRoots ?? [],
             parentCarrierCID: parentCarrierCID,
             rootEnvelope: envelope,
-            rootAuthorityKey: try XCTUnwrap(ParentWorkAuthorityKey(
+            rootAuthorityKey: try XCTUnwrap(ParentProcessKey(
                 configuration.processPublicKey
             ))
         )
@@ -1904,25 +3075,35 @@ final class NodeStoreTests: XCTestCase {
         try JSONDecoder().decode(type, from: Data(json.utf8))
     }
 
-    private func childProofFixture() async throws -> (
-        child: Block,
+    private func childProofFixture(
+        childTimestamp: Int64 = 1
+    ) async throws -> (
         childCID: String,
+        childVolume: SerializedVolume,
         first: ChildBlockProof,
         second: ChildBlockProof,
-        acquisitionEntries: [String: Data]
+        rootVolumes: [SerializedVolume]
     ) {
         let content = TestContentStore()
         try await LatticeState.emptyHeader.storeRecursively(storer: content)
         let child = try await BlockBuilder.buildChildGenesis(
             spec: NexusGenesis.spec,
             parentState: LatticeState.emptyHeader,
-            timestamp: 1,
+            timestamp: childTimestamp,
             target: UInt256.max,
             fetcher: content
         )
-        let childCID = try BlockHeader(node: child).rawCID
+        let childHeader = try BlockHeader(node: child)
+        let childCID = childHeader.rawCID
+        try await childHeader.store(storer: content)
+        let storedChildVolume = await content.volume(root: childCID)
+        let childVolume = try XCTUnwrap(storedChildVolume)
         var proofs: [ChildBlockProof] = []
-        for (timestamp, nonce) in [(Int64(2), UInt64(1)), (Int64(3), UInt64(2))] {
+        var rootVolumes: [SerializedVolume] = []
+        for (timestamp, nonce) in [
+            (childTimestamp + 1, UInt64(1)),
+            (childTimestamp + 2, UInt64(2)),
+        ] {
             let root = try await BlockBuilder.buildGenesis(
                 spec: NexusGenesis.spec,
                 children: ["Child": child],
@@ -1933,6 +3114,9 @@ final class NodeStoreTests: XCTestCase {
             )
             let rootHeader = try BlockHeader(node: root)
             try await rootHeader.storeRecursively(storer: content as any Storer)
+            try await VolumeImpl<Block>(node: root).store(storer: content)
+            let rootVolume = await content.volume(root: rootHeader.rawCID)
+            rootVolumes.append(try XCTUnwrap(rootVolume))
             proofs.append(try await ChildBlockProof.generate(
                 rootHeader: rootHeader,
                 childDirectory: "Child",
@@ -1940,35 +3124,12 @@ final class NodeStoreTests: XCTestCase {
             ))
         }
         return (
-            child,
             childCID,
+            childVolume,
             proofs[0],
             proofs[1],
-            try await acquisitionEntries(for: child, fetcher: content)
+            rootVolumes
         )
-    }
-
-    private func acquisitionEntries(
-        for block: Block,
-        fetcher: any Fetcher
-    ) async throws -> [String: Data] {
-        let collector = TestContentStore()
-        try await BlockHeader(node: block).storeBlock(
-            fetcher: fetcher,
-            storer: collector
-        )
-        return await collector.allEntries()
-    }
-
-    private func replacingRoot(
-        _ entries: [String: Data],
-        oldCID: String,
-        with block: Block
-    ) throws -> [String: Data] {
-        var entries = entries
-        entries.removeValue(forKey: oldCID)
-        entries[try BlockHeader(node: block).rawCID] = try XCTUnwrap(block.toData())
-        return entries
     }
 }
 
@@ -1986,6 +3147,7 @@ private actor RecordingVolumeStorer: VolumeStorer {
 
 private actor TestContentStore: Fetcher, Storer, VolumeStorer {
     private var entries: [String: Data] = [:]
+    private var volumes: [String: SerializedVolume] = [:]
 
     func fetch(rawCid: String) throws -> Data {
         guard let data = entries[rawCid] else { throw FetcherError.notFound(rawCid) }
@@ -1998,9 +3160,99 @@ private actor TestContentStore: Fetcher, Storer, VolumeStorer {
 
     func store(volume: SerializedVolume) {
         entries.merge(volume.entries) { existing, _ in existing }
+        volumes[volume.root] = volume
     }
 
     func allEntries() -> [String: Data] { entries }
+    func volume(root: String) -> SerializedVolume? { volumes[root] }
+}
+
+private actor BlockingVolumeBroker: RetainedRootMergeBroker {
+    nonisolated let near: (any VolumeBroker)? = nil
+    nonisolated let far: (any VolumeBroker)? = nil
+
+    private let broker: DiskBroker
+    private var stores = 0
+    private var enteredWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseContinuation: CheckedContinuation<Void, Never>?
+
+    init(broker: DiskBroker) {
+        self.broker = broker
+    }
+
+    func hasVolume(root: String) async -> Bool {
+        await broker.hasVolume(root: root)
+    }
+
+    func fetchVolumeLocal(root: String) async -> SerializedVolume? {
+        await broker.fetchVolumeLocal(root: root)
+    }
+
+    func storeVolumesLocal(_ volumes: [SerializedVolume]) async throws {
+        let shouldBlock = stores == 0 && !volumes.isEmpty
+        stores += volumes.count
+        if shouldBlock {
+            enteredWaiters.forEach { $0.resume() }
+            enteredWaiters.removeAll()
+            await withCheckedContinuation { continuation in
+                releaseContinuation = continuation
+            }
+        }
+        try await broker.storeVolumesLocal(volumes)
+    }
+
+    func pin(
+        root: String,
+        owner: String,
+        count: Int,
+        ttl: Duration?
+    ) async throws {
+        try await broker.pin(root: root, owner: owner, count: count, ttl: ttl)
+    }
+
+    func unpin(root: String, owner: String, count: Int) async throws {
+        try await broker.unpin(root: root, owner: owner, count: count)
+    }
+
+    func unpinAll(owner: String) async throws {
+        try await broker.unpinAll(owner: owner)
+    }
+
+    func owners(root: String) async -> Set<String> {
+        await broker.owners(root: root)
+    }
+
+    func evictUnpinned() async throws -> Int {
+        try await broker.evictUnpinned()
+    }
+
+    func advanceRetainedRoots(scope: String, roots: [String]) async throws {
+        try await broker.advanceRetainedRoots(scope: scope, roots: roots)
+    }
+
+    func retainedRoots(scope: String) async throws -> [String] {
+        try await broker.retainedRoots(scope: scope)
+    }
+
+    func mergeRetainedRoots(scope: String, roots: [String]) async throws {
+        try await broker.mergeRetainedRoots(scope: scope, roots: roots)
+    }
+
+    func waitUntilFirstStore() async {
+        guard stores == 0 else { return }
+        await withCheckedContinuation { continuation in
+            enteredWaiters.append(continuation)
+        }
+    }
+
+    func releaseFirstStore() {
+        releaseContinuation?.resume()
+        releaseContinuation = nil
+    }
+
+    func storeCount() -> Int {
+        stores
+    }
 }
 
 private func XCTAssertThrowsErrorAsync<T>(

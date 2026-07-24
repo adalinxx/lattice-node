@@ -6,32 +6,27 @@ public enum ChainHelloError: Error, Equatable, Sendable {
     case incompatibleProtocol
     case wrongNexusGenesis
     case wrongChainPath
-    case wrongMinimumRootWork
 }
 
 /// Authenticated application handshake for both the same-chain overlay and a
 /// pinned parent link. Synchronization state is advertised separately because
 /// competing roots on one child path remain ordinary fork-choice candidates.
 public struct ChainHello: Codable, Equatable, Sendable {
-    /// Version 2 makes an ordered empty inherited-work snapshot the live
-    /// parent's session-completion marker.
-    public static let protocolVersion: UInt16 = 2
+    /// Version 4 removes node-local policy from peer compatibility.
+    public static let protocolVersion: UInt16 = 4
     public static let maximumEncodedSize = 64 * 1024
 
     public let version: UInt16
     public let nexusGenesisCID: String
     public let chainPath: [String]
-    public let minimumRootWorkHex: String
 
     public init(
         nexusGenesisCID: String,
-        chainPath: [String],
-        minimumRootWorkHex: String
+        chainPath: [String]
     ) {
         version = Self.protocolVersion
         self.nexusGenesisCID = nexusGenesisCID
         self.chainPath = chainPath
-        self.minimumRootWorkHex = minimumRootWorkHex
     }
 
     public func encode() throws -> Data {
@@ -59,8 +54,7 @@ public struct ChainHello: Codable, Equatable, Sendable {
     /// authority.
     public func validateCompatibility(
         expectedNexusGenesisCID: String,
-        expectedChainPath: [String],
-        expectedMinimumRootWorkHex: String
+        expectedChainPath: [String]
     ) throws {
         try validateShape()
         guard version == Self.protocolVersion else {
@@ -72,15 +66,11 @@ public struct ChainHello: Codable, Equatable, Sendable {
         guard chainPath == expectedChainPath else {
             throw ChainHelloError.wrongChainPath
         }
-        guard minimumRootWorkHex == expectedMinimumRootWorkHex else {
-            throw ChainHelloError.wrongMinimumRootWork
-        }
     }
 
     private func validateShape() throws {
         guard _isBoundedWireAtom(nexusGenesisCID),
-              _isAbsoluteChainPath(chainPath),
-              _isCanonicalWorkHex(minimumRootWorkHex) else {
+              _isAbsoluteChainPath(chainPath) else {
             throw ChainHelloError.malformed
         }
     }
@@ -94,14 +84,6 @@ func _isBoundedWireAtom(_ value: String, maximumBytes: Int = 128) -> Bool {
     let bytes = value.utf8
     return !bytes.isEmpty && bytes.count <= maximumBytes
         && bytes.allSatisfy { (0x21...0x7e).contains($0) }
-}
-
-private func _isCanonicalWorkHex(_ value: String) -> Bool {
-    value.utf8.count == 64
-        && value != String(repeating: "0", count: 64)
-        && value.utf8.allSatisfy {
-            (0x30...0x39).contains($0) || (0x61...0x66).contains($0)
-        }
 }
 
 func _canonicalJSONEncode<T: Encodable>(_ value: T) throws -> Data {

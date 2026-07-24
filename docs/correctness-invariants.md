@@ -33,11 +33,33 @@ Peer-facing content requests name one complete Volume root. Entry-level CIDs
 are internal resolution details, and no Volume becomes locally visible until
 its exact membership and CID bytes validate.
 
+A complete Volume may span several bounded Ivy frames. Chunks from different
+requests, authenticated sessions, or runtime generations never combine, and
+partial assembly is never application-visible.
+
 ## NODE-STORAGE-002 — a durable fact never outruns its content
 
 Live publication orders complete Volume storage, merge retention, then the
-SQLite semantic reference. Exact retained-set reconciliation and garbage
-collection run only while publication is quiescent.
+SQLite semantic reference. Admission and issued-hierarchy retention grow
+merge-only while live. Prepared proof eviction serializes its store, SQLite
+capacity mutation, and exact retained-set advance through one gate. Contextual
+child offers use a separate durable bounded LRU: new roots are pinned before
+the index changes and offer eviction never touches issued ownership. An exact,
+authenticated parent snapshot recursively reserves descendants and atomically
+replaces the issued set before acknowledgement; parent work is not visible
+before that acknowledgement. Removal acknowledgements never gate parent
+progress. A prior authenticated parent proof first promotes the candidate into
+a durable admission handoff; admission then transfers the roots before that
+handoff is released. Failed or idle cleanup can safely over-retain until an
+exact snapshot or startup rebuild reconciles ownership before garbage
+collection. Canonicity never changes retention or validity; accepted, shared,
+and independently retained roots remain owned.
+
+The bounded in-memory child-intent set has its own exact VolumeBroker scope.
+An intent becomes visible only after its complete content-bound closure is
+stored and retained; replacement, anchoring, and staleness release roots only
+after the remaining exact set is installed. Restart clears this scope because
+child intents are not consensus recovery facts.
 
 ## NODE-MEMPOOL-001 — the mempool is tip-relative, not consensus
 

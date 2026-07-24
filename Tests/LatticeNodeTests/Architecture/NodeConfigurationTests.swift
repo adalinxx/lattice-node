@@ -5,31 +5,30 @@ import XCTest
 @testable import LatticeNode
 
 final class NodeConfigurationTests: XCTestCase {
-    func testChainAddressUsesWireSizedUnicodeComponents() throws {
-        let address = try XCTUnwrap(ChainAddress(["Nexus", "日本語-☃"]))
+    func testChainAddressUsesConsensusDirectoryGrammar() throws {
+        let address = try XCTUnwrap(ChainAddress(["Nexus", "Payments-1"]))
         XCTAssertNoThrow(try ChainHello(
             nexusGenesisCID: NexusGenesis.expectedBlockHash,
-            chainPath: address.components,
-            minimumRootWorkHex: String(repeating: "0", count: 63) + "1"
+            chainPath: address.components
         ).encode())
 
         XCTAssertNil(ChainAddress([
             "Nexus",
-            String(repeating: "x", count: ChainAddress.maximumComponentBytes + 1),
+            String(repeating: "x", count: 65),
         ]))
-        XCTAssertNotNil(ChainAddress(["Nexus", "line\nbreak"]))
+        XCTAssertNil(ChainAddress(["Nexus", "日本語-☃"]))
+        XCTAssertNil(ChainAddress(["Nexus", "line\nbreak"]))
         XCTAssertNil(ChainAddress(["Nexus", "has/slash"]))
         XCTAssertNil(ChainAddress(["Payments"]))
         XCTAssertThrowsError(try ChainHello(
             nexusGenesisCID: NexusGenesis.expectedBlockHash,
-            chainPath: ["Payments"],
-            minimumRootWorkHex: String(repeating: "0", count: 63) + "1"
+            chainPath: ["Payments"]
         ).encode())
     }
 
     func testConfigurationRejectsPathWhoseCanonicalHandshakeIsOversized() throws {
-        let escapedControl = String(repeating: "\u{0001}", count: 64)
-        let path = ["Nexus"] + Array(repeating: escapedControl, count: 256)
+        let component = String(repeating: "x", count: 64)
+        let path = ["Nexus"] + Array(repeating: component, count: 1_100)
         XCTAssertNotNil(ChainAddress(path))
 
         XCTAssertThrowsError(try NodeConfiguration(
@@ -64,6 +63,18 @@ final class NodeConfigurationTests: XCTestCase {
         )) { error in
             XCTAssertEqual(error as? NodeConfigurationError, .invalidPorts)
         }
+    }
+
+    func testZeroMinimumRootWorkIsValidLocalPolicy() throws {
+        let key = Curve25519.Signing.PrivateKey()
+        XCTAssertNoThrow(try NodeConfiguration(
+            chainPath: ["Nexus"],
+            minimumRootWork: .zero,
+            storagePath: FileManager.default.temporaryDirectory,
+            privateKeyHex: key.rawRepresentation.map {
+                String(format: "%02x", $0)
+            }.joined()
+        ))
     }
 
     func testSigningKeyRecreatesConfiguredIdentity() throws {

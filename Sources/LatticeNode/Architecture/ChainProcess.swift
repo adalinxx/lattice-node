@@ -3,10 +3,6 @@ import Lattice
 import VolumeBroker
 import cashew
 
-enum AdmissionAcquisitionScope {
-    @TaskLocal static var exactSource: (any ContentSource)?
-}
-
 public enum ChainProcessError: Error, Equatable, Sendable {
     case invalidStoragePath
     case storageInUse
@@ -14,11 +10,10 @@ public enum ChainProcessError: Error, Equatable, Sendable {
     case invalidNexusGenesis
     case missingMaterializedVolume(String)
     case nexusHasNoInheritedWork
-    case parentWorkAuthorityMismatch
     case chainNotBootstrapped
     case unresolvedCanonicalTip(String)
     case malformedAuthenticatedChildProof
-    case acquisitionPackageTooLarge
+    case consensusRevisionExhausted
 }
 
 public enum ChainProcessPhase: String, Sendable {
@@ -106,65 +101,7 @@ typealias CanonicalCommitPublisher = @Sendable (ChainCommit) async
 struct DurableDirectChildProof: Sendable {
     let directory: String
     let childCID: String
-    let childBlock: Block
     let proof: ChildBlockProof
-    let acquisitionEntries: [String: Data]
-}
-
-private actor BoundedContentCollector: VolumeStorer {
-    private let maximumBytes: Int
-    private var byteCount = 0
-    private var values: [String: Data] = [:]
-
-    init(maximumBytes: Int) {
-        self.maximumBytes = maximumBytes
-    }
-
-    func store(volume: SerializedVolume) throws {
-        try store(entries: volume.entries)
-    }
-
-    private func store(entries: [String: Data]) throws {
-        for (cid, data) in entries {
-            if let existing = values[cid] {
-                guard existing == data else {
-                    throw ChainProcessError.malformedAuthenticatedChildProof
-                }
-                continue
-            }
-            let framedBytes = 6 + cid.utf8.count + data.count
-            let next = byteCount.addingReportingOverflow(framedBytes)
-            guard !next.overflow, next.partialValue <= maximumBytes else {
-                throw ChainProcessError.acquisitionPackageTooLarge
-            }
-            values[cid] = data
-            byteCount = next.partialValue
-        }
-    }
-
-    func entries() -> [String: Data] {
-        values
-    }
-}
-
-/// Stores a complete Volume before making its root live in this process's
-/// retention set. Live retention is merge-only; startup is the sole exact
-/// reconciliation point.
-private final class RetainingVolumeStorer: VolumeStorer {
-    private let volumes: any VolumeStorer
-    private let broker: DiskBroker
-    private let scope: String
-
-    init(volumes: any VolumeStorer, broker: DiskBroker, scope: String) {
-        self.volumes = volumes
-        self.broker = broker
-        self.scope = scope
-    }
-
-    func store(volume: SerializedVolume) async throws {
-        try await volumes.store(volume: volume)
-        try await broker.mergeRetainedRoots(scope: scope, roots: [volume.root])
-    }
 }
 
 struct DurableLocalTransaction: Sendable {
@@ -176,7 +113,7 @@ struct DurableLocalTransaction: Sendable {
 /// One process owns one absolute chain path. Child processes have an explicit
 /// pre-genesis phase so target-miss carriers can relay deeper accepted work
 /// without inventing local chain state.
-public actor ChainProcess: Fetcher, VolumeStorer {
+public actor ChainProcess: ContentSource, Fetcher, VolumeStorer {
     private enum RuntimePhase: Sendable {
         case awaitingGenesis
         case active(ChainLevel)
@@ -195,15 +132,11 @@ public actor ChainProcess: Fetcher, VolumeStorer {
 
     private let store: NodeStore
     private let broker: DiskBroker
-    private let brokerStorer: BrokerStorer
-    private let localSource: any ContentSource
     private let localFetcher: CoalescingFetcher
-    /// Immutable local-plus-remote source. Every network acquisition wraps it
-    /// in a fresh coalescer so Ivy's root trace cannot cross candidates.
-    private let acquisitionSource: any ContentSource
     private let retentionScope: String
     private let durableMempoolOwner: String
     private let liveMempoolOwner: String
+    private let childIntentRetentionScope: String
     private let directoryLock: StorageDirectoryLock
     private var runtimePhase: RuntimePhase
     private var livePinnedMempoolRoots = Set<String>()
@@ -225,26 +158,22 @@ public actor ChainProcess: Fetcher, VolumeStorer {
         configuration: NodeConfiguration,
         store: NodeStore,
         broker: DiskBroker,
-        brokerStorer: BrokerStorer,
-        localSource: any ContentSource,
         localFetcher: CoalescingFetcher,
-        acquisitionSource: any ContentSource,
         retentionScope: String,
         durableMempoolOwner: String,
         liveMempoolOwner: String,
+        childIntentRetentionScope: String,
         directoryLock: StorageDirectoryLock,
         runtimePhase: RuntimePhase
     ) {
         self.configuration = configuration
         self.store = store
         self.broker = broker
-        self.brokerStorer = brokerStorer
-        self.localSource = localSource
         self.localFetcher = localFetcher
-        self.acquisitionSource = acquisitionSource
         self.retentionScope = retentionScope
         self.durableMempoolOwner = durableMempoolOwner
         self.liveMempoolOwner = liveMempoolOwner
+        self.childIntentRetentionScope = childIntentRetentionScope
         self.directoryLock = directoryLock
         self.runtimePhase = runtimePhase
     }
@@ -252,8 +181,7 @@ public actor ChainProcess: Fetcher, VolumeStorer {
     /// Completes store validation, retained-root reconciliation, and recovery
     /// before returning a process that networking may expose.
     public static func open(
-        configuration: NodeConfiguration,
-        remoteSource: (any ContentSource)? = nil
+        configuration: NodeConfiguration
     ) async throws -> ChainProcess {
         guard configuration.storagePath.isFileURL else {
             throw ChainProcessError.invalidStoragePath
@@ -274,39 +202,37 @@ public actor ChainProcess: Fetcher, VolumeStorer {
         let broker = try DiskBroker(
             path: configuration.storagePath.appendingPathComponent("volumes.db").path
         )
-        let brokerStorer = BrokerStorer(broker: broker)
-        let brokerFetcher = BrokerFetcher(broker: broker)
-        let localSource: any ContentSource = brokerFetcher
-        let localFetcher = CoalescingFetcher(localSource)
-        var sources: [any ContentSource] = [brokerFetcher]
-        if let remoteSource { sources.append(remoteSource) }
-        let acquisitionSource = CompositeContentSource(sources)
+        let localFetcher = CoalescingFetcher(broker)
         let retentionScope = [
             configuration.nexusGenesisCID,
             configuration.address.key,
         ].joined(separator: ":")
         let legacyMempoolRetentionScope = retentionScope + ":mempool"
+        let issuedHierarchyRetentionScope = retentionScope + ":issued-hierarchy"
+        let preparedHierarchyRetentionScope = retentionScope + ":prepared-hierarchy"
+        let parentEvidenceInboxRetentionScope =
+            retentionScope + ":parent-evidence-inbox"
         let durableMempoolOwner = retentionScope + ":durable-mempool"
         let liveMempoolOwner = retentionScope + ":live-mempool"
-        let recoveryVolumeStorer = RetainingVolumeStorer(
-            volumes: brokerStorer,
-            broker: broker,
-            scope: retentionScope
-        )
+        let contextualCandidateOwner = retentionScope + ":contextual-candidates"
+        let childIntentRetentionScope = retentionScope + ":child-intents"
         let store = try NodeStore(
             databasePath: configuration.storagePath.appendingPathComponent("state.db"),
             nexusGenesisCID: configuration.nexusGenesisCID,
             chainPath: configuration.chainPath,
-            minimumRootWork: configuration.minimumRootWork,
             spawningParentKey: configuration.parentEndpoint?.publicKey ?? "",
             issuingAuthorityKey: configuration.processPublicKey,
-            recoveryVolumeStorer: recoveryVolumeStorer,
-            recoveryVolumeBroker: broker
+            recoveryVolumeBroker: broker,
+            issuedRecoveryRetentionScope: issuedHierarchyRetentionScope,
+            preparedRecoveryRetentionScope: preparedHierarchyRetentionScope,
+            parentEvidenceInboxRetentionScope:
+                parentEvidenceInboxRetentionScope,
+            contextualCandidateOwner: contextualCandidateOwner
         )
 
         // Protocol constants are ordinary Volumes and therefore ordinary GC
         // roots. Materialize them before the one exact startup reconciliation.
-        let constantStorage = NodeAdmissionStorage(storage: brokerStorer)
+        let constantStorage = NodeAdmissionStorage(storage: broker)
         try await LatticeState.emptyHeader.storeRecursively(
             storer: constantStorage as any VolumeStorer
         )
@@ -314,16 +240,46 @@ public actor ChainProcess: Fetcher, VolumeStorer {
 
         let staged = try await store.stagedAdmissions()
         try await store.auditNormalizedIndexes()
-        let retainedRoots = try await durableRetainedRoots(
+        try await store.pruneAdmittedContextualCandidates()
+        let retainedRoots = durableRetainedRoots(
             staged: staged,
-            store: store,
             additionalRoots: constantRoots
         )
-        for root in retainedRoots {
+        let issuedRecoveryRoots = try await store.issuedRecoveryVolumeRoots()
+        let preparedRecoveryRoots = try await store.preparedRecoveryVolumeRoots()
+        let parentEvidenceInboxRoots = try await store
+            .parentEvidenceInboxRoots()
+        let contextualCandidateRoots = try await store
+            .contextualCandidateVolumeRoots()
+        for root in Set(
+            retainedRoots + issuedRecoveryRoots + preparedRecoveryRoots
+                + parentEvidenceInboxRoots + contextualCandidateRoots
+        ) {
             guard await broker.fetchVolumeLocal(root: root) != nil else {
                 throw ChainProcessError.missingMaterializedVolume(root)
             }
         }
+        // Populate the new exact hierarchy scopes before removing their roots
+        // from the legacy admission scope.
+        try await broker.advanceRetainedRoots(
+            scope: issuedHierarchyRetentionScope,
+            roots: issuedRecoveryRoots
+        )
+        // Startup is quiescent under the storage-directory lock, so stale
+        // counts can be replaced before any local garbage-collection pass.
+        try await broker.unpinAll(owner: contextualCandidateOwner)
+        try await broker.pinBatch(
+            roots: contextualCandidateRoots,
+            owner: contextualCandidateOwner
+        )
+        try await broker.advanceRetainedRoots(
+            scope: preparedHierarchyRetentionScope,
+            roots: preparedRecoveryRoots
+        )
+        try await broker.advanceRetainedRoots(
+            scope: parentEvidenceInboxRetentionScope,
+            roots: parentEvidenceInboxRoots
+        )
         try await broker.advanceRetainedRoots(
             scope: retentionScope,
             roots: retainedRoots
@@ -334,7 +290,7 @@ public actor ChainProcess: Fetcher, VolumeStorer {
             guard await broker.fetchVolumeLocal(root: root) != nil,
                   let resolved = try? await VolumeImpl<Transaction>(
                     rawCID: root
-                  ).resolveRecursive(source: localSource),
+                  ).resolveRecursive(source: broker),
                   resolved.node != nil else {
                 throw ChainProcessError.missingMaterializedVolume(root)
             }
@@ -351,6 +307,10 @@ public actor ChainProcess: Fetcher, VolumeStorer {
         // The live pool is operational cache, not restart authority. Owner
         // pins support O(changes) updates and are cleared for each process.
         try await broker.unpinAll(owner: liveMempoolOwner)
+        try await broker.advanceRetainedRoots(
+            scope: childIntentRetentionScope,
+            roots: []
+        )
 
         // This is the one recovery-time materialization of the parent's durable
         // fact set. Live fragments merge directly into Core below; keeping a
@@ -367,7 +327,7 @@ public actor ChainProcess: Fetcher, VolumeStorer {
                     throw ChainProcessError.invalidNexusGenesis
                 }
                 let admissionStorage = NodeAdmissionStorage(
-                    storage: brokerStorer
+                    storage: broker
                 )
                 let bootstrapped = try await ChainLevel.bootstrap(
                     context: context,
@@ -375,7 +335,7 @@ public actor ChainProcess: Fetcher, VolumeStorer {
                     fetcher: localFetcher,
                     validationContentStorer: admissionStorage,
                     materializedVolumeStorer: admissionStorage,
-                    staging: { context in
+                    stage: { context in
                         let hierarchyArtifacts = context.issuedCarrierLink.map {
                             AdmissionHierarchyArtifacts(
                                 carrierLink: $0,
@@ -418,7 +378,8 @@ public actor ChainProcess: Fetcher, VolumeStorer {
             // projection is a derived cache and must not be able to add facts
             // or prevent a valid history from reopening.
             let chain = try await ChainState.restore(
-                replaying: batches
+                replaying: batches,
+                revisionFloor: try await store.consensusRevisionFloor()
             )
             if !configuration.address.isNexus,
                let initialParentWork {
@@ -431,7 +392,7 @@ public actor ChainProcess: Fetcher, VolumeStorer {
                     throw ChainProcessError.malformedAuthenticatedChildProof
                 }
                 if !inherited.isEmpty,
-                   await chain.mergeInheritedWork(inherited) == nil {
+                   !(await chain.restoreInheritedWork(inherited)) {
                     throw ChainProcessError.malformedAuthenticatedChildProof
                 }
             }
@@ -448,13 +409,11 @@ public actor ChainProcess: Fetcher, VolumeStorer {
             configuration: configuration,
             store: store,
             broker: broker,
-            brokerStorer: brokerStorer,
-            localSource: localSource,
             localFetcher: localFetcher,
-            acquisitionSource: acquisitionSource,
             retentionScope: retentionScope,
             durableMempoolOwner: durableMempoolOwner,
             liveMempoolOwner: liveMempoolOwner,
+            childIntentRetentionScope: childIntentRetentionScope,
             directoryLock: directoryLock,
             runtimePhase: runtimePhase
         )
@@ -465,7 +424,7 @@ public actor ChainProcess: Fetcher, VolumeStorer {
         authenticatedChildPackage suppliedAuthenticatedChildPackage:
             AuthenticatedChildPackage? = nil,
         preparingChildDirectories: [String] = [],
-        allowsRemoteAcquisition: Bool = false,
+        remoteSource: (any ContentSource)? = nil,
         canonicalCommitPublisher: CanonicalCommitPublisher? = nil
     ) async throws -> NodeAdmissionOutcome {
         let authenticatedChildPackage: AuthenticatedChildPackage?
@@ -485,25 +444,12 @@ public actor ChainProcess: Fetcher, VolumeStorer {
         )
 
         let package = authenticatedChildPackage?.package
-        let acquisitionEntries = authenticatedChildPackage?.acquisitionEntries ?? [:]
         let attemptFetcher = try Self.attemptFetcher(
             package: package,
-            acquisitionEntries: acquisitionEntries,
-            fallback: allowsRemoteAcquisition
-                ? AdmissionAcquisitionScope.exactSource.map {
-                    CompositeContentSource([localSource, $0])
-                } ?? acquisitionSource
-                : localSource
+            fallback: remoteSource.map {
+                CompositeContentSource([broker, $0])
+            } ?? broker
         )
-        // The child genesis CID commits its parent-work authority through the
-        // ChainSpec. It must name the same parent this process is configured to
-        // trust; the parent link deliberately carries no duplicate key.
-        if package?.parentGenesisLink != nil {
-            try await validateParentWorkAuthority(
-                blockHeader,
-                fetcher: attemptFetcher
-            )
-        }
         if case .active(let level) = runtimePhase {
             return try await admitActive(
                 blockHeader,
@@ -571,7 +517,7 @@ public actor ChainProcess: Fetcher, VolumeStorer {
                 )
             )
         }
-        let admissionStorage = NodeAdmissionStorage(storage: brokerStorer)
+        let admissionStorage = NodeAdmissionStorage(storage: broker)
         let carrierEvidence = try await Self.canonicalCarrierEvidence(
             blockHeader,
             authenticatedPackage: authenticatedChildPackage,
@@ -617,7 +563,7 @@ public actor ChainProcess: Fetcher, VolumeStorer {
             childPackage: package,
             validationContentStorer: admissionStorage,
             materializedVolumeStorer: admissionStorage,
-            staging: stage
+            stage: stage
         )
         let decision: NodeAdmissionDecision
         let link: ParentCarrierLink
@@ -641,11 +587,22 @@ public actor ChainProcess: Fetcher, VolumeStorer {
                     throw ChainProcessError.malformedAuthenticatedChildProof
                 }
                 if !inherited.isEmpty,
-                   await acceptance.level.chain.mergeInheritedWork(inherited) == nil {
-                    throw ChainProcessError.malformedAuthenticatedChildProof
+                   await acceptance.level.chain.acceptsInheritedWork(inherited) {
+                    let nextRevision = try Self.nextConsensusRevision(
+                        await acceptance.level.chain.currentRevision()
+                    )
+                    try await store.advanceConsensusRevisionFloor(nextRevision)
+                    guard await acceptance.level.chain.mergeInheritedWork(inherited) != nil else {
+                        throw ChainProcessError.malformedAuthenticatedChildProof
+                    }
                 }
             }
             runtimePhase = .active(acceptance.level)
+            // The admission batch now owns every materialized root. Candidate
+            // retention may release its overlapping reference without a GC gap.
+            _ = try? await store.removeContextualCandidateIfAdmitted(
+                candidateCID: blockHeader.rawCID
+            )
             let commit = acceptance.commit
             let receipt: CanonicalCommitReceipt?
             if let canonicalCommitPublisher {
@@ -655,15 +612,6 @@ public actor ChainProcess: Fetcher, VolumeStorer {
             }
             releaseOperation()
             operationHeld = false
-            _ = try? await promotePreparedChildProofs(
-                carrierCID: blockHeader.rawCID,
-                upstreamProof: package.proof
-            )
-            _ = try? await acquirePendingChildProofs(
-                carrier: blockHeader,
-                directories: directChildDirectories,
-                fetcher: attemptFetcher
-            )
             return NodeAdmissionOutcome(
                 decision: .canonicalized(commit),
                 parentCarrierLink: acceptance.parentCarrierLink,
@@ -689,11 +637,6 @@ public actor ChainProcess: Fetcher, VolumeStorer {
         )
         releaseOperation()
         operationHeld = false
-        _ = try? await acquirePendingChildProofs(
-            carrier: blockHeader,
-            directories: directChildDirectories,
-            fetcher: attemptFetcher
-        )
         return NodeAdmissionOutcome(
             decision: decision,
             parentCarrierLink: link,
@@ -719,7 +662,6 @@ public actor ChainProcess: Fetcher, VolumeStorer {
                 parentCarrierLink: evidence.parentCarrierLink,
                 parentGenesisLink: evidence.parentGenesisLink
             ),
-            acquisitionEntries: evidence.acquisitionEntries,
             parentCarrierCertificate: evidence.parentCarrierCertificate,
             parentGenesisCertificate: evidence.parentGenesisCertificate
         )
@@ -754,7 +696,7 @@ public actor ChainProcess: Fetcher, VolumeStorer {
         canonicalCommitPublisher: CanonicalCommitPublisher?
     ) async throws -> NodeAdmissionOutcome {
         let package = authenticatedPackage?.package
-        let admissionStorage = NodeAdmissionStorage(storage: brokerStorer)
+        let admissionStorage = NodeAdmissionStorage(storage: broker)
         let preflight = try await level.preflightBlockHeaderChainLocal(
             blockHeader,
             fetcher: attemptFetcher,
@@ -813,7 +755,10 @@ public actor ChainProcess: Fetcher, VolumeStorer {
                 hierarchyArtifacts: hierarchyArtifacts,
                 incomingCarrierEvidence: hierarchyArtifacts == nil
                     ? carrierEvidence
-                    : nil
+                    : nil,
+                consensusRevisionFloor: try Self.nextConsensusRevision(
+                    await level.chain.currentRevision()
+                )
             )
         }
 
@@ -850,10 +795,11 @@ public actor ChainProcess: Fetcher, VolumeStorer {
             result = try await level.commitPreflight(
                 token,
                 materializedVolumeStorer: admissionStorage,
-                staging: stage
+                stage: stage
             )
         }
 
+        let decision = NodeAdmissionDecision(result)
         let admissionStaged = result.commit != nil
         if !admissionStaged,
            let link = result.parentCarrierLink {
@@ -875,6 +821,11 @@ public actor ChainProcess: Fetcher, VolumeStorer {
         if (admissionStaged || result.parentCarrierLink != nil),
            let prospectiveParentWork,
            !prospectiveParentWork.isEmpty {
+            try await store.advanceConsensusRevisionFloor(
+                Self.nextConsensusRevision(
+                    await level.chain.currentRevision()
+                )
+            )
             inheritedCommit = await level.chain.mergeInheritedWork(
                 prospectiveParentWork
             )
@@ -890,32 +841,20 @@ public actor ChainProcess: Fetcher, VolumeStorer {
                 receipt = await canonicalCommitPublisher(inheritedCommit)
             }
         }
+        if decision.isAccepted {
+            // Staging (or the earlier duplicate admission) is already durable.
+            _ = try? await store.removeContextualCandidateIfAdmitted(
+                candidateCID: blockHeader.rawCID
+            )
+        }
 
         // The canonical decision is now durable and ordered for publication.
         // Everything below is replayable availability work.
         releaseOperation()
         operationHeld = false
 
-        if let link = result.parentCarrierLink {
-            if admissionStaged {
-                _ = try? await promotePreparedChildProofs(
-                    carrierCID: blockHeader.rawCID,
-                    upstreamProof: package?.proof
-                )
-            } else {
-                try await promotePreparedChildProofs(
-                    carrierCID: link.carrierCID,
-                    upstreamProof: carrierEvidence?.proof
-                )
-            }
-            _ = try? await acquirePendingChildProofs(
-                carrier: blockHeader,
-                directories: directChildDirectories,
-                fetcher: attemptFetcher
-            )
-        }
         return NodeAdmissionOutcome(
-            decision: NodeAdmissionDecision(result),
+            decision: decision,
             parentCarrierLink: result.parentCarrierLink,
             sameChainPredecessor: result.sameChainPredecessor,
             inheritedWorkChanged: inheritedCommit != nil,
@@ -935,12 +874,12 @@ public actor ChainProcess: Fetcher, VolumeStorer {
         )
     }
 
-    func portableRecoveryAttachmentCID(
+    func portableEvidenceVolumeCID(
         scope: IssuedChildProofScope,
         edgeCID: String,
         rootCID: String
     ) async throws -> String? {
-        try await store.portableRecoveryAttachmentCID(
+        try await store.portableEvidenceVolumeCID(
             scope: scope,
             edgeCID: edgeCID,
             rootCID: rootCID
@@ -949,39 +888,17 @@ public actor ChainProcess: Fetcher, VolumeStorer {
 
     /// Same-chain content serving reads only this process's durable local tiers.
     public func content(_ cids: Set<String>) async -> [String: Data] {
-        var entries: [String: Data] = [:]
-        for cid in cids where entries[cid] == nil {
-            if let data = await broker.fetchDataLocal(cid: cid) {
-                entries[cid] = data
-            }
-        }
-        return entries
+        await fetch(cids)
+    }
+
+    public func fetch(_ cids: Set<String>) async -> [String: Data] {
+        await broker.fetchDataLocal(cids: cids)
     }
 
     /// Peer content exchange serves complete local Volumes. Membership is a
     /// storage fact and cannot be reconstructed from an arbitrary CID list.
     func volume(_ rootCID: String) async -> SerializedVolume? {
         await broker.fetchVolumeLocal(root: rootCID)
-    }
-
-    /// Collects exactly the durable inputs Lattice will read while validating
-    /// this block: block content, policy modules, and targeted state paths. It
-    /// never traverses children or ancestors.
-    /// Candidate availability contains only this chain's exact validation
-    /// inputs. Descendant packages remain owned by their immediate parent.
-    func durableCandidateEntries(
-        for block: Block,
-        fetcher: (any Fetcher)? = nil,
-        maximumBytes: Int = ChildAcquisitionPackage.maximumBytes
-    ) async throws -> [String: Data] {
-        await acquireOperation()
-        defer { releaseOperation() }
-        let fetcher: any Fetcher = fetcher ?? localFetcher
-        return try await Self.collectCandidateEntries(
-            for: block,
-            fetcher: fetcher,
-            maximumBytes: maximumBytes
-        )
     }
 
     /// The public process fetch port is deliberately local-only. Network
@@ -991,7 +908,7 @@ public actor ChainProcess: Fetcher, VolumeStorer {
     }
 
     public func store(volume: SerializedVolume) async throws {
-        try await brokerStorer.store(volume: volume)
+        try await broker.store(volume: volume)
     }
 
     @discardableResult
@@ -1012,7 +929,7 @@ public actor ChainProcess: Fetcher, VolumeStorer {
         }) {
             return volume.rawCID
         }
-        try await volume.store(storer: brokerStorer)
+        try await volume.store(storer: broker)
         try Task.checkCancellation()
         try await broker.pin(root: volume.rawCID, owner: durableMempoolOwner)
         do {
@@ -1037,7 +954,7 @@ public actor ChainProcess: Fetcher, VolumeStorer {
         try await acquireMutationOperation()
         defer { releaseOperation() }
         let volume = try VolumeImpl<Transaction>(node: transaction)
-        try await volume.store(storer: brokerStorer)
+        try await volume.store(storer: broker)
         // Eviction uses the same process mutation gate, so publishing the
         // complete Volume and its live owner pin is atomic at the node boundary.
         if !livePinnedMempoolRoots.contains(volume.rawCID) {
@@ -1072,6 +989,103 @@ public actor ChainProcess: Fetcher, VolumeStorer {
         }
     }
 
+    func storeContextualCandidate(
+        _ header: BlockHeader,
+        fetcher: any Fetcher,
+        children: [ChildCandidateReservationReference] = [],
+        capacity: Int
+    ) async throws {
+        guard capacity > 0 else {
+            throw ChainProcessError.malformedAuthenticatedChildProof
+        }
+        try await acquireMutationOperation()
+        defer { releaseOperation() }
+
+        if try await store.touchContextualCandidate(
+            candidateCID: header.rawCID,
+            children: children
+        ) {
+            return
+        }
+
+        let storage = NodeAdmissionStorage(storage: broker)
+        try await header.storeBlock(fetcher: fetcher, storer: storage)
+        let roots = Array(Set(await storage.takeStoredVolumeRoots())).sorted()
+        guard roots.contains(header.rawCID) else {
+            throw ChainProcessError.malformedAuthenticatedChildProof
+        }
+        try await store.persistContextualCandidateRoots(
+            candidateCID: header.rawCID,
+            roots: roots,
+            children: children,
+            capacity: capacity
+        )
+    }
+
+    func contextualCandidateChildren(
+        candidateCIDs: Set<String>
+    ) async throws -> [ChildCandidateReservationReference]? {
+        try await store.contextualCandidateChildren(
+            candidateCIDs: candidateCIDs
+        )
+    }
+
+    func currentContextualCandidateChildren()
+        async throws -> [ChildCandidateReservationReference]
+    {
+        try await store.currentContextualCandidateChildren()
+    }
+
+    func beginContextualCandidateHandoff(
+        candidateCID: String
+    ) async throws -> Bool {
+        try await acquireMutationOperation()
+        defer { releaseOperation() }
+        return try await store.beginContextualCandidateHandoff(
+            candidateCID: candidateCID
+        )
+    }
+
+    func replaceIssuedContextualCandidates(
+        _ candidateCIDs: Set<String>,
+        capacity: Int
+    ) async throws -> Bool {
+        try await acquireMutationOperation()
+        defer { releaseOperation() }
+        return try await store.replaceIssuedContextualCandidates(
+            candidateCIDs,
+            capacity: capacity
+        )
+    }
+
+    /// Stores one validated child-intent closure and atomically replaces the
+    /// exact live retention set while process eviction is excluded.
+    func storeChildIntent(
+        _ header: BlockHeader,
+        fetcher: any Fetcher,
+        retaining existingRoots: Set<String>
+    ) async throws -> Set<String> {
+        try await acquireMutationOperation()
+        defer { releaseOperation() }
+        let storage = NodeAdmissionStorage(storage: broker)
+        try await header.storeBlock(fetcher: fetcher, storer: storage)
+        let storedRoots = Set(await storage.takeStoredVolumeRoots())
+        try await broker.advanceRetainedRoots(
+            scope: childIntentRetentionScope,
+            roots: Array(existingRoots.union(storedRoots)).sorted()
+        )
+        return storedRoots
+    }
+
+    func retainChildIntentRoots(_ roots: Set<String>) async throws {
+        try await acquireMutationOperation()
+        defer { releaseOperation() }
+        try await broker.advanceRetainedRoots(
+            scope: childIntentRetentionScope,
+            roots: roots.sorted()
+        )
+    }
+
     func removeLocalTransaction(_ transactionCID: String) async throws {
         try await acquireMutationOperation()
         defer { releaseOperation() }
@@ -1091,7 +1105,7 @@ public actor ChainProcess: Fetcher, VolumeStorer {
         for record in try await store.localMempoolTransactions() {
             let volume = try await VolumeImpl<Transaction>(
                 rawCID: record.transactionCID
-            ).resolveRecursive(source: localSource)
+            ).resolveRecursive(source: broker)
             guard let transaction = volume.node else {
                 throw ChainProcessError.missingMaterializedVolume(
                     record.transactionCID
@@ -1156,11 +1170,30 @@ public actor ChainProcess: Fetcher, VolumeStorer {
     @discardableResult
     public func applyInheritedWorkSnapshot(
         _ snapshot: InheritedWorkSnapshot,
-        from parentAuthorityKey: String
+        from parentProcessKey: String
     ) async throws -> ChainCommit? {
         let update = try await applyInheritedWorkSnapshot(
             snapshot,
-            from: parentAuthorityKey,
+            from: parentProcessKey,
+            sourceID: nil,
+            baseRevision: nil,
+            canonicalCommitPublisher: nil
+        )
+        return update.commit
+    }
+
+    @discardableResult
+    public func applyInheritedWorkExport(
+        _ snapshot: InheritedWorkSnapshot,
+        sourceID: String,
+        baseRevision: UInt64?,
+        from parentProcessKey: String
+    ) async throws -> ChainCommit? {
+        let update = try await applyInheritedWorkSnapshot(
+            snapshot,
+            from: parentProcessKey,
+            sourceID: sourceID,
+            baseRevision: baseRevision,
             canonicalCommitPublisher: nil
         )
         return update.commit
@@ -1171,7 +1204,9 @@ public actor ChainProcess: Fetcher, VolumeStorer {
     /// overtake this inherited reorg in the service FIFO.
     func applyInheritedWorkSnapshot(
         _ snapshot: InheritedWorkSnapshot,
-        from parentAuthorityKey: String,
+        from parentProcessKey: String,
+        sourceID: String?,
+        baseRevision: UInt64?,
         canonicalCommitPublisher: CanonicalCommitPublisher?
     ) async throws -> InheritedWorkUpdate {
         await acquireOperation()
@@ -1179,6 +1214,7 @@ public actor ChainProcess: Fetcher, VolumeStorer {
         guard !configuration.address.isNexus else {
             throw ChainProcessError.nexusHasNoInheritedWork
         }
+        var consensusRevisionFloor: UInt64?
         if case .active(let level) = runtimePhase {
             guard let projected = try await projectParentWork(
                 snapshot,
@@ -1186,10 +1222,18 @@ public actor ChainProcess: Fetcher, VolumeStorer {
             ), await level.chain.acceptsInheritedWork(projected) else {
                 throw ChainProcessError.malformedAuthenticatedChildProof
             }
+            if !projected.isEmpty {
+                consensusRevisionFloor = try Self.nextConsensusRevision(
+                    await level.chain.currentRevision()
+                )
+            }
         }
         guard let changes = try await store.mergeInheritedWorkSnapshot(
             snapshot,
-            from: parentAuthorityKey
+            from: parentProcessKey,
+            sourceID: sourceID,
+            baseRevision: baseRevision,
+            consensusRevisionFloor: consensusRevisionFloor
         ) else {
             return InheritedWorkUpdate(
                 commit: nil,
@@ -1229,6 +1273,25 @@ public actor ChainProcess: Fetcher, VolumeStorer {
         defer { releaseOperation() }
         guard case .active(let level) = runtimePhase else { return nil }
         return await level.chain.parentSecuringWorkSnapshot(since: revision)
+    }
+
+    func parentSecuringWorkExport(
+        since cursor: ParentWorkCursor?
+    ) async throws -> (sourceID: String, export: ParentSecuringWorkExport)? {
+        await acquireOperation()
+        defer { releaseOperation() }
+        guard case .active(let level) = runtimePhase else { return nil }
+        let sourceID = try await store.syncSourceID()
+        return (
+            sourceID,
+            await level.chain.parentSecuringWorkExport(
+                since: cursor?.sourceID == sourceID ? cursor?.revision : nil
+            )
+        )
+    }
+
+    func inheritedWorkCursor() async throws -> ParentWorkCursor? {
+        try await store.inheritedWorkCursor()
     }
 
     /// The parent publishes generic locations; only this child joins them to
@@ -1387,35 +1450,35 @@ public actor ChainProcess: Fetcher, VolumeStorer {
                 throw ChainProcessError.malformedAuthenticatedChildProof
             }
             let childCID = try BlockHeader(node: child).rawCID
-            let acquisitionEntries: [String: Data]
             if let supplied = selected[directory] {
                 guard try BlockHeader(node: supplied.block).rawCID == childCID else {
                     throw ChainProcessError.malformedAuthenticatedChildProof
                 }
-                acquisitionEntries = try await Self.collectCandidateEntries(
-                    for: child,
-                    fetcher: CoalescingFetcher(OverlayContentSource(
-                        entries: supplied.acquisitionEntries,
-                        fallback: localSource
-                    )),
-                    maximumBytes: ChildAcquisitionPackage.maximumBytes
+            }
+            let isChildGenesis = child.parent == nil
+            let bootstrapRoots: [String]
+            if isChildGenesis && selected[directory]?.parentCreatedGenesis == true {
+                let bootstrapStorage = NodeAdmissionStorage(
+                    storage: broker
                 )
-            } else {
-                acquisitionEntries = try await Self.collectCandidateEntries(
-                    for: child,
+                try await childHeader.storeBlock(
                     fetcher: localFetcher,
-                    maximumBytes: ChildAcquisitionPackage.maximumBytes
+                    storer: bootstrapStorage
                 )
+                bootstrapRoots = await bootstrapStorage.takeStoredVolumeRoots()
+            } else {
+                bootstrapRoots = []
             }
             prepared.append(try PreparedChildProof(
                 directory: directory,
-                child: child,
+                childCID: childCID,
+                isChildGenesis: isChildGenesis,
+                bootstrapRoots: bootstrapRoots,
                 proof: try await ChildBlockProof.generate(
                     rootHeader: rootHeader,
                     childDirectory: directory,
                     fetcher: localFetcher
-                ),
-                acquisitionEntries: acquisitionEntries
+                )
             ))
         }
         guard selected.keys.allSatisfy({ directory in
@@ -1436,7 +1499,8 @@ public actor ChainProcess: Fetcher, VolumeStorer {
     /// or enumerates the complete children trie.
     func prepareChildProofs(
         for carrier: BlockHeader,
-        directories: [String]
+        directories: [String],
+        remoteSource: (any ContentSource)? = nil
     ) async throws {
         var directories = try validatedDirectChildDirectories(directories)
         try await acquireMutationOperation()
@@ -1459,7 +1523,9 @@ public actor ChainProcess: Fetcher, VolumeStorer {
         _ = try await acquirePendingChildProofs(
             carrier: carrier,
             directories: directories,
-            fetcher: CoalescingFetcher(acquisitionSource)
+            fetcher: CoalescingFetcher(remoteSource.map {
+                CompositeContentSource([broker, $0])
+            } ?? broker)
         )
     }
 
@@ -1473,7 +1539,10 @@ public actor ChainProcess: Fetcher, VolumeStorer {
 
     /// Retries one bounded carrier batch retained across a crash after remote
     /// content is available again. Individual acquisition misses remain pending.
-    func retryPendingChildProofs(carrierCID: String) async throws -> [String] {
+    func retryPendingChildProofs(
+        carrierCID: String,
+        remoteSource: (any ContentSource)? = nil
+    ) async throws -> [String] {
         try await acquireMutationOperation()
         let directories: [String]
         do {
@@ -1491,7 +1560,9 @@ public actor ChainProcess: Fetcher, VolumeStorer {
                 encryptionInfo: nil
             ),
             directories: directories,
-            fetcher: CoalescingFetcher(acquisitionSource)
+            fetcher: CoalescingFetcher(remoteSource.map {
+                CompositeContentSource([broker, $0])
+            } ?? broker)
         )
     }
 
@@ -1516,9 +1587,7 @@ public actor ChainProcess: Fetcher, VolumeStorer {
             durable.append(DurableDirectChildProof(
                 directory: edge.directory,
                 childCID: edge.childCID,
-                childBlock: evidence.child,
-                proof: evidence.proof,
-                acquisitionEntries: evidence.acquisitionEntries
+                proof: evidence.proof
             ))
         }
         return durable
@@ -1580,13 +1649,71 @@ public actor ChainProcess: Fetcher, VolumeStorer {
 
     func issuedChildEvidenceSummaries(
         directory: String,
-        after: IssuedChildEvidenceSummary?,
+        afterOrdinal: UInt64,
+        throughOrdinal: UInt64,
         limit: Int
     ) async throws -> [IssuedChildEvidenceSummary] {
         try await store.issuedChildEvidenceSummaries(
             directory: directory,
-            after: after,
+            afterOrdinal: afterOrdinal,
+            throughOrdinal: throughOrdinal,
             limit: limit
+        )
+    }
+
+    func issuedChildEvidenceScanHead(directory: String) async throws
+        -> (sourceID: String, throughOrdinal: UInt64)
+    {
+        try await store.issuedChildEvidenceScanHead(directory: directory)
+    }
+
+    func issuedChildEvidenceSummary(
+        childCID: String,
+        directory: String,
+        rootCID: String
+    ) async throws -> (sourceID: String, summary: IssuedChildEvidenceSummary)? {
+        try await store.issuedChildEvidenceSummary(
+            childCID: childCID,
+            directory: directory,
+            rootCID: rootCID
+        )
+    }
+
+    func parentEvidenceScanCursor() async throws -> ParentEvidenceScanCursor {
+        try await store.parentEvidenceScanCursor()
+    }
+
+    func parentEvidenceInbox() async throws -> [ParentEvidenceInboxItem] {
+        try await store.parentEvidenceInbox()
+    }
+
+    func retainParentEvidence(
+        sourceID: String,
+        ordinal: UInt64,
+        attachment: ChildEvidenceVolume,
+        package: AuthenticatedChildPackage,
+        advanceScan: Bool
+    ) async throws {
+        try await acquireMutationOperation()
+        defer { releaseOperation() }
+        try await store.storeParentEvidenceInbox(
+            sourceID: sourceID,
+            ordinal: ordinal,
+            attachment: attachment,
+            package: package,
+            advanceScan: advanceScan
+        )
+    }
+
+    func advanceParentEvidenceScan(
+        sourceID: String,
+        throughOrdinal: UInt64
+    ) async throws {
+        try await acquireMutationOperation()
+        defer { releaseOperation() }
+        try await store.advanceParentEvidenceScan(
+            sourceID: sourceID,
+            throughOrdinal: throughOrdinal
         )
     }
 
@@ -1769,54 +1896,8 @@ public actor ChainProcess: Fetcher, VolumeStorer {
             }
     }
 
-    /// A child genesis commits the one parent key allowed to influence its
-    /// fork choice. Configuration selects the same live peer; accepting a
-    /// mismatch would make the durable source differ from consensus authority.
-    private func validateParentWorkAuthority(
-        _ blockHeader: BlockHeader,
-        fetcher: any Fetcher
-    ) async throws {
-        guard let configured = configuration.parentEndpoint?.publicKey,
-              let authority = ParentWorkAuthorityKey(configured) else {
-            throw ChainProcessError.parentWorkAuthorityMismatch
-        }
-        let child = try await Self.resolvedCandidate(
-            blockHeader,
-            fetcher: fetcher
-        )
-        guard child.parent == nil,
-              let spec = try await child.spec.resolve(fetcher: fetcher).node,
-              spec.parentWorkAuthorityKey == authority else {
-            throw ChainProcessError.parentWorkAuthorityMismatch
-        }
-    }
-
-    private nonisolated static func collectCandidateEntries(
-        for block: Block,
-        fetcher: any Fetcher,
-        maximumBytes: Int
-    ) async throws -> [String: Data] {
-        guard maximumBytes > 0 else {
-            throw ChainProcessError.acquisitionPackageTooLarge
-        }
-        let header = try BlockHeader(node: block)
-        let collector = BoundedContentCollector(maximumBytes: maximumBytes)
-        try await header.storeBlock(fetcher: fetcher, storer: collector)
-        let entries = await collector.entries()
-        guard let blockData = block.toData(),
-              (try? ChildAcquisitionPackage(
-                  entries: entries,
-                  childCID: header.rawCID,
-                  childData: blockData,
-                  maximumBytes: maximumBytes
-              )) != nil else {
-            throw ChainProcessError.malformedAuthenticatedChildProof
-        }
-        return entries
-    }
-
-    /// Proof bytes authenticate the parent path; this package retains only the
-    /// child graph Lattice actually resolves while validating the child.
+    /// Proof bytes authenticate the parent path. Child validation content is
+    /// resolved from this child process's local or exact peer source.
     private nonisolated static func canonicalCarrierEvidence(
         _ header: BlockHeader,
         authenticatedPackage: AuthenticatedChildPackage?,
@@ -1829,12 +1910,8 @@ public actor ChainProcess: Fetcher, VolumeStorer {
         let child = try await resolvedCandidate(header, fetcher: fetcher)
         return AdmissionCarrierEvidence(
             proof: package.proof,
-            child: child,
-            acquisitionEntries: try await Self.collectCandidateEntries(
-                for: child,
-                fetcher: fetcher,
-                maximumBytes: ChildAcquisitionPackage.maximumBytes
-            ),
+            childCID: try BlockHeader(node: child).rawCID,
+            isChildGenesis: child.parent == nil,
             parentCarrierLink: package.parentCarrierLink,
             parentGenesisLink: package.parentGenesisLink,
             parentCarrierCertificate:
@@ -1860,7 +1937,7 @@ public actor ChainProcess: Fetcher, VolumeStorer {
         )
         let availableDirectories = preparedDirectories.union(retainedDirectories)
         var prepared: [PreparedChildProof] = []
-        var completed: [String] = []
+        var absent: [String] = []
         for directory in directories where !availableDirectories.contains(directory) {
             switch await Self.resolveDirectChildProof(
                 carrier: carrier,
@@ -1868,10 +1945,9 @@ public actor ChainProcess: Fetcher, VolumeStorer {
                 fetcher: fetcher
             ) {
             case .absent:
-                completed.append(directory)
+                absent.append(directory)
             case .prepared(let proof):
                 prepared.append(proof)
-                completed.append(directory)
             case .unavailable:
                 break
             }
@@ -1884,16 +1960,8 @@ public actor ChainProcess: Fetcher, VolumeStorer {
             .map(\.directory))
             .intersection(directories)
         guard !active.isEmpty else { return [] }
-        let durablePrepared = Set(
-            try await store.preparedChildProofs(carrierCID: carrier.rawCID)
-                .map(\.directory)
-        ).union(try await store.retainedDirectChildProofs(
-            carrierCID: carrier.rawCID
-        ).map(\.directory))
         prepared = prepared.filter { active.contains($0.directory) }
-        completed = Array(active.intersection(
-            Set(completed).union(durablePrepared)
-        )).sorted()
+        absent = Array(active.intersection(absent)).sorted()
         try Task.checkCancellation()
         try await store.persistPreparedChildProofs(
             carrierCID: carrier.rawCID,
@@ -1907,6 +1975,12 @@ public actor ChainProcess: Fetcher, VolumeStorer {
             carrierCID: carrier.rawCID
         )
         try Task.checkCancellation()
+        let retained = Set(try await store.retainedDirectChildProofs(
+            carrierCID: carrier.rawCID
+        ).map(\.directory))
+        let completed = Array(active.intersection(
+            Set(absent).union(retained)
+        )).sorted()
         try await store.removePendingChildProofRoutes(
             carrierCID: carrier.rawCID,
             directories: completed
@@ -1942,16 +2016,13 @@ public actor ChainProcess: Fetcher, VolumeStorer {
                 childDirectory: directory,
                 fetcher: fetcher
             )
-            let acquisitionEntries = try await Self.collectCandidateEntries(
-                for: child,
-                fetcher: fetcher,
-                maximumBytes: ChildAcquisitionPackage.maximumBytes
-            )
+            let isChildGenesis = child.parent == nil
             return .prepared(try PreparedChildProof(
                 directory: directory,
-                child: child,
-                proof: proof,
-                acquisitionEntries: acquisitionEntries
+                childCID: childHeader.rawCID,
+                isChildGenesis: isChildGenesis,
+                bootstrapRoots: [],
+                proof: proof
             ))
         } catch {
             return .unavailable
@@ -1973,10 +2044,6 @@ public actor ChainProcess: Fetcher, VolumeStorer {
             ),
             pendingChildProofRoutes: pendingChildProofRoutes,
             pendingChildProofCapacity: Self.preparedChildProofCapacity
-        )
-        try await promotePreparedChildProofs(
-            carrierCID: link.carrierCID,
-            upstreamProof: carrierEvidence?.proof
         )
     }
 
@@ -2029,7 +2096,7 @@ public actor ChainProcess: Fetcher, VolumeStorer {
         for prepared in byDirectory.values.sorted(by: {
             $0.directory < $1.directory
         }) {
-            if prepared.child.parent == nil,
+            if prepared.isChildGenesis,
                try await store.issuedParentGenesisLink(
                     directory: prepared.directory,
                     childGenesisCID: prepared.childCID
@@ -2066,7 +2133,7 @@ public actor ChainProcess: Fetcher, VolumeStorer {
                 continue
             }
             let genesisLink: ParentGenesisLink?
-            if prepared.child.parent == nil {
+            if prepared.isChildGenesis {
                 guard let link = try await store.issuedParentGenesisLink(
                     directory: prepared.directory,
                     childGenesisCID: prepared.childCID
@@ -2085,7 +2152,7 @@ public actor ChainProcess: Fetcher, VolumeStorer {
                 ),
                 certificatesSignedBy: configuration
             )
-            guard let rootAuthorityKey = ParentWorkAuthorityKey(
+            guard let rootAuthorityKey = ParentProcessKey(
                 configuration.processPublicKey
             ) else {
                 throw ChainProcessError.malformedAuthenticatedChildProof
@@ -2093,8 +2160,9 @@ public actor ChainProcess: Fetcher, VolumeStorer {
             try Task.checkCancellation()
             try await store.persistIssuedChildProof(
                 proof,
-                child: prepared.child,
-                acquisitionEntries: prepared.acquisitionEntries,
+                childCID: prepared.childCID,
+                isChildGenesis: prepared.isChildGenesis,
+                bootstrapRoots: prepared.bootstrapRoots,
                 parentCarrierCID: carrierCID,
                 rootEnvelope: rootEnvelope,
                 rootAuthorityKey: rootAuthorityKey
@@ -2185,16 +2253,10 @@ public actor ChainProcess: Fetcher, VolumeStorer {
     /// copy useful sparse content into the durable NodeStore.
     nonisolated static func attemptContentSource(
         package: ChildValidationPackage?,
-        acquisitionEntries: [String: Data] = [:],
         fallback: any ContentSource
     ) throws -> any ContentSource {
-        guard let package else {
-            guard acquisitionEntries.isEmpty else {
-                throw ChainProcessError.malformedAuthenticatedChildProof
-            }
-            return fallback
-        }
-        var entries = acquisitionEntries
+        guard let package else { return fallback }
+        var entries: [String: Data] = [:]
         for entry in package.proof.entries {
             if let existing = entries[entry.cid] {
                 guard existing == entry.data else {
@@ -2212,12 +2274,10 @@ public actor ChainProcess: Fetcher, VolumeStorer {
 
     nonisolated static func attemptFetcher(
         package: ChildValidationPackage?,
-        acquisitionEntries: [String: Data] = [:],
         fallback: any ContentSource
     ) throws -> CoalescingFetcher {
         CoalescingFetcher(try attemptContentSource(
             package: package,
-            acquisitionEntries: acquisitionEntries,
             fallback: fallback
         ))
     }
@@ -2242,6 +2302,7 @@ public actor ChainProcess: Fetcher, VolumeStorer {
         pendingChildProofCapacity: Int,
         hierarchyArtifacts: AdmissionHierarchyArtifacts? = nil,
         incomingCarrierEvidence: AdmissionCarrierEvidence? = nil,
+        consensusRevisionFloor: UInt64? = nil,
         afterRetainingRoots: (@Sendable () async -> Void)? = nil
     ) async throws {
         let roots = await admissionStorage.takeStoredVolumeRoots()
@@ -2263,17 +2324,25 @@ public actor ChainProcess: Fetcher, VolumeStorer {
             pendingChildProofRoutes: pendingChildProofRoutes,
             pendingChildProofCapacity: pendingChildProofCapacity,
             hierarchyArtifacts: hierarchyArtifacts,
-            incomingCarrierEvidence: incomingCarrierEvidence
+            incomingCarrierEvidence: incomingCarrierEvidence,
+            consensusRevisionFloor: consensusRevisionFloor
         )
+    }
+
+    private nonisolated static func nextConsensusRevision(
+        _ revision: UInt64
+    ) throws -> UInt64 {
+        guard revision < .max else {
+            throw ChainProcessError.consensusRevisionExhausted
+        }
+        return revision + 1
     }
 
     private nonisolated static func durableRetainedRoots(
         staged: [StagedAdmission],
-        store: NodeStore,
         additionalRoots: [String] = []
-    ) async throws -> [String] {
+    ) -> [String] {
         var roots = Set(staged.flatMap(\.volumeRoots))
-        roots.formUnion(try await store.recoveryAttachmentCIDs())
         roots.formUnion(additionalRoots)
         return roots.sorted()
     }

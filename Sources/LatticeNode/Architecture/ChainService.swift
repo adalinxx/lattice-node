@@ -1,6 +1,7 @@
 import Foundation
 import Lattice
 import UInt256
+import VolumeBroker
 import cashew
 
 public struct SubmitTransactionRequest: Codable, Sendable {
@@ -177,7 +178,6 @@ public struct DirectChildProofSummary: Codable, Sendable, Equatable {
 public struct DirectChildProofPublication: Sendable {
     public let directory: String
     public let childCID: String
-    public let childBlock: Block
     public let proof: ChildBlockProof
 }
 
@@ -204,10 +204,14 @@ public typealias ChildCandidateProvider = @Sendable (
     ChildCandidateRequestContext
 ) async throws
     -> [DirectChildCandidate]
+public typealias ChildCandidateReservationReconciler = @Sendable (
+    [ChildCandidateReservationReference]
+) async -> Bool
 public typealias ChildProofPublisher = @Sendable (
     DirectChildProofPublication
 ) async throws -> Void
 public typealias AcceptedBlockPublisher = @Sendable (_ blockCID: String) async throws -> Void
+public typealias SecuringWorkPublisher = @Sendable () async -> Void
 public typealias AcceptedTransactionPublisher = @Sendable (
     _ volumeRootCID: String
 ) async throws -> Void
@@ -223,6 +227,7 @@ public struct ChildDeployIntentRequest: Codable, Sendable {
     public let directory: String
     public let spec: ChainSpec
     public let genesisTransactions: [Transaction]
+    public let policyModules: [ContentBoundWasmPolicyModule]
     public let target: UInt256
     public let timestamp: Int64
 
@@ -230,12 +235,14 @@ public struct ChildDeployIntentRequest: Codable, Sendable {
         directory: String,
         spec: ChainSpec,
         genesisTransactions: [Transaction],
+        policyModules: [ContentBoundWasmPolicyModule] = [],
         target: UInt256,
         timestamp: Int64
     ) {
         self.directory = directory
         self.spec = spec
         self.genesisTransactions = genesisTransactions
+        self.policyModules = policyModules
         self.target = target
         self.timestamp = timestamp
     }
@@ -244,6 +251,7 @@ public struct ChildDeployIntentRequest: Codable, Sendable {
         case directory
         case spec
         case genesisTransactions
+        case policyModules
         case target
         case timestamp
     }
@@ -256,6 +264,10 @@ public struct ChildDeployIntentRequest: Codable, Sendable {
             [ContentBoundTransaction].self,
             forKey: .genesisTransactions
         ).map { try $0.transaction() }
+        policyModules = try container.decodeIfPresent(
+            [ContentBoundWasmPolicyModule].self,
+            forKey: .policyModules
+        ) ?? []
         target = try container.decode(UInt256.self, forKey: .target)
         timestamp = try container.decode(Int64.self, forKey: .timestamp)
     }
@@ -270,6 +282,7 @@ public struct ChildDeployIntentRequest: Codable, Sendable {
             },
             forKey: .genesisTransactions
         )
+        try container.encode(policyModules, forKey: .policyModules)
         try container.encode(target, forKey: .target)
         try container.encode(timestamp, forKey: .timestamp)
     }
@@ -310,6 +323,7 @@ public enum ChainServiceError: Error, Equatable, Sendable {
     case requestTooLarge
     case invalidChildDirectory
     case invalidChildGenesis
+    case invalidChildPolicyModules
     case childIntentTooLarge
     case childIntentLimitReached
     case childCandidateLimitReached
@@ -323,6 +337,7 @@ public enum ChainServiceError: Error, Equatable, Sendable {
     case noDeploymentAvailable
     case mempoolUnavailable
     case parentUnavailable
+    case childCandidateReservationFailed
 }
 
 /// Transport-independent operations for one path. A future HTTP layer only
@@ -334,7 +349,7 @@ public actor ChainService {
         let genesisCID: String
         let genesis: Block
         let parentStateCID: String
-        let acquisitionEntries: [String: Data]
+        let volumeRoots: Set<String>
     }
 
     private struct Anchor: Hashable {
@@ -345,6 +360,12 @@ public actor ChainService {
     private struct ValidatedRewardPlan {
         let current: Transaction?
         let descendants: [MiningReward]
+    }
+
+    private struct FittingMiningTemplate {
+        let template: MiningTemplate
+        let deploymentTransactionAdvance: Int
+        let advancesDeploymentChild: Bool
     }
 
     private struct QueuedCanonicalCommit: Sendable {
@@ -366,8 +387,7 @@ public actor ChainService {
         ChainServiceLimits.maximumPayloadBytes
     private static let maximumChildIntents = 64
     private static let maximumChildIntentBytes =
-        ChainServiceLimits.maximumPayloadBytes
-    private static let maximumChildCandidateBytes = 16 * 1024 * 1024
+        ChainServiceLimits.maximumChildIntentPayloadBytes
     private static let templateLifetimeSeconds: Int64 = 30
     private static let templateLifetimeMilliseconds: UInt64 = 30_000
     private static let templateCapacity = 16
@@ -376,8 +396,11 @@ public actor ChainService {
     private let pool: TransactionPool
     private let templates: MiningTemplateBook
     private let childCandidateProvider: ChildCandidateProvider
+    private let childCandidateReservationReconciler:
+        ChildCandidateReservationReconciler
     private let childProofPublisher: ChildProofPublisher
     private let acceptedBlockPublisher: AcceptedBlockPublisher
+    private let securingWorkPublisher: SecuringWorkPublisher
     private let acceptedTransactionPublisher: AcceptedTransactionPublisher
     private let maximumChildCandidates: Int
     private var childIntents: [String: ChildIntent] = [:]
@@ -389,7 +412,7 @@ public actor ChainService {
     private var canonicalCommitQueue: [QueuedCanonicalCommit] = []
     private var canonicalCommitWorker: Task<Void, Never>?
     private var canonicalCommitWorkerReserved = false
-    private var parentConsensusReady: Bool
+    private var parentWorkReady: Bool
 
     // This actor calls other actors and is therefore reentrant. Keep its pool,
     // template cache, and pending intents in one externally observable order.
@@ -399,8 +422,11 @@ public actor ChainService {
     public init(
         process: ChainProcess,
         childCandidateProvider: @escaping ChildCandidateProvider,
+        childCandidateReservationReconciler:
+            @escaping ChildCandidateReservationReconciler = { $0.isEmpty },
         childProofPublisher: @escaping ChildProofPublisher,
         acceptedBlockPublisher: @escaping AcceptedBlockPublisher,
+        securingWorkPublisher: @escaping SecuringWorkPublisher,
         acceptedTransactionPublisher: @escaping AcceptedTransactionPublisher = { _ in },
         mempoolMaxCount: Int = 10_000,
         maximumChildCandidates: Int = 64
@@ -408,8 +434,11 @@ public actor ChainService {
         precondition(mempoolMaxCount > 0 && maximumChildCandidates > 0)
         self.process = process
         self.childCandidateProvider = childCandidateProvider
+        self.childCandidateReservationReconciler =
+            childCandidateReservationReconciler
         self.childProofPublisher = childProofPublisher
         self.acceptedBlockPublisher = acceptedBlockPublisher
+        self.securingWorkPublisher = securingWorkPublisher
         self.acceptedTransactionPublisher = acceptedTransactionPublisher
         self.pool = TransactionPool(
             maxCount: mempoolMaxCount,
@@ -422,19 +451,19 @@ public actor ChainService {
             capacity: Self.templateCapacity
         )
         self.maximumChildCandidates = maximumChildCandidates
-        self.parentConsensusReady = process.configuration.address.isNexus
+        self.parentWorkReady = process.configuration.address.isNexus
     }
 
     /// A child may retain and exchange immutable facts while disconnected, but
-    /// only a complete sync from its live configured parent makes its current
-    /// fork choice actionable. Nexus alone starts ready because it has no
-    /// parent; every child waits for the network runtime's session fence.
-    public func setParentConsensusReady(_ ready: Bool) async {
+    /// only a complete live work sync makes its own fork choice actionable.
+    /// This flag never represents the parent's canonical choice. Nexus starts
+    /// ready because it has no inherited work.
+    public func setParentWorkReady(_ ready: Bool) async {
         await acquireOperation()
         defer { releaseOperation() }
-        guard parentConsensusReady != ready else { return }
-        parentConsensusReady = ready
-        await templates.invalidateAll()
+        guard parentWorkReady != ready else { return }
+        parentWorkReady = ready
+        await invalidateTemplatesLocked()
     }
 
     public func status() async -> ChainServiceStatusResponse {
@@ -444,11 +473,13 @@ public actor ChainService {
         let status = await process.status()
         if status.phase == .active,
            let tip = try? await process.canonicalTipBlock() {
-            removeStaleChildIntents(parentStateCID: tip.postState.rawCID)
+            try? await removeStaleChildIntents(
+                parentStateCID: tip.postState.rawCID
+            )
         }
         let phase: ChainServicePhase = if status.phase != .active {
             .awaitingGenesis
-        } else if parentConsensusReady {
+        } else if parentWorkReady {
             .active
         } else {
             .awaitingParent
@@ -489,7 +520,36 @@ public actor ChainService {
     @discardableResult
     public func applyInheritedWorkSnapshot(
         _ snapshot: InheritedWorkSnapshot,
-        from parentAuthorityKey: String
+        from parentProcessKey: String
+    ) async throws -> ChainCommit? {
+        try await applyInheritedWork(
+            snapshot,
+            from: parentProcessKey,
+            sourceID: nil,
+            baseRevision: nil
+        )
+    }
+
+    @discardableResult
+    public func applyInheritedWorkExport(
+        _ snapshot: InheritedWorkSnapshot,
+        sourceID: String,
+        baseRevision: UInt64?,
+        from parentProcessKey: String
+    ) async throws -> ChainCommit? {
+        try await applyInheritedWork(
+            snapshot,
+            from: parentProcessKey,
+            sourceID: sourceID,
+            baseRevision: baseRevision
+        )
+    }
+
+    private func applyInheritedWork(
+        _ snapshot: InheritedWorkSnapshot,
+        from parentProcessKey: String,
+        sourceID: String?,
+        baseRevision: UInt64?
     ) async throws -> ChainCommit? {
         await acquireOperation()
         var ownsOperation = true
@@ -498,11 +558,16 @@ public actor ChainService {
         }
         let update = try await process.applyInheritedWorkSnapshot(
             snapshot,
-            from: parentAuthorityKey,
+            from: parentProcessKey,
+            sourceID: sourceID,
+            baseRevision: baseRevision,
             canonicalCommitPublisher: { [self] commit in
                 await enqueueCanonicalCommit(commit)
             }
         )
+        // The work relation is durable now. Relay it before optional
+        // service-owned canonical projections such as mempool reconciliation.
+        await securingWorkPublisher()
         guard let commit = update.commit,
               commit.canonicalChanged,
               let receipt = update.canonicalCommitReceipt else {
@@ -524,17 +589,19 @@ public actor ChainService {
     public func admitNetworkCandidate(
         _ header: BlockHeader,
         authenticatedChildPackage: AuthenticatedChildPackage?,
-        preparingChildDirectories: [String]
+        preparingChildDirectories: [String],
+        contentSource: any ContentSource
     ) async throws -> NodeAdmissionOutcome {
         let outcome = try await process.admit(
             header,
             authenticatedChildPackage: authenticatedChildPackage,
             preparingChildDirectories: preparingChildDirectories,
-            allowsRemoteAcquisition: true,
+            remoteSource: contentSource,
             canonicalCommitPublisher: { [self] commit in
                 await enqueueCanonicalCommit(commit)
             }
         )
+        await publishCarrierWorkIfNeeded(outcome)
         guard let block = await locallyStoredBlock(header) else {
             // A target-miss carrier is intentionally not local chain state,
             // but its authenticated path can still carry an accepted direct
@@ -602,8 +669,16 @@ public actor ChainService {
     public func restoreLocalTransactions() async throws {
         await acquireOperation()
         defer { releaseOperation() }
+        try await restoreLocalTransactionsLocked()
+    }
+
+    private func restoreLocalTransactionsLocked() async throws {
+        _ = await pool.clear()
         let durable = try await process.localTransactions()
-        guard !durable.isEmpty else { return }
+        guard !durable.isEmpty else {
+            try await syncLiveMempoolRootsLocked([])
+            return
+        }
         let tip = try await process.canonicalTipBlock()
         let spec = try await chainSpec(for: tip)
         for item in durable {
@@ -634,7 +709,9 @@ public actor ChainService {
     ) async throws -> (cid: String, inserted: Bool) {
         try await prepareMempoolLocked()
         let previous = try await process.canonicalTipBlock()
-        removeStaleChildIntents(parentStateCID: previous.postState.rawCID)
+        try await removeStaleChildIntents(
+            parentStateCID: previous.postState.rawCID
+        )
         let spec = try await chainSpec(for: previous)
         guard let envelope = transaction.toData(),
               envelope.count <= spec.maxBlockSize,
@@ -758,11 +835,11 @@ public actor ChainService {
 
     private func prepareMempoolLocked() async throws {
         if mempoolUnavailable {
+            mempoolUnavailable = false
             do {
-                try await pruneDurableLocalTransactionsLocked(keeping: [])
-                try await syncLiveMempoolRootsLocked([])
-                mempoolUnavailable = false
+                try await restoreLocalTransactionsLocked()
             } catch {
+                mempoolUnavailable = true
                 throw ChainServiceError.mempoolUnavailable
             }
         }
@@ -808,8 +885,8 @@ public actor ChainService {
     ) async throws -> ChildDeployIntentResponse {
         await acquireOperation()
         defer { releaseOperation() }
-        guard parentConsensusReady else { throw ChainServiceError.parentUnavailable }
-        guard request.directory.utf8.count <= Self.maximumDirectoryBytes,
+        guard parentWorkReady else { throw ChainServiceError.parentUnavailable }
+        guard StateAtomLimits.isDirectory(request.directory),
               let childAddress = ChainAddress(
                   process.configuration.chainPath + [request.directory]
               ) else {
@@ -819,18 +896,49 @@ public actor ChainService {
               encoded.count <= Self.maximumChildIntentBytes else {
             throw ChainServiceError.childIntentTooLarge
         }
-        guard let parentAuthority = ParentWorkAuthorityKey(
-            process.configuration.processPublicKey
-        ), request.spec.parentWorkAuthorityKey == nil
-                || request.spec.parentWorkAuthorityKey == parentAuthority else {
-            throw ChainServiceError.invalidChildGenesis
-        }
-        let childSpec = request.spec.withParentWorkAuthorityKey(parentAuthority)
+        let childSpec = request.spec
         let parent = try await process.canonicalTipBlock()
-        removeStaleChildIntents(parentStateCID: parent.postState.rawCID)
+        try await removeStaleChildIntents(
+            parentStateCID: parent.postState.rawCID
+        )
         guard childIntents[request.directory] != nil
             || childIntents.count < Self.maximumChildIntents else {
             throw ChainServiceError.childIntentLimitReached
+        }
+        guard request.policyModules.count
+                <= process.configuration.resourcePolicy.maximumWasmPolicies else {
+            throw ChainServiceError.invalidChildPolicyModules
+        }
+        let requiredModuleCIDs = Set(childSpec.wasmPolicies.map(\.moduleCID))
+        let suppliedModuleCIDs = Set(request.policyModules.map(\.rootCID))
+        guard suppliedModuleCIDs.count == request.policyModules.count,
+              suppliedModuleCIDs == requiredModuleCIDs else {
+            throw ChainServiceError.invalidChildPolicyModules
+        }
+        let requestContent = MemoryBroker()
+        do {
+            for module in request.policyModules {
+                guard module.bytes.count <= WasmPolicyEvaluator.maxModuleBytes
+                else {
+                    throw ChainServiceError.invalidChildPolicyModules
+                }
+                try await module.header().store(storer: requestContent)
+            }
+        } catch {
+            throw ChainServiceError.invalidChildPolicyModules
+        }
+        let childContentSource = CompositeContentSource([
+            requestContent,
+            process,
+        ])
+        let childContentFetcher = CoalescingFetcher(childContentSource)
+        guard request.genesisTransactions.allSatisfy({ transaction in
+            guard let body = transaction.body.node else { return false }
+            return transaction.signatures.isEmpty
+                && body.signers.isEmpty
+                && body.stateAtomsAreValid()
+        }) else {
+            throw ChainServiceError.invalidChildGenesis
         }
         let genesis = try await BlockBuilder.buildChildGenesis(
             spec: childSpec,
@@ -838,23 +946,23 @@ public actor ChainService {
             transactions: request.genesisTransactions,
             timestamp: request.timestamp,
             target: request.target,
-            fetcher: process
+            fetcher: childContentFetcher
         )
         let valid = try await genesis.validateGenesis(
-            fetcher: process,
+            fetcher: childContentFetcher,
             chainPath: childAddress.components
         ).0
         guard valid else { throw ChainServiceError.invalidChildGenesis }
 
         let header = try BlockHeader(node: genesis)
-
-        // Store the prepared genesis envelope and its request-owned content.
-        // `parentState` deliberately references the parent's existing state;
-        // recursively claiming that graph as child-deploy content would invent
-        // cross-volume ownership.
-        try await header.storeBlock(fetcher: process, storer: process)
-        let acquisitionEntries = try await process.durableCandidateEntries(
-            for: genesis
+        let retainedOtherRoots = childIntents.reduce(into: Set<String>()) {
+            guard $1.key != request.directory else { return }
+            $0.formUnion($1.value.volumeRoots)
+        }
+        let volumeRoots = try await process.storeChildIntent(
+            header,
+            fetcher: childContentFetcher,
+            retaining: retainedOtherRoots
         )
         let intent = ChildIntent(
             directory: request.directory,
@@ -862,7 +970,7 @@ public actor ChainService {
             genesisCID: header.rawCID,
             genesis: genesis,
             parentStateCID: parent.postState.rawCID,
-            acquisitionEntries: acquisitionEntries
+            volumeRoots: volumeRoots
         )
         childIntents[request.directory] = intent
 
@@ -880,20 +988,102 @@ public actor ChainService {
     ) async throws -> MiningTemplateResponse {
         await acquireOperation()
         defer { releaseOperation() }
-        guard parentConsensusReady else { throw ChainServiceError.parentUnavailable }
+        guard parentWorkReady else { throw ChainServiceError.parentUnavailable }
         try await prepareMempoolLocked()
         guard process.configuration.address.isNexus else {
             throw ChainServiceError.parentCarrierRequired
         }
-        let assembled = try await buildMiningTemplate(
-            rewards: request.rewards,
-            mode: request.mode,
-            parentCarrier: nil
+        // A child candidate is optional until its exact process durably acks
+        // the reservation. One rebuild lets the runtime omit every peer that
+        // failed the bounded ack round while preserving healthy siblings.
+        for attempt in 0...1 {
+            let assembled: MiningTemplate
+            do {
+                assembled = try await buildMiningTemplate(
+                    rewards: request.rewards,
+                    mode: request.mode,
+                    parentCarrier: nil
+                )
+            } catch {
+                _ = await reconcileCurrentCandidateReservations()
+                throw error
+            }
+            let issuance = await templates.issueTrackingInsertion(assembled)
+            if await reconcileCurrentCandidateReservations() {
+                let template = issuance.template
+                guard template.remainingLifetimeMilliseconds > 0 else {
+                    await templates.discard(workID: template.workID)
+                    _ = await reconcileCurrentCandidateReservations()
+                    throw MiningTemplateError.expired
+                }
+                return MiningTemplateResponse(
+                    template: template,
+                    maximumLifetimeMilliseconds: Self.templateLifetimeMilliseconds
+                )
+            }
+            if issuance.inserted {
+                await templates.discard(workID: issuance.template.workID)
+            }
+            _ = await reconcileCurrentCandidateReservations()
+            if attempt == 1 {
+                throw ChainServiceError.childCandidateReservationFailed
+            }
+        }
+        throw ChainServiceError.childCandidateReservationFailed
+    }
+
+    /// Applies one exact parent-issued snapshot only after recursively making
+    /// every committed direct-child candidate durable at its exact process.
+    public func replaceIssuedCandidateReservations(
+        _ candidateCIDs: [String]
+    ) async -> Bool {
+        await acquireOperation()
+        defer { releaseOperation() }
+        let desired = Set(candidateCIDs)
+        guard desired.count == candidateCIDs.count,
+              desired.count <= Self.templateCapacity,
+              let children = try? await process.contextualCandidateChildren(
+                candidateCIDs: desired
+              ),
+              await childCandidateReservationReconciler(children) else {
+            return false
+        }
+        return (try? await process.replaceIssuedContextualCandidates(
+            desired,
+            capacity: Self.templateCapacity
+        )) == true
+    }
+
+    private func reconcileCurrentCandidateReservations() async -> Bool {
+        let candidates = await templates.activeChildCandidates()
+        let references: [ChildCandidateReservationReference]
+        do {
+            references = try candidates.compactMap { candidate in
+                guard let peerKey = candidate.advertiserPeerKey else { return nil }
+                return ChildCandidateReservationReference(
+                    peerKey: peerKey,
+                    candidateCID: try BlockHeader(node: candidate.block).rawCID
+                )
+            }
+        } catch {
+            return false
+        }
+        return await childCandidateReservationReconciler(
+            Array(Set(references)).sorted {
+                ($0.peerKey.description, $0.candidateCID)
+                    < ($1.peerKey.description, $1.candidateCID)
+            }
         )
-        let template = await templates.issue(assembled)
-        return MiningTemplateResponse(
-            template: template,
-            maximumLifetimeMilliseconds: Self.templateLifetimeMilliseconds
+    }
+
+    private func reconcileRetainedCandidateDescendants() async {
+        guard let references = try? await process
+            .currentContextualCandidateChildren() else { return }
+        _ = await childCandidateReservationReconciler(
+            Array(Set(references)).sorted {
+                ($0.peerKey.description, $0.candidateCID)
+                    < ($1.peerKey.description, $1.candidateCID)
+            }
         )
     }
 
@@ -907,14 +1097,14 @@ public actor ChainService {
     ) async throws -> DirectChildCandidate {
         await acquireOperation()
         defer { releaseOperation() }
-        guard parentConsensusReady else { throw ChainServiceError.parentUnavailable }
+        guard parentWorkReady else { throw ChainServiceError.parentUnavailable }
         try await prepareMempoolLocked()
         guard !process.configuration.address.isNexus,
               (try? BlockHeader(node: parentCarrier)) != nil else {
             throw ChainServiceError.invalidParentCarrier
         }
         let fetcher = CoalescingFetcher(CompositeContentSource([
-            FetcherContentSource(process),
+            process,
             parentContentSource,
         ]))
         let template = try await buildMiningTemplate(
@@ -923,36 +1113,31 @@ public actor ChainService {
             parentCarrier: parentCarrier,
             fetcher: fetcher
         )
+        let candidateHeader = try BlockHeader(node: template.block)
+        let childReservations = try template.childCandidates.compactMap {
+            candidate -> ChildCandidateReservationReference? in
+            guard let peerKey = candidate.advertiserPeerKey else { return nil }
+            return ChildCandidateReservationReference(
+                peerKey: peerKey,
+                candidateCID: try BlockHeader(node: candidate.block).rawCID
+            )
+        }
+        try await process.storeContextualCandidate(
+            candidateHeader,
+            fetcher: fetcher,
+            children: Array(Set(childReservations)),
+            capacity: Self.templateCapacity
+        )
         _ = try await process.prepareChildProofs(
             for: template.block,
             children: template.childCandidates,
             capacity: Self.templateCapacity
         )
-        var acquisitionEntries = try await process.durableCandidateEntries(
-            for: template.block,
-            fetcher: fetcher
-        )
-        for child in template.childCandidates {
-            for (cid, data) in child.acquisitionEntries {
-                if let existing = acquisitionEntries[cid], existing != data {
-                    throw ChildAcquisitionPackageError.malformed
-                }
-                acquisitionEntries[cid] = data
-            }
-        }
-        guard let blockData = template.block.toData() else {
-            throw ChildAcquisitionPackageError.malformed
-        }
-        _ = try ChildAcquisitionPackage(
-            entries: acquisitionEntries,
-            childCID: try BlockHeader(node: template.block).rawCID,
-            childData: blockData,
-            maximumBytes: ChildAcquisitionPackage.maximumBytes
-        )
         return DirectChildCandidate(
             directory: process.configuration.address.directory,
             block: template.block,
-            acquisitionEntries: acquisitionEntries
+            searchWitness: template.searchWitness,
+            deploymentWitness: template.deploymentWitness
         )
     }
 
@@ -964,7 +1149,9 @@ public actor ChainService {
     ) async throws -> MiningTemplate {
         let fetcher: any Fetcher = fetcher ?? process
         let previous = try await process.canonicalTipBlock()
-        removeStaleChildIntents(parentStateCID: previous.postState.rawCID)
+        try await removeStaleChildIntents(
+            parentStateCID: previous.postState.rawCID
+        )
         let spec = try await chainSpec(for: previous)
         let rewardPlan = try await validatedRewardPlan(rewards)
         let reward = try await validatedRewardTransaction(
@@ -974,7 +1161,13 @@ public actor ChainService {
         )
         let maximumTransactions = Int(clamping: spec.maxNumberOfTransactionsPerBlock)
         var poolLimit = max(0, maximumTransactions - (reward == nil ? 0 : 1))
-        let timestamp = try nextTimestamp(after: previous.timestamp)
+        var largestFittingPoolLimit = -1
+        var largestFittingTemplate: FittingMiningTemplate?
+        var maximumPoolLimit = poolLimit
+        let timestamp = try nextTimestamp(
+            after: previous.timestamp,
+            parentCarrier: parentCarrier
+        )
         let pooled: [Transaction]
         if let parentCarrier {
             var contextual: [Transaction] = []
@@ -1056,11 +1249,23 @@ public actor ChainService {
                 fetcher: fetcher
             )
             try requireReward(rewardPlan.current, in: provisional.block)
-            if !blockFits(provisional.block, spec: spec) {
-                guard poolLimit > 0 else {
-                    throw ChainServiceError.templateTooLarge
+            if try await !blockFits(
+                provisional.block,
+                spec: spec,
+                fetcher: fetcher
+            ) {
+                maximumPoolLimit = poolLimit - 1
+                if maximumPoolLimit <= largestFittingPoolLimit {
+                    guard let largestFittingTemplate else {
+                        throw ChainServiceError.templateTooLarge
+                    }
+                    return finishMiningTemplate(
+                        largestFittingTemplate,
+                        mode: mode
+                    )
                 }
-                poolLimit /= 2
+                poolLimit = largestFittingPoolLimit
+                    + (maximumPoolLimit - largestFittingPoolLimit + 1) / 2
                 continue
             }
 
@@ -1102,17 +1307,40 @@ public actor ChainService {
                !providedDeployment {
                 throw ChainServiceError.noDeploymentAvailable
             }
+            let localChildren = eligibleChildren(
+                parentStateCID: previous.postState.rawCID,
+                anchors: selectedAnchors
+            )
             let children = try combineChildren(
                 providedChildren,
-                eligibleChildren(
-                    parentStateCID: previous.postState.rawCID,
-                    anchors: selectedAnchors
-                )
+                localChildren
             )
-            let template = try await templates.preview(
+            let requiredDirectories: Set<String> = if localDeploymentIncluded {
+                Set(localChildren.map(\.directory))
+            } else {
+                Set(provided.deploymentDirectory.map { [$0] } ?? [])
+            }
+            let requiredChildren = children.filter {
+                requiredDirectories.contains($0.directory)
+            }
+            var optionalChildren = children.filter {
+                !requiredDirectories.contains($0.directory)
+            }
+            if !optionalChildren.isEmpty {
+                let offset = Int(
+                    previous.height % UInt64(optionalChildren.count)
+                )
+                optionalChildren = Array(optionalChildren[offset...])
+                    + optionalChildren[..<offset]
+            }
+
+            var selectedChildCount = optionalChildren.count
+            var template = try await templates.preview(
                 previous: previous,
                 transactions: selectedTransactions,
-                children: children,
+                children: (requiredChildren
+                    + optionalChildren.prefix(selectedChildCount))
+                    .sorted { $0.directory < $1.directory },
                 parentCarrier: parentCarrier,
                 timestamp: timestamp,
                 fetcher: fetcher
@@ -1122,24 +1350,105 @@ public actor ChainService {
                 provisional.block,
                 final: template.block
             )
+            if try await !blockFits(
+                template.block,
+                spec: spec,
+                fetcher: fetcher
+            ), !optionalChildren.isEmpty {
+                let minimumChildCount = poolLimit == 0 ? 0 : 1
+                let minimumTemplate = try await templates.preview(
+                    previous: previous,
+                    transactions: selectedTransactions,
+                    children: (requiredChildren
+                        + optionalChildren.prefix(minimumChildCount))
+                        .sorted { $0.directory < $1.directory },
+                    parentCarrier: parentCarrier,
+                    timestamp: timestamp,
+                    fetcher: fetcher
+                )
+                if try await blockFits(
+                    minimumTemplate.block,
+                    spec: spec,
+                    fetcher: fetcher
+                ) {
+                    var fittingLimit = minimumChildCount
+                    var failingLimit = optionalChildren.count
+                    template = minimumTemplate
+                    while fittingLimit + 1 < failingLimit {
+                        let probeLimit = fittingLimit
+                            + (failingLimit - fittingLimit) / 2
+                        let probe = try await templates.preview(
+                            previous: previous,
+                            transactions: selectedTransactions,
+                            children: (requiredChildren
+                                + optionalChildren.prefix(probeLimit))
+                                .sorted { $0.directory < $1.directory },
+                            parentCarrier: parentCarrier,
+                            timestamp: timestamp,
+                            fetcher: fetcher
+                        )
+                        if try await blockFits(
+                            probe.block,
+                            spec: spec,
+                            fetcher: fetcher
+                        ) {
+                            fittingLimit = probeLimit
+                            template = probe
+                        } else {
+                            failingLimit = probeLimit
+                        }
+                    }
+                    selectedChildCount = fittingLimit
+                }
+            }
 
-            if blockFits(template.block, spec: spec) {
-                if localDeploymentIncluded {
-                    deploymentTransactionCursor &+= deploymentCursorAdvance
+            if try await blockFits(
+                template.block,
+                spec: spec,
+                fetcher: fetcher
+            ) {
+                largestFittingPoolLimit = poolLimit
+                let fittingTemplate = FittingMiningTemplate(
+                    template: template,
+                    deploymentTransactionAdvance: localDeploymentIncluded
+                        ? deploymentCursorAdvance
+                        : 0,
+                    advancesDeploymentChild: providedDeployment
+                )
+                largestFittingTemplate = fittingTemplate
+                if poolLimit < maximumPoolLimit {
+                    poolLimit += (maximumPoolLimit - poolLimit + 1) / 2
+                    continue
                 }
-                if providedDeployment {
-                    deploymentChildCursor &+= 1
-                }
-                if mode == .deployment {
-                    deploymentSourceCursor &+= 1
-                }
-                return template
+                return finishMiningTemplate(fittingTemplate, mode: mode)
             }
-            guard poolLimit > 0 else {
-                throw ChainServiceError.templateTooLarge
+            maximumPoolLimit = poolLimit - 1
+            if maximumPoolLimit <= largestFittingPoolLimit {
+                guard let largestFittingTemplate else {
+                    throw ChainServiceError.templateTooLarge
+                }
+                return finishMiningTemplate(
+                    largestFittingTemplate,
+                    mode: mode
+                )
             }
-            poolLimit /= 2
+            poolLimit = largestFittingPoolLimit
+                + (maximumPoolLimit - largestFittingPoolLimit + 1) / 2
         }
+    }
+
+    private func finishMiningTemplate(
+        _ fitting: FittingMiningTemplate,
+        mode: MiningMode
+    ) -> MiningTemplate {
+        deploymentTransactionCursor &+= fitting.deploymentTransactionAdvance
+        if fitting.advancesDeploymentChild {
+            deploymentChildCursor &+= 1
+        }
+        if mode == .deployment {
+            deploymentSourceCursor &+= 1
+        }
+        return fitting.template
     }
 
     public func submitWork(
@@ -1150,7 +1459,7 @@ public actor ChainService {
         defer {
             if ownsOperation { releaseOperation() }
         }
-        guard parentConsensusReady else { throw ChainServiceError.parentUnavailable }
+        guard parentWorkReady else { throw ChainServiceError.parentUnavailable }
         guard process.configuration.address.isNexus else {
             throw ChainServiceError.parentCarrierRequired
         }
@@ -1175,11 +1484,14 @@ public actor ChainService {
                 await enqueueCanonicalCommit(commit)
             }
         )
+        await publishCarrierWorkIfNeeded(outcome)
         let effects = await applyAdmissionEffects(
             block: candidate,
             header: header,
             outcome: outcome
         )
+        await templates.discard(workID: request.workID)
+        _ = await reconcileCurrentCandidateReservations()
 
         // The process enqueued this commit while preserving its own mutation
         // order. Release our gate before waiting because reconciliation must
@@ -1224,6 +1536,15 @@ public actor ChainService {
             header: header,
             outcome: outcome
         )
+    }
+
+    private func publishCarrierWorkIfNeeded(
+        _ outcome: NodeAdmissionOutcome
+    ) async {
+        guard case .carrier = outcome.decision else { return }
+        // A target-miss carrier can activate inherited work without being
+        // retained or announced as same-chain block state.
+        await securingWorkPublisher()
     }
 
     private func handleCarrierAdmission(
@@ -1278,14 +1599,13 @@ public actor ChainService {
         } catch {
             _ = await pool.clear()
             do {
-                try await pruneDurableLocalTransactionsLocked(keeping: [])
                 try await syncLiveMempoolRootsLocked([])
-                mempoolUnavailable = false
-            } catch {
-                mempoolUnavailable = true
+            } catch {}
+            mempoolUnavailable = true
+            await invalidateTemplatesLocked()
+            if (try? await process.retainChildIntentRoots([])) != nil {
+                childIntents.removeAll()
             }
-            await templates.invalidateAll()
-            childIntents.removeAll()
         }
     }
 
@@ -1305,13 +1625,6 @@ public actor ChainService {
             try? await acceptedBlockPublisher(header.rawCID)
         case .acceptedSide:
             try? await acceptedBlockPublisher(header.rawCID)
-        case .carrier where outcome.inheritedWorkChanged:
-            // The carrier itself may be a target miss. Reannounce the accepted
-            // tip so the runtime pushes the new generic work delta without
-            // advertising an unaccepted same-chain block.
-            if let tipCID = await process.status().tipCID {
-                try? await acceptedBlockPublisher(tipCID)
-            }
         default:
             break
         }
@@ -1331,7 +1644,11 @@ public actor ChainService {
                 ) {
                     genesisLinks.append(link)
                     if childIntents[anchor.directory]?.genesisCID == anchor.genesisCID {
-                        childIntents.removeValue(forKey: anchor.directory)
+                        var remaining = childIntents
+                        remaining.removeValue(forKey: anchor.directory)
+                        if (try? await replaceChildIntents(remaining)) != nil {
+                            childIntents = remaining
+                        }
                     }
                 }
             }
@@ -1343,6 +1660,11 @@ public actor ChainService {
             header: header,
             outcome: outcome
         )
+        if outcome.decision.isAccepted {
+            Task { [weak self] in
+                await self?.reconcileRetainedCandidateDescendants()
+            }
+        }
         return AdmissionEffects(
             parentGenesisLinks: genesisLinks.sorted {
                 $0.directory < $1.directory
@@ -1356,6 +1678,11 @@ public actor ChainService {
         outcome: NodeAdmissionOutcome
     ) async -> [DirectChildProofSummary] {
         guard let link = outcome.parentCarrierLink else { return [] }
+        // Work was already published. This eager retry only improves proof
+        // latency; durable pending routes make failure and restart harmless.
+        _ = try? await process.retryPendingChildProofs(
+            carrierCID: header.rawCID
+        )
         let durableProofs = (try? await process.durableDirectChildProofs(
             carrierCID: header.rawCID,
             rootCID: link.rootCID
@@ -1365,7 +1692,6 @@ public actor ChainService {
             let publication = DirectChildProofPublication(
                 directory: durable.directory,
                 childCID: durable.childCID,
-                childBlock: durable.childBlock,
                 proof: durable.proof
             )
             do {
@@ -1435,14 +1761,22 @@ public actor ChainService {
             let result = try await process.preflightTransaction(transaction)
             return Self.poolDisposition(result.disposition)
         }
+        let pooledRoots = Set(await pool.snapshot().map(\.cid))
         try await pruneDurableLocalTransactionsLocked(
-            keeping: Set(await pool.snapshot().map(\.cid))
+            keeping: pooledRoots
         )
-        try await syncLiveMempoolRootsLocked(
-            Set(await pool.snapshot().map(\.cid))
+        try await syncLiveMempoolRootsLocked(pooledRoots)
+        try await removeStaleChildIntents(
+            parentStateCID: tip.postState.rawCID
         )
+        for cid in removedByCID.keys.sorted() where pooledRoots.contains(cid) {
+            try? await acceptedTransactionPublisher(cid)
+        }
+    }
+
+    private func invalidateTemplatesLocked() async {
         await templates.invalidateAll()
-        removeStaleChildIntents(parentStateCID: tip.postState.rawCID)
+        _ = await reconcileCurrentCandidateReservations()
     }
 
     private nonisolated static func poolDisposition(
@@ -1510,6 +1844,7 @@ public actor ChainService {
               body.genesisActions.isEmpty,
               body.receiptActions.isEmpty,
               body.withdrawalActions.isEmpty,
+              body.stateAtomsAreValid(),
               body.accountActionsAreValid(),
               resolved.signaturesAreValid(),
               resolved.signaturesMatchSigners(),
@@ -1615,7 +1950,7 @@ public actor ChainService {
             return DirectChildCandidate(
                 directory: intent.directory,
                 block: intent.genesis,
-                acquisitionEntries: intent.acquisitionEntries
+                parentCreatedGenesis: true
             )
         }.sorted { $0.directory < $1.directory }
     }
@@ -1624,27 +1959,20 @@ public actor ChainService {
         context: ChildCandidateRequestContext,
         deploymentCursor: Int
     ) async throws
-        -> (candidates: [DirectChildCandidate], hasDeployment: Bool) {
+        -> (
+            candidates: [DirectChildCandidate],
+            hasDeployment: Bool,
+            deploymentDirectory: String?
+        ) {
         let candidates = try await childCandidateProvider(context)
         var directories: Set<String> = []
-        var encodedBytes = 0
         var accepted: [(
             candidate: DirectChildCandidate,
             targets: (search: UInt256, deployment: UInt256?)
         )] = []
         for candidate in candidates.sorted(by: candidateOrder) {
-            guard let childCID = try? BlockHeader(node: candidate.block).rawCID,
-                  let childData = candidate.block.toData() else { continue }
-            guard let package = try? ChildAcquisitionPackage(
-                entries: candidate.acquisitionEntries,
-                childCID: childCID,
-                childData: childData,
-                maximumBytes: min(
-                    Self.maximumChildCandidateBytes,
-                    ChildAcquisitionPackage.maximumBytes
-                )
-            ) else { continue }
-            guard accepted.count < maximumChildCandidates,
+            guard (try? BlockHeader(node: candidate.block)) != nil,
+                  accepted.count < maximumChildCandidates,
                   candidate.directory.utf8.count <= Self.maximumDirectoryBytes,
                   !directories.contains(candidate.directory),
                   ChainAddress(
@@ -1654,47 +1982,27 @@ public actor ChainService {
                       == context.parentCarrier.prevState.rawCID else {
                 continue
             }
-            let candidateFetcher = CoalescingFetcher(OverlayContentSource(
-                entries: package.entries,
-                fallback: FetcherContentSource(process)
-            ))
-            guard (try? await process.durableCandidateEntries(
-                for: candidate.block,
-                fetcher: candidateFetcher,
-                maximumBytes: min(
-                    Self.maximumChildCandidateBytes,
-                    ChildAcquisitionPackage.maximumBytes
-                )
-            )) != nil,
-                  let targets = try? await committedCandidateTargets(
-                    block: candidate.block,
-                    fetcher: candidateFetcher
-                  ),
+            guard let targets = await schedulingTargets(for: candidate),
                   context.mode == .deployment
                     || targets.deployment == nil,
-                  package.framedByteCount
-                    <= Self.maximumChildCandidateBytes - encodedBytes,
                   directories.insert(candidate.directory).inserted else {
                 continue
             }
-            encodedBytes += package.framedByteCount
-            accepted.append((DirectChildCandidate(
-                    directory: candidate.directory,
-                    block: candidate.block,
-                    acquisitionEntries: package.entries
-                ), targets))
+            accepted.append((candidate, targets))
         }
         guard context.mode == .deployment else {
             return (
                 candidates: accepted.map(\.candidate),
-                hasDeployment: false
+                hasDeployment: false,
+                deploymentDirectory: nil
             )
         }
         let deployments = accepted.filter { $0.targets.deployment != nil }
         guard !deployments.isEmpty else {
             return (
                 candidates: accepted.map(\.candidate),
-                hasDeployment: false
+                hasDeployment: false,
+                deploymentDirectory: nil
             )
         }
         let selected = deployments[deploymentCursor % deployments.count]
@@ -1702,7 +2010,8 @@ public actor ChainService {
             candidates: accepted.filter { $0.targets.deployment == nil }
                 .map(\.candidate)
                 + [selected.candidate],
-            hasDeployment: true
+            hasDeployment: true,
+            deploymentDirectory: selected.candidate.directory
         )
     }
 
@@ -1718,8 +2027,13 @@ public actor ChainService {
         return (leftCID ?? "") < (rightCID ?? "")
     }
 
-    private func blockFits(_ block: Block, spec: ChainSpec) -> Bool {
-        block.toData().map { $0.count <= spec.maxBlockSize } ?? false
+    private func blockFits(
+        _ block: Block,
+        spec: ChainSpec,
+        fetcher: any Fetcher
+    ) async throws -> Bool {
+        try await block.logicalContentByteSize(fetcher: fetcher)
+            <= spec.maxBlockSize
     }
 
     private func requireSameTemplateContext(
@@ -1763,10 +2077,25 @@ public actor ChainService {
         return byDirectory.values.sorted { $0.directory < $1.directory }
     }
 
-    private func removeStaleChildIntents(parentStateCID: String) {
-        childIntents = childIntents.filter {
+    private func removeStaleChildIntents(
+        parentStateCID: String
+    ) async throws {
+        let remaining = childIntents.filter {
             $0.value.parentStateCID == parentStateCID
         }
+        guard remaining.count != childIntents.count else { return }
+        try await replaceChildIntents(remaining)
+        childIntents = remaining
+    }
+
+    private func replaceChildIntents(
+        _ intents: [String: ChildIntent]
+    ) async throws {
+        try await process.retainChildIntentRoots(
+            intents.values.reduce(into: Set<String>()) {
+                $0.formUnion($1.volumeRoots)
+            }
+        )
     }
 
     private func requireReward(
@@ -1837,12 +2166,15 @@ public actor ChainService {
         return transactions
     }
 
-    private func nextTimestamp(after previous: Int64) throws -> Int64 {
-        let now = Int64(Date().timeIntervalSince1970 * 1_000)
-        if now > previous { return now }
-        let (next, overflow) = previous.addingReportingOverflow(1)
+    private func nextTimestamp(
+        after previous: Int64,
+        parentCarrier: Block?
+    ) throws -> Int64 {
+        let (minimum, overflow) = previous.addingReportingOverflow(1)
         guard !overflow else { throw ChainServiceError.timestampOverflow }
-        return next
+        if let parentCarrier { return max(minimum, parentCarrier.timestamp) }
+        let now = Int64(Date().timeIntervalSince1970 * 1_000)
+        return max(minimum, now)
     }
 
     private func acquireOperation() async {

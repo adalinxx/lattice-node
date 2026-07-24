@@ -59,16 +59,24 @@ One mined root CID identifies one physical grind. It has one terminal block
 location per chain and may be projected across exact hierarchy edges. Repeated
 observations of that root do not create additional work.
 
-Wire and durable work facts use the unique canonical CID spelling for that
-identity. An alternate multibase spelling is rejected before it can become a
-second work key. This encoding rule is distinct from branch canonicity: every
-accepted branch's eligible work still counts whether or not that branch is the
-current canonical projection.
+Same-chain predecessor connectivity makes a later grind support its ancestors
+within that chain's GHOST calculation; it does not move the grind's terminal
+location onto an ancestor for a later vertical join. Hierarchy projection is
+exact: only a parent block named by a direct parent-to-child edge gives that
+grind a location in the child. Consequently `parentWorkRevision` is the
+immediate parent's stream cursor, not a global hierarchy generation.
+
+CID spellings are normalized at the content-addressing boundary before they
+become work keys. Alternate multibase text for the same CID therefore cannot
+create a second identity. This encoding rule is distinct from branch
+canonicity: every accepted branch's eligible work still counts whether or not
+that branch is the current canonical projection.
 
 A child candidate is delivered with a sparse proof from the mined root to that
-exact child. Admission checks the setup-wide root-work floor before resolving
-expensive child content, then verifies the path, carrier continuity, vertical
-state binding, the local target, and the local state transition.
+exact child. Lattice verifies the root, path, carrier continuity, vertical state
+binding, local target, and local state transition. Before expensive acquisition,
+each node may independently decline roots below its configured work floor; that
+is local, non-punitive policy rather than peer compatibility or validity.
 
 Accepted parent work may contribute to a child's fork choice even when the
 parent branch is not the parent's current canonical projection. Parent
@@ -84,9 +92,11 @@ older revisions may add previously unseen monotone facts, and reconnect may
 replay the same relation at the same watermark. Its marker must match;
 a mismatch revokes the session. Until that marker arrives, the child keeps the bounded
 incomplete batch out of fork choice. Before the first marker it exposes no
-current canonical decision and produces no mining work; during later deltas the
-last complete view remains operational. Disconnecting discards an incomplete
-batch and revokes readiness.
+operational consensus decision and produces no mining work. It may still ingest
+and project independently verifiable same-chain history for recovery; that
+projection is explicitly stale until readiness. During later deltas the last
+complete view remains operational. Disconnecting discards an incomplete batch
+and revokes readiness.
 
 `parentState` commits the carrier's `prevState`. It is not a parent-block
 backlink and is never inverted to discover ancestry.
@@ -125,7 +135,7 @@ The node uses two Ivy sessions:
   direct children and carries contextual candidates, inherited work, and
   root-bound proof facts.
 
-Both planes currently require node protocol version 2. Portable signed parent
+Both planes currently require node protocol version 4. Portable signed parent
 facts are versioned wire semantics, so mixed-version peers refuse the session
 and must be upgraded together.
 
@@ -138,6 +148,29 @@ protocol messages never request arbitrary CID selections.
 During a candidate round, the parent may serve the ephemeral provisional
 carrier only as that request's root and only for the lifetime of the round.
 
+Candidate replies are offers, not miner-work durability. After staging a
+template, the parent sends each exact child advertiser the complete sorted set
+of candidate CIDs referenced by all remaining live templates. The child first
+applies the same replacement recursively to its direct children, then commits
+its local issued set and acknowledges. The parent returns the new work only
+after every required acknowledgement. The set is bounded by the 16-entry
+template book; an empty set releases all offers and issued reservations.
+Requests and acknowledgements are accepted only on the authenticated direct
+parent/child session for the exact child path. Removal delivery is serialized
+but asynchronous because over-retention is safe and a child must never stall
+parent consensus. Before applying a removal, a child durably fences any earlier
+parent-proof notification into admission handoff ownership. Expired idle work
+may remain over-retained until the next template, submission, invalidation, or
+reconnect boundary; this is bounded and never makes expired work valid.
+
+Each candidate-root content session uses the node's `NodeResourcePolicy` for
+archive bytes, Volume count, and member count. `ChainSpec.maxBlockSize` remains
+chain-selected validity for that chain's complete block Volume boundary
+(excluding the spec and materialized state Volumes). Unknown specs and parent
+witnesses receive separate node-local byte checks before decoding. Exceeding a
+local ceiling declines or defers acquisition without proving the candidate
+invalid or punishing its advertiser.
+
 Hierarchy authorization comes from the configured immediate-parent key or a
 durable parent-issued child directory/genesis relationship, not a process key
 choosing a branch. CAS bytes are non-secret availability and grant no validity:
@@ -145,10 +178,14 @@ the consumer verifies every CID and the exact Lattice evidence it reads.
 
 ### Child-evidence availability
 
-The root-independent direct edge belongs to one ordinary child-evidence Volume.
-Its canonical manifest commits the envelope and exact sorted acquisition-member
-CIDs; those members retain their original content addresses. Missing, extra,
-duplicate, or CID-mismatched members invalidate the whole Volume. A parent
+The root-independent direct edge is derived from an ordinary child-evidence
+Volume. Its canonical one-entry manifest commits only the child CID and proof
+envelope; no duplicate direct-edge Volume exists.
+Child-chain validation Volumes are acquired from the child chain's exact
+same-chain advertisers. For a parent-created genesis, the exact configured
+parent is the preferred source because it created and retains the complete
+Volume roots; any exact same-chain advertiser may supply the same CID-verified
+Volumes as an availability fallback. A parent
 persists the edge when it issues the child commitment; a child persists the
 incoming edge when it validates that commitment. Children never return edge
 inventories or topology to parents.
@@ -162,26 +199,37 @@ parent fact; Lattice still derives work and validates the child. A genesis
 attachment requires both certificates. Nexus neither requests nor accepts
 portable attachments.
 
-Both inventories are cursor-bound and name one exact Volume at a time. Each
-current Ivy response is one frame-bounded complete Volume; oversized Volumes
-are rejected rather than partially published. Ivy owns request deadlines and session fencing,
+Both inventories are cursor-bound and name one exact Volume at a time. Ivy
+streams each complete Volume as an ordered, bounded sequence of frames;
+the receiver applies the one-entry evidence archive bound before allocating
+that stream. Refusing a globally valid archive because it exceeds this local
+application bound, or because receive capacity is temporarily full, is
+reputation-neutral and retried; malformed framing remains punishable.
+Ivy owns request deadlines and session fencing,
 while the node caps concurrent acquisition and recycles a silent or malformed
 session. Exact-announcer binding provides accountability and prevents one peer
 from making the node search the wider network for arbitrary roots; it is not a
 source of content validity.
 
 Parent-to-child evidence uses the same shape: each index or live summary names
-the child CID, physical root CID, and complete attachment Volume CID. The child
-fetches that Volume directly from the exact parent session. Multiple roots for
-one child are separate summaries. No proof-root pagination or evidence
-request/response layer exists beneath this inventory.
+the parent's stable sync-source ID, monotone evidence ordinal, child CID,
+physical root CID, and complete attachment Volume CID. An index walk fixes its
+`through` ordinal on the first page and advances by durable `next` cursors, so
+new evidence cannot reshuffle the walk. A changed source ID restarts at zero.
+The child fetches the Volume directly from the exact parent session, validates
+it, and durably retains it in a pre-admission inbox before advancing its scan
+cursor. Live summaries use the same inbox without advancing that cursor.
+Admission transfers ownership to ordinary chain recovery before releasing the
+inbox root. Multiple roots for one child are separate summaries. No proof-root
+pagination or evidence request/response layer exists beneath this inventory.
 
 Inherited work flows only parent to child. The parent exports one generic,
 monotone `grind -> (parent block, quantity)` relation to every direct child.
 The child alone joins those locations through its durable exact
 `parent block -> child block` edges. A completion marker makes each stream pass
 atomic; the first completed pass from the configured live parent grants
-consensus readiness.
+consensus readiness. The relation is independent of both the parent's canonical
+choice and Volume availability.
 
 ### Transaction pool
 
