@@ -2112,7 +2112,7 @@ final class NetworkTrustTests: XCTestCase {
         )
     }
 
-    func testCandidateRequestEnforcesRewardAndActualFrameBounds() async throws {
+    func testCandidateRequestEnforcesHierarchyRewardAndFrameBounds() async throws {
         XCTAssertEqual(
             ChildCandidateRequestMessage.maximumRewardBytes,
             ChainServiceLimits.maximumPayloadBytes
@@ -2120,40 +2120,45 @@ final class NetworkTrustTests: XCTestCase {
         let parent = try await canonicalNetworkBlock()
         let parentCID = try BlockHeader(node: parent).rawCID
         let parentData = try XCTUnwrap(parent.toData())
-        let rewardData = try _canonicalJSONEncode([MiningReward]())
-        let fixedBytes = 13 + 2
-            + 2 + parentCID.utf8.count
-            + 4 + rewardData.count
-            + 4 + parentData.count
-        let exactPath = wirePath(
-            encodedContribution: ChildCandidateRequestMessage.maximumEncodedBytes
-                - fixedBytes
+        let maximumDepthPath = ["Nexus"] + Array(
+            repeating: String(repeating: "x", count: 64),
+            count: 256
         )
-        let exact = try ChildCandidateRequestMessage(
+        let valid = try ChildCandidateRequestMessage(
             requestID: 15,
             budgetMilliseconds: 750,
-            childPath: exactPath,
+            childPath: maximumDepthPath,
             parentCID: parentCID,
             parentData: parentData,
             rewards: []
         ).encoded()
-        XCTAssertEqual(
-            exact.count,
+        XCTAssertLessThan(
+            valid.count,
             ChildCandidateRequestMessage.maximumEncodedBytes
         )
 
-        let oversizedPath = wirePath(
-            encodedContribution: ChildCandidateRequestMessage.maximumEncodedBytes
-                - fixedBytes + 1
+        let reward = MiningReward(
+            chainPath: maximumDepthPath,
+            transaction: try unsignedTransaction(path: maximumDepthPath)
         )
         XCTAssertThrowsError(try ChildCandidateRequestMessage(
             requestID: 16,
             budgetMilliseconds: 750,
-            childPath: oversizedPath,
+            childPath: maximumDepthPath,
             parentCID: parentCID,
             parentData: parentData,
-            rewards: []
+            rewards: Array(
+                repeating: reward,
+                count: ChildCandidateRequestMessage.maximumRewards + 1
+            )
         ).encoded()) { error in
+            XCTAssertEqual(error as? NodeNetworkWireError, .malformed)
+        }
+
+        XCTAssertThrowsError(try ChildCandidateRequestMessage.decoded(Data(
+            repeating: 0,
+            count: ChildCandidateRequestMessage.maximumEncodedBytes + 1
+        ))) { error in
             XCTAssertEqual(error as? NodeNetworkWireError, .oversized)
         }
     }
@@ -8636,28 +8641,6 @@ final class NetworkTrustTests: XCTestCase {
             signatures: [:],
             body: try HeaderImpl<TransactionBody>(node: body)
         )
-    }
-
-    private func wirePath(encodedContribution: Int) -> [String] {
-        // Every component contributes a two-byte length and its UTF-8 bytes.
-        // "Nexus" is fixed, and an absolute path needs at least one child.
-        var remaining = encodedContribution - 7
-        var contributions: [Int] = []
-        let maximumContribution = StateAtomLimits.maximumDirectoryBytes + 2
-        while remaining > maximumContribution {
-            contributions.append(maximumContribution)
-            remaining -= maximumContribution
-        }
-        if remaining >= 3 {
-            contributions.append(remaining)
-        } else {
-            precondition(!contributions.isEmpty)
-            contributions[contributions.count - 1] -= 3 - remaining
-            contributions.append(3)
-        }
-        return ["Nexus"] + contributions.map {
-            String(repeating: "x", count: $0 - 2)
-        }
     }
 
     private func networkService(

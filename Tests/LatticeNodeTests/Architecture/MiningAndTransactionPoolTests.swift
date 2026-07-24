@@ -984,6 +984,86 @@ final class TransactionPoolArchitectureTests: XCTestCase {
         XCTAssertEqual(restored?.body.rawCID, low.body.rawCID)
     }
 
+    func testReadyTransactionsOutrankNonReadyFeesAtCapacity() async throws {
+        let store = MiningTestStore()
+        let ready = try signedTransaction(
+            key: CryptoUtils.generateKeyPair(),
+            accountActions: [],
+            fee: 1,
+            nonce: 0
+        )
+        let future = try signedTransaction(
+            key: CryptoUtils.generateKeyPair(),
+            accountActions: [],
+            fee: .max,
+            nonce: 1
+        )
+
+        let readyPool = TransactionPool(maxCount: 1)
+        _ = try await readyPool.submit(ready, spec: testSpec(), fetcher: store)
+        await XCTAssertThrowsErrorAsync(
+            try await readyPool.submit(
+                future,
+                spec: testSpec(),
+                fetcher: store,
+                disposition: .future
+            )
+        ) { error in
+            XCTAssertEqual(error as? TransactionPoolError, .full)
+        }
+
+        let futurePool = TransactionPool(maxCount: 1)
+        _ = try await futurePool.submit(
+            future,
+            spec: testSpec(),
+            fetcher: store,
+            disposition: .future
+        )
+        let mutation = try await futurePool.submit(
+            ready,
+            spec: testSpec(),
+            fetcher: store
+        )
+        XCTAssertEqual(mutation.evicted.map(\.transaction.body.rawCID), [
+            future.body.rawCID,
+        ])
+    }
+
+    func testNonReadyQueueIsBoundedPerSigner() async throws {
+        let store = MiningTestStore()
+        let pool = TransactionPool(maxNonReadyPerSigner: 1)
+        let key = CryptoUtils.generateKeyPair()
+        let first = try signedTransaction(
+            key: key,
+            accountActions: [],
+            fee: 1,
+            nonce: 1
+        )
+        let second = try signedTransaction(
+            key: key,
+            accountActions: [],
+            fee: 2,
+            nonce: 2
+        )
+
+        _ = try await pool.submit(
+            first,
+            spec: testSpec(),
+            fetcher: store,
+            disposition: .future
+        )
+        await XCTAssertThrowsErrorAsync(
+            try await pool.submit(
+                second,
+                spec: testSpec(),
+                fetcher: store,
+                disposition: .unavailable
+            )
+        ) { error in
+            XCTAssertEqual(error as? TransactionPoolError, .full)
+        }
+    }
+
     func testExpiredTransactionsArePruned() async throws {
         let store = MiningTestStore()
         let pool = TransactionPool(entryLifetime: 10)

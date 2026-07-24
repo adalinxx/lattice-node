@@ -51,6 +51,7 @@ jobs:
           RELEASE_PLATFORM: linux-amd64
         run: |
           set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           source_epoch="$(git log -1 --format=%ct)"
           staging_root=/workspace/lattice-node
           rm -rf "$staging_root"

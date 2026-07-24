@@ -55,6 +55,36 @@ final class ChainServiceTests: XCTestCase {
         _ = try await service.miningTemplate(MiningTemplateRequest())
     }
 
+    func testTransactionSubmissionDoesNotWaitForGossip() async throws {
+        let publicationStarted = TaskStartLatch()
+        let publicationRelease = TaskStartLatch()
+        let service = makeService(
+            process: try await nexusProcess(),
+            acceptedTransactionPublisher: { _ in
+                await publicationStarted.signal()
+                await publicationRelease.wait()
+            }
+        )
+        let submitted = expectation(
+            description: "durable submission finishes while gossip is blocked"
+        )
+        let submission = Task {
+            defer { submitted.fulfill() }
+            return try await service.submitTransaction(
+                SubmitTransactionRequest(transaction: signedTransaction(
+                    key: CryptoUtils.generateKeyPair(),
+                    chainPath: ["Nexus"]
+                ))
+            )
+        }
+
+        await publicationStarted.wait()
+        await fulfillment(of: [submitted], timeout: 1)
+        await publicationRelease.signal()
+        let response = try await submission.value
+        XCTAssertEqual(response.mempoolCount, 1)
+    }
+
     func testParentWorkReadinessDoesNotGateVerifiableNetworkHistory()
         async throws {
         let fixture = try await activeChildService(spec: NexusGenesis.spec)
@@ -611,6 +641,34 @@ final class ChainServiceTests: XCTestCase {
         }
         let status = await service.status()
         XCTAssertEqual(status.mempoolCount, 1)
+    }
+
+    func testReadyTransactionDisplacesUnfundedFutureFeeClaim() async throws {
+        let service = makeService(
+            process: try await nexusProcess(),
+            mempoolMaxCount: 1
+        )
+        _ = try await service.submitNetworkTransaction(
+            try signedTransaction(
+                key: CryptoUtils.generateKeyPair(),
+                chainPath: ["Nexus"],
+                fee: .max,
+                nonce: 1
+            )
+        )
+        let ready = try signedTransaction(
+            key: CryptoUtils.generateKeyPair(),
+            chainPath: ["Nexus"]
+        )
+
+        let submitted = try await service.submitTransaction(
+            SubmitTransactionRequest(transaction: ready)
+        )
+        let inventory = await service.transactionInventoryRoots()
+
+        XCTAssertEqual(inventory, [
+            submitted.transactionCID,
+        ])
     }
 
     func testLocalMempoolTransactionIsDurableContent() async throws {
@@ -2730,6 +2788,8 @@ final class ChainServiceTests: XCTestCase {
         childProofPublisher: @escaping ChildProofPublisher = { _ in },
         acceptedBlockPublisher: @escaping AcceptedBlockPublisher = { _ in },
         securingWorkPublisher: @escaping SecuringWorkPublisher = {},
+        acceptedTransactionPublisher:
+            @escaping AcceptedTransactionPublisher = { _ in },
         mempoolMaxCount: Int = 10_000
     ) -> ChainService {
         ChainService(
@@ -2740,6 +2800,7 @@ final class ChainServiceTests: XCTestCase {
             childProofPublisher: childProofPublisher,
             acceptedBlockPublisher: acceptedBlockPublisher,
             securingWorkPublisher: securingWorkPublisher,
+            acceptedTransactionPublisher: acceptedTransactionPublisher,
             mempoolMaxCount: mempoolMaxCount
         )
     }
