@@ -1,134 +1,150 @@
-# Process Trust Model — the spawn tree
+# Process trust model
 
-This document states the **process-level** organizing principle: how the chain
-tree is realized as a tree of OS processes, and what one process is allowed to
-trust about another. It is the trust-and-authority companion to
-[fractal-structure.md](fractal-structure.md) (the securing relationship) and the
-node-mechanics companion to [Per-Process Topology](../architecture.md#per-process-topology).
+## One process, one chain
 
-## Two trees, one shape
+Each process owns one absolute Nexus-inclusive chain path. External
+orchestration decides which processes run; a node starts and supervises no
+descendant processes.
 
-In production the chain tree spans operating-system processes: Nexus runs in the
-root process; each child chain runs as its own `LatticeNode` started with
-`--genesis-hex --chain-directory --subscribe-p2p`. **The process tree mirrors the chain tree** — there is one
-process per chain, and a process's parent in the spawn tree is the process for
-its chain's parent. The self-similarity of the chain tree
-([fractal-structure.md](fractal-structure.md)) therefore repeats at the process
-layer: every parent→child edge is the same kind of edge, all the way down.
+The process topology follows direct chain relationships without collapsing
+them into one runtime:
 
-```
-Nexus process ──spawns──▶ Nexus/Payments process ──spawns──▶ Nexus/Payments/Rollups process
-   (root)                      (child)                              (grandchild)
+```text
+Nexus process  ── authenticated facts ──▶  Nexus/Payments process
 ```
 
-## Single root: Nexus
+The parent owns only its own chain. The child owns only its own chain. Neither
+process grants the other database access, enumeration, mutation, or consensus
+authority. An accepted direct relationship may request an exact set of CAS
+objects by CID; those read-only bytes are protocol availability, not access to
+the process's storage interface.
 
-There is exactly **one** root in the spawn tree, the Nexus process. A chain that
-is conceptually a "root chain" of its own subtree is still, in the realized
-topology, a **child** spawned under some parent — only Nexus has no parent
-process. This is the deliberate retirement of the *federated skeleton*: we do not
-support non-Nexus root chains that bootstrap their own independent securing
-frame. Every chain enters the tree by being spawned beneath Nexus (directly or
-transitively), and inherits its place in the single global securing relationship
-from that lineage. (The *addressing* relativity of
-[chain-addressing.md](chain-addressing.md) is unchanged — a process still knows
-only "my parent" and "my child edges"; single-root constrains the *realized*
-topology, not the relative naming model.)
+## Configured parent authority
 
-## The spawn relationship
+A non-Nexus process must be started with both:
 
-A child process exists because a parent process **spawned** it. Concretely
-([architecture.md](../architecture.md#per-process-topology)):
+- its complete path, such as `Nexus/Payments`; and
+- its immediate parent fact endpoint, such as
+  `<nexus-process-key>@parent.example:4002`.
 
-1. **Deploy** — `POST /api/chain/deploy` on the parent builds the child genesis
-   and returns `genesisHex` + the parent P2P endpoint.
-2. **Spawn** — an orchestrator launches the child with that genesis and a
-   `--subscribe-p2p` link back to the parent.
-3. **Extract** — the child opens a dedicated link to the parent, and accepts
-   `parent.children[directory]` blocks via a root-anchored `ChildBlockProof`
-   validated against the parent's proof-of-work root hash.
-4. **Register** — the child calls `POST /api/chain/register-rpc`, so `GET
-   /api/chain/map` can resolve any chain path to a direct RPC URL.
+The configured process public key pins which authenticated Ivy peer may provide
+parent facts. A path claim by itself is not authority. Nexus rejects a parent
+configuration because it is the single root.
 
-The spawn is what makes a chain a chain in this tree: its genesis, its directory
-edge label, and its securing parent are all fixed at spawn time by the parent.
+## Verify content independently
 
-## The chain of trust — what "trust" means here
+Parent authorization and content validity answer different questions:
 
-A child process **trusts its parent because the parent spawned it.** The parent
-is the authority that minted the child's genesis and is the source of the
-proof-carrying ancestor blocks the child needs for consensus. That trust is
-**lineage authorization**, established by a verifiable spawn chain from Nexus
-down to the child.
+- The configured key answers: "which process is allowed to speak as my
+  immediate parent?"
+- CIDs, proof of work, child-inclusion proofs, state continuity, and consensus
+  validation answer: "are these facts valid?"
 
-It is critical to be precise about scope, because this model sits next to the
-opposite principle for *data*:
+The first never bypasses the second. A correctly authenticated parent can
+provide availability and lineage facts, but cannot force invalid bytes into
+child state or dictate the child's fork choice.
 
-- **Trusted (authorization / scope):** *which* process is the legitimate parent
-  for a given chain directory, and therefore which process may act as that
-  chain's consensus provider and what authority scope it carries. This is
-  attested by the spawn chain — a child does not re-derive from scratch whether
-  its parent is "allowed to be" its parent; the spawn lineage says so.
-- **Never trusted (availability / content):** the *bytes* any peer serves. Block
-  content, parent blocks, and volume data are always cryptographically verified
-  on use — `ChildBlockProof` against the parent PoW root, CID-matching on every
-  ingressed object, JIT completeness checks during resolution. As
-  [protocol.md](../protocol.md) puts it, the source that serves the bytes is not
-  trusted; it only provides availability. The availability/serving model is in
-  [block-content-storage.md](block-content-storage.md) and
-  [content-addressed-ingress.md](content-addressed-ingress.md).
+## Separate planes
 
-So the spawn chain of trust **composes with**, and never replaces, content
-verification. It answers *"is this the right parent, and what is it authorized to
-speak for?"* — not *"can I skip checking these bytes?"* The answer to the second
-question is always no.
+Same-chain overlay traffic and parent/child facts use separate Ivy instances.
+The hierarchy plane disables relay and carries only direct relationship facts.
+This prevents a public overlay peer from becoming a parent merely by claiming a
+path.
 
-## Spawn certificates
+Direct children authenticate and advertise their absolute path on the hierarchy
+plane. The parent may request a candidate or publish a proof only for an
+immediate child whose path equals `parentPath + [directory]`.
 
-The lineage is made verifiable by **spawn certificates** (an Ivy primitive). A
-parent issues a signed certificate attesting that it spawned a given child
-directory under a given genesis; a chain of such certificates from Nexus to a
-target chain is the cryptographic witness of that chain's place in the tree.
+Exact-CID exchange is explicitly enabled only on this private Ivy plane. A
+connection must complete its own compatible hierarchy hello before it may read
+content; reconnecting with the same key does not inherit the previous
+connection's authorization. Requests cannot enumerate storage and must name a
+complete bounded selection. The response is non-secret content-addressed
+availability: the receiver verifies every CID and all Lattice evidence before
+the bytes can affect state. Any accepted replica for a locally issued direct
+child path may participate; a path claim remains routing, not branch authority.
 
-- `SpawnCertificate` — one parent→child attestation.
-- `SpawnCertificateChain.verify` — checks an unbroken, correctly-signed lineage
-  from a trusted root (Nexus) down to the leaf identity, with canonicalized
-  identity keys so issuer/child keys compare unambiguously across the chain. The
-  `leaf` **must** be the connection's possession-proven public key — never a key
-  lifted out of the presented chain — or the proof attests nothing about the peer
-  you are actually talking to.
-- `verifiedScope` — the chain-path scope the verified lineage confers on the
-  leaf (which chain path it legitimately speaks for), used to **bound** what a
-  process is allowed to assert or serve as that chain. Callers must enforce the
-  returned scope, not merely check that `verify` succeeded.
+During one bounded child-candidate round, the parent also serves the exact
+provisional carrier only when that carrier CID is the request root. The lease
+is reference-counted, scoped to the runtime generation, and removed after the
+round. It is never persisted and cannot be smuggled into a request rooted at
+unrelated durable content.
 
-A certificate chain lets any party confirm a chain's lineage and scope **without
-trusting the messenger** — it is verify-not-trust applied to *authority* the same
-way `ChildBlockProof` applies it to *block content*.
+The hierarchy receiver gives its one configured immediate parent a narrow
+transport-liveness exemption from its local Tally bucket. That exemption is
+limited to the private plane's exact configured bootstrap key; it does not
+weaken the hierarchy hello, path, authenticated-parent, fact, or Lattice
+validation gates. Overlay peers and all other hierarchy peers remain
+Tally-gated.
 
-## Why it matters for consensus
+## Direct-edge retention, one-way authority
 
-Consensus is Hierarchical GHOST over `trueCumWork`
-([consensus-fork-choice.md](consensus-fork-choice.md)): a block's weight is its
-own-chain forward subtree weight plus the inherited securing weight of its
-ancestors. To evaluate that, **each chain must keep a complete GHOST view from
-the Nexus root down to itself** — it subscribes to every valid ancestor block as
-well as its own. The spawn tree is exactly the structure that delivers that view:
-inherited weight flows *down* the spawn edges (parent → child), and the trusted
-parent link is how a child obtains its ancestors' proof-carrying blocks.
+A direct parent-child commitment has one root-independent identity: parent
+carrier CID, child directory, child CID, and canonical one-hop sparse proof.
+The parent retains an edge when it issues that commitment. The child retains the
+incoming edge after validation and may relay complete parent-signed root
+attachments to same-chain peers.
 
-The trust boundary is therefore the spawn tree: **inside** the lineage a child
-relies on its parent as the authorized consensus provider for the ancestor view;
-**outside** it (an unrelated chain, an unverified peer), everything is federated —
-full verification, no inherited authority.
+No child sends an edge inventory, accepted topology, coverage claim, or work
+back to its parent. The parent is child-agnostic outside bounded candidate and
+proof publication. The child owns the exact vertical relation used for
+consensus projection.
+## Genesis authority
 
-## References
+Nexus has no parent, so its genesis is constructed locally and pinned by CID:
 
-- [fractal-structure.md](fractal-structure.md) — the securing relationship this
-  realizes at the process layer.
-- [architecture.md](../architecture.md#per-process-topology) — the concrete
-  deploy → spawn → extract → register mechanics.
-- [consensus-fork-choice.md](consensus-fork-choice.md) — the `trueCumWork` model
-  the spawn tree feeds.
-- [chain-addressing.md](chain-addressing.md) — relative, route-based identity,
-  unchanged by single-root.
+`bafyreiayw4z5qz4lt2sljf2enzn7uol3qa6bebadav7qwnqz7agxkiuwhq`
+
+The CID is checked before configured root bootstrap, never used as a
+peer-admission signature permit. Every child genesis is ordinary content bound
+to a parent state. A prepared child intent becomes authoritative only after a
+separately signed parent `GenesisAction` transaction is accepted in a carrier
+and the child verifies the resulting parent genesis link. The action and link
+identify only the child directory and exact genesis CID. Parent-process trust
+is local configuration authenticated by Ivy; it is not committed in the child
+`ChainSpec` and can rotate without changing blockchain content.
+
+Signature and signer fields inside a genesis block carry no authority and need
+no special empty shape. The exact genesis CID is the authorization: local
+configuration for Nexus and the parent action commitment for a child. Ordinary
+transactions after genesis remain signature-strict.
+
+## Inherited work
+
+Inherited work is a trusted, monotone report from the configured immediate
+parent, not a proof protocol. For one chain it is the partial function:
+
+`grind -> (block, greatest verified quantity)`
+
+A grind has one block location per chain. Repeating the same location takes the
+maximum quantity; another location is a hard conflict even if either block is
+unknown, disconnected, or noncanonical.
+
+The parent publishes this generic relation over all connected accepted blocks.
+Canonicity does not filter work. Every direct child receives the same relation;
+the parent knows no child topology. The child alone owns the partial function
+`parent block -> child block` and performs an exact join. Parent ancestry never
+invents a child commitment. After the join, ordinary same-chain ancestry makes
+a descendant location contribute to each ancestor's GHOST subtree.
+
+This accounting is orthogonal to data availability. A work fact neither
+transfers a Volume nor claims that its bytes are available; CAS discovery and
+validation proceed independently.
+
+The durable table is keyed uniquely by grind and indexed by parent block. A live
+delta updates only changed grinds and looks up only matching child edges. A new
+edge activates already-durable facts at that exact parent block. Full
+materialization is limited to startup and a new/reconnected parent session.
+
+Wire passes are bounded and atomic. All frames share one nondecreasing revision
+and end with an ordered empty marker. Incomplete state is discarded when the
+exact session changes. The first complete pass from the configured live parent
+makes child consensus ready; losing that live authority preserves verified
+facts for recovery but pauses consensus publication. This readiness dependency
+propagates recursively. Nexus has no incoming parent report.
+## Operational consequence
+
+Treat `--parent` as security configuration, not discovery. Changing it changes
+who may supply parent facts. Keep process identity keys stable, restrict the
+fact-plane port to intended relationships, and back up identity separately from
+wipeable chain storage.
