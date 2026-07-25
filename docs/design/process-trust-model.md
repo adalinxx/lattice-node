@@ -109,42 +109,29 @@ no special empty shape. The exact genesis CID is the authorization: local
 configuration for Nexus and the parent action commitment for a child. Ordinary
 transactions after genesis remain signature-strict.
 
-## Inherited work
+## Parent-state continuity and work
 
-Inherited work is a trusted, monotone report from the configured immediate
-parent, not a proof protocol. For one chain it is the partial function:
+The immediate parent answers one authority question for a non-genesis child
+candidate: is the new parent-state reference equal to, or transitively reachable
+from, the predecessor's reference through connected accepted parent blocks?
+The answer is signed over the Nexus genesis, exact parent path, and exact state
+pair. It is immutable and portable, so any peer may relay it. Parent canonicity
+does not affect this reachability fact.
 
-`grind -> (block, greatest verified quantity)`
+Work is not a parent assertion. Lattice derives it from the candidate's
+content-addressed directory proof: the root grind must beat the terminal target
+and commit uniquely to that child along the directory path. One grind counts at
+most once at a chain-local location, independent grinds sum, and work affects
+fork choice only after the terminal child is accepted and connected.
 
-A grind has one block location per chain. Repeating the same location takes the
-maximum quantity; another location is a hard conflict even if either block is
-unknown, disconnected, or noncanonical.
-
-The parent publishes this generic relation over all connected accepted blocks.
-Canonicity does not filter work. Every direct child receives the same relation;
-the parent knows no child topology. The child alone owns the partial function
-`parent block -> child block` and performs an exact join. Parent ancestry never
-invents a child commitment. After the join, ordinary same-chain ancestry makes
-a descendant location contribute to each ancestor's GHOST subtree.
-
-This accounting is orthogonal to data availability. A work fact neither
-transfers a Volume nor claims that its bytes are available; CAS discovery and
-validation proceed independently.
-
-The durable table is keyed uniquely by grind and indexed by parent block. A live
-delta updates only changed grinds and looks up only matching child edges. A new
-edge activates already-durable facts at that exact parent block. Full
-materialization is limited to startup and a new/reconnected parent session.
-
-Wire passes are bounded and atomic. All frames share one nondecreasing revision
-and end with an ordered empty marker. Incomplete state is discarded when the
-exact session changes. The first complete pass from the configured live parent
-makes child consensus ready; losing that live authority preserves verified
-facts for recovery but pauses consensus publication. This readiness dependency
-propagates recursively. Nexus has no incoming parent report.
+The parent therefore publishes no work totals, revisions, readiness marker, or
+child topology. Data availability remains separate: Ivy and VolumeBroker move
+the proof and certificate Volumes, while Lattice independently verifies the
+facts they contain.
 ## Operational consequence
 
-Treat `--parent` as security configuration, not discovery. Changing it changes
-who may supply parent facts. Keep process identity keys stable, restrict the
-fact-plane port to intended relationships, and back up identity separately from
-wipeable chain storage.
+Treat `--parent` as security configuration and preferred live authority, not as
+the only possible data source. Changing it changes who may issue new parent
+facts. Keep process identity keys stable, restrict the fact-plane port to
+intended relationships, and back up identity separately from wipeable chain
+storage.

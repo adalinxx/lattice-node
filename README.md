@@ -62,9 +62,10 @@ swift run lattice-node \
 The child starts in `awaitingGenesis`. Create a child intent on the parent,
 submit the separately signed parent `GenesisAction` transaction, and mine the
 parent block that commits it. The authenticated hierarchy plane then delivers
-the genesis proof. The child becomes active only after that same live parent
-finishes its current inherited-work export. Genesis is returned as a normal
-content-addressed block; there is no opaque serialized bootstrap channel.
+the genesis proof and signed authorization. The child derives work from that
+proof and becomes active once the genesis is durably admitted. Genesis is
+returned as a normal content-addressed block; there is no opaque serialized
+bootstrap channel.
 
 ## Mining
 

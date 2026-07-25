@@ -130,9 +130,6 @@ struct LatticeNodeCommand: AsyncParsableCommand {
                 guard let network else { throw CancellationError() }
                 try await network.publishAcceptedBlock(blockCID)
             },
-            securingWorkPublisher: { [weak network] in
-                await network?.publishSecuringWork()
-            },
             acceptedTransactionPublisher: { [weak network] rootCID in
                 guard let network else { throw CancellationError() }
                 try await network.publishTransaction(rootCID)
@@ -163,19 +160,6 @@ struct LatticeNodeCommand: AsyncParsableCommand {
                     preparingChildDirectories: admission.preparingChildDirectories,
                     contentSource: admission.contentSource
                 )
-            },
-            inheritedWork: {
-                [weak service] snapshot, sourceID, baseRevision, key in
-                guard let service else { throw CancellationError() }
-                return try await service.applyInheritedWorkExport(
-                    snapshot,
-                    sourceID: sourceID,
-                    baseRevision: baseRevision,
-                    from: key
-                )
-            },
-            parentWorkReadiness: { [weak service] ready in
-                await service?.setParentWorkReady(ready)
             },
             transaction: { [weak service] transaction in
                 guard let service else { throw CancellationError() }

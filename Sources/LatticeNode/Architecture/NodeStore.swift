@@ -126,11 +126,6 @@ struct ParentEvidenceScanCursor: Equatable, Sendable {
     let ordinal: UInt64
 }
 
-struct ParentWorkCursor: Equatable, Sendable {
-    let sourceID: String
-    let revision: UInt64
-}
-
 struct ParentEvidenceInboxItem: Sendable {
     let sourceID: String
     let ordinal: UInt64
@@ -214,11 +209,9 @@ enum IssuedChildProofScope: String, Sendable {
 
 /// Node-owned immutable facts and availability indexes for one absolute path.
 actor NodeStore {
-    /// Epoch 33 removes node-local parent and work-floor policy from durable
-    /// chain identity. Existing stores must be rebuilt from the pinned genesis.
-    static let currentSchemaEpoch: Int64 = 33
-    private static let legacyParentWorkSourceID =
-        "00000000-0000-0000-0000-000000000000"
+    /// Epoch 34 removes the redundant inherited-work feed. Older stores must be
+    /// wiped; Nexus deterministically recreates the configured exact genesis.
+    static let currentSchemaEpoch: Int64 = 34
 
     private let database: NodeSQLite
     private let nexusGenesisCID: String
@@ -960,100 +953,6 @@ actor NodeStore {
         ).isEmpty
     }
 
-    /// Materialize the one configured parent's fact set only when a process
-    /// opens or recovers. Live updates stay in one monotone SQL table and go
-    /// straight to Core as their original fragment.
-    func inheritedWorkSnapshot(
-        matchingParentBlockCIDs parentBlockCIDs: Set<String>? = nil
-    ) throws -> InheritedWorkSnapshot? {
-        guard parentProcessKey != nil else { return nil }
-        if let parentBlockCIDs,
-           !parentBlockCIDs.allSatisfy(CIDIdentity.isCanonical) {
-            throw NodeStoreError.corrupt("invalid inherited work lookup")
-        }
-        let sourceRows = try database.query(
-            "SELECT source_id, revision, fact_count FROM parent_work_source"
-        )
-        guard sourceRows.count <= 1 else {
-            throw NodeStoreError.corrupt("duplicate immediate-parent work source")
-        }
-        guard let sourceRow = sourceRows.first else {
-            let hasFacts = try hasParentWorkFacts()
-            guard !hasFacts else {
-                throw NodeStoreError.corrupt("parent work facts have no source revision")
-            }
-            return nil
-        }
-        guard sourceRow["source_id"]?.textValue != nil,
-              let revisionText = sourceRow["revision"]?.textValue,
-              let factCount = sourceRow["fact_count"]?.intValue,
-              factCount >= 0 else {
-            throw NodeStoreError.corrupt("malformed immediate-parent work source")
-        }
-        let revision = try Self.parentWorkRevision(from: revisionText)
-        let rows: [[String: NodeSQLiteValue]] = if let parentBlockCIDs {
-            if parentBlockCIDs.isEmpty {
-                []
-            } else {
-                try database.query(
-                    "SELECT block_cid, grind_id, work FROM parent_work_facts WHERE block_cid IN (\((1...parentBlockCIDs.count).map { "?\($0)" }.joined(separator: ", "))) ORDER BY block_cid, grind_id",
-                    params: parentBlockCIDs.sorted().map(NodeSQLiteValue.text)
-                )
-            }
-        } else {
-            try database.query(
-                "SELECT block_cid, grind_id, work FROM parent_work_facts ORDER BY block_cid, grind_id"
-            )
-        }
-        guard parentBlockCIDs != nil || factCount == Int64(rows.count) else {
-            throw NodeStoreError.corrupt("immediate-parent work fact count mismatch")
-        }
-        var facts: [InheritedWorkFact] = []
-        facts.reserveCapacity(rows.count)
-        for row in rows {
-            guard let blockCID = row["block_cid"]?.textValue,
-                  let grindID = row["grind_id"]?.textValue,
-                  let workText = row["work"]?.textValue,
-                  CIDIdentity.isCanonical(blockCID),
-                  CIDIdentity.isCanonical(grindID) else {
-                throw NodeStoreError.corrupt("malformed inherited work fact")
-            }
-            guard let fact = InheritedWorkFact(
-                blockCID: blockCID,
-                grindID: grindID,
-                work: try Self.parentWorkValue(from: workText)
-            ) else {
-                throw NodeStoreError.corrupt("zero inherited work fact")
-            }
-            facts.append(fact)
-        }
-        return InheritedWorkSnapshot(revision: revision, facts: facts)
-    }
-
-    func inheritedWorkRevision() throws -> UInt64? {
-        try inheritedWorkCursor()?.revision
-    }
-
-    func inheritedWorkCursor() throws -> ParentWorkCursor? {
-        guard parentProcessKey != nil else { return nil }
-        let rows = try database.query(
-            "SELECT source_id, revision FROM parent_work_source"
-        )
-        guard rows.count <= 1 else {
-            throw NodeStoreError.corrupt("duplicate immediate-parent work source")
-        }
-        guard let row = rows.first else { return nil }
-        guard let sourceID = row["source_id"]?.textValue,
-              UUID(uuidString: sourceID) != nil,
-              let revisionText = row["revision"]?.textValue else {
-            throw NodeStoreError.corrupt("malformed immediate-parent work source")
-        }
-        return ParentWorkCursor(
-            sourceID: sourceID,
-            revision: try Self.parentWorkRevision(from: revisionText)
-        )
-    }
-
     func syncSourceID() throws -> String {
         guard let sourceID = try database.query(
             "SELECT sync_source_id FROM node_metadata WHERE singleton = 1"
@@ -1062,182 +961,6 @@ actor NodeStore {
             throw NodeStoreError.corrupt("malformed sync source identifier")
         }
         return sourceID
-    }
-
-    /// Persist one authenticated parent's monotone facts. A revision is only a
-    /// progress watermark, so an older fragment may still strengthen one
-    /// physical grind at its reserved parent-block location. Returns only
-    /// facts that changed, at the durable revision, so Core need not reread
-    /// the complete source.
-    func mergeInheritedWorkSnapshot(
-        _ snapshot: InheritedWorkSnapshot,
-        from authorityKey: String,
-        sourceID: String? = nil,
-        baseRevision: UInt64? = nil,
-        consensusRevisionFloor: UInt64? = nil
-    ) throws -> InheritedWorkSnapshot? {
-        guard let authority = parentProcessKey,
-              authority.value == authorityKey,
-              snapshot.hasUniqueGrindLocations,
-              sourceID.map({ UUID(uuidString: $0) != nil }) ?? true,
-              sourceID != nil || baseRevision == nil,
-              baseRevision.map({ $0 <= snapshot.revision }) ?? true else {
-            throw NodeStoreError.invalidConfiguration(
-                "invalid immediate-parent work facts"
-            )
-        }
-        let facts = try snapshot.blockCIDs.flatMap { blockCID in
-            guard CIDIdentity.isCanonical(blockCID) else {
-                throw NodeStoreError.invalidConfiguration(
-                    "inherited work has an invalid child block identifier"
-                )
-            }
-            let measure = snapshot.sourceWork(forBlock: blockCID)
-            guard !measure.isEmpty else {
-                throw NodeStoreError.invalidConfiguration(
-                    "inherited work contains an empty child block measure"
-                )
-            }
-            return try measure.grindIDs.sorted().map { grindID in
-                guard CIDIdentity.isCanonical(grindID) else {
-                    throw NodeStoreError.invalidConfiguration(
-                        "inherited work has an invalid physical grind identifier"
-                    )
-                }
-                guard let work = measure.work(forGrind: grindID), work > .zero else {
-                    throw NodeStoreError.invalidConfiguration(
-                        "inherited work contains zero physical grind work"
-                    )
-                }
-                return (blockCID, grindID, work)
-            }
-        }
-        return try database.transaction {
-            var advanced = false
-            var changedFacts: [InheritedWorkFact] = []
-            var durableRevision = snapshot.revision
-            let sourceRows = try database.query(
-                "SELECT source_id, revision, fact_count FROM parent_work_source"
-            )
-            guard sourceRows.count <= 1 else {
-                throw NodeStoreError.corrupt("duplicate immediate-parent work source")
-            }
-            if let sourceRow = sourceRows.first {
-                guard let currentSourceID = sourceRow["source_id"]?.textValue,
-                      UUID(uuidString: currentSourceID) != nil,
-                      let revisionText = sourceRow["revision"]?.textValue,
-                      let factCount = sourceRow["fact_count"]?.intValue,
-                      factCount >= 0 else {
-                    throw NodeStoreError.corrupt("malformed immediate-parent work source")
-                }
-                let currentRevision = try Self.parentWorkRevision(from: revisionText)
-                if let sourceID {
-                    if let baseRevision {
-                        guard currentSourceID == sourceID,
-                              currentRevision == baseRevision else {
-                            throw NodeStoreError.invalidConfiguration(
-                                "inherited work delta does not match durable cursor"
-                            )
-                        }
-                    }
-                    durableRevision = snapshot.revision
-                    if currentSourceID != sourceID
-                        || currentRevision != snapshot.revision
-                    {
-                        try database.execute(
-                            "UPDATE parent_work_source SET source_id = ?1, revision = ?2 WHERE singleton = 1",
-                            params: [
-                                .text(sourceID),
-                                .text(String(snapshot.revision)),
-                            ]
-                        )
-                        advanced = true
-                    }
-                } else {
-                    durableRevision = max(currentRevision, snapshot.revision)
-                    if snapshot.revision > currentRevision {
-                        try database.execute(
-                            "UPDATE parent_work_source SET revision = ?1 WHERE singleton = 1",
-                            params: [.text(String(snapshot.revision))]
-                        )
-                        advanced = true
-                    }
-                }
-            } else {
-                let hasFacts = try hasParentWorkFacts()
-                guard !hasFacts else {
-                    throw NodeStoreError.corrupt("parent work facts have no source revision")
-                }
-                guard baseRevision == nil else {
-                    throw NodeStoreError.invalidConfiguration(
-                        "inherited work delta has no durable cursor"
-                    )
-                }
-                let initialSourceID = sourceID ?? Self.legacyParentWorkSourceID
-                try database.execute(
-                    "INSERT INTO parent_work_source (singleton, source_id, revision, fact_count) VALUES (1, ?1, ?2, 0)",
-                    params: [
-                        .text(initialSourceID),
-                        .text(String(snapshot.revision)),
-                    ]
-                )
-                advanced = true
-            }
-
-            for (blockCID, grindID, work) in facts {
-                let locationRows = try database.query(
-                    "SELECT block_cid, work FROM parent_work_facts WHERE grind_id = ?1",
-                    params: [.text(grindID)]
-                )
-                guard locationRows.count <= 1 else {
-                    throw NodeStoreError.corrupt("duplicate parent grind")
-                }
-                guard locationRows.allSatisfy({
-                    $0["block_cid"]?.textValue == blockCID
-                }) else {
-                    throw NodeStoreError.corrupt(
-                        "one parent grind has multiple block locations"
-                    )
-                }
-                let currentWork = try locationRows.first?["work"]?.textValue.map {
-                    try Self.parentWorkValue(from: $0)
-                }
-                if work > (currentWork ?? .zero) {
-                    if currentWork == nil {
-                        try database.execute(
-                            "INSERT INTO parent_work_facts (block_cid, grind_id, work) VALUES (?1, ?2, ?3)",
-                            params: [
-                                .text(blockCID), .text(grindID), .text(work.toHexString()),
-                            ]
-                        )
-                        try database.execute(
-                            "UPDATE parent_work_source SET fact_count = fact_count + 1 WHERE singleton = 1"
-                        )
-                    } else {
-                        try database.execute(
-                            "UPDATE parent_work_facts SET work = ?1 WHERE grind_id = ?2",
-                            params: [
-                                .text(work.toHexString()), .text(grindID),
-                            ]
-                        )
-                    }
-                    advanced = true
-                    changedFacts.append(InheritedWorkFact(
-                        blockCID: blockCID,
-                        grindID: grindID,
-                        work: work
-                    )!)
-                }
-            }
-            if !changedFacts.isEmpty, let consensusRevisionFloor {
-                try persistConsensusRevisionFloor(consensusRevisionFloor)
-            }
-            guard advanced else { return nil }
-            return InheritedWorkSnapshot(
-                revision: durableRevision,
-                facts: changedFacts
-            )
-        }
     }
 
     private static func acceptedBlocks(
@@ -3742,8 +3465,6 @@ actor NodeStore {
         "issued_child_proofs",
         "parent_evidence_scan",
         "parent_evidence_inbox",
-        "parent_work_source",
-        "parent_work_facts",
         "local_mempool_transactions",
         "child_genesis_volume_roots",
         "prepared_child_proofs",
@@ -3884,24 +3605,6 @@ actor NodeStore {
             "CREATE INDEX IF NOT EXISTS issued_child_edges_by_child ON issued_child_edges (child_cid, parent_carrier_cid, edge_cid)"
         )
         try database.execute("""
-            CREATE TABLE IF NOT EXISTS parent_work_source (
-                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-                source_id TEXT NOT NULL,
-                revision TEXT NOT NULL,
-                fact_count INTEGER NOT NULL CHECK (fact_count >= 0)
-            ) WITHOUT ROWID
-            """)
-        try database.execute("""
-            CREATE TABLE IF NOT EXISTS parent_work_facts (
-                block_cid TEXT NOT NULL,
-                grind_id TEXT PRIMARY KEY,
-                work TEXT NOT NULL
-            ) WITHOUT ROWID
-            """)
-        try database.execute(
-            "CREATE INDEX IF NOT EXISTS parent_work_facts_by_block ON parent_work_facts (block_cid, grind_id)"
-        )
-        try database.execute("""
             CREATE TABLE IF NOT EXISTS local_mempool_transactions (
                 transaction_cid TEXT PRIMARY KEY,
                 added_at INTEGER NOT NULL CHECK (added_at >= 0)
@@ -3973,28 +3676,6 @@ actor NodeStore {
         } catch {
             throw NodeStoreError.corrupt(String(describing: error))
         }
-    }
-
-    private func hasParentWorkFacts() throws -> Bool {
-        try !database.query(
-            "SELECT 1 AS present FROM parent_work_facts LIMIT 1"
-        ).isEmpty
-    }
-
-    private static func parentWorkRevision(from value: String) throws -> UInt64 {
-        guard let revision = UInt64(value), String(revision) == value else {
-            throw NodeStoreError.corrupt("malformed parent work revision")
-        }
-        return revision
-    }
-
-    private static func parentWorkValue(from value: String) throws -> UInt256 {
-        guard let work = UInt256.fromHexString(value),
-              work > .zero,
-              work.toHexString() == value else {
-            throw NodeStoreError.corrupt("malformed parent work fact")
-        }
-        return work
     }
 
     private static func normalizedFacts(

@@ -9,198 +9,6 @@ import cashew
 @testable import LatticeNode
 
 final class ChainServiceTests: XCTestCase {
-    func testParentWorkReadinessGatesConsensusButNotTransactions() async throws {
-        let service = ChainService(
-            process: try await nexusProcess(),
-            childCandidateProvider: { _ in [] },
-            childProofPublisher: { _ in },
-            acceptedBlockPublisher: { _ in },
-            securingWorkPublisher: {}
-        )
-        await service.setParentWorkReady(false)
-
-        let stale = await service.status()
-        XCTAssertEqual(stale.phase, .awaitingParent)
-        XCTAssertNotNil(stale.tipCID)
-        await XCTAssertThrowsErrorAsync(
-            try await service.miningTemplate(MiningTemplateRequest(
-                mode: .deployment
-            ))
-        ) { error in
-            XCTAssertEqual(error as? ChainServiceError, .parentUnavailable)
-        }
-        await XCTAssertThrowsErrorAsync(
-            try await service.createChildDeployIntent(ChildDeployIntentRequest(
-                directory: "Child",
-                spec: NexusGenesis.spec,
-                genesisTransactions: [],
-                target: .max,
-                timestamp: 1
-            ))
-        ) { error in
-            XCTAssertEqual(error as? ChainServiceError, .parentUnavailable)
-        }
-
-        let transaction = try signedTransaction(
-            key: CryptoUtils.generateKeyPair(),
-            chainPath: ["Nexus"]
-        )
-        _ = try await service.submitTransaction(
-            SubmitTransactionRequest(transaction: transaction)
-        )
-
-        await service.setParentWorkReady(true)
-        let ready = await service.status()
-        XCTAssertEqual(ready.phase, .active)
-        _ = try await service.miningTemplate(MiningTemplateRequest())
-    }
-
-    func testTransactionSubmissionDoesNotWaitForGossip() async throws {
-        let publicationStarted = TaskStartLatch()
-        let publicationRelease = TaskStartLatch()
-        let service = makeService(
-            process: try await nexusProcess(),
-            acceptedTransactionPublisher: { _ in
-                await publicationStarted.signal()
-                await publicationRelease.wait()
-            }
-        )
-        let submitted = expectation(
-            description: "durable submission finishes while gossip is blocked"
-        )
-        let submission = Task {
-            defer { submitted.fulfill() }
-            return try await service.submitTransaction(
-                SubmitTransactionRequest(transaction: signedTransaction(
-                    key: CryptoUtils.generateKeyPair(),
-                    chainPath: ["Nexus"]
-                ))
-            )
-        }
-
-        await publicationStarted.wait()
-        await fulfillment(of: [submitted], timeout: 1)
-        await publicationRelease.signal()
-        let response = try await submission.value
-        XCTAssertEqual(response.mempoolCount, 1)
-    }
-
-    func testParentWorkReadinessDoesNotGateVerifiableNetworkHistory()
-        async throws {
-        let fixture = try await activeChildService(spec: NexusGenesis.spec)
-        await fixture.service.setParentWorkReady(true)
-
-        let timestamp = fixture.parentCarrier.timestamp + 1
-        let provisionalParent = try await BlockBuilder.buildBlock(
-            previous: fixture.parentCarrier,
-            timestamp: timestamp,
-            nonce: 0,
-            fetcher: fixture.parent
-        )
-        let candidate = try await fixture.service.miningCandidate(
-            parentCarrier: provisionalParent,
-            parentContentSource: FetcherContentSource(fixture.parent)
-        )
-        let content = CoalescingFetcher(CompositeContentSource([
-            fixture.parent,
-            fixture.process,
-        ]))
-        let carrier = try await BlockBuilder.buildBlock(
-            previous: fixture.parentCarrier,
-            children: ["Payments": candidate.block],
-            timestamp: timestamp,
-            nonce: 0,
-            fetcher: content
-        )
-        let carrierHeader = try BlockHeader(node: carrier)
-        let parentAdmission = try await fixture.parent.admit(carrierHeader)
-        let carrierLink = try XCTUnwrap(parentAdmission.parentCarrierLink)
-        let proof = try await ChildBlockProof.generate(
-            rootHeader: carrierHeader,
-            childDirectory: "Payments",
-            fetcher: content
-        )
-        let package = AuthenticatedChildPackage(
-            package: ChildValidationPackage(
-                proof: proof,
-                parentCarrierLink: carrierLink
-            )
-        )
-        let candidateHeader = try BlockHeader(node: candidate.block)
-
-        await fixture.service.setParentWorkReady(false)
-        let admitted = try await fixture.service.admitNetworkCandidate(
-            candidateHeader,
-            authenticatedChildPackage: package,
-            preparingChildDirectories: [],
-            contentSource: FetcherContentSource(fixture.process)
-        )
-        XCTAssertTrue(admitted.decision.isAccepted)
-        let awaitingParent = await fixture.service.status()
-        XCTAssertEqual(awaitingParent.phase, .awaitingParent)
-        XCTAssertEqual(awaitingParent.tipCID, candidateHeader.rawCID)
-        await XCTAssertThrowsErrorAsync(
-            try await fixture.service.miningTemplate(MiningTemplateRequest())
-        ) { error in
-            XCTAssertEqual(error as? ChainServiceError, .parentUnavailable)
-        }
-
-        await fixture.service.setParentWorkReady(true)
-        let ready = await fixture.service.status()
-        XCTAssertEqual(ready.phase, .active)
-        XCTAssertEqual(ready.tipCID, candidateHeader.rawCID)
-    }
-
-    func testAuthenticatedGenesisBootstrapsBeforeParentWorkIsReady()
-        async throws {
-        let parent = try await nexusProcess()
-        let parentGenesis = try await parent.canonicalTipBlock()
-        let parentAuthority = try XCTUnwrap(
-            ParentProcessKey(parent.configuration.processPublicKey)
-        )
-        let child = try await anchoredChildGenesis(
-            parent: parent,
-            parentGenesis: parentGenesis,
-            parentAuthority: parentAuthority,
-            transactions: [],
-            childTimestamp: 1,
-            carrierNonce: 0
-        )
-        let directory = FileManager.default.temporaryDirectory
-            .appendingPathComponent(
-                "lattice-child-bootstrap-\(UUID().uuidString)"
-            )
-        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
-        let process = try await ChainProcess.open(configuration: NodeConfiguration(
-            chainPath: ["Nexus", "Payments"],
-            minimumRootWork: UInt256(1),
-            storagePath: directory,
-            privateKeyHex: String(repeating: "02", count: 32),
-            parentEndpoint: ParentEndpoint(
-                publicKey: parent.configuration.processPublicKey,
-                host: "127.0.0.1",
-                port: 4002
-            )
-        ))
-        let service = makeService(process: process)
-
-        let admitted = try await service.admitNetworkCandidate(
-            child.header,
-            authenticatedChildPackage: child.package,
-            preparingChildDirectories: [],
-            contentSource: FetcherContentSource(parent)
-        )
-        XCTAssertTrue(admitted.decision.isAccepted)
-        let status = await service.status()
-        XCTAssertEqual(status.phase, .awaitingParent)
-        XCTAssertEqual(status.tipCID, child.header.rawCID)
-        await XCTAssertThrowsErrorAsync(
-            try await service.miningTemplate(MiningTemplateRequest())
-        ) { error in
-            XCTAssertEqual(error as? ChainServiceError, .parentUnavailable)
-        }
-    }
-
     func testTransactionRequestsCarryConcreteBodiesThroughJSON() throws {
         let key = CryptoUtils.generateKeyPair()
         let transaction = try signedTransaction(
@@ -1427,7 +1235,6 @@ final class ChainServiceTests: XCTestCase {
             initialReward: 10,
             halvingInterval: 100
         ))
-        await fixture.service.setParentWorkReady(true)
         let intent = try await simpleChildIntent(
             service: fixture.service,
             directory: "Grandchild",
@@ -1514,7 +1321,6 @@ final class ChainServiceTests: XCTestCase {
             let fixture = try await activeChildService(
                 spec: spec(maxBlockSize: maxBlockSize)
             )
-            await fixture.service.setParentWorkReady(true)
             _ = try await fixture.service.submitTransaction(
                 SubmitTransactionRequest(transaction: transaction)
             )
@@ -1526,7 +1332,6 @@ final class ChainServiceTests: XCTestCase {
         }
 
         let sizing = try await activeChildService(spec: spec(maxBlockSize: 1_000_000))
-        await sizing.service.setParentWorkReady(true)
         _ = try await sizing.service.submitTransaction(
             SubmitTransactionRequest(transaction: transaction)
         )
@@ -1595,7 +1400,6 @@ final class ChainServiceTests: XCTestCase {
             maxBlockSize: Int
         ) async throws -> DirectChildCandidate {
             let fixture = try await activeChildService(spec: spec(maxBlockSize))
-            await fixture.service.setParentWorkReady(true)
             for transaction in transactions {
                 _ = try await fixture.service.submitTransaction(
                     SubmitTransactionRequest(transaction: transaction)
@@ -1608,7 +1412,6 @@ final class ChainServiceTests: XCTestCase {
         }
 
         let sizing = try await activeChildService(spec: spec(1_000_000))
-        await sizing.service.setParentWorkReady(true)
         for transaction in transactions.prefix(6) {
             _ = try await sizing.service.submitTransaction(
                 SubmitTransactionRequest(transaction: transaction)
@@ -1623,7 +1426,6 @@ final class ChainServiceTests: XCTestCase {
         )
 
         let fullSizing = try await activeChildService(spec: spec(1_000_000))
-        await fullSizing.service.setParentWorkReady(true)
         for transaction in transactions {
             _ = try await fullSizing.service.submitTransaction(
                 SubmitTransactionRequest(transaction: transaction)
@@ -1694,7 +1496,6 @@ final class ChainServiceTests: XCTestCase {
         ) async throws -> (DirectChildCandidate, ChainProcess) {
             let fixture = try await activeChildService(spec: spec(maxBlockSize))
             let service = childService(fixture, directories: childDirectories)
-            await service.setParentWorkReady(true)
             if let transaction {
                 _ = try await service.submitTransaction(
                     SubmitTransactionRequest(transaction: transaction)
@@ -1778,7 +1579,6 @@ final class ChainServiceTests: XCTestCase {
             stableFixture,
             directories: ["A", "B"]
         )
-        await stableService.setParentWorkReady(true)
         func scheduledDirectory() async throws -> String {
             let candidate = try await stableService.miningCandidate(
                 parentCarrier: stableFixture.parentCarrier,
@@ -1934,7 +1734,6 @@ final class ChainServiceTests: XCTestCase {
 
         let publishedProofs = PublishedProofs()
         let publishedBlocks = PublishedBlocks()
-        let publishedWork = PublishedBlocks()
         let service = makeService(
             process: process,
             childCandidateProvider: { context in
@@ -1956,9 +1755,6 @@ final class ChainServiceTests: XCTestCase {
             },
             acceptedBlockPublisher: { blockCID in
                 await publishedBlocks.record(blockCID)
-            },
-            securingWorkPublisher: {
-                await publishedWork.record("work")
             }
         )
         let template = try await service.miningTemplate(MiningTemplateRequest())
@@ -1984,8 +1780,6 @@ final class ChainServiceTests: XCTestCase {
         XCTAssertEqual(publicationCount, 1)
         let publishedBlockCount = await publishedBlocks.count()
         XCTAssertEqual(publishedBlockCount, 0)
-        let publishedWorkCount = await publishedWork.count()
-        XCTAssertEqual(publishedWorkCount, 1)
         let admissionsAfter = try await store.stagedAdmissions()
         let leavesAfter = try await process.acceptedLeafPage(
             afterCID: nil,
@@ -2163,7 +1957,6 @@ final class ChainServiceTests: XCTestCase {
             },
             childProofPublisher: { _ in },
             acceptedBlockPublisher: { _ in },
-            securingWorkPublisher: {},
             maximumChildCandidates: 1
         )
 
@@ -2395,7 +2188,6 @@ final class ChainServiceTests: XCTestCase {
             childGenesis.parentState.rawCID
         )
         let childService = makeService(process: childProcess)
-        await childService.setParentWorkReady(true)
         await XCTAssertThrowsErrorAsync(
             try await childService.miningTemplate(MiningTemplateRequest())
         ) { error in
@@ -2498,7 +2290,6 @@ final class ChainServiceTests: XCTestCase {
 
     func testContextualCandidateIsStableAcrossParentCarrierIdentity() async throws {
         let fixture = try await activeChildService(spec: NexusGenesis.spec)
-        await fixture.service.setParentWorkReady(true)
         let carrierTimestamp = fixture.parentCarrier.timestamp + 1
         let firstCarrier = try await BlockBuilder.buildBlock(
             previous: fixture.parentCarrier,
@@ -2540,7 +2331,6 @@ final class ChainServiceTests: XCTestCase {
 
     func testAbandonedParentCarriersDoNotExhaustChildCandidates() async throws {
         let fixture = try await activeChildService(spec: NexusGenesis.spec)
-        await fixture.service.setParentWorkReady(true)
         var candidateCIDs: Set<String> = []
 
         for offset in 1...20 {
@@ -2787,7 +2577,6 @@ final class ChainServiceTests: XCTestCase {
             @escaping ChildCandidateReservationReconciler = { $0.isEmpty },
         childProofPublisher: @escaping ChildProofPublisher = { _ in },
         acceptedBlockPublisher: @escaping AcceptedBlockPublisher = { _ in },
-        securingWorkPublisher: @escaping SecuringWorkPublisher = {},
         acceptedTransactionPublisher:
             @escaping AcceptedTransactionPublisher = { _ in },
         mempoolMaxCount: Int = 10_000
@@ -2799,7 +2588,6 @@ final class ChainServiceTests: XCTestCase {
                 childCandidateReservationReconciler,
             childProofPublisher: childProofPublisher,
             acceptedBlockPublisher: acceptedBlockPublisher,
-            securingWorkPublisher: securingWorkPublisher,
             acceptedTransactionPublisher: acceptedTransactionPublisher,
             mempoolMaxCount: mempoolMaxCount
         )

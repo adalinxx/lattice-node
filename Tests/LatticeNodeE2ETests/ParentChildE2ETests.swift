@@ -75,11 +75,11 @@ final class ParentChildE2ETests: XCTestCase {
         // A child may start before either its parent or its directory exists.
         // It owns no local genesis and remains awaiting its direct parent.
         try child.start()
-        let awaitingParent = try await child.waitForStatus { status in
+        let awaitingGenesis = try await child.waitForStatus { status in
             status.phase == .awaitingGenesis && status.tipCID == nil
         }
-        XCTAssertEqual(awaitingParent.chainPath, ["Nexus", "Payments"])
-        XCTAssertEqual(awaitingParent.nexusGenesisCID, NexusGenesis.expectedBlockHash)
+        XCTAssertEqual(awaitingGenesis.chainPath, ["Nexus", "Payments"])
+        XCTAssertEqual(awaitingGenesis.nexusGenesisCID, NexusGenesis.expectedBlockHash)
 
         try parent.start()
         let initialParent = try await parent.waitForStatus { status in
@@ -264,642 +264,6 @@ final class ParentChildE2ETests: XCTestCase {
         XCTAssertNotEqual(finalChild.tipCID, progressedTip)
 
         try await cluster.stopAll()
-        passed = true
-    }
-
-    func testPortableContinuityWaitsForLiveParentWorkBeforeConsensus() async throws {
-        let workspace = try E2EWorkspace()
-        let cluster = E2ECluster()
-        var passed = false
-        defer {
-            cluster.forceTerminateAll()
-            if passed {
-                try? workspace.remove()
-            } else {
-                print("lattice-node E2E artifacts retained at \(workspace.url.path)")
-            }
-        }
-
-        let binary = try E2EBinary.latticeNode()
-        let parentIdentity = try workspace.makeIdentity(
-            named: "portable-parent",
-            seed: 1
-        )
-        let parentKey = try PeerKey(parentIdentity.publicKey)
-        let sourceIdentity = try workspace.makeIdentity(
-            named: "portable-source",
-            seed: 2
-        )
-        let lateIdentity = try workspace.makeIdentity(
-            named: "portable-late",
-            seed: 3
-        )
-        let ports = try E2EPorts.allocate(count: 9)
-        let parent = E2ENode(
-            binary: binary,
-            configuration: E2ENode.Configuration(
-                name: "portable-parent",
-                chainPath: "Nexus",
-                storage: workspace.url.appendingPathComponent("portable-parent"),
-                identity: parentIdentity,
-                overlayPort: ports[0],
-                factPort: ports[1],
-                rpcPort: ports[2]
-            ),
-            logDirectory: workspace.logs
-        )
-        let source = E2ENode(
-            binary: binary,
-            configuration: E2ENode.Configuration(
-                name: "portable-source",
-                chainPath: "Nexus/Payments",
-                storage: workspace.url.appendingPathComponent("portable-source"),
-                identity: sourceIdentity,
-                overlayPort: ports[3],
-                factPort: ports[4],
-                rpcPort: ports[5],
-                parent: .init(publicKey: parentKey.hex, factPort: ports[1])
-            ),
-            logDirectory: workspace.logs
-        )
-        let late = E2ENode(
-            binary: binary,
-            configuration: E2ENode.Configuration(
-                name: "portable-late",
-                chainPath: "Nexus/Payments",
-                storage: workspace.url.appendingPathComponent("portable-late"),
-                identity: lateIdentity,
-                overlayPort: ports[6],
-                factPort: ports[7],
-                rpcPort: ports[8],
-                overlayPeers: [try overlayPeer(
-                    identity: sourceIdentity,
-                    port: ports[3]
-                )],
-                parent: .init(publicKey: parentKey.hex, factPort: ports[1])
-            ),
-            logDirectory: workspace.logs
-        )
-        cluster.add(parent)
-        cluster.add(source)
-        cluster.add(late)
-
-        try parent.start()
-        try source.start()
-        _ = try await parent.waitForStatus { $0.phase == .active }
-        let intent = try await childIntent(
-            on: parent,
-            directory: "Payments",
-            timestamp: 1
-        )
-        try await submitLegacyGenesisAnchor(
-            on: parent,
-            intent: intent,
-            chainPath: ["Nexus"]
-        )
-        let deployed = try await mine(parent, mode: .deployment)
-        XCTAssertTrue(deployed.accepted)
-        _ = try await source.waitForStatus {
-            $0.phase == .active && $0.tipCID == intent.genesisCID
-        }
-
-        let transaction = try legacySignedTransaction(
-            chainPath: ["Nexus", "Payments"],
-            keySeed: 4
-        )
-        let _: SubmitTransactionResponse = try await source.post(
-            "/v1/transactions",
-            body: SubmitTransactionRequest(transaction: transaction)
-        )
-        _ = try await source.waitForStatus { $0.mempoolCount == 1 }
-        var sourceTip: ChainServiceStatusResponse?
-        for _ in 0..<5 {
-            let work = try await mine(parent)
-            XCTAssertTrue(work.accepted)
-            guard let progressed = try? await source.waitForStatus(
-                timeout: .seconds(2),
-                where: { ($0.height ?? 0) > 0 }
-            ) else { continue }
-            sourceTip = progressed
-            break
-        }
-        let expectedTip = try XCTUnwrap(sourceTip)
-
-        // Historical parent-signed attachments remain portable across the
-        // same-chain overlay, but neither an existing child nor a late joiner
-        // may treat them as a current view of parent state.
-        try await parent.stop()
-        try await source.stop()
-        try source.start()
-        let staleSource = try await source.waitForStatus {
-            $0.phase == .awaitingParent && $0.tipCID == expectedTip.tipCID
-        }
-        XCTAssertEqual(staleSource.height, expectedTip.height)
-        do {
-            let _: MiningTemplateResponse = try await source.post(
-                "/v1/mining/templates",
-                body: MiningTemplateRequest(mode: .normal)
-            )
-            XCTFail("child issued mining work without current parent state")
-        } catch let error as E2EHTTPError {
-            XCTAssertEqual(error.status, 503)
-        }
-
-        try late.start()
-        let staleLate = try await late.waitForStatus(timeout: .seconds(20)) {
-            $0.phase == .awaitingParent && $0.tipCID == expectedTip.tipCID
-        }
-        XCTAssertEqual(staleLate.height, expectedTip.height)
-        do {
-            let _: MiningTemplateResponse = try await late.post(
-                "/v1/mining/templates",
-                body: MiningTemplateRequest(mode: .normal)
-            )
-            XCTFail("late child issued mining work without current parent state")
-        } catch let error as E2EHTTPError {
-            XCTAssertEqual(error.status, 503)
-        }
-
-        // The configured parent completes a fresh inherited-work snapshot.
-        // Only that live completion makes the already verified tip
-        // operational on both same-chain peers.
-        try parent.start()
-        _ = try await parent.waitForStatus { $0.phase == .active }
-        // Both child processes reconnect independently. Ivy's configured-peer
-        // backoff is capped at 30 seconds, so each assertion spans one cap.
-        _ = try await source.waitForStatus(timeout: .seconds(40)) {
-            $0.phase == .active && $0.tipCID == expectedTip.tipCID
-        }
-        let recovered = try await late.waitForStatus(timeout: .seconds(40)) {
-            $0.phase == .active && $0.tipCID == expectedTip.tipCID
-        }
-        XCTAssertEqual(recovered.height, expectedTip.height)
-
-        // Accepted history is locally durable, but reopening it while the
-        // parent is offline still exposes only a stale last-known tip.
-        try await parent.stop()
-        try await late.stop()
-        try await source.stop()
-        try late.start()
-        let reopenedStale = try await late.waitForStatus(timeout: .seconds(10)) {
-            $0.phase == .awaitingParent && $0.tipCID == expectedTip.tipCID
-        }
-        XCTAssertEqual(reopenedStale.height, expectedTip.height)
-
-        try parent.start()
-        _ = try await parent.waitForStatus { $0.phase == .active }
-        let reopened = try await late.waitForStatus(timeout: .seconds(40)) {
-            $0.phase == .active && $0.tipCID == expectedTip.tipCID
-        }
-        XCTAssertEqual(reopened.height, expectedTip.height)
-
-        try await cluster.stopAll()
-        passed = true
-    }
-
-    func testNestedLateJoinReplaysThroughRestartedIntermediateParent() async throws {
-        let workspace = try E2EWorkspace()
-        let cluster = E2ECluster()
-        var passed = false
-        defer {
-            cluster.forceTerminateAll()
-            if passed {
-                try? workspace.remove()
-            } else {
-                print("lattice-node E2E artifacts retained at \(workspace.url.path)")
-            }
-        }
-
-        let binary = try E2EBinary.latticeNode()
-        let nexusIdentity = try workspace.makeIdentity(named: "nexus")
-        let nexusPeerKey = try PeerKey(nexusIdentity.publicKey)
-        let paymentsIdentity = try workspace.makeIdentity(named: "payments")
-        let paymentsPeerKey = try PeerKey(paymentsIdentity.publicKey)
-        let receiptsIdentity = try workspace.makeIdentity(named: "receipts")
-        let ports = try E2EPorts.allocate(count: 9)
-
-        let nexus = E2ENode(
-            binary: binary,
-            configuration: E2ENode.Configuration(
-                name: "nexus",
-                chainPath: "Nexus",
-                storage: workspace.url.appendingPathComponent("nexus", isDirectory: true),
-                identity: nexusIdentity,
-                overlayPort: ports[0],
-                factPort: ports[1],
-                rpcPort: ports[2]
-            ),
-            logDirectory: workspace.logs
-        )
-        let payments = E2ENode(
-            binary: binary,
-            configuration: E2ENode.Configuration(
-                name: "payments",
-                chainPath: "Nexus/Payments",
-                storage: workspace.url.appendingPathComponent("payments", isDirectory: true),
-                identity: paymentsIdentity,
-                overlayPort: ports[3],
-                factPort: ports[4],
-                rpcPort: ports[5],
-                parent: .init(publicKey: nexusPeerKey.hex, factPort: ports[1])
-            ),
-            logDirectory: workspace.logs
-        )
-        let receipts = E2ENode(
-            binary: binary,
-            configuration: E2ENode.Configuration(
-                name: "receipts",
-                chainPath: "Nexus/Payments/Receipts",
-                storage: workspace.url.appendingPathComponent("receipts", isDirectory: true),
-                identity: receiptsIdentity,
-                overlayPort: ports[6],
-                factPort: ports[7],
-                rpcPort: ports[8],
-                parent: .init(publicKey: paymentsPeerKey.hex, factPort: ports[4])
-            ),
-            logDirectory: workspace.logs
-        )
-        cluster.add(nexus)
-        cluster.add(payments)
-        cluster.add(receipts)
-
-        try nexus.start()
-        let nexusGenesis = try await nexus.waitForStatus { status in
-            status.phase == .active && status.tipCID == NexusGenesis.expectedBlockHash
-        }
-        XCTAssertEqual(nexusGenesis.chainPath, ["Nexus"])
-        XCTAssertEqual(nexusGenesis.height, 0)
-
-        let paymentsIntent = try await childIntent(
-            on: nexus,
-            directory: "Payments",
-            timestamp: 1
-        )
-        try await submitLegacyGenesisAnchor(
-            on: nexus,
-            intent: paymentsIntent,
-            chainPath: ["Nexus"]
-        )
-        let paymentsAnchorWork = try await mine(nexus, mode: .deployment)
-        XCTAssertTrue(paymentsAnchorWork.accepted)
-
-        try payments.start()
-        let paymentsGenesis = try await payments.waitForStatus { status in
-            status.phase == .active && status.tipCID == paymentsIntent.genesisCID
-        }
-        XCTAssertEqual(paymentsGenesis.chainPath, ["Nexus", "Payments"])
-        XCTAssertEqual(paymentsGenesis.nexusGenesisCID, NexusGenesis.expectedBlockHash)
-        XCTAssertEqual(paymentsGenesis.height, 0)
-
-        let receiptsIntent = try await childIntent(
-            on: payments,
-            directory: "Receipts",
-            timestamp: 2
-        )
-        try await submitLegacyGenesisAnchor(
-            on: payments,
-            intent: receiptsIntent,
-            chainPath: ["Nexus", "Payments"]
-        )
-
-        // Nexus mines one physical root; Payments supplies its contextual
-        // candidate, which commits the direct Receipts genesis beneath it.
-        let receiptsAnchorWork = try await mine(nexus, mode: .deployment)
-        XCTAssertTrue(receiptsAnchorWork.accepted)
-        let nexusWithReceipts = try await nexus.waitForStatus { status in
-            status.phase == .active && status.tipCID == receiptsAnchorWork.tipCID
-        }
-        let nexusHeight = try XCTUnwrap(nexusWithReceipts.height)
-        let paymentsWithReceipts = try await payments.waitForStatus { status in
-            status.phase == .active
-                && status.tipCID != paymentsIntent.genesisCID
-                && (status.height ?? 0) > 0
-                && status.mempoolCount == 0
-        }
-        let paymentsTip = try XCTUnwrap(paymentsWithReceipts.tipCID)
-        let paymentsHeight = try XCTUnwrap(paymentsWithReceipts.height)
-
-        // Neither ancestor is available while the newest child starts. It must
-        // wait rather than manufacture a genesis from the root tree.
-        try await payments.stop()
-        try await nexus.stop()
-        try receipts.start()
-        let awaitingReceipts = try await receipts.waitForStatus { status in
-            status.phase == .awaitingGenesis && status.tipCID == nil
-        }
-        XCTAssertEqual(awaitingReceipts.chainPath, ["Nexus", "Payments", "Receipts"])
-        XCTAssertEqual(awaitingReceipts.nexusGenesisCID, NexusGenesis.expectedBlockHash)
-
-        // Durable history lets both descendants recover their tips, but each
-        // remains non-consensus-ready until its configured parent has a live
-        // inherited-work session.
-        try payments.start()
-        let restoredPayments = try await payments.waitForStatus { status in
-            status.phase == .awaitingParent && status.tipCID == paymentsTip
-        }
-        XCTAssertEqual(restoredPayments.height, paymentsHeight)
-        let receiptsGenesis = try await receipts.waitForStatus { status in
-            status.phase == .awaitingParent
-                && status.tipCID == receiptsIntent.genesisCID
-        }
-        XCTAssertEqual(receiptsGenesis.height, 0)
-        XCTAssertEqual(receiptsGenesis.nexusGenesisCID, NexusGenesis.expectedBlockHash)
-        for node in [payments, receipts] {
-            do {
-                let _: MiningTemplateResponse = try await node.post(
-                    "/v1/mining/templates",
-                    body: MiningTemplateRequest(mode: .normal)
-                )
-                XCTFail("descendant issued mining work without its live parent")
-            } catch let error as E2EHTTPError {
-                XCTAssertEqual(error.status, 503)
-            }
-        }
-
-        // A subsequent Nexus root cascades through Payments and then its
-        // direct child; neither parent chooses the descendant's tip. The
-        // private parent session reconnects asynchronously after Nexus comes
-        // back, so require progress within bounded physical rounds rather than
-        // coupling this correctness check to the first scheduler turn.
-        try nexus.start()
-        let restoredNexus = try await nexus.waitForStatus { status in
-            status.phase == .active && status.tipCID == receiptsAnchorWork.tipCID
-        }
-        XCTAssertEqual(restoredNexus.height, nexusHeight)
-        _ = try await payments.waitForStatus(timeout: .seconds(20)) {
-            $0.phase == .active && $0.tipCID == paymentsTip
-        }
-        _ = try await receipts.waitForStatus(timeout: .seconds(20)) {
-            $0.phase == .active && $0.tipCID == receiptsIntent.genesisCID
-        }
-
-        // Public ingress at the second hop travels through the direct parent
-        // and is included by a later physical Nexus root.
-        let receiptsTransaction = try legacySignedTransaction(
-            chainPath: ["Nexus", "Payments", "Receipts"]
-        )
-        let _: SubmitTransactionResponse = try await receipts.post(
-            "/v1/transactions",
-            body: SubmitTransactionRequest(transaction: receiptsTransaction)
-        )
-        let queuedReceipts = try await receipts.waitForStatus { $0.mempoolCount == 1 }
-        XCTAssertEqual(queuedReceipts.mempoolCount, 1)
-        var progressedPayments: ChainServiceStatusResponse?
-        var progressedReceipts: ChainServiceStatusResponse?
-        for _ in 0..<5 {
-            let work = try await mine(nexus)
-            XCTAssertTrue(work.accepted)
-            guard work.accepted,
-                  let paymentsStatus = try? await payments.waitForStatus(
-                    timeout: .seconds(2),
-                    where: { status in
-                        status.phase == .active && (status.height ?? 0) > paymentsHeight
-                    }
-                  ),
-                  let receiptsStatus = try? await receipts.waitForStatus(
-                    timeout: .seconds(2),
-                    where: { status in
-                        status.phase == .active
-                            && status.tipCID != receiptsIntent.genesisCID
-                            && (status.height ?? 0) > (receiptsGenesis.height ?? 0)
-                            && status.mempoolCount == 0
-                    }
-                  )
-            else { continue }
-            progressedPayments = paymentsStatus
-            progressedReceipts = receiptsStatus
-            break
-        }
-        let finalPayments = try XCTUnwrap(progressedPayments)
-        let finalReceipts = try XCTUnwrap(progressedReceipts)
-        XCTAssertNotEqual(finalPayments.tipCID, paymentsTip)
-        XCTAssertNotEqual(finalReceipts.tipCID, receiptsIntent.genesisCID)
-
-        try await cluster.stopAll()
-        passed = true
-    }
-
-    func testLiveHierarchyPartitionRevokesAndRestoresDescendantConsensus()
-        async throws
-    {
-        let workspace = try E2EWorkspace()
-        let cluster = E2ECluster()
-        let binary = try E2EBinary.latticeNode()
-        let nexusIdentity = try workspace.makeIdentity(named: "partition-nexus")
-        let nexusKey = try PeerKey(nexusIdentity.publicKey)
-        let paymentsIdentity = try workspace.makeIdentity(named: "partition-payments")
-        let paymentsKey = try PeerKey(paymentsIdentity.publicKey)
-        let receiptsIdentity = try workspace.makeIdentity(named: "partition-receipts")
-        let ports = try E2EPorts.allocate(count: 10)
-        let proxy = LoopbackTCPFaultProxy(
-            listenPort: ports[9],
-            targetPort: ports[1]
-        )
-        var passed = false
-        defer {
-            proxy.stop()
-            cluster.forceTerminateAll()
-            if passed {
-                try? workspace.remove()
-            } else {
-                print("lattice-node E2E artifacts retained at \(workspace.url.path)")
-            }
-        }
-
-        let nexus = E2ENode(
-            binary: binary,
-            configuration: E2ENode.Configuration(
-                name: "partition-nexus",
-                chainPath: "Nexus",
-                storage: workspace.url.appendingPathComponent("partition-nexus"),
-                identity: nexusIdentity,
-                overlayPort: ports[0],
-                factPort: ports[1],
-                rpcPort: ports[2]
-            ),
-            logDirectory: workspace.logs
-        )
-        let payments = E2ENode(
-            binary: binary,
-            configuration: E2ENode.Configuration(
-                name: "partition-payments",
-                chainPath: "Nexus/Payments",
-                storage: workspace.url.appendingPathComponent("partition-payments"),
-                identity: paymentsIdentity,
-                overlayPort: ports[3],
-                factPort: ports[4],
-                rpcPort: ports[5],
-                parent: .init(
-                    publicKey: nexusKey.hex,
-                    factPort: ports[9]
-                )
-            ),
-            logDirectory: workspace.logs
-        )
-        let receipts = E2ENode(
-            binary: binary,
-            configuration: E2ENode.Configuration(
-                name: "partition-receipts",
-                chainPath: "Nexus/Payments/Receipts",
-                storage: workspace.url.appendingPathComponent("partition-receipts"),
-                identity: receiptsIdentity,
-                overlayPort: ports[6],
-                factPort: ports[7],
-                rpcPort: ports[8],
-                parent: .init(
-                    publicKey: paymentsKey.hex,
-                    factPort: ports[4]
-                )
-            ),
-            logDirectory: workspace.logs
-        )
-        cluster.add(nexus)
-        cluster.add(payments)
-        cluster.add(receipts)
-
-        E2EPorts.release([ports[9]])
-        try proxy.start()
-        try nexus.start()
-        _ = try await waitForNexus(nexus)
-
-        let paymentsIntent = try await childIntent(
-            on: nexus,
-            directory: "Payments",
-            timestamp: 1
-        )
-        try await submitLegacyGenesisAnchor(
-            on: nexus,
-            intent: paymentsIntent,
-            chainPath: ["Nexus"]
-        )
-        let paymentsDeployment = try await mine(nexus, mode: .deployment)
-        XCTAssertTrue(paymentsDeployment.accepted)
-
-        try payments.start()
-        try await proxy.waitForConnections(1)
-        _ = try await payments.waitForStatus {
-            $0.phase == .active && $0.tipCID == paymentsIntent.genesisCID
-        }
-
-        let receiptsIntent = try await childIntent(
-            on: payments,
-            directory: "Receipts",
-            timestamp: 2
-        )
-        try await submitLegacyGenesisAnchor(
-            on: payments,
-            intent: receiptsIntent,
-            chainPath: ["Nexus", "Payments"]
-        )
-        let receiptsDeployment = try await mine(nexus, mode: .deployment)
-        XCTAssertTrue(receiptsDeployment.accepted)
-
-        try receipts.start()
-        let paymentsBeforePartition = try await payments.waitForStatus {
-            $0.phase == .active
-                && $0.tipCID != paymentsIntent.genesisCID
-                && ($0.height ?? 0) > 0
-                && $0.mempoolCount == 0
-        }
-        let receiptsGenesis = try await receipts.waitForStatus {
-            $0.phase == .active && $0.tipCID == receiptsIntent.genesisCID
-        }
-        let paymentsTip = try XCTUnwrap(paymentsBeforePartition.tipCID)
-        let paymentsHeight = try XCTUnwrap(paymentsBeforePartition.height)
-        let paymentsWorkRevision = try XCTUnwrap(
-            paymentsBeforePartition.parentWorkRevision
-        )
-        let receiptsTip = try XCTUnwrap(receiptsGenesis.tipCID)
-        let receiptsHeight = try XCTUnwrap(receiptsGenesis.height)
-        let receiptsWorkRevision = try XCTUnwrap(
-            receiptsGenesis.parentWorkRevision
-        )
-
-        proxy.cut()
-        try await proxy.waitForNoActiveConnections()
-        let partitionedPayments = try await payments.waitForStatus(
-            timeout: .seconds(20)
-        ) {
-            $0.phase == .awaitingParent && $0.tipCID == paymentsTip
-        }
-        let partitionedReceipts = try await receipts.waitForStatus(
-            timeout: .seconds(20)
-        ) {
-            $0.phase == .awaitingParent && $0.tipCID == receiptsTip
-        }
-        XCTAssertEqual(partitionedPayments.height, paymentsHeight)
-        XCTAssertEqual(partitionedReceipts.height, receiptsHeight)
-        for node in [payments, receipts] {
-            do {
-                let _: MiningTemplateResponse = try await node.post(
-                    "/v1/mining/templates",
-                    body: MiningTemplateRequest()
-                )
-                XCTFail("partitioned descendant issued mining work")
-            } catch let error as E2EHTTPError {
-                XCTAssertEqual(error.status, 503)
-            }
-        }
-
-        let parentDuringPartition = try await mine(nexus)
-        XCTAssertTrue(parentDuringPartition.accepted)
-        _ = try await nexus.waitForStatus {
-            $0.tipCID == parentDuringPartition.tipCID
-        }
-        let stillPartitioned = try await payments.waitForStatus {
-            $0.phase == .awaitingParent && $0.tipCID == paymentsTip
-        }
-        XCTAssertEqual(stillPartitioned.height, paymentsHeight)
-
-        proxy.heal()
-        try await proxy.waitForConnections(2)
-        _ = try await payments.waitForStatus(timeout: .seconds(20)) {
-            $0.phase == .active
-                && $0.tipCID == paymentsTip
-                && ($0.parentWorkRevision ?? 0) > paymentsWorkRevision
-        }
-        _ = try await receipts.waitForStatus(timeout: .seconds(20)) {
-            $0.phase == .active
-                && $0.tipCID == receiptsTip
-                && $0.parentWorkRevision == receiptsWorkRevision
-        }
-
-        let transaction = try legacySignedTransaction(
-            chainPath: ["Nexus", "Payments", "Receipts"]
-        )
-        let _: SubmitTransactionResponse = try await receipts.post(
-            "/v1/transactions",
-            body: SubmitTransactionRequest(transaction: transaction)
-        )
-        _ = try await receipts.waitForStatus { $0.mempoolCount == 1 }
-
-        var advancedPayments: ChainServiceStatusResponse?
-        var advancedReceipts: ChainServiceStatusResponse?
-        for _ in 0..<5 {
-            let work = try await mine(nexus)
-            XCTAssertTrue(work.accepted)
-            guard let nextPayments = try? await payments.waitForStatus(
-                timeout: .seconds(2),
-                where: {
-                    $0.phase == .active && ($0.height ?? 0) > paymentsHeight
-                }
-            ), let nextReceipts = try? await receipts.waitForStatus(
-                timeout: .seconds(2),
-                where: {
-                    $0.phase == .active
-                        && ($0.height ?? 0) > receiptsHeight
-                        && $0.mempoolCount == 0
-                }
-            ) else { continue }
-            advancedPayments = nextPayments
-            advancedReceipts = nextReceipts
-            break
-        }
-        XCTAssertNotNil(advancedPayments)
-        XCTAssertNotNil(advancedReceipts)
-
-        try await cluster.stopAll()
-        proxy.stop()
         passed = true
     }
 
@@ -1989,12 +1353,6 @@ final class ParentChildE2ETests: XCTestCase {
             of: p3.blockCID,
             after: p3Announcements
         )
-        let acceptedParent = try await parent.waitForStatus { _ in true }
-        let acceptedParentRevision = try XCTUnwrap(acceptedParent.revision)
-        _ = try await child.waitForStatus {
-            ($0.parentWorkRevision ?? 0) >= acceptedParentRevision
-        }
-
         XCTAssertGreaterThan(bWork, aInitialWork)
         let pRootWork = WorkSum(workForTarget(p1.template.block.target))
             + WorkSum(workForTarget(p2.template.block.target))
@@ -2273,12 +1631,6 @@ final class ParentChildE2ETests: XCTestCase {
             of: pTip,
             after: pTipAnnouncements
         )
-        let acceptedParent = try await parent.waitForStatus { _ in true }
-        let acceptedParentRevision = try XCTUnwrap(acceptedParent.revision)
-        _ = try await middle.waitForStatus {
-            ($0.parentWorkRevision ?? 0) >= acceptedParentRevision
-        }
-
         _ = try await waitForTip(leaf, leafB.genesisCID)
         let unchangedMiddle = try await middle.waitForStatus { _ in true }
         XCTAssertEqual(unchangedMiddle.tipCID, middleBTip)
@@ -2622,21 +1974,11 @@ final class ParentChildE2ETests: XCTestCase {
         try await parent.stop()
         child.forceTerminate()
         try child.start()
-        let staleChild = try await child.waitForStatus { status in
-            status.phase == .awaitingParent
+        let offlineRecoveredChild = try await child.waitForStatus { status in
+            status.phase == .active
                 && status.tipCID == intent.genesisCID
         }
-        XCTAssertEqual(staleChild.height, 0)
-        do {
-            let _: MiningTemplateResponse = try await child.post(
-                "/v1/mining/templates",
-                body: MiningTemplateRequest(mode: .normal)
-            )
-            XCTFail("child issued mining work without its live parent")
-        } catch let error as E2EHTTPError {
-            XCTAssertEqual(error.status, 503)
-        }
-
+        XCTAssertEqual(offlineRecoveredChild.height, 0)
         try parent.start()
         _ = try await parent.waitForStatus { $0.phase == .active }
         let recoveredChild = try await child.waitForStatus { status in
@@ -3332,8 +2674,8 @@ final class ParentChildE2ETests: XCTestCase {
         // A cold peer has no child-chain state except what the exact Market
         // advertiser serves over Ivy. In particular, validating the historic
         // withdrawal requires the parent receipt-state witness committed by
-        // that child block; the live trusted parent supplies only current
-        // inherited work and readiness.
+        // that child block; neither availability nor weight is trusted from
+        // the peer.
         let settledStatus = try await child.waitForStatus { $0.phase == .active }
         let settledTip = try XCTUnwrap(settledStatus.tipCID)
         try late.start()
@@ -3353,7 +2695,7 @@ final class ParentChildE2ETests: XCTestCase {
         passed = true
     }
 
-    func testTwoChildExchangeSurvivesHeavierNexusForkAfterSettlement() async throws {
+    func testTwoChildExchangeStateDoesNotCrossHeavierNexusFork() async throws {
         let workspace = try E2EWorkspace()
         let cluster = E2ECluster()
         var passed = false
@@ -3749,48 +3091,29 @@ final class ParentChildE2ETests: XCTestCase {
             "/v1/transactions",
             body: SubmitTransactionRequest(transaction: aliceSpendsB)
         )
-        var spentA: ChainServiceStatusResponse?
-        var spentB: ChainServiceStatusResponse?
         var expectedParent = forkTip.blockCID
+        var publishedStrandedCandidates = false
         for _ in 0..<5 {
             let work = try await mineBlock(nexus)
             XCTAssertTrue(work.response.accepted)
             XCTAssertEqual(work.template.block.parent?.rawCID, expectedParent)
+            publishedStrandedCandidates =
+                Set(work.response.publishedChildProofs.map(\.directory))
+                    == Set(["ChildA", "ChildB"])
             expectedParent = work.blockCID
-            let a = try? await childA.waitForStatus(
-                timeout: .seconds(2),
-                where: {
-                    guard $0.mempoolCount == 0,
-                          let height = $0.height,
-                          let withdrawnHeight = withdrawnA.height else {
-                        return false
-                    }
-                    return height >= withdrawnHeight + 1
-                }
-            )
-            let b = try? await childB.waitForStatus(
-                timeout: .seconds(2),
-                where: {
-                    guard $0.mempoolCount == 0,
-                          let height = $0.height,
-                          let withdrawnHeight = withdrawnB.height else {
-                        return false
-                    }
-                    return height >= withdrawnHeight + 1
-                }
-            )
-            if let a, let b {
-                spentA = a
-                spentB = b
-                break
-            }
+            if publishedStrandedCandidates { break }
+            try await Task.sleep(for: .milliseconds(300))
         }
-        let spentAStatus = try XCTUnwrap(spentA)
-        let spentBStatus = try XCTUnwrap(spentB)
-        let spentATip = try XCTUnwrap(spentAStatus.tipCID)
-        let spentBTip = try XCTUnwrap(spentBStatus.tipCID)
-        XCTAssertNotEqual(spentATip, withdrawnATip)
-        XCTAssertNotEqual(spentBTip, withdrawnBTip)
+        XCTAssertTrue(publishedStrandedCandidates)
+        try await Task.sleep(for: .seconds(1))
+        let strandedA = try await childA.waitForStatus {
+            $0.tipCID == withdrawnATip && $0.mempoolCount == 1
+        }
+        let strandedB = try await childB.waitForStatus {
+            $0.tipCID == withdrawnBTip && $0.mempoolCount == 1
+        }
+        XCTAssertEqual(strandedA.height, withdrawnA.height)
+        XCTAssertEqual(strandedB.height, withdrawnB.height)
 
         try await cluster.stopAll()
         passed = true

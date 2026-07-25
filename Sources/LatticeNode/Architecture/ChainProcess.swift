@@ -9,7 +9,6 @@ public enum ChainProcessError: Error, Equatable, Sendable {
     case storageUnavailable
     case invalidNexusGenesis
     case missingMaterializedVolume(String)
-    case nexusHasNoInheritedWork
     case chainNotBootstrapped
     case unresolvedCanonicalTip(String)
     case malformedAuthenticatedChildProof
@@ -28,7 +27,6 @@ public struct ChainProcessStatus: Sendable, Equatable {
     public let tipCID: String?
     public let height: UInt64?
     public let revision: UInt64?
-    public let parentWorkRevision: UInt64?
 }
 
 /// The result must be routed immediately when `parentCarrierLink` is present;
@@ -37,20 +35,17 @@ public struct NodeAdmissionOutcome: Sendable {
     public let decision: NodeAdmissionDecision
     public let parentCarrierLink: ParentCarrierLink?
     public let sameChainPredecessor: SameChainPredecessorRequirement?
-    let inheritedWorkChanged: Bool
     let canonicalCommitReceipt: CanonicalCommitReceipt?
 
     init(
         decision: NodeAdmissionDecision,
         parentCarrierLink: ParentCarrierLink?,
         sameChainPredecessor: SameChainPredecessorRequirement?,
-        inheritedWorkChanged: Bool = false,
         canonicalCommitReceipt: CanonicalCommitReceipt? = nil
     ) {
         self.decision = decision
         self.parentCarrierLink = parentCarrierLink
         self.sameChainPredecessor = sameChainPredecessor
-        self.inheritedWorkChanged = inheritedWorkChanged
         self.canonicalCommitReceipt = canonicalCommitReceipt
     }
 }
@@ -81,15 +76,6 @@ actor CanonicalCommitReceipt {
         waiters.removeAll()
         for waiter in pending { waiter.resume() }
     }
-}
-
-/// The process owns the order in which consensus mutations become durable;
-/// the service owns the projections that follow those mutations. Keeping the
-/// receipt with the commit lets the process reserve the service FIFO before a
-/// later process mutation can overtake it.
-struct InheritedWorkUpdate: Sendable {
-    let commit: ChainCommit?
-    let canonicalCommitReceipt: CanonicalCommitReceipt?
 }
 
 /// Receives each mutation commit while `ChainProcess` still owns its operation
@@ -141,8 +127,8 @@ public actor ChainProcess: ContentSource, Fetcher, VolumeStorer {
     private var runtimePhase: RuntimePhase
     private var livePinnedMempoolRoots = Set<String>()
 
-    // Actors are reentrant. This queue keeps admission, inherited-work updates,
-    // and eviction in one durability order across their suspension points.
+    // Actors are reentrant. This queue keeps admission and eviction in one
+    // durability order across their suspension points.
     private struct OperationWaiter {
         let id: UUID
         let continuation: CheckedContinuation<Bool, Never>
@@ -312,12 +298,6 @@ public actor ChainProcess: ContentSource, Fetcher, VolumeStorer {
             roots: []
         )
 
-        // This is the one recovery-time materialization of the parent's durable
-        // fact set. Live fragments merge directly into Core below; keeping a
-        // provider installed would make every later local admission revisit
-        // this complete snapshot.
-        let initialParentWork = try await store.inheritedWorkSnapshot()
-
         let context = try configuration.runtimeContext
         let runtimePhase: RuntimePhase
         if staged.isEmpty {
@@ -381,21 +361,6 @@ public actor ChainProcess: ContentSource, Fetcher, VolumeStorer {
                 replaying: batches,
                 revisionFloor: try await store.consensusRevisionFloor()
             )
-            if !configuration.address.isNexus,
-               let initialParentWork {
-                let bindings = try await store
-                    .incomingParentCarrierBlocksByChildBlock()
-                guard let inherited = await chain.inheritedWorkSnapshot(
-                    from: initialParentWork,
-                    parentCarrierBlocksByChildBlock: bindings
-                ), await chain.acceptsInheritedWork(inherited) else {
-                    throw ChainProcessError.malformedAuthenticatedChildProof
-                }
-                if !inherited.isEmpty,
-                   !(await chain.restoreInheritedWork(inherited)) {
-                    throw ChainProcessError.malformedAuthenticatedChildProof
-                }
-            }
             let level = ChainLevel(chain: chain, context: context)
             runtimePhase = .active(level)
         }
@@ -569,34 +534,6 @@ public actor ChainProcess: ContentSource, Fetcher, VolumeStorer {
         let link: ParentCarrierLink
         switch result {
         case .accepted(let acceptance):
-            // The exact admission batch is already durable. Hierarchy-proof
-            // promotion is recoverable post-commit work;
-            // neither may turn an accepted block into a reported failure.
-            // Pre-genesis parent pushes are already durable. Merge the one
-            // recovered source view once before exposing the new level; later
-            // fragments use Core's bounded incremental path.
-            if let parentWork = try await store.inheritedWorkSnapshot() {
-                let bindings = try await store
-                    .incomingParentCarrierBlocksByChildBlock()
-                guard let inherited = await acceptance.level.chain
-                    .inheritedWorkSnapshot(
-                        from: parentWork,
-                        parentCarrierBlocksByChildBlock: bindings
-                    ), await acceptance.level.chain.acceptsInheritedWork(inherited)
-                else {
-                    throw ChainProcessError.malformedAuthenticatedChildProof
-                }
-                if !inherited.isEmpty,
-                   await acceptance.level.chain.acceptsInheritedWork(inherited) {
-                    let nextRevision = try Self.nextConsensusRevision(
-                        await acceptance.level.chain.currentRevision()
-                    )
-                    try await store.advanceConsensusRevisionFloor(nextRevision)
-                    guard await acceptance.level.chain.mergeInheritedWork(inherited) != nil else {
-                        throw ChainProcessError.malformedAuthenticatedChildProof
-                    }
-                }
-            }
             runtimePhase = .active(acceptance.level)
             // The admission batch now owns every materialized root. Candidate
             // retention may release its overlapping reference without a GC gap.
@@ -769,20 +706,6 @@ public actor ChainProcess: ContentSource, Fetcher, VolumeStorer {
                 releaseOperation()
             }
         }
-        let prospectiveParentWork: InheritedWorkSnapshot?
-        if mayIssueCarrierLink,
-           !configuration.address.isNexus {
-            prospectiveParentWork = try await prospectiveInheritedWork(
-                forChildBlockCID: blockHeader.rawCID,
-                adding: carrierEvidence
-            )
-            if let prospectiveParentWork,
-               !(await level.chain.acceptsInheritedWork(prospectiveParentWork)) {
-                throw ChainProcessError.malformedAuthenticatedChildProof
-            }
-        } else {
-            prospectiveParentWork = nil
-        }
         let result: ChainLocalBlockResult
         switch preflight {
         case .terminal(let terminal, _):
@@ -817,28 +740,10 @@ public actor ChainProcess: ContentSource, Fetcher, VolumeStorer {
                 pendingChildProofCapacity: Self.preparedChildProofCapacity
             )
         }
-        let inheritedCommit: ChainCommit?
-        if (admissionStaged || result.parentCarrierLink != nil),
-           let prospectiveParentWork,
-           !prospectiveParentWork.isEmpty {
-            try await store.advanceConsensusRevisionFloor(
-                Self.nextConsensusRevision(
-                    await level.chain.currentRevision()
-                )
-            )
-            inheritedCommit = await level.chain.mergeInheritedWork(
-                prospectiveParentWork
-            )
-        } else {
-            inheritedCommit = nil
-        }
         var receipt: CanonicalCommitReceipt?
         if let canonicalCommitPublisher {
             if let commit = result.commit {
                 receipt = await canonicalCommitPublisher(commit)
-            }
-            if let inheritedCommit, inheritedCommit.canonicalChanged {
-                receipt = await canonicalCommitPublisher(inheritedCommit)
             }
         }
         if decision.isAccepted {
@@ -857,7 +762,6 @@ public actor ChainProcess: ContentSource, Fetcher, VolumeStorer {
             decision: decision,
             parentCarrierLink: result.parentCarrierLink,
             sameChainPredecessor: result.sameChainPredecessor,
-            inheritedWorkChanged: inheritedCommit != nil,
             canonicalCommitReceipt: receipt
         )
     }
@@ -1164,219 +1068,6 @@ public actor ChainProcess: ContentSource, Fetcher, VolumeStorer {
         )
     }
 
-    /// The configured parent is the sole live inherited-work authority. The
-    /// caller authenticates the Ivy session; this method binds that identity
-    /// to the durable genesis/configured authority before Core sees the facts.
-    @discardableResult
-    public func applyInheritedWorkSnapshot(
-        _ snapshot: InheritedWorkSnapshot,
-        from parentProcessKey: String
-    ) async throws -> ChainCommit? {
-        let update = try await applyInheritedWorkSnapshot(
-            snapshot,
-            from: parentProcessKey,
-            sourceID: nil,
-            baseRevision: nil,
-            canonicalCommitPublisher: nil
-        )
-        return update.commit
-    }
-
-    @discardableResult
-    public func applyInheritedWorkExport(
-        _ snapshot: InheritedWorkSnapshot,
-        sourceID: String,
-        baseRevision: UInt64?,
-        from parentProcessKey: String
-    ) async throws -> ChainCommit? {
-        let update = try await applyInheritedWorkSnapshot(
-            snapshot,
-            from: parentProcessKey,
-            sourceID: sourceID,
-            baseRevision: baseRevision,
-            canonicalCommitPublisher: nil
-        )
-        return update.commit
-    }
-
-    /// The publisher is invoked before releasing this process's mutation
-    /// order. Otherwise a ready network admission can commit, publish, and
-    /// overtake this inherited reorg in the service FIFO.
-    func applyInheritedWorkSnapshot(
-        _ snapshot: InheritedWorkSnapshot,
-        from parentProcessKey: String,
-        sourceID: String?,
-        baseRevision: UInt64?,
-        canonicalCommitPublisher: CanonicalCommitPublisher?
-    ) async throws -> InheritedWorkUpdate {
-        await acquireOperation()
-        defer { releaseOperation() }
-        guard !configuration.address.isNexus else {
-            throw ChainProcessError.nexusHasNoInheritedWork
-        }
-        var consensusRevisionFloor: UInt64?
-        if case .active(let level) = runtimePhase {
-            guard let projected = try await projectParentWork(
-                snapshot,
-                onto: level
-            ), await level.chain.acceptsInheritedWork(projected) else {
-                throw ChainProcessError.malformedAuthenticatedChildProof
-            }
-            if !projected.isEmpty {
-                consensusRevisionFloor = try Self.nextConsensusRevision(
-                    await level.chain.currentRevision()
-                )
-            }
-        }
-        guard let changes = try await store.mergeInheritedWorkSnapshot(
-            snapshot,
-            from: parentProcessKey,
-            sourceID: sourceID,
-            baseRevision: baseRevision,
-            consensusRevisionFloor: consensusRevisionFloor
-        ) else {
-            return InheritedWorkUpdate(
-                commit: nil,
-                canonicalCommitReceipt: nil
-            )
-        }
-        guard case .active(let level) = runtimePhase else {
-            return InheritedWorkUpdate(
-                commit: nil,
-                canonicalCommitReceipt: nil
-            )
-        }
-        guard let projected = try await projectParentWork(changes, onto: level)
-        else {
-            throw ChainProcessError.malformedAuthenticatedChildProof
-        }
-        let commit = await level.chain.mergeInheritedWork(projected)
-        let receipt: CanonicalCommitReceipt?
-        if let commit, commit.canonicalChanged,
-           let canonicalCommitPublisher {
-            receipt = await canonicalCommitPublisher(commit)
-        } else {
-            receipt = nil
-        }
-        return InheritedWorkUpdate(
-            commit: commit,
-            canonicalCommitReceipt: receipt
-        )
-    }
-
-    /// Every direct child receives the same parent-owned securing-work view.
-    /// Child-specific projection belongs exclusively to the receiving child.
-    public func parentSecuringWorkSnapshot(
-        since revision: UInt64? = nil
-    ) async -> InheritedWorkSnapshot? {
-        await acquireOperation()
-        defer { releaseOperation() }
-        guard case .active(let level) = runtimePhase else { return nil }
-        return await level.chain.parentSecuringWorkSnapshot(since: revision)
-    }
-
-    func parentSecuringWorkExport(
-        since cursor: ParentWorkCursor?
-    ) async throws -> (sourceID: String, export: ParentSecuringWorkExport)? {
-        await acquireOperation()
-        defer { releaseOperation() }
-        guard case .active(let level) = runtimePhase else { return nil }
-        let sourceID = try await store.syncSourceID()
-        return (
-            sourceID,
-            await level.chain.parentSecuringWorkExport(
-                since: cursor?.sourceID == sourceID ? cursor?.revision : nil
-            )
-        )
-    }
-
-    func inheritedWorkCursor() async throws -> ParentWorkCursor? {
-        try await store.inheritedWorkCursor()
-    }
-
-    /// The parent publishes generic locations; only this child joins them to
-    /// child blocks through its durable incoming direct edges.
-    private func projectParentWork(
-        _ parent: InheritedWorkSnapshot,
-        onto level: ChainLevel
-    ) async throws -> InheritedWorkSnapshot? {
-        let parentBlocks = Set(parent.blockCIDs)
-        let bindings = if parentBlocks.count <= 256 {
-            try await store.incomingParentCarrierBlocksByChildBlock(
-                matching: parentBlocks
-            )
-        } else {
-            try await store.incomingParentCarrierBlocksByChildBlock()
-        }
-        return await level.chain.inheritedWorkSnapshot(
-            from: parent,
-            parentCarrierBlocksByChildBlock: bindings
-        )
-    }
-
-    /// Validate the exact relation that will become durable before either a
-    /// new child block or a late incoming edge commits. The block need not be
-    /// connected yet: Core's unique-grind check is location-based.
-    private func prospectiveInheritedWork(
-        forChildBlockCID childBlockCID: String,
-        adding carrierEvidence: AdmissionCarrierEvidence?
-    ) async throws -> InheritedWorkSnapshot? {
-        var addedParentCarrierCID: String?
-        var addedEdgeCID: String?
-        if let carrierEvidence {
-            guard let edge = await DirectChildEdge.derive(
-                from: carrierEvidence.proof
-            ), edge.childCID == childBlockCID,
-               let edgeCID = edge.edgeCID else {
-                throw ChainProcessError.malformedAuthenticatedChildProof
-            }
-            addedParentCarrierCID = edge.parentCarrierCID
-            addedEdgeCID = edgeCID
-        }
-        let childAccepted = try await store.hasAcceptedBlock(childBlockCID)
-        if childAccepted,
-           let addedEdgeCID,
-           try await store.hasIncomingCarrierEdge(addedEdgeCID) {
-            return nil
-        }
-        var parentCarrierCIDs = if addedParentCarrierCID != nil,
-                                   childAccepted {
-            Set<String>()
-        } else {
-            try await store.incomingParentCarrierBlockCIDs(
-                forChildBlockCID: childBlockCID
-            )
-        }
-        if let addedParentCarrierCID {
-            parentCarrierCIDs.insert(addedParentCarrierCID)
-        }
-        guard !parentCarrierCIDs.isEmpty,
-              let parent = try await store.inheritedWorkSnapshot(
-                matchingParentBlockCIDs: parentCarrierCIDs
-              ) else {
-            return nil
-        }
-        var projected: [InheritedWorkFact] = []
-        for parentBlockCID in parent.blockCIDs {
-            let measure = parent.sourceWork(forBlock: parentBlockCID)
-            for grindID in measure.grindIDs {
-                guard let work = measure.work(forGrind: grindID),
-                      let fact = InheritedWorkFact(
-                        blockCID: childBlockCID,
-                        grindID: grindID,
-                        work: work
-                      ) else {
-                    throw ChainProcessError.malformedAuthenticatedChildProof
-                }
-                projected.append(fact)
-            }
-        }
-        return InheritedWorkSnapshot(
-            revision: parent.revision,
-            facts: projected
-        )
-    }
-
     public func issuedParentCarrierLink(
         carrierCID: String,
         rootCID: String
@@ -1385,6 +1076,22 @@ public actor ChainProcess: ContentSource, Fetcher, VolumeStorer {
             carrierCID: carrierCID,
             rootCID: rootCID
         )
+    }
+
+    /// Answer one generic state-reachability query from an immediate child.
+    /// The query contains no child block identity and creates no child state.
+    func parentStateContinuityLink(
+        from fromStateCID: String,
+        to toStateCID: String
+    ) async -> ParentStateContinuityLink? {
+        guard case .active(let level) = runtimePhase else { return nil }
+        switch await level.parentStateContinuityLink(
+            from: fromStateCID,
+            to: toStateCID
+        ) {
+        case .success(let link): return link
+        case .failure: return nil
+        }
     }
 
     /// Pages authenticated root contexts for one local carrier. Nexus is its
@@ -1720,7 +1427,6 @@ public actor ChainProcess: ContentSource, Fetcher, VolumeStorer {
     public func status() async -> ChainProcessStatus {
         await acquireOperation()
         defer { releaseOperation() }
-        let parentWorkRevision = try? await store.inheritedWorkRevision()
         guard case .active(let level) = runtimePhase else {
             return ChainProcessStatus(
                 phase: .awaitingGenesis,
@@ -1728,8 +1434,7 @@ public actor ChainProcess: ContentSource, Fetcher, VolumeStorer {
                 nexusGenesisCID: configuration.nexusGenesisCID,
                 tipCID: nil,
                 height: nil,
-                revision: nil,
-                parentWorkRevision: parentWorkRevision
+                revision: nil
             )
         }
         return ChainProcessStatus(
@@ -1738,8 +1443,7 @@ public actor ChainProcess: ContentSource, Fetcher, VolumeStorer {
             nexusGenesisCID: configuration.nexusGenesisCID,
             tipCID: await level.chain.getMainChainTip(),
             height: await level.chain.getHighestBlockHeight(),
-            revision: await level.chain.currentRevision(),
-            parentWorkRevision: parentWorkRevision
+            revision: await level.chain.currentRevision()
         )
     }
 

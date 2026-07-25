@@ -34,22 +34,6 @@ public typealias NetworkAdmissionHandler = @Sendable (
     _ admission: NetworkCandidateAdmission
 ) async throws -> NodeAdmissionOutcome
 
-/// Service-owned reconciliation for a parent work push. The runtime owns
-/// authenticated routing; the service owns template and mempool projection.
-public typealias NetworkInheritedWorkHandler = @Sendable (
-    _ snapshot: InheritedWorkSnapshot,
-    _ sourceID: String,
-    _ baseRevision: UInt64?,
-    _ parentProcessKey: String
-) async throws -> ChainCommit?
-
-/// Reports that the current authenticated parent session completed and
-/// durably applied a coherent work pass. This is not the parent's canonical
-/// tip or fork-choice state.
-public typealias NetworkParentWorkReadinessHandler = @Sendable (
-    _ ready: Bool
-) async -> Void
-
 public typealias NetworkTransactionHandler = @Sendable (
     _ transaction: Transaction
 ) async throws -> Bool
@@ -66,8 +50,6 @@ public struct NodeNetworkHandlers: Sendable {
     public let childCandidateBuilder: ContextualChildCandidateBuilder?
     public let candidateReservations: NetworkCandidateReservationHandler?
     public let admission: NetworkAdmissionHandler
-    public let inheritedWork: NetworkInheritedWorkHandler?
-    public let parentWorkReadiness: NetworkParentWorkReadinessHandler?
     public let transaction: NetworkTransactionHandler?
     public let transactionInventory: TransactionInventoryProvider?
 
@@ -75,16 +57,12 @@ public struct NodeNetworkHandlers: Sendable {
         childCandidateBuilder: ContextualChildCandidateBuilder? = nil,
         candidateReservations: NetworkCandidateReservationHandler? = nil,
         admission: @escaping NetworkAdmissionHandler,
-        inheritedWork: NetworkInheritedWorkHandler? = nil,
-        parentWorkReadiness: NetworkParentWorkReadinessHandler? = nil,
         transaction: NetworkTransactionHandler? = nil,
         transactionInventory: TransactionInventoryProvider? = nil
     ) {
         self.childCandidateBuilder = childCandidateBuilder
         self.candidateReservations = candidateReservations
         self.admission = admission
-        self.inheritedWork = inheritedWork
-        self.parentWorkReadiness = parentWorkReadiness
         self.transaction = transaction
         self.transactionInventory = transactionInventory
     }
@@ -119,216 +97,6 @@ private enum NodePolicyDecline: Error {
     case belowMinimumRootWork
     case chainSpecTooLarge
     case tooManyWasmPolicies
-}
-
-/// Pages one parent-owned fact snapshot without retaining encoded frames.
-/// Oversized batches split until each canonical frame fits.
-private struct InheritedWorkPushPlan: Sendable {
-    let sourceID: String
-    let baseRevision: UInt64?
-    let revision: UInt64
-    let facts: [InheritedWorkFact]
-    let maximumPayloadBytes: Int
-
-    init?(
-        sourceID: String,
-        export: ParentSecuringWorkExport,
-        maximumPayloadBytes: Int = InheritedWorkPushMessage.maximumEncodedBytes
-    ) {
-        self.init(
-            sourceID: sourceID,
-            baseRevision: export.baseRevision,
-            snapshot: export.snapshot,
-            maximumPayloadBytes: maximumPayloadBytes
-        )
-    }
-
-    private init?(
-        sourceID: String,
-        baseRevision: UInt64?,
-        snapshot: InheritedWorkSnapshot,
-        maximumPayloadBytes: Int
-    ) {
-        guard maximumPayloadBytes > 0,
-              maximumPayloadBytes <= InheritedWorkPushMessage.maximumEncodedBytes,
-              UUID(uuidString: sourceID) != nil,
-              snapshot.hasUniqueGrindLocations else {
-            return nil
-        }
-        self.sourceID = sourceID
-        self.baseRevision = baseRevision
-        revision = snapshot.revision
-        facts = snapshot.facts
-        self.maximumPayloadBytes = maximumPayloadBytes
-    }
-
-    init?(
-        snapshot: InheritedWorkSnapshot,
-        sourceID: String = InheritedWorkPushMessage.legacySourceID,
-        baseRevision: UInt64? = nil,
-        maximumPayloadBytes: Int = InheritedWorkPushMessage.maximumEncodedBytes
-    ) {
-        self.init(
-            sourceID: sourceID,
-            baseRevision: baseRevision,
-            snapshot: snapshot,
-            maximumPayloadBytes: maximumPayloadBytes
-        )
-    }
-}
-
-private struct InheritedWorkPushPacker {
-    enum Next {
-        case payload(Data)
-        case finished
-        case unencodable
-    }
-
-    private let sourceID: String
-    private let baseRevision: UInt64?
-    private let revision: UInt64
-    private let facts: [InheritedWorkFact]
-    private let maximumPayloadBytes: Int
-    private var factIndex = 0
-    private var pending: [[InheritedWorkFact]] = []
-
-    init(plan: InheritedWorkPushPlan) {
-        sourceID = plan.sourceID
-        baseRevision = plan.baseRevision
-        revision = plan.revision
-        facts = plan.facts
-        maximumPayloadBytes = plan.maximumPayloadBytes
-    }
-
-    mutating func next() -> Next {
-        while true {
-            if let fragment = pending.popLast() {
-                if let payload = payload(for: fragment) {
-                    return .payload(payload)
-                }
-                guard let split = split(fragment) else { return .unencodable }
-                pending.append(split.tail)
-                pending.append(split.head)
-                continue
-            }
-            guard beginNextBatch() else { return .finished }
-        }
-    }
-
-    private mutating func beginNextBatch() -> Bool {
-        precondition(pending.isEmpty)
-        let end = min(facts.count, factIndex + InheritedWorkPushMessage.maximumFacts)
-        guard factIndex < end else { return false }
-        let fragment = Array(facts[factIndex..<end])
-        factIndex = end
-        pending.append(fragment)
-        return true
-    }
-
-    private func payload(for facts: [InheritedWorkFact]) -> Data? {
-        let snapshot = InheritedWorkSnapshot(revision: revision, facts: facts)
-        guard let data = try? InheritedWorkPushMessage(
-            sourceID: sourceID,
-            baseRevision: baseRevision,
-            snapshot: snapshot
-        ).encoded(),
-              data.count <= maximumPayloadBytes else {
-            return nil
-        }
-        return data
-    }
-
-    private func split(
-        _ facts: [InheritedWorkFact]
-    ) -> (head: [InheritedWorkFact], tail: [InheritedWorkFact])? {
-        guard facts.count > 1 else { return nil }
-        let middle = facts.count / 2
-        return (Array(facts[..<middle]), Array(facts[middle...]))
-    }
-}
-
-/// A frame accepted by Ivy is ordered into that authenticated session. A local
-/// admission rejection is transient (for example, Tally's token bucket), so
-/// the sender must retry the exact frame rather than discard the rest of a
-/// monotone export.
-enum InheritedWorkPushSendResult: Sendable {
-    case enqueued
-    case retry
-    case stopped
-}
-
-/// Atomic inherited-work state for one exact authenticated parent session.
-/// A pass has one revision and becomes actionable only at its matching empty
-/// marker. Equal completed revisions are valid because a child-topology change
-/// can reroute new facts without mutating the parent's chain generation.
-struct ParentWorkAssembler {
-    enum IngestResult {
-        case pending
-        case completed(InheritedWorkSnapshot)
-    }
-
-    let sessionID: Data
-    private(set) var completedSourceID: String?
-    private(set) var completedBaseRevision: UInt64?
-    private(set) var completedRevision: UInt64?
-    private var pendingSourceID: String?
-    private var pendingBaseRevision: UInt64?
-    private var pendingRevision: UInt64?
-    private var factsByGrind: [String: InheritedWorkFact] = [:]
-
-    init(sessionID: Data) {
-        self.sessionID = sessionID
-    }
-
-    mutating func ingest(_ snapshot: InheritedWorkSnapshot) -> IngestResult? {
-        ingest(InheritedWorkPushMessage(snapshot: snapshot))
-    }
-
-    mutating func ingest(_ push: InheritedWorkPushMessage) -> IngestResult? {
-        let snapshot = push.snapshot
-        if completedSourceID == push.sourceID,
-           let completedRevision,
-           snapshot.revision < completedRevision {
-            return nil
-        }
-        if let pendingRevision {
-            guard pendingSourceID == push.sourceID,
-                  pendingBaseRevision == push.baseRevision,
-                  pendingRevision == snapshot.revision else { return nil }
-        } else {
-            pendingSourceID = push.sourceID
-            pendingBaseRevision = push.baseRevision
-            pendingRevision = snapshot.revision
-        }
-        if !snapshot.isEmpty {
-            for fact in snapshot.facts {
-                if let existing = factsByGrind[fact.grindID] {
-                    guard existing.blockCID == fact.blockCID else { return nil }
-                    if fact.work > existing.work {
-                        factsByGrind[fact.grindID] = fact
-                    }
-                } else {
-                    factsByGrind[fact.grindID] = fact
-                }
-            }
-            return .pending
-        }
-
-        let completed = InheritedWorkSnapshot(
-            revision: snapshot.revision,
-            facts: Array(factsByGrind.values)
-        )
-        let sourceID = pendingSourceID!
-        let baseRevision = pendingBaseRevision
-        completedSourceID = sourceID
-        completedBaseRevision = baseRevision
-        completedRevision = snapshot.revision
-        pendingSourceID = nil
-        pendingBaseRevision = nil
-        pendingRevision = nil
-        factsByGrind.removeAll(keepingCapacity: false)
-        return .completed(completed)
-    }
 }
 
 public enum NodeNetworkRuntimeError: Error, Equatable, Sendable {
@@ -487,6 +255,13 @@ public actor NodeNetworkRuntime: IvyDelegate {
         let request: ChildEvidenceIndexRequestMessage
     }
 
+    private struct PendingParentStateContinuity: Sendable {
+        let peer: AuthenticatedPeer
+        let request: ParentStateContinuityRequestMessage
+        let blockCID: String
+        let package: AuthenticatedChildPackage
+    }
+
     private struct PendingPortableAttachmentIndex: Sendable {
         let peer: AuthenticatedPeer
         let request: PortableAttachmentIndexRequestMessage
@@ -580,17 +355,6 @@ public actor NodeNetworkRuntime: IvyDelegate {
         case hierarchy
     }
 
-    /// Exactly one export may advance a child's cursor at a time. New parent
-    /// facts only mark the current view stale; a reset cancels the task so a
-    /// replacement session receives a full resend instead of an old stream's
-    /// tail.
-    private struct InheritedWorkPushState {
-        let token: UInt64
-        let generation: UInt64
-        let task: Task<Void, Never>
-        var needsRefresh: Bool
-    }
-
     private struct ParentEvidenceTail {
         let token: UInt64
         let task: Task<Bool, Never>
@@ -603,6 +367,7 @@ public actor NodeNetworkRuntime: IvyDelegate {
     private static let futureCandidateRetryInterval: Duration = .seconds(1)
     private static let maximumDirectChildren = 64
     private static let maximumConcurrentChildBuilds = 8
+    private static let maximumConcurrentParentStateQueries = 64
     private static let maximumPeersPerChildPath = 4
     private static let maximumReconnectEvidenceAnnouncements = 64
     private static let maximumReconnectCarrierRoots = 64
@@ -632,10 +397,6 @@ public actor NodeNetworkRuntime: IvyDelegate {
     private var overlayPeers: [PeerKey: AuthenticatedPeer] = [:]
     private var hierarchyPeers: [PeerKey: HierarchyPeer] = [:]
     private var hierarchySessions: [PeerKey: AuthenticatedPeer] = [:]
-    /// A parent snapshot is authoritative only after its exact live session
-    /// sends the ordered empty completion marker. Until then these fragments
-    /// are transport state, not fork-choice input.
-    private var parentWorkAssembler: ParentWorkAssembler?
     private let provisionalRoots = ProvisionalVolumeRegistry()
     private var childEvidenceReadyPeers: Set<PeerKey> = []
     private var childEvidenceReadyWaiters:
@@ -647,12 +408,6 @@ public actor NodeNetworkRuntime: IvyDelegate {
     private var childEvidencePublicationFailedSessions: Set<ChildEvidenceSession> = []
     private var childEvidencePublicationsInFlight:
         [ChildEvidenceSession: Int] = [:]
-    /// Last complete export accepted by each ready direct child session. A
-    /// reconnect clears this value and receives a full monotone resend.
-    private var inheritedWorkSentByChildPeer: [PeerKey: ParentWorkCursor] = [:]
-    private var inheritedWorkRequestedByChildPeer: Set<PeerKey> = []
-    private var inheritedWorkPushes: [PeerKey: InheritedWorkPushState] = [:]
-    private var nextInheritedWorkPushToken: UInt64 = 0
     private var overlayHelloDeadlines: [PeerKey: HelloDeadline] = [:]
     private var hierarchyHelloDeadlines: [PeerKey: HelloDeadline] = [:]
     private var waitingCandidateRetryTask: Task<Void, Never>?
@@ -673,6 +428,9 @@ public actor NodeNetworkRuntime: IvyDelegate {
     private var candidateWorker: Task<Void, Never>?
     private var candidateWorkerGeneration: UInt64?
     private var pendingEvidenceIndexes: [UInt64: PendingChildEvidenceIndex] = [:]
+    private var pendingParentStateContinuity:
+        [UInt64: PendingParentStateContinuity] = [:]
+    private var activeParentStateQueries = 0
     private var pendingPortableAttachmentIndexes:
         [UInt64: PendingPortableAttachmentIndex] = [:]
     private var activeEvidenceVolumes = Set<EvidenceVolumeLease>()
@@ -691,7 +449,6 @@ public actor NodeNetworkRuntime: IvyDelegate {
     private var parentEvidenceOperationCount = 0
     private var nextParentEvidenceToken: UInt64 = 0
     private var handlers: NodeNetworkHandlers?
-    private var parentWorkReady: Bool
     private var pendingChildCandidates: [UInt64: PendingChildCandidateRequest] = [:]
     private var childCandidateBuilds: [UInt64: ChildCandidateBuild] = [:]
     private var pendingCandidateReservations:
@@ -806,7 +563,6 @@ public actor NodeNetworkRuntime: IvyDelegate {
                 configuredParentIvyPeerKey: $0.publicKey
             )
         }
-        parentWorkReady = configuration.address.isNexus
     }
 
     /// Installs both delegates and the recovered process's local content source
@@ -866,10 +622,6 @@ public actor NodeNetworkRuntime: IvyDelegate {
                 * Self.maximumCandidateWaitTicks,
             durableDescendants: recoveredDescendants
         )
-        if !configuration.address.isNexus {
-            parentWorkReady = false
-            await handlers.parentWorkReadiness?(false)
-        }
         await overlay.install(
             delegate: self,
             contentSource: ChainProcessIvyContentSource(process: process)
@@ -1000,16 +752,11 @@ public actor NodeNetworkRuntime: IvyDelegate {
     }
 
     private func clearRuntimeState() async {
-        if !configuration.address.isNexus {
-            parentWorkReady = false
-            await handlers?.parentWorkReadiness?(false)
-        }
         process = nil
         overlaySessions.removeAll()
         overlayPeers.removeAll()
         hierarchyPeers.removeAll()
         hierarchySessions.removeAll()
-        parentWorkAssembler = nil
         await provisionalRoots.removeAll()
         childEvidenceReadyPeers.removeAll()
         childEvidenceIndexCompleteSessions.removeAll()
@@ -1022,10 +769,6 @@ public actor NodeNetworkRuntime: IvyDelegate {
         for waiter in evidenceReadyWaiters {
             waiter.continuation.resume(returning: false)
         }
-        inheritedWorkSentByChildPeer.removeAll()
-        inheritedWorkRequestedByChildPeer.removeAll()
-        for push in inheritedWorkPushes.values { push.task.cancel() }
-        inheritedWorkPushes.removeAll()
         for deadline in overlayHelloDeadlines.values { deadline.task.cancel() }
         overlayHelloDeadlines.removeAll()
         for deadline in hierarchyHelloDeadlines.values { deadline.task.cancel() }
@@ -1057,6 +800,8 @@ public actor NodeNetworkRuntime: IvyDelegate {
                 * Self.maximumCandidateWaitTicks
         )
         pendingEvidenceIndexes.removeAll()
+        pendingParentStateContinuity.removeAll()
+        activeParentStateQueries = 0
         pendingPortableAttachmentIndexes.removeAll()
         activeEvidenceVolumes.removeAll()
         portableEvidenceWorker?.cancel()
@@ -1095,7 +840,6 @@ public actor NodeNetworkRuntime: IvyDelegate {
         guard isRunning, let process else {
             throw NodeNetworkRuntimeError.notRunning
         }
-        guard parentWorkReady else { return }
         try await announceBlock(
             blockCID,
             generation: runtimeGeneration,
@@ -1134,7 +878,6 @@ public actor NodeNetworkRuntime: IvyDelegate {
         guard isRunning, let process else {
             throw NodeNetworkRuntimeError.notRunning
         }
-        guard parentWorkReady else { return }
         try await canonicalTipDidChange(
             generation: runtimeGeneration,
             process: process
@@ -1173,29 +916,9 @@ public actor NodeNetworkRuntime: IvyDelegate {
             throw NodeNetworkRuntimeError.notRunning
         }
         let generation = runtimeGeneration
-        guard parentWorkReady else { return }
-        // Every accepted branch can add inherited work for a direct child.
-        // Canonicity is not a work-export filter.
-        await pushInheritedWork(
-            generation: generation,
-            process: process
-        )
-        guard isCurrentRuntime(generation: generation, process: process) else {
-            throw NodeNetworkRuntimeError.notRunning
-        }
         try await announceBlock(
             blockCID,
             generation: generation,
-            process: process
-        )
-    }
-
-    /// Publishes generic securing work without implying that a same-chain
-    /// block was accepted or became canonical.
-    public func publishSecuringWork() async {
-        guard isRunning, let process, parentWorkReady else { return }
-        await pushInheritedWork(
-            generation: runtimeGeneration,
             process: process
         )
     }
@@ -1229,7 +952,6 @@ public actor NodeNetworkRuntime: IvyDelegate {
     ) async -> [DirectChildCandidate] {
         guard isRunning,
             let process,
-              parentWorkReady,
               context.rewards.count <= ChildCandidateRequestMessage.maximumRewards,
               let parentData = context.parentCarrier.toData(),
               let parentCID = try? BlockHeader(node: context.parentCarrier).rawCID,
@@ -1690,579 +1412,6 @@ public actor NodeNetworkRuntime: IvyDelegate {
         await provisionalRoots.volume(cid, generation: runtimeGeneration)
     }
 
-    /// Schedule one serialized export per child peer. The task owns its cursor
-    /// until every frame is locally queued; newer parent facts mark one
-    /// refresh pass and therefore cannot overtake or disappear behind a
-    /// throttled frame.
-    private func pushInheritedWork(
-        generation: UInt64? = nil,
-        process expectedProcess: ChainProcess? = nil
-    ) async {
-        guard parentWorkReady,
-              let fence = resolvedRuntimeFence(
-            generation: generation,
-            process: expectedProcess
-        ) else { return }
-        var peersByChildPath: [[String]: [AuthenticatedPeer]] = [:]
-        for (peerKey, role) in hierarchyPeers {
-            guard case .child(let childPath) = role,
-                  let peer = hierarchySessions[peerKey],
-                  inheritedWorkRequestedByChildPeer.contains(peerKey)
-            else { continue }
-            peersByChildPath[childPath, default: []].append(peer)
-        }
-
-        guard !peersByChildPath.isEmpty else { return }
-
-        var fullPlan: InheritedWorkPushPlan?
-        var deltaPlansByRevision: [UInt64: InheritedWorkPushPlan] = [:]
-        for childPath in peersByChildPath.keys.sorted(by: {
-            $0.lexicographicallyPrecedes($1)
-        }) {
-            let peers = peersByChildPath[childPath]!.sorted(by: {
-                $0.key.hex < $1.key.hex
-            }).filter {
-                !coalesceInheritedWorkPushIfActive(
-                    to: $0,
-                    generation: fence.generation
-                )
-            }
-            guard !peers.isEmpty else { continue }
-            for peer in peers {
-                guard isCurrentRuntime(
-                    generation: fence.generation,
-                    process: fence.process
-                ) else {
-                    continue
-                }
-                let plan: InheritedWorkPushPlan?
-                if let cursor = inheritedWorkSentByChildPeer[peer.key] {
-                    if let cached = deltaPlansByRevision[cursor.revision] {
-                        plan = cached
-                    } else {
-                        let update = try? await fence.process
-                            .parentSecuringWorkExport(since: cursor)
-                        plan = update.flatMap {
-                            InheritedWorkPushPlan(
-                                sourceID: $0.sourceID,
-                                export: $0.export
-                            )
-                        }
-                        if let plan {
-                            deltaPlansByRevision[cursor.revision] = plan
-                        }
-                    }
-                } else {
-                    if fullPlan == nil {
-                        let update = try? await fence.process
-                            .parentSecuringWorkExport(since: nil)
-                        fullPlan = update.flatMap {
-                            InheritedWorkPushPlan(
-                                sourceID: $0.sourceID,
-                                export: $0.export
-                            )
-                        }
-                    }
-                    plan = fullPlan
-                }
-                guard let plan,
-                      isCurrentRuntime(
-                        generation: fence.generation,
-                        process: fence.process
-                      ) else { continue }
-                scheduleInheritedWorkPush(
-                    plan: plan,
-                    to: peer,
-                    childPath: childPath,
-                    generation: fence.generation,
-                    process: fence.process
-                )
-            }
-        }
-    }
-
-    private func respondToInheritedWorkRequest(
-        _ request: InheritedWorkRequestMessage,
-        from peer: AuthenticatedPeer,
-        childPath: [String],
-        generation: UInt64,
-        process: ChainProcess
-    ) async {
-        resetInheritedWorkPush(for: peer.key)
-        inheritedWorkRequestedByChildPeer.insert(peer.key)
-        guard parentWorkReady,
-              isCurrentRuntime(generation: generation, process: process),
-              hierarchySessions[peer.key]?.sessionID == peer.sessionID,
-              hierarchyPeers[peer.key] == .child(childPath) else {
-            return
-        }
-        let cursor = request.sourceID.flatMap { sourceID in
-            request.revision.map {
-                ParentWorkCursor(sourceID: sourceID, revision: $0)
-            }
-        }
-        guard let update = try? await process.parentSecuringWorkExport(
-            since: cursor
-        ), let plan = InheritedWorkPushPlan(
-            sourceID: update.sourceID,
-            export: update.export
-        ), isCurrentRuntime(
-            generation: generation,
-            process: process
-        ) else {
-            return
-        }
-        scheduleInheritedWorkPush(
-            plan: plan,
-            to: peer,
-            childPath: childPath,
-            generation: generation,
-            process: process
-        )
-    }
-
-    private func coalesceInheritedWorkPushIfActive(
-        to peer: AuthenticatedPeer,
-        generation: UInt64
-    ) -> Bool {
-        guard var current = inheritedWorkPushes[peer.key] else { return false }
-        guard current.generation == generation else {
-            current.task.cancel()
-            inheritedWorkPushes.removeValue(forKey: peer.key)
-            return false
-        }
-        current.needsRefresh = true
-        inheritedWorkPushes[peer.key] = current
-        return true
-    }
-
-    private func scheduleInheritedWorkPush(
-        plan: InheritedWorkPushPlan,
-        to peer: AuthenticatedPeer,
-        childPath: [String],
-        generation: UInt64,
-        process: ChainProcess
-    ) {
-        guard isCurrentRuntime(generation: generation, process: process),
-              hierarchySessions[peer.key]?.sessionID == peer.sessionID,
-              case .child(let connectedPath)? = hierarchyPeers[peer.key],
-              connectedPath == childPath else {
-            return
-        }
-        let peerKey = peer.key
-        if var current = inheritedWorkPushes[peerKey] {
-            guard current.generation == generation else {
-                current.task.cancel()
-                inheritedWorkPushes.removeValue(forKey: peerKey)
-                return scheduleInheritedWorkPush(
-                    plan: plan,
-                    to: peer,
-                    childPath: childPath,
-                    generation: generation,
-                    process: process
-                )
-            }
-            current.needsRefresh = true
-            inheritedWorkPushes[peerKey] = current
-            return
-        }
-
-        // An older suspended snapshot may resume after a newer complete pass.
-        // It has no facts the child lacks, so do not let it regress the
-        // cursor or start a redundant task.
-        if let sent = inheritedWorkSentByChildPeer[peerKey],
-           sent.sourceID == plan.sourceID,
-           sent.revision >= plan.revision {
-            return
-        }
-
-        nextInheritedWorkPushToken &+= 1
-        let token = nextInheritedWorkPushToken
-        let task = Task { [weak self] in
-            guard let self else { return }
-            await self.drainInheritedWorkPush(
-                initialPlan: plan,
-                to: peer,
-                childPath: childPath,
-                generation: generation,
-                process: process,
-                token: token
-            )
-        }
-        inheritedWorkPushes[peerKey] = InheritedWorkPushState(
-            token: token,
-            generation: generation,
-            task: task,
-            needsRefresh: false
-        )
-    }
-
-    private func resetInheritedWorkPush(for peerKey: PeerKey) {
-        inheritedWorkSentByChildPeer.removeValue(forKey: peerKey)
-        inheritedWorkRequestedByChildPeer.remove(peerKey)
-        inheritedWorkPushes.removeValue(forKey: peerKey)?.task.cancel()
-    }
-
-    /// End only this drain after a failed local snapshot read. A replacement
-    /// session or a later parent change can then schedule a fresh full export.
-    private func finishInheritedWorkPush(
-        peerKey: PeerKey,
-        generation: UInt64,
-        token: UInt64
-    ) {
-        guard let state = inheritedWorkPushes[peerKey],
-              state.token == token,
-              state.generation == generation else {
-            return
-        }
-        inheritedWorkPushes.removeValue(forKey: peerKey)
-    }
-
-    private enum InheritedWorkPushPass {
-        case send(InheritedWorkPushPlan)
-        case stopped
-    }
-
-    private enum InheritedWorkPushCompletion {
-        case refresh
-        case finished
-        case stopped
-    }
-
-    private func prepareInheritedWorkPushPass(
-        plan: InheritedWorkPushPlan,
-        peerKey: PeerKey,
-        sessionID: Data,
-        childPath: [String],
-        generation: UInt64,
-        process: ChainProcess,
-        token: UInt64
-    ) -> InheritedWorkPushPass {
-        guard isCurrentInheritedWorkPush(
-            peerKey: peerKey,
-            sessionID: sessionID,
-            childPath: childPath,
-            generation: generation,
-            process: process,
-            token: token
-        ) else {
-            return .stopped
-        }
-        // Empty passes still traverse the real streamer: its marker is the
-        // receiver's exact-session atomic completion boundary.
-        return .send(plan)
-    }
-
-    /// Complete one pass atomically with refresh inspection. A caller that
-    /// races this method either marks the next pass or observes no task and
-    /// starts a new one; neither case can lose its parent facts.
-    private func completeInheritedWorkPushPass(
-        sourceID: String,
-        revision: UInt64,
-        queued: Bool,
-        peerKey: PeerKey,
-        sessionID: Data,
-        childPath: [String],
-        generation: UInt64,
-        process: ChainProcess,
-        token: UInt64
-    ) -> InheritedWorkPushCompletion {
-        guard isCurrentInheritedWorkPush(
-            peerKey: peerKey,
-            sessionID: sessionID,
-            childPath: childPath,
-            generation: generation,
-            process: process,
-            token: token
-        ) else {
-            return .stopped
-        }
-        guard queued else {
-            inheritedWorkPushes.removeValue(forKey: peerKey)
-            return .stopped
-        }
-        inheritedWorkSentByChildPeer[peerKey] = ParentWorkCursor(
-            sourceID: sourceID,
-            revision: revision
-        )
-        guard inheritedWorkPushes[peerKey]?.needsRefresh == true else {
-            inheritedWorkPushes.removeValue(forKey: peerKey)
-            return .finished
-        }
-        inheritedWorkPushes[peerKey]?.needsRefresh = false
-        return .refresh
-    }
-
-    private func isCurrentInheritedWorkPush(
-        peerKey: PeerKey,
-        sessionID: Data,
-        childPath: [String],
-        generation: UInt64,
-        process: ChainProcess,
-        token: UInt64
-    ) -> Bool {
-        guard !Task.isCancelled,
-              isCurrentRuntime(generation: generation, process: process),
-              let state = inheritedWorkPushes[peerKey],
-              state.token == token,
-              state.generation == generation,
-              hierarchySessions[peerKey]?.sessionID == sessionID,
-              case .child(let connectedPath)? = hierarchyPeers[peerKey],
-              connectedPath == childPath else {
-            return false
-        }
-        return true
-    }
-
-    private var inheritedWorkPushRetryDelay: Duration? {
-        let tally = planeConfigurations.hierarchy.tallyConfig
-        guard tally.perPeerRequestRefillPerSecond > 0 else {
-            return nil
-        }
-        let seconds = 1 / tally.perPeerRequestRefillPerSecond
-        let milliseconds = min(
-            max((seconds * 1_000).rounded(.up), 1),
-            Double(Int64.max)
-        )
-        return .milliseconds(Int64(milliseconds))
-    }
-
-    private func drainInheritedWorkPush(
-        initialPlan: InheritedWorkPushPlan,
-        to peer: AuthenticatedPeer,
-        childPath: [String],
-        generation: UInt64,
-        process: ChainProcess,
-        token: UInt64
-    ) async {
-        let peerKey = peer.key
-        var plan = initialPlan
-        while true {
-            let pass = prepareInheritedWorkPushPass(
-                plan: plan,
-                peerKey: peerKey,
-                sessionID: peer.sessionID,
-                childPath: childPath,
-                generation: generation,
-                process: process,
-                token: token
-            )
-            let queued: Bool
-            switch pass {
-            case .send(let update):
-                let retryDelay = inheritedWorkPushRetryDelay
-                let retryDelayNanoseconds = retryDelay.map(Self.nanoseconds)
-                queued = await Self.streamInheritedWorkPushPayloads(
-                    plan: update,
-                    send: { [hierarchy] payload in
-                        while true {
-                            guard await self.isCurrentInheritedWorkPush(
-                                peerKey: peerKey,
-                                sessionID: peer.sessionID,
-                                childPath: childPath,
-                                generation: generation,
-                                process: process,
-                                token: token
-                            ) else {
-                                return .stopped
-                            }
-                            switch await hierarchy.sendMessage(
-                                to: peer,
-                                topic: NodeNetworkTopic.inheritedWorkPush,
-                                payload: payload
-                            ) {
-                            case .enqueued:
-                                return .enqueued
-                            case .backpressured:
-                                guard await hierarchy.waitUntilWritable(to: peer),
-                                      await self.isCurrentInheritedWorkPush(
-                                        peerKey: peerKey,
-                                        sessionID: peer.sessionID,
-                                        childPath: childPath,
-                                        generation: generation,
-                                        process: process,
-                                        token: token
-                                      ) else {
-                                    return .stopped
-                                }
-                            case .locallyRejected:
-                                return retryDelay == nil ? .stopped : .retry
-                            case .notConnected:
-                                return .stopped
-                            }
-                        }
-                    },
-                    waitForRetry: {
-                        guard let retryDelayNanoseconds,
-                              await self.isCurrentInheritedWorkPush(
-                            peerKey: peerKey,
-                            sessionID: peer.sessionID,
-                            childPath: childPath,
-                            generation: generation,
-                            process: process,
-                            token: token
-                        ) else {
-                            return false
-                        }
-                        do {
-                            try await Task.sleep(nanoseconds: retryDelayNanoseconds)
-                        } catch {
-                            return false
-                        }
-                        return await self.isCurrentInheritedWorkPush(
-                            peerKey: peerKey,
-                            sessionID: peer.sessionID,
-                            childPath: childPath,
-                            generation: generation,
-                            process: process,
-                            token: token
-                        )
-                    }
-                )
-            case .stopped:
-                return
-            }
-            switch completeInheritedWorkPushPass(
-                sourceID: plan.sourceID,
-                revision: plan.revision,
-                queued: queued,
-                peerKey: peerKey,
-                sessionID: peer.sessionID,
-                childPath: childPath,
-                generation: generation,
-                process: process,
-                token: token
-            ) {
-            case .refresh:
-                guard let refreshed = try? await process.parentSecuringWorkExport(
-                    since: inheritedWorkSentByChildPeer[peerKey]
-                ), let refreshedPlan = InheritedWorkPushPlan(
-                    sourceID: refreshed.sourceID,
-                    export: refreshed.export
-                ) else {
-                    finishInheritedWorkPush(
-                        peerKey: peerKey,
-                        generation: generation,
-                        token: token
-                    )
-                    return
-                }
-                plan = refreshedPlan
-            case .finished, .stopped:
-                return
-            }
-        }
-    }
-
-    /// The caller waits for Ivy transport writability before returning `.retry`
-    /// for a local admission rejection. The packer advances after `.enqueued`
-    /// only, preserving frame order and the sender cursor's exact meaning
-    /// without adding a receiver acknowledgement protocol.
-    static func streamInheritedWorkPushPayloads(
-        snapshot: InheritedWorkSnapshot,
-        sourceID: String = InheritedWorkPushMessage.legacySourceID,
-        baseRevision: UInt64? = nil,
-        maximumPayloadBytes: Int = InheritedWorkPushMessage.maximumEncodedBytes,
-        send: @escaping @Sendable (Data) async -> InheritedWorkPushSendResult,
-        waitForRetry: @escaping @Sendable () async -> Bool
-    ) async -> Bool {
-        guard let plan = InheritedWorkPushPlan(
-            snapshot: snapshot,
-            sourceID: sourceID,
-            baseRevision: baseRevision,
-            maximumPayloadBytes: maximumPayloadBytes
-        ) else {
-            return false
-        }
-        return await streamInheritedWorkPushPayloads(
-            plan: plan,
-            send: send,
-            waitForRetry: waitForRetry
-        )
-    }
-
-    private static func streamInheritedWorkPushPayloads(
-        plan: InheritedWorkPushPlan,
-        send: @escaping @Sendable (Data) async -> InheritedWorkPushSendResult,
-        waitForRetry: @escaping @Sendable () async -> Bool
-    ) async -> Bool {
-        var packer = InheritedWorkPushPacker(plan: plan)
-        while true {
-            switch packer.next() {
-            case .payload(let payload):
-                var delivered = false
-                while !delivered {
-                    switch await send(payload) {
-                    case .enqueued:
-                        delivered = true
-                    case .retry:
-                        guard await waitForRetry() else { return false }
-                    case .stopped:
-                        return false
-                    }
-                }
-            case .finished:
-                guard let marker = try? InheritedWorkPushMessage(
-                    sourceID: plan.sourceID,
-                    baseRevision: plan.baseRevision,
-                    snapshot: InheritedWorkSnapshot(
-                        revision: plan.revision,
-                        facts: []
-                    )
-                ).encoded() else { return false }
-                while true {
-                    switch await send(marker) {
-                    case .enqueued:
-                        return true
-                    case .retry:
-                        guard await waitForRetry() else { return false }
-                    case .stopped:
-                        return false
-                    }
-                }
-            case .unencodable:
-                return false
-            }
-        }
-    }
-
-    /// Test-only convenience wrapper. Production streams directly through
-    /// `streamInheritedWorkPushPayloads` and never retains every frame.
-    static func inheritedWorkPushPayloads(
-        snapshot: InheritedWorkSnapshot,
-        sourceID: String = InheritedWorkPushMessage.legacySourceID,
-        baseRevision: UInt64? = nil,
-        maximumPayloadBytes: Int = InheritedWorkPushMessage.maximumEncodedBytes
-    ) -> [Data]? {
-        guard let plan = InheritedWorkPushPlan(
-            snapshot: snapshot,
-            sourceID: sourceID,
-            baseRevision: baseRevision,
-            maximumPayloadBytes: maximumPayloadBytes
-        ) else { return nil }
-        var packer = InheritedWorkPushPacker(plan: plan)
-        var payloads: [Data] = []
-        while true {
-            switch packer.next() {
-            case .payload(let payload):
-                payloads.append(payload)
-            case .finished:
-                guard let marker = try? InheritedWorkPushMessage(
-                    sourceID: plan.sourceID,
-                    baseRevision: plan.baseRevision,
-                    snapshot: InheritedWorkSnapshot(
-                        revision: snapshot.revision,
-                        facts: []
-                    )
-                ).encoded() else { return nil }
-                payloads.append(marker)
-                return payloads
-            case .unencodable:
-                return nil
-            }
-        }
-    }
-
     /// Publishes an already-promoted absolute proof prepared durably by the
     /// process admission boundary.
     @discardableResult
@@ -2609,17 +1758,8 @@ public actor NodeNetworkRuntime: IvyDelegate {
         }
         guard let payload = try? hello.encode() else { return }
         if ivy === hierarchy {
-            // A hierarchy role belongs to one authenticated connection. A
-            // replacement parent connection must complete its own inherited
-            // work sync before this chain can act on fork choice.
-            let isConfiguredParent =
-                configuration.parentEndpoint.flatMap {
-                    try? PeerKey($0.publicKey)
-                } == peer.key
+            // A hierarchy role belongs to one authenticated connection.
             _ = clearHierarchyAuthorization(for: peer.key)
-            if isConfiguredParent {
-                await setParentWorkReady(false)
-            }
             scheduleHierarchyHelloDeadline(for: peer, generation: generation)
         }
         guard isCurrentRuntime(generation: generation, process: process) else {
@@ -2688,10 +1828,7 @@ public actor NodeNetworkRuntime: IvyDelegate {
             // In that case this is the old connection ending, not a loss of
             // the authenticated parent/child relationship.
             guard !(await ivy.connectedPeers).contains(peer) else { return }
-            let removed = clearHierarchyAuthorization(for: key)
-            if case .parent? = removed {
-                await setParentWorkReady(false)
-            }
+            _ = clearHierarchyAuthorization(for: key)
         }
     }
 
@@ -2703,7 +1840,6 @@ public actor NodeNetworkRuntime: IvyDelegate {
         hierarchySessions.removeValue(forKey: key)
         childEvidenceReadyPeers.remove(key)
         cancelChildEvidenceReadyWaiters(for: key)
-        resetInheritedWorkPush(for: key)
         dirtyCandidateReservationPeers.remove(key)
         if desiredCandidateReservations[key]?.isEmpty == true {
             desiredCandidateReservations.removeValue(forKey: key)
@@ -2714,7 +1850,9 @@ public actor NodeNetworkRuntime: IvyDelegate {
         )
         if case .parent? = removedRole {
             pendingEvidenceIndexes.removeAll()
-            parentWorkAssembler = nil
+            pendingParentStateContinuity = pendingParentStateContinuity.filter {
+                $0.value.peer.key != key
+            }
         }
         cancelChildCandidateWork(for: key)
         let reservations = pendingCandidateReservations.filter {
@@ -3861,102 +2999,94 @@ public actor NodeNetworkRuntime: IvyDelegate {
               let role = hierarchyPeers[peer.key] else { return }
 
         switch (message.topic, role) {
-        case (NodeNetworkTopic.securingWorkRequest, .child(let childPath)):
-            guard let request = try? InheritedWorkRequestMessage.decoded(
-                message.payload
-            ) else { return }
-            await respondToInheritedWorkRequest(
-                request,
-                from: peer,
-                childPath: childPath,
-                generation: generation,
-                process: process
-            )
-
-        case (NodeNetworkTopic.inheritedWorkPush, .parent):
-            guard !configuration.address.isNexus else { return }
-            guard let push = try? InheritedWorkPushMessage.decoded(message.payload) else {
-                await rejectParentWorkStream(
-                    from: peer,
-                    generation: generation,
-                    process: process
-                )
+        case (NodeNetworkTopic.parentStateContinuityRequest,
+              .child(let childPath)):
+            guard activeParentStateQueries
+                    < Self.maximumConcurrentParentStateQueries,
+                  let request = try?
+                    ParentStateContinuityRequestMessage.decoded(
+                        message.payload
+                    ),
+                  request.childPath == childPath else { return }
+            activeParentStateQueries += 1
+            defer { activeParentStateQueries -= 1 }
+            guard let link = await process.parentStateContinuityLink(
+                    from: request.fromStateCID,
+                    to: request.toStateCID
+                  ),
+                  let certificate = try?
+                    ParentStateContinuityCertificateV1(
+                        link: link,
+                        signedBy: configuration
+                    ).encode(),
+                  let payload = try?
+                    ParentStateContinuityResponseMessage(
+                        requestID: request.requestID,
+                        childPath: childPath,
+                        link: link,
+                        certificate: certificate
+                    ).encoded() else {
                 return
             }
-            do {
-                var assembler = parentWorkAssembler.flatMap {
-                    $0.sessionID == peer.sessionID ? $0 : nil
-                } ?? ParentWorkAssembler(sessionID: peer.sessionID)
-                guard let result = assembler.ingest(push) else {
-                    await rejectParentWorkStream(
-                        from: peer,
-                        generation: generation,
-                        process: process
-                    )
-                    return
-                }
-                parentWorkAssembler = assembler
-                guard case .completed(let completeSnapshot) = result else {
-                    return
-                }
-                guard let sourceID = assembler.completedSourceID else {
-                    await rejectParentWorkStream(
-                        from: peer,
-                        generation: generation,
-                        process: process
-                    )
-                    return
-                }
-                let commit: ChainCommit?
-                if let inheritedWorkHandler = handlers?.inheritedWork {
-                    commit = try await inheritedWorkHandler(
-                        completeSnapshot,
-                        sourceID,
-                        assembler.completedBaseRevision,
-                        peer.key.hex
-                    )
-                } else {
-                    commit = try await process.applyInheritedWorkExport(
-                        completeSnapshot,
-                        sourceID: sourceID,
-                        baseRevision: assembler.completedBaseRevision,
-                        from: peer.key.hex
-                    )
-                }
-                guard isCurrentRuntime(generation: generation, process: process) else {
-                    return
-                }
-                guard configuredParentPeer()?.sessionID == peer.sessionID else {
-                    return
-                }
-                let becameReady = await setParentWorkReady(true, from: peer)
-                guard parentWorkReady,
-                      configuredParentPeer()?.sessionID == peer.sessionID else {
-                    return
-                }
-                // A parent's newly inherited work is itself exportable work
-                // for this chain's direct children even when this chain's tip
-                // remains unchanged.
-                await pushInheritedWork(
-                    generation: generation,
-                    process: process
-                )
-                if becameReady || commit?.canonicalChanged == true {
-                    try? await canonicalTipDidChange(
-                        generation: generation,
-                        process: process
-                    )
-                }
-            } catch {
-                // The parent has already advanced its local export cursor.
-                // Reconnecting resets that cursor and gets the whole monotone
-                // view again; a direct parent is configured to reconnect.
-                await rejectParentWorkStream(
-                    from: peer,
-                    generation: generation,
-                    process: process
-                )
+            _ = await hierarchy.sendMessage(
+                to: peer,
+                topic: NodeNetworkTopic.parentStateContinuityResponse,
+                payload: payload
+            )
+
+        case (NodeNetworkTopic.parentStateContinuityResponse, .parent):
+            guard let response = try?
+                    ParentStateContinuityResponseMessage.decoded(
+                        message.payload
+                    ),
+                  let pending = pendingParentStateContinuity[
+                    response.requestID
+                  ],
+                  pending.peer.key == peer.key,
+                  pending.peer.sessionID == peer.sessionID,
+                  response.childPath == configuration.chainPath,
+                  response.childPath == pending.request.childPath,
+                  response.link.fromStateCID
+                    == pending.request.fromStateCID,
+                  response.link.toStateCID == pending.request.toStateCID,
+                  let authority = ParentProcessKey(
+                    configuration.parentEndpoint?.publicKey ?? ""
+                  ),
+                  let certificate = try?
+                    ParentStateContinuityCertificateV1.decode(
+                        response.certificate
+                    ),
+                  certificate.verifies(
+                    link: response.link,
+                    authorityKey: authority,
+                    expectedNexusGenesisCID: configuration.nexusGenesisCID,
+                    expectedParentPath:
+                        Array(configuration.chainPath.dropLast())
+                  ) else {
+                return
             }
+            pendingParentStateContinuity.removeValue(
+                forKey: response.requestID
+            )
+            let current = pending.package
+            let enriched = AuthenticatedChildPackage(
+                package: ChildValidationPackage(
+                    proof: current.package.proof,
+                    parentCarrierLink: current.package.parentCarrierLink,
+                    parentGenesisLink: current.package.parentGenesisLink,
+                    parentStateContinuityLink: response.link
+                ),
+                parentCarrierCertificate:
+                    current.parentCarrierCertificate,
+                parentGenesisCertificate:
+                    current.parentGenesisCertificate,
+                parentStateContinuityCertificate: certificate
+            )
+            _ = candidateAcquirer.observe(CandidateSeed(
+                blockCID: pending.blockCID,
+                package: enriched
+            ))
+            serviceCandidateAcquirer()
 
         case (NodeNetworkTopic.childEvidenceAvailable, .parent):
             guard
@@ -4254,11 +3384,6 @@ public actor NodeNetworkRuntime: IvyDelegate {
             return
         }
         if case .parent = role {
-            await requestInheritedWork(
-                from: peer,
-                generation: generation,
-                process: process
-            )
             await requestEvidenceIndex(
                 generation: generation,
                 process: process
@@ -4850,6 +3975,23 @@ public actor NodeNetworkRuntime: IvyDelegate {
                 )
             }
         }
+        if case .unavailable(.parentStateContinuity(
+            let parentPath,
+            let fromStateCID,
+            let toStateCID
+        )) = outcome.decision,
+           parentPath == Array(configuration.chainPath.dropLast()),
+           let authenticatedPackage {
+            await requestParentStateContinuity(
+                from: fromStateCID,
+                to: toStateCID,
+                for: candidate.blockCID,
+                package: authenticatedPackage,
+                generation: generation,
+                process: process
+            )
+        }
+
         let resolution: CandidateAcquirer.Resolution
         if let predecessor = outcome.sameChainPredecessor {
             resolution = .predecessor(predecessor.predecessorCID)
@@ -5231,32 +4373,72 @@ public actor NodeNetworkRuntime: IvyDelegate {
         )
     }
 
-    private func requestInheritedWork(
-        from parent: AuthenticatedPeer,
+    private func requestParentStateContinuity(
+        from fromStateCID: String,
+        to toStateCID: String,
+        for blockCID: String,
+        package: AuthenticatedChildPackage,
         generation: UInt64,
         process: ChainProcess
     ) async {
         guard !configuration.address.isNexus,
               isCurrentRuntime(generation: generation, process: process),
-              configuredParentPeer()?.sessionID == parent.sessionID else {
+              pendingParentStateContinuity.count
+                < Self.maximumPendingRequests,
+              !pendingParentStateContinuity.values.contains(where: {
+                  $0.blockCID == blockCID
+                    && $0.request.fromStateCID == fromStateCID
+                    && $0.request.toStateCID == toStateCID
+              }),
+              let parent = configuredParentPeer() else {
             return
         }
-        let cursor = try? await process.inheritedWorkCursor()
-        guard let payload = try? InheritedWorkRequestMessage(
-            sourceID: cursor?.sourceID,
-            revision: cursor?.revision
-        ).encoded() else {
-            return
-        }
+        let request = ParentStateContinuityRequestMessage(
+            requestID: makeRequestID(),
+            childPath: configuration.chainPath,
+            fromStateCID: fromStateCID,
+            toStateCID: toStateCID
+        )
+        guard let payload = try? request.encoded() else { return }
+        pendingParentStateContinuity[request.requestID] =
+            PendingParentStateContinuity(
+                peer: parent,
+                request: request,
+                blockCID: blockCID,
+                package: package
+            )
         let result = await hierarchy.sendMessage(
             to: parent,
-            topic: NodeNetworkTopic.securingWorkRequest,
+            topic: NodeNetworkTopic.parentStateContinuityRequest,
             payload: payload
         )
-        guard case .enqueued = result else {
-            await hierarchy.recycleSession(ifCurrent: parent)
+        guard isCurrentRuntime(
+            generation: generation,
+            process: process
+        ), case .enqueued = result else {
+            pendingParentStateContinuity.removeValue(
+                forKey: request.requestID
+            )
             return
         }
+        let delay = Self.nanoseconds(
+            planeConfigurations.hierarchy.requestTimeout
+        )
+        Task { [weak self] in
+            try? await Task.sleep(nanoseconds: delay)
+            await self?.parentStateContinuityRequestTimedOut(
+                request.requestID,
+                generation: generation
+            )
+        }
+    }
+
+    private func parentStateContinuityRequestTimedOut(
+        _ requestID: UInt64,
+        generation: UInt64
+    ) {
+        guard isCurrentGeneration(generation) else { return }
+        pendingParentStateContinuity.removeValue(forKey: requestID)
     }
 
     private func requestEvidenceIndex(
@@ -6095,70 +5277,6 @@ public actor NodeNetworkRuntime: IvyDelegate {
               case .parent? = hierarchyPeers[key]
         else { return nil }
         return hierarchySessions[key]
-    }
-
-    private func rejectParentWorkStream(
-        from peer: AuthenticatedPeer,
-        generation: UInt64,
-        process: ChainProcess
-    ) async {
-        guard isCurrentRuntime(generation: generation, process: process),
-              configuredParentPeer()?.sessionID == peer.sessionID else {
-            return
-        }
-        parentWorkAssembler = nil
-        await setParentWorkReady(false)
-        guard isCurrentRuntime(generation: generation, process: process),
-              configuredParentPeer()?.sessionID == peer.sessionID else {
-            return
-        }
-        await hierarchy.recycleSession(ifCurrent: peer)
-    }
-
-    @discardableResult
-    private func setParentWorkReady(
-        _ ready: Bool,
-        from parent: AuthenticatedPeer? = nil
-    ) async -> Bool {
-        guard !configuration.address.isNexus else { return false }
-        guard let process else { return false }
-        let generation = runtimeGeneration
-        guard isCurrentRuntime(generation: generation, process: process) else {
-            return false
-        }
-        let readinessHandler = handlers?.parentWorkReadiness
-        if ready {
-            guard !parentWorkReady else { return false }
-            guard let parent,
-                  configuredParentPeer()?.sessionID == parent.sessionID else {
-                return false
-            }
-            parentWorkReady = true
-            await readinessHandler?(true)
-            guard isCurrentRuntime(generation: generation, process: process),
-                  parentWorkReady,
-                  configuredParentPeer()?.sessionID == parent.sessionID else {
-                return false
-            }
-            return true
-        } else {
-            guard parentWorkReady else { return false }
-            parentWorkReady = false
-            parentWorkAssembler = nil
-            let childPeers: [AuthenticatedPeer] = hierarchySessions.compactMap {
-                key, peer in
-                guard case .child? = hierarchyPeers[key] else { return nil }
-                return peer
-            }
-            for child in childPeers {
-                _ = clearHierarchyAuthorization(for: child.key)
-            }
-            for child in childPeers {
-                await hierarchy.recycleSession(ifCurrent: child)
-            }
-            await readinessHandler?(false)
-            return false
-        }
     }
 
     private func makeRequestID() -> UInt64 {

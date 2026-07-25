@@ -46,9 +46,8 @@ capacity mutation, and exact retained-set advance through one gate. Contextual
 child offers use a separate durable bounded LRU: new roots are pinned before
 the index changes and offer eviction never touches issued ownership. An exact,
 authenticated parent snapshot recursively reserves descendants and atomically
-replaces the issued set before acknowledgement; parent work is not visible
-before that acknowledgement. Removal acknowledgements never gate parent
-progress. A prior authenticated parent proof first promotes the candidate into
+replaces the issued set before acknowledgement. Removal acknowledgements never
+gate parent progress. A prior authenticated parent proof first promotes the candidate into
 a durable admission handoff; admission then transfers the roots before that
 handoff is released. Failed or idle cleanup can safely over-retain until an
 exact snapshot or startup rebuild reconciles ownership before garbage

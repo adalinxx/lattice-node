@@ -32,14 +32,12 @@ curl --fail http://127.0.0.1:8080/health
 Important fields:
 
 - `phase`: `active`, `awaitingGenesis` for an unbootstrapped child, or
-  `awaitingParent` when a bootstrapped child does not have a complete
-  inherited-work view from its live configured parent session.
+  no tip-dependent intermediate phase.
 - `chainPath`: the complete path owned by this process.
 - `nexusGenesisCID`: must be
   `bafyreiayw4z5qz4lt2sljf2enzn7uol3qa6bebadav7qwnqz7agxkiuwhq`.
 - `tipCID` and `height`: null only while a child awaits genesis.
-- `revision` and `parentWorkRevision`: local consensus and completed
-  immediate-parent work watermarks, useful for causal monitoring.
+- `revision`: the local consensus mutation watermark.
 - `mempoolCount`, `mempoolBytes`, and `pendingChildIntents`: bounded service
   pressure indicators.
 
@@ -84,12 +82,10 @@ lattice-node \
 
 The parent endpoint is an authority boundary, not merely a bootstrap hint. Back
 up the configured parent key and child process identity as operational secrets.
-A same-chain peer may restore verifiable parent continuity while this endpoint
-is unavailable, but it cannot make the child `active`: only the configured
-parent's ordered inherited-work completion on the current authenticated session
-does that. Losing the session returns the child to `awaitingParent`; mining,
-work submission, child deployment, canonical publication, and inherited-work
-export to descendants remain unavailable until it reconnects.
+Same-chain peers can relay parent-signed genesis and continuity facts, so losing
+the live parent does not revoke already verified history or fork choice. A child
+needs its configured parent, directly or through a portable signed fact, only
+when admission requires a new parent-state continuity or genesis authorization.
 
 For application testing, deploy a normal child with test-oriented parameters.
 Nexus retains its one pinned genesis.

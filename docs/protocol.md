@@ -61,10 +61,8 @@ observations of that root do not create additional work.
 
 Same-chain predecessor connectivity makes a later grind support its ancestors
 within that chain's GHOST calculation; it does not move the grind's terminal
-location onto an ancestor for a later vertical join. Hierarchy projection is
-exact: only a parent block named by a direct parent-to-child edge gives that
-grind a location in the child. Consequently `parentWorkRevision` is the
-immediate parent's stream cursor, not a global hierarchy generation.
+location onto an ancestor. The sparse directory proof itself identifies the
+root grind and its unique terminal location in each traversed chain.
 
 CID spellings are normalized at the content-addressing boundary before they
 become work keys. Alternate multibase text for the same CID therefore cannot
@@ -73,30 +71,23 @@ canonicity: every accepted branch's eligible work still counts whether or not
 that branch is the current canonical projection.
 
 A child candidate is delivered with a sparse proof from the mined root to that
-exact child. Lattice verifies the root, path, carrier continuity, vertical state
-binding, local target, and local state transition. Before expensive acquisition,
-each node may independently decline roots below its configured work floor; that
-is local, non-punitive policy rather than peer compatibility or validity.
+exact child. Lattice verifies the directory path and derives target-qualified
+work directly from the proof. The carrier block need not itself be valid,
+accepted, connected, or canonical: proof-of-work is a physical fact, not a
+parent-consensus claim. Work influences fork choice only after the child block
+is accepted and connected. Before expensive acquisition, each node may
+independently decline roots below its configured work floor; that is local,
+non-punitive policy rather than peer compatibility or validity.
 
-Accepted parent work may contribute to a child's fork choice even when the
-parent branch is not the parent's current canonical projection. Parent
-canonicity alone contributes nothing. An authenticated parent process may issue
-root-bound carrier and genesis facts; it cannot declare the child valid or
-choose the child's tip.
-
-Immutable carrier/genesis facts may be relayed by same-chain peers with the
-parent's certificate. Current inherited weight may not: after each parent
-reconnect, nonempty monotone fragments end with an ordered empty snapshot on
-that exact session. Every pass carries one nondecreasing revision; equal or
-older revisions may add previously unseen monotone facts, and reconnect may
-replay the same relation at the same watermark. Its marker must match;
-a mismatch revokes the session. Until that marker arrives, the child keeps the bounded
-incomplete batch out of fork choice. Before the first marker it exposes no
-operational consensus decision and produces no mining work. It may still ingest
-and project independently verifiable same-chain history for recovery; that
-projection is explicitly stale until readiness. During later deltas the last
-complete view remains operational. Disconnecting discards an incomplete batch
-and revokes readiness.
+Parent canonicity never affects work. An authenticated parent process may issue
+genesis and parent-state continuity facts; it cannot declare the child valid,
+assign work, or choose the child's tip. Continuity is transitive: for consecutive
+child blocks, the new parent-state CID must equal or be reachable through the
+parent's connected accepted same-chain graph from the predecessor's parent-state
+CID. A signed continuity link is portable through same-chain peers. Thus a
+restarted child can recompute fork choice entirely from durable accepted blocks
+and proof-derived work, while contacting its configured parent only when it
+needs a genuinely new parent-authorized continuity or genesis fact.
 
 `parentState` commits the carrier's `prevState`. It is not a parent-block
 backlink and is never inverted to discover ancestry.
@@ -132,8 +123,8 @@ The node uses two Ivy sessions:
 
 - the public same-chain overlay exchanges announcements and same-path content;
 - the private hierarchy plane connects one configured immediate parent with its
-  direct children and carries contextual candidates, inherited work, and
-  root-bound proof facts.
+  direct children and carries contextual candidates, signed parent-state
+  continuity facts, and root-bound proof facts.
 
 Both planes currently require node protocol version 4. Portable signed parent
 facts are versioned wire semantics, so mixed-version peers refuse the session
@@ -191,8 +182,8 @@ incoming edge when it validates that commitment. Children never return edge
 inventories or topology to parents.
 
 On the same-chain overlay, a child can advertise a child-evidence Volume whose
-envelope contains the complete proof plus detached parent carrier/genesis
-certificates. Each
+envelope contains the complete proof plus any detached parent carrier, genesis,
+or state-continuity certificates. Each
 certificate is bound to the Nexus genesis, absolute parent path, fact fields,
 and configured Ed25519 parent authority. It authenticates only the immutable
 parent fact; Lattice still derives work and validates the child. A genesis
@@ -223,13 +214,20 @@ Admission transfers ownership to ordinary chain recovery before releasing the
 inbox root. Multiple roots for one child are separate summaries. No proof-root
 pagination or evidence request/response layer exists beneath this inventory.
 
-Inherited work flows only parent to child. The parent exports one generic,
-monotone `grind -> (parent block, quantity)` relation to every direct child.
-The child alone joins those locations through its durable exact
-`parent block -> child block` edges. A completion marker makes each stream pass
-atomic; the first completed pass from the configured live parent grants
-consensus readiness. The relation is independent of both the parent's canonical
-choice and Volume availability.
+For a non-genesis child candidate, the configured immediate parent answers only
+an exact state-reachability question: whether the candidate's parent-state
+reference is equal to, or a transitive accepted same-chain successor of, its
+predecessor's reference. The parent signs the exact state pair, parent path,
+and Nexus genesis. Any same-chain peer may later relay that immutable
+certificate. Parent canonicity does not affect reachability, and the
+certificate carries no work total.
+
+Child work is derived directly from the candidate's content-addressed directory
+proof. A carrier need not be admitted or valid on its own chain: the root grind
+must be real, beat the terminal target, and commit uniquely to the child along
+the directory path. Once the child is accepted and connected, that contribution
+is ordinary chain-local GHOST input. There is no live parent-work stream or
+consensus-readiness handshake.
 
 ### Transaction pool
 

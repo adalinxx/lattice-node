@@ -14,15 +14,18 @@ public struct AuthenticatedChildPackage: Sendable {
     let package: ChildValidationPackage
     let parentCarrierCertificate: ParentCarrierCertificateV1?
     let parentGenesisCertificate: ParentGenesisCertificateV1?
+    let parentStateContinuityCertificate: ParentStateContinuityCertificateV1?
 
     init(
         package: ChildValidationPackage,
         parentCarrierCertificate: ParentCarrierCertificateV1? = nil,
-        parentGenesisCertificate: ParentGenesisCertificateV1? = nil
+        parentGenesisCertificate: ParentGenesisCertificateV1? = nil,
+        parentStateContinuityCertificate: ParentStateContinuityCertificateV1? = nil
     ) {
         self.package = package
         self.parentCarrierCertificate = parentCarrierCertificate
         self.parentGenesisCertificate = parentGenesisCertificate
+        self.parentStateContinuityCertificate = parentStateContinuityCertificate
     }
 }
 
@@ -34,21 +37,31 @@ public struct ChildValidationPackageEnvelope: Sendable {
     public static let maximumEncodedSize = Int(IvyConfig.protocolMaxFrameSize)
         - 1024
 
-    private static let magic = Data("LNCPKG03".utf8)
+    private static let magic = Data("LNCPKG04".utf8)
 
     public let proofBytes: Data
     public let parentCarrierLink: ParentCarrierLink?
     public let parentGenesisLink: ParentGenesisLink?
+    public let parentStateContinuityLink: ParentStateContinuityLink?
     public let parentCarrierCertificate: ParentCarrierCertificateV1?
     public let parentGenesisCertificate: ParentGenesisCertificateV1?
+    public let parentStateContinuityCertificate: ParentStateContinuityCertificateV1?
 
     public init(_ package: ChildValidationPackage) throws {
         proofBytes = try package.proof.serialize()
         parentCarrierLink = package.parentCarrierLink
         parentGenesisLink = package.parentGenesisLink
+        parentStateContinuityLink = package.parentStateContinuityLink
         parentCarrierCertificate = nil
         parentGenesisCertificate = nil
+        parentStateContinuityCertificate = nil
         try validateCanonicalContents()
+    }
+
+    /// Canonical proof-only Volume payload. Parent-issued state and genesis
+    /// facts are separate authenticated inputs.
+    public init(proof: ChildBlockProof) throws {
+        try self.init(ChildValidationPackage(proof: proof))
     }
 
     /// Build peer-portable root evidence. Signatures authenticate the parent
@@ -60,25 +73,36 @@ public struct ChildValidationPackageEnvelope: Sendable {
         proofBytes = try package.proof.serialize()
         parentCarrierLink = package.parentCarrierLink
         parentGenesisLink = package.parentGenesisLink
+        parentStateContinuityLink = package.parentStateContinuityLink
         parentCarrierCertificate = try package.parentCarrierLink.map {
             try ParentCarrierCertificateV1(link: $0, signedBy: configuration)
         }
         parentGenesisCertificate = try package.parentGenesisLink.map {
             try ParentGenesisCertificateV1(link: $0, signedBy: configuration)
         }
+        parentStateContinuityCertificate =
+            try package.parentStateContinuityLink.map {
+                try ParentStateContinuityCertificateV1(
+                    link: $0,
+                    signedBy: configuration
+                )
+            }
         try validateCanonicalContents()
     }
 
     init(
         _ package: ChildValidationPackage,
         parentCarrierCertificate: ParentCarrierCertificateV1?,
-        parentGenesisCertificate: ParentGenesisCertificateV1?
+        parentGenesisCertificate: ParentGenesisCertificateV1?,
+        parentStateContinuityCertificate: ParentStateContinuityCertificateV1? = nil
     ) throws {
         proofBytes = try package.proof.serialize()
         parentCarrierLink = package.parentCarrierLink
         parentGenesisLink = package.parentGenesisLink
+        parentStateContinuityLink = package.parentStateContinuityLink
         self.parentCarrierCertificate = parentCarrierCertificate
         self.parentGenesisCertificate = parentGenesisCertificate
+        self.parentStateContinuityCertificate = parentStateContinuityCertificate
         try validateCanonicalContents()
     }
 
@@ -86,14 +110,18 @@ public struct ChildValidationPackageEnvelope: Sendable {
         proofBytes: Data,
         parentCarrierLink: ParentCarrierLink?,
         parentGenesisLink: ParentGenesisLink?,
+        parentStateContinuityLink: ParentStateContinuityLink?,
         parentCarrierCertificate: ParentCarrierCertificateV1?,
-        parentGenesisCertificate: ParentGenesisCertificateV1?
+        parentGenesisCertificate: ParentGenesisCertificateV1?,
+        parentStateContinuityCertificate: ParentStateContinuityCertificateV1?
     ) throws {
         self.proofBytes = proofBytes
         self.parentCarrierLink = parentCarrierLink
         self.parentGenesisLink = parentGenesisLink
+        self.parentStateContinuityLink = parentStateContinuityLink
         self.parentCarrierCertificate = parentCarrierCertificate
         self.parentGenesisCertificate = parentGenesisCertificate
+        self.parentStateContinuityCertificate = parentStateContinuityCertificate
         try validateCanonicalContents()
     }
 
@@ -101,19 +129,25 @@ public struct ChildValidationPackageEnvelope: Sendable {
         try validateCanonicalContents()
         let carrierBytes = try _canonicalJSONEncode(parentCarrierLink)
         let genesisBytes = try _canonicalJSONEncode(parentGenesisLink)
+        let continuityBytes = try _canonicalJSONEncode(parentStateContinuityLink)
         let carrierCertificateBytes = try parentCarrierCertificate?.encode() ?? Data()
         let genesisCertificateBytes = try parentGenesisCertificate?.encode() ?? Data()
+        let continuityCertificateBytes =
+            try parentStateContinuityCertificate?.encode() ?? Data()
         guard proofBytes.count <= Int(UInt32.max),
               carrierBytes.count <= Int(UInt32.max),
               genesisBytes.count <= Int(UInt32.max),
+              continuityBytes.count <= Int(UInt32.max),
               carrierCertificateBytes.count <= Int(UInt32.max),
-              genesisCertificateBytes.count <= Int(UInt32.max) else {
+              genesisCertificateBytes.count <= Int(UInt32.max),
+              continuityCertificateBytes.count <= Int(UInt32.max) else {
             throw ChildValidationPackageEnvelopeError.oversized
         }
 
         var data = Data(
-            capacity: 28 + proofBytes.count + carrierBytes.count + genesisBytes.count
-                + carrierCertificateBytes.count + genesisCertificateBytes.count
+            capacity: 36 + proofBytes.count + carrierBytes.count + genesisBytes.count
+                + continuityBytes.count + carrierCertificateBytes.count
+                + genesisCertificateBytes.count + continuityCertificateBytes.count
         )
         data.append(Self.magic)
         _appendUInt32(UInt32(proofBytes.count), to: &data)
@@ -122,10 +156,14 @@ public struct ChildValidationPackageEnvelope: Sendable {
         data.append(carrierBytes)
         _appendUInt32(UInt32(genesisBytes.count), to: &data)
         data.append(genesisBytes)
+        _appendUInt32(UInt32(continuityBytes.count), to: &data)
+        data.append(continuityBytes)
         _appendUInt32(UInt32(carrierCertificateBytes.count), to: &data)
         data.append(carrierCertificateBytes)
         _appendUInt32(UInt32(genesisCertificateBytes.count), to: &data)
         data.append(genesisCertificateBytes)
+        _appendUInt32(UInt32(continuityCertificateBytes.count), to: &data)
+        data.append(continuityCertificateBytes)
         guard data.count <= Self.maximumEncodedSize else {
             throw ChildValidationPackageEnvelopeError.oversized
         }
@@ -140,7 +178,7 @@ public struct ChildValidationPackageEnvelope: Sendable {
               data.count <= min(maximumEncodedSize, localMaximumEncodedSize) else {
             throw ChildValidationPackageEnvelopeError.oversized
         }
-        guard data.count >= magic.count + 20, data.prefix(magic.count) == magic else {
+        guard data.count >= magic.count + 28, data.prefix(magic.count) == magic else {
             throw ChildValidationPackageEnvelopeError.malformed
         }
 
@@ -148,6 +186,10 @@ public struct ChildValidationPackageEnvelope: Sendable {
         guard let proofBytes = _readLengthPrefixedBytes(data, position: &position),
               let carrierBytes = _readLengthPrefixedBytes(data, position: &position),
               let genesisBytes = _readLengthPrefixedBytes(data, position: &position),
+              let continuityBytes = _readLengthPrefixedBytes(
+                data,
+                position: &position
+              ),
               let carrierCertificateBytes = _readLengthPrefixedBytes(
                 data,
                 position: &position
@@ -156,24 +198,35 @@ public struct ChildValidationPackageEnvelope: Sendable {
                 data,
                 position: &position
               ),
+              let continuityCertificateBytes = _readLengthPrefixedBytes(
+                data,
+                position: &position
+              ),
               position == data.endIndex else {
             throw ChildValidationPackageEnvelopeError.malformed
         }
         let carrier: ParentCarrierLink?
         let genesis: ParentGenesisLink?
+        let continuity: ParentStateContinuityLink?
         do {
             carrier = try JSONDecoder().decode(ParentCarrierLink?.self, from: carrierBytes)
             genesis = try JSONDecoder().decode(ParentGenesisLink?.self, from: genesisBytes)
+            continuity = try JSONDecoder().decode(
+                ParentStateContinuityLink?.self,
+                from: continuityBytes
+            )
         } catch {
             throw ChildValidationPackageEnvelopeError.malformed
         }
         guard (try? _canonicalJSONEncode(carrier)) == carrierBytes,
-              (try? _canonicalJSONEncode(genesis)) == genesisBytes else {
+              (try? _canonicalJSONEncode(genesis)) == genesisBytes,
+              (try? _canonicalJSONEncode(continuity)) == continuityBytes else {
             throw ChildValidationPackageEnvelopeError.nonCanonical
         }
 
         let carrierCertificate: ParentCarrierCertificateV1?
         let genesisCertificate: ParentGenesisCertificateV1?
+        let continuityCertificate: ParentStateContinuityCertificateV1?
         do {
             carrierCertificate = carrierCertificateBytes.isEmpty
                 ? nil
@@ -181,6 +234,11 @@ public struct ChildValidationPackageEnvelope: Sendable {
             genesisCertificate = genesisCertificateBytes.isEmpty
                 ? nil
                 : try ParentGenesisCertificateV1.decode(genesisCertificateBytes)
+            continuityCertificate = continuityCertificateBytes.isEmpty
+                ? nil
+                : try ParentStateContinuityCertificateV1.decode(
+                    continuityCertificateBytes
+                )
         } catch {
             throw ChildValidationPackageEnvelopeError.malformed
         }
@@ -189,8 +247,10 @@ public struct ChildValidationPackageEnvelope: Sendable {
             proofBytes: proofBytes,
             parentCarrierLink: carrier,
             parentGenesisLink: genesis,
+            parentStateContinuityLink: continuity,
             parentCarrierCertificate: carrierCertificate,
-            parentGenesisCertificate: genesisCertificate
+            parentGenesisCertificate: genesisCertificate,
+            parentStateContinuityCertificate: continuityCertificate
         )
         guard try envelope.encode() == data else {
             throw ChildValidationPackageEnvelopeError.nonCanonical
@@ -205,7 +265,8 @@ public struct ChildValidationPackageEnvelope: Sendable {
         return ChildValidationPackage(
             proof: proof,
             parentCarrierLink: parentCarrierLink,
-            parentGenesisLink: parentGenesisLink
+            parentGenesisLink: parentGenesisLink,
+            parentStateContinuityLink: parentStateContinuityLink
         )
     }
 
@@ -226,9 +287,16 @@ public struct ChildValidationPackageEnvelope: Sendable {
                       && StateAtomLimits.isDirectory($0.directory)
                       && _isBoundedWireAtom($0.childGenesisCID)
               }) ?? true,
+              parentStateContinuityLink.map({
+                  _isAbsoluteChainPath($0.parentPath)
+                      && _isBoundedWireAtom($0.fromStateCID)
+                      && _isBoundedWireAtom($0.toStateCID)
+              }) ?? true,
               parentCarrierCertificate == nil
                 || parentCarrierLink?.rootCID == proof.rootCID,
-              parentGenesisCertificate == nil || parentGenesisLink != nil else {
+              parentGenesisCertificate == nil || parentGenesisLink != nil,
+              parentStateContinuityCertificate == nil
+                || parentStateContinuityLink != nil else {
             throw ChildValidationPackageEnvelopeError.malformed
         }
     }
@@ -281,7 +349,10 @@ public struct AuthenticatedParentFactGate: Sendable {
         }
         let parentPath = Array(childPath.dropLast())
         guard envelope.parentCarrierLink.map({ $0.parentPath == parentPath }) ?? true,
-              envelope.parentGenesisLink.map({ $0.parentPath == parentPath }) ?? true else {
+              envelope.parentGenesisLink.map({ $0.parentPath == parentPath }) ?? true,
+              envelope.parentStateContinuityLink.map({
+                  $0.parentPath == parentPath
+              }) ?? true else {
             throw AuthenticatedParentFactGateError.wrongParentPath
         }
         let authority = ParentProcessKey(configuredParentIvyPeerKey)!
@@ -293,7 +364,9 @@ public struct AuthenticatedParentFactGate: Sendable {
         return AuthenticatedChildPackage(
             package: try envelope.makeValidationPackage(),
             parentCarrierCertificate: envelope.parentCarrierCertificate,
-            parentGenesisCertificate: envelope.parentGenesisCertificate
+            parentGenesisCertificate: envelope.parentGenesisCertificate,
+            parentStateContinuityCertificate:
+                envelope.parentStateContinuityCertificate
         )
     }
 
@@ -309,7 +382,10 @@ public struct AuthenticatedParentFactGate: Sendable {
         }
         let parentPath = Array(childPath.dropLast())
         guard envelope.parentCarrierLink.map({ $0.parentPath == parentPath }) ?? true,
-              envelope.parentGenesisLink.map({ $0.parentPath == parentPath }) ?? true else {
+              envelope.parentGenesisLink.map({ $0.parentPath == parentPath }) ?? true,
+              envelope.parentStateContinuityLink.map({
+                  $0.parentPath == parentPath
+              }) ?? true else {
             throw AuthenticatedParentFactGateError.wrongParentPath
         }
         try verifyCertificates(
@@ -320,7 +396,9 @@ public struct AuthenticatedParentFactGate: Sendable {
         return AuthenticatedChildPackage(
             package: try envelope.makeValidationPackage(),
             parentCarrierCertificate: envelope.parentCarrierCertificate,
-            parentGenesisCertificate: envelope.parentGenesisCertificate
+            parentGenesisCertificate: envelope.parentGenesisCertificate,
+            parentStateContinuityCertificate:
+                envelope.parentStateContinuityCertificate
         )
     }
 
@@ -346,6 +424,20 @@ public struct AuthenticatedParentFactGate: Sendable {
         }
         if let link = envelope.parentGenesisLink {
             if let certificate = envelope.parentGenesisCertificate {
+                guard certificate.verifies(
+                    link: link,
+                    authorityKey: authorityKey,
+                    expectedNexusGenesisCID: nexusGenesisCID,
+                    expectedParentPath: parentPath
+                ) else {
+                    throw AuthenticatedParentFactGateError.invalidCertificate
+                }
+            } else if requirePortable {
+                throw AuthenticatedParentFactGateError.missingPortableCertificate
+            }
+        }
+        if let link = envelope.parentStateContinuityLink {
+            if let certificate = envelope.parentStateContinuityCertificate {
                 guard certificate.verifies(
                     link: link,
                     authorityKey: authorityKey,

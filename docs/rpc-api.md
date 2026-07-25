@@ -49,7 +49,6 @@ Both routes return the same chain-process status:
   "tipCID": "<cid>",
   "height": 42,
   "revision": 57,
-  "parentWorkRevision": null,
   "mempoolCount": 3,
   "mempoolBytes": 2048,
   "pendingChildIntents": 0
@@ -58,13 +57,10 @@ Both routes return the same chain-process status:
 
 A child reports `phase: "awaitingGenesis"`, with null tip and height, until it
 receives its authenticated genesis link from its immediate parent.
-After bootstrap, a child reports `phase: "awaitingParent"` whenever its live
-configured parent session has not completed the current inherited-work export.
-Its retained tip may still be shown, but it is not operational consensus.
+After bootstrap, it reports `phase: "active"` from its durable accepted graph;
+parent connectivity does not change the meaning of proof-derived work.
 
-`revision` is the local consensus mutation watermark. `parentWorkRevision` is
-the last inherited-work watermark durably completed from the configured parent;
-it is null on Nexus or before the first parent pass.
+`revision` is the local consensus mutation watermark.
 
 ## Transactions
 
@@ -203,8 +199,9 @@ delivers the authenticated genesis link.
 
 - Malformed or invalid requests return `400 Bad Request`.
 - Requests that require an active child before genesis return `409 Conflict`.
-- Consensus-producing requests on a bootstrapped child in `awaitingParent`
-  return `503 Service Unavailable`.
+- Consensus-producing requests return `503 Service Unavailable` only when the
+  process is not active or the requested local resource is temporarily
+  unavailable.
 - A full transaction pool or child-intent capacity returns `429 Too Many
   Requests`.
 - A temporarily unavailable transaction policy returns `503 Service

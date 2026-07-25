@@ -175,3 +175,89 @@ public struct ParentGenesisCertificateV1: Equatable, Sendable {
             + (try _canonicalJSONEncode(link))
     }
 }
+
+/// A portable signature over one exact transitive parent-state reachability
+/// fact. The parent process signs only after its accepted graph proves it.
+public struct ParentStateContinuityCertificateV1: Equatable, Sendable {
+    public static let maximumEncodedSize = 64
+
+    private static let domain =
+        Data("lattice-node.parent-state-continuity.v1\0".utf8)
+
+    public let signature: Data
+
+    public init(
+        link: ParentStateContinuityLink,
+        signedBy configuration: NodeConfiguration
+    ) throws {
+        guard link.parentPath == configuration.chainPath else {
+            throw ParentFactCertificateError.wrongConfiguration
+        }
+        signature = try configuration.signingKey.signature(
+            for: Self.signedBytes(
+                link: link,
+                nexusGenesisCID: configuration.nexusGenesisCID
+            )
+        )
+    }
+
+    private init(signature: Data) {
+        self.signature = signature
+    }
+
+    public func encode() throws -> Data {
+        guard signature.count == Self.maximumEncodedSize else {
+            throw ParentFactCertificateError.malformed
+        }
+        return signature
+    }
+
+    public static func decode(_ data: Data) throws -> Self {
+        guard data.count <= maximumEncodedSize else {
+            throw ParentFactCertificateError.oversized
+        }
+        guard data.count == maximumEncodedSize else {
+            throw ParentFactCertificateError.malformed
+        }
+        return Self(signature: data)
+    }
+
+    public func verifies(
+        link: ParentStateContinuityLink,
+        authorityKey: ParentProcessKey,
+        expectedNexusGenesisCID: String,
+        expectedParentPath: [String]
+    ) -> Bool {
+        guard link.parentPath == expectedParentPath,
+              let body = try? Self.signedBytes(
+                link: link,
+                nexusGenesisCID: expectedNexusGenesisCID
+              ),
+              let key = try? PeerKey(authorityKey.value),
+              let publicKey = try? Curve25519.Signing.PublicKey(
+                rawRepresentation: key.rawRepresentation
+              ) else {
+            return false
+        }
+        return publicKey.isValidSignature(signature, for: body)
+    }
+
+    private static func signedBytes(
+        link: ParentStateContinuityLink,
+        nexusGenesisCID: String
+    ) throws -> Data {
+        guard _isBoundedWireAtom(nexusGenesisCID),
+              CIDIdentity.isCanonical(nexusGenesisCID),
+              _isAbsoluteChainPath(link.parentPath),
+              _isBoundedWireAtom(link.fromStateCID),
+              CIDIdentity.isCanonical(link.fromStateCID),
+              _isBoundedWireAtom(link.toStateCID),
+              CIDIdentity.isCanonical(link.toStateCID),
+              link.fromStateCID != link.toStateCID else {
+            throw ParentFactCertificateError.malformed
+        }
+        return domain
+            + (try _canonicalJSONEncode(nexusGenesisCID))
+            + (try _canonicalJSONEncode(link))
+    }
+}

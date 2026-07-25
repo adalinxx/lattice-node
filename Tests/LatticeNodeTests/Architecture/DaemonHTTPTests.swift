@@ -44,7 +44,7 @@ final class DaemonHTTPTests: XCTestCase {
         XCTAssertEqual(invocationCount, 0)
     }
 
-    func testParentUnavailableIsServiceUnavailable() async throws {
+    func testNexusTemplateDoesNotRequireParentReadiness() async throws {
         let storage = FileManager.default.temporaryDirectory.appendingPathComponent(
             "lattice-http-parent-unavailable-\(UUID().uuidString)"
         )
@@ -60,9 +60,7 @@ final class DaemonHTTPTests: XCTestCase {
             childCandidateProvider: { _ in [] },
             childProofPublisher: { _ in },
             acceptedBlockPublisher: { _ in },
-            securingWorkPublisher: {}
         )
-        await service.setParentWorkReady(false)
         let app = makeApplication(service: service, host: "127.0.0.1", port: 8080)
         let body = try JSONEncoder().encode(MiningTemplateRequest())
 
@@ -73,7 +71,7 @@ final class DaemonHTTPTests: XCTestCase {
                 headers: [.contentType: "application/json"],
                 body: ByteBuffer(bytes: body)
             ) { response in
-                XCTAssertEqual(response.status, .serviceUnavailable)
+                XCTAssertEqual(response.status, .ok)
             }
         }
     }
@@ -112,7 +110,6 @@ final class DaemonHTTPTests: XCTestCase {
             childCandidateProvider: { _ in [] },
             childProofPublisher: { _ in },
             acceptedBlockPublisher: { _ in },
-            securingWorkPublisher: {}
         )
         let app = makeApplication(
             service: service,
@@ -190,7 +187,6 @@ final class DaemonHTTPTests: XCTestCase {
             childCandidateProvider: { _ in [] },
             childProofPublisher: { _ in },
             acceptedBlockPublisher: { _ in },
-            securingWorkPublisher: {}
         )
         let app = makeApplication(
             service: service,
