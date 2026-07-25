@@ -564,12 +564,19 @@ final class ParentChildE2ETests: XCTestCase {
             )
             break
         }
-        XCTAssertTrue(try XCTUnwrap(receiptsDeployment).accepted)
+        let deployment = try XCTUnwrap(receiptsDeployment)
+        XCTAssertTrue(deployment.accepted)
+        XCTAssertEqual(deployment.durableChildProofs.map(\.directory), ["Payments"])
+        let deployedPaymentsCID = try XCTUnwrap(
+            deployment.durableChildProofs.first?.childCID
+        )
         let receiptsBeforeCarrier = try await receipts.waitForStatus {
             $0.phase == .active && $0.tipCID == receiptsIntent.genesisCID
         }
         let paymentsBeforeCarrier = try await payments.waitForStatus {
-            $0.phase == .active && $0.mempoolCount == 0 && ($0.height ?? 0) > 0
+            $0.phase == .active
+                && $0.tipCID == deployedPaymentsCID
+                && $0.mempoolCount == 0
         }
         let paymentsTip = try XCTUnwrap(paymentsBeforeCarrier.tipCID)
         let paymentsHeight = try XCTUnwrap(paymentsBeforeCarrier.height)
