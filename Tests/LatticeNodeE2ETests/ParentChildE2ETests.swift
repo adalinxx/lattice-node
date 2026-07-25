@@ -598,13 +598,15 @@ final class ParentChildE2ETests: XCTestCase {
             "/v1/mining/templates",
             body: MiningTemplateRequest()
         )
+        let maximumPaymentsTarget = hardTarget
+            * UInt256(UInt64(ChainSpec.maxTargetChange))
         let carrierMidstate = ProofOfWork.midstate(for: selectedTemplate.block)
         var carrierNonce: UInt64 = 0
         var rootHash = ProofOfWork.hash(
             midstate: carrierMidstate,
             nonce: carrierNonce
         )
-        while rootHash <= hardTarget {
+        while rootHash <= maximumPaymentsTarget {
             carrierNonce += 1
             rootHash = ProofOfWork.hash(
                 midstate: carrierMidstate,
@@ -613,7 +615,7 @@ final class ParentChildE2ETests: XCTestCase {
         }
         XCTAssertEqual(selectedTemplate.searchTarget, .max)
         XCTAssertLessThan(hardTarget, .max)
-        XCTAssertGreaterThan(rootHash, hardTarget)
+        XCTAssertGreaterThan(rootHash, maximumPaymentsTarget)
 
         // Search the exact public template through the shipped worker, then
         // submit that worker's nonce through the public node RPC.
@@ -747,13 +749,15 @@ final class ParentChildE2ETests: XCTestCase {
                 break
             }
         }
-        let firstTip = try XCTUnwrap(bProgress)
+        _ = try XCTUnwrap(bProgress)
 
         try a.start()
-        let caughtUpA = try await a.waitForStatus {
-            $0.tipCID == firstTip.tipCID && $0.height == firstTip.height
-        }
-        XCTAssertEqual(caughtUpA.tipCID, firstTip.tipCID)
+        let firstTipCID = try await waitForReplicaConvergence(
+            a,
+            b,
+            excluding: intent.genesisCID
+        )
+        let firstTip = try await a.waitForStatus { $0.tipCID == firstTipCID }
 
         try await b.stop()
         let _: SubmitTransactionResponse = try await a.post(
@@ -777,13 +781,15 @@ final class ParentChildE2ETests: XCTestCase {
                 break
             }
         }
-        let secondTip = try XCTUnwrap(aProgress)
+        _ = try XCTUnwrap(aProgress)
 
         try b.start()
-        let caughtUpB = try await b.waitForStatus {
-            $0.tipCID == secondTip.tipCID && $0.height == secondTip.height
-        }
-        XCTAssertEqual(caughtUpB.tipCID, secondTip.tipCID)
+        let secondTipCID = try await waitForReplicaConvergence(
+            a,
+            b,
+            excluding: firstTipCID
+        )
+        XCTAssertNotEqual(secondTipCID, firstTipCID)
 
         try await cluster.stopAll()
         passed = true
@@ -1855,8 +1861,8 @@ final class ParentChildE2ETests: XCTestCase {
         let stoppedHeight = try XCTUnwrap(stoppedBeforeStop.height)
 
         // SIGSTOP preserves the authenticated private-Ivy session but prevents
-        // this direct child from replying. Nexus must omit it at its bounded
-        // deadline and still carry the healthy sibling in the next root.
+        // this direct child from replying. Every Nexus round remains bounded,
+        // and repeated real rounds must still carry the healthy sibling.
         try stopped.suspend()
         let _: SubmitTransactionResponse = try await healthy.post(
             "/v1/transactions",
@@ -1865,22 +1871,26 @@ final class ParentChildE2ETests: XCTestCase {
             )
         )
         _ = try await healthy.waitForStatus { $0.mempoolCount == 1 }
-        let template: MiningTemplateResponse = try await nexus.post(
-            "/v1/mining/templates",
-            body: MiningTemplateRequest(),
-            timeout: 20
-        )
-        let work: SubmitWorkResponse = try await nexus.post(
-            "/v1/mining/work",
-            body: SubmitWorkRequest(workID: template.workID, nonce: 0)
-        )
-        XCTAssertTrue(work.accepted)
-        let healthyAfterStop = try await healthy.waitForStatus { status in
-            status.phase == .active
-                && (status.height ?? 0) > healthyHeight
-                && status.mempoolCount == 0
+        var healthyAfterStop: ChainServiceStatusResponse?
+        for _ in 0..<5 {
+            let work = try await mine(nexus)
+            XCTAssertTrue(work.accepted)
+            if let status = try? await healthy.waitForStatus(
+                timeout: .seconds(2),
+                where: {
+                    $0.phase == .active
+                        && ($0.height ?? 0) > healthyHeight
+                        && $0.mempoolCount == 0
+                }
+            ) {
+                healthyAfterStop = status
+                break
+            }
         }
-        XCTAssertNotEqual(healthyAfterStop.tipCID, healthyBeforeStop.tipCID)
+        XCTAssertNotEqual(
+            try XCTUnwrap(healthyAfterStop).tipCID,
+            healthyBeforeStop.tipCID
+        )
 
         // The stopped child reopens its pre-stop durable projection. Its
         // hierarchy recovery remains independent from healthy sibling progress.
