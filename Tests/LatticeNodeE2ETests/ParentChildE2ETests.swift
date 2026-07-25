@@ -1128,7 +1128,7 @@ final class ParentChildE2ETests: XCTestCase {
             throw error
         }
         _ = try await a.waitForStatus { $0.mempoolCount == 1 }
-        var stateProvenTip: String?
+        var stateProvenStatus: ChainServiceStatusResponse?
         for _ in 0..<5 {
             let work: SubmitWorkResponse
             do {
@@ -1146,33 +1146,72 @@ final class ParentChildE2ETests: XCTestCase {
                 timeout: .seconds(2),
                 where: { $0.tipCID == next && $0.mempoolCount == 0 }
             ), status.phase == .active else { continue }
-            stateProvenTip = next
+            stateProvenStatus = status
             break
         }
-        let finalTip = try XCTUnwrap(
-            stateProvenTip,
+        let durableState = try XCTUnwrap(
+            stateProvenStatus,
             "dependent spend did not prove both branch effects"
         )
+        let durableHeight = try XCTUnwrap(durableState.height)
 
         a.forceTerminate()
         b.forceTerminate()
         try a.start()
         try b.start()
-        _ = try await a.waitForStatus(
-            timeout: .seconds(60),
-            where: { $0.tipCID == finalTip }
+        let recovered = try await waitForReplicaConvergenceStatus(
+            a,
+            b,
+            excluding: intent.genesisCID,
+            minimumHeight: durableHeight
         )
-        _ = try await b.waitForStatus(
-            timeout: .seconds(60),
-            where: { $0.tipCID == finalTip }
+        let recoveredTip = try XCTUnwrap(recovered.tipCID)
+
+        // Spending the pre-restart output proves durable state recovery even
+        // when queued parent evidence advances a replica past the observed CID.
+        let spendRecoveredState = try signedTransaction(
+            key: sink,
+            chainPath: childPath,
+            accountActions: [
+                AccountAction(owner: sinkAddress, delta: -2),
+                AccountAction(owner: ownerAAddress, delta: 2),
+            ],
+            nonce: 0
+        )
+        let _: SubmitTransactionResponse = try await a.post(
+            "/v1/transactions",
+            body: SubmitTransactionRequest(transaction: spendRecoveredState)
+        )
+        _ = try await a.waitForStatus { $0.mempoolCount == 1 }
+        var finalTip: String?
+        for _ in 0..<5 {
+            let work = try await mine(nexus)
+            XCTAssertTrue(work.accepted)
+            guard let next = try? await waitForReplicaConvergence(
+                a,
+                b,
+                excluding: recoveredTip
+            ), let aStatus = try? await a.waitForStatus(
+                timeout: .seconds(2),
+                where: { $0.tipCID == next && $0.mempoolCount == 0 }
+            ), let bStatus = try? await b.waitForStatus(
+                timeout: .seconds(2),
+                where: { $0.tipCID == next && $0.mempoolCount == 0 }
+            ), aStatus.height == bStatus.height else { continue }
+            finalTip = next
+            break
+        }
+        let coldJoinTip = try XCTUnwrap(
+            finalTip,
+            "recovered branch state was not spendable"
         )
 
         try cold.start()
         let coldStatus = try await cold.waitForStatus(
             timeout: .seconds(60),
-            where: { $0.phase == .active && $0.tipCID == finalTip }
+            where: { $0.phase == .active && $0.tipCID == coldJoinTip }
         )
-        XCTAssertEqual(coldStatus.tipCID, finalTip)
+        XCTAssertEqual(coldStatus.tipCID, coldJoinTip)
 
         try await cluster.stopAll()
         passed = true
@@ -3371,7 +3410,8 @@ final class ParentChildE2ETests: XCTestCase {
     private func waitForReplicaConvergenceStatus(
         _ first: E2ENode,
         _ second: E2ENode,
-        excluding excludedCID: String
+        excluding excludedCID: String,
+        minimumHeight: UInt64 = 0
     ) async throws -> ChainServiceStatusResponse {
         let clock = ContinuousClock()
         let deadline = clock.now + .seconds(30)
@@ -3387,7 +3427,9 @@ final class ParentChildE2ETests: XCTestCase {
             if let firstStatus,
                let firstTip = firstStatus.tipCID,
                firstTip != excludedCID,
-               firstTip == secondStatus?.tipCID {
+               firstTip == secondStatus?.tipCID,
+               firstStatus.height ?? 0 >= minimumHeight,
+               secondStatus?.height ?? 0 >= minimumHeight {
                 return firstStatus
             }
             try await Task.sleep(for: .milliseconds(50))
