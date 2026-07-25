@@ -1,8 +1,8 @@
 # Recursive commitments, independent processes
 
 The canonical design rationale is in Lattice's
-[philosophy](https://github.com/adalinxx/Lattice/blob/25.0.1/docs/philosophy.md)
-and [foundational architecture](https://github.com/adalinxx/Lattice/blob/25.0.1/docs/foundational-architecture.md).
+[philosophy](https://github.com/adalinxx/Lattice/blob/26.0.0/docs/philosophy.md)
+and [foundational architecture](https://github.com/adalinxx/Lattice/blob/26.0.0/docs/foundational-architecture.md).
 This page records only the consequences for `lattice-node`.
 
 The hierarchy is recursive data, not a recursive runtime. A mined root may
@@ -17,8 +17,8 @@ That gives the node four rules:
    direct-child processes; a provider supplies availability, not validity.
 3. Lattice validates one sparse root-to-candidate route and updates only the
    accepted forest for that process's path.
-4. Accepted parent work may affect a child's weight, but the parent's canonical
-   tip is never a command to change child state or fork choice.
+4. A child's directory proof derives its own physical work; the parent's
+   canonical tip is never a command to change child state or fork choice.
 
 The compact model is: **recursive commitments, independent decisions**. See
 [chain addressing](chain-addressing.md) and the

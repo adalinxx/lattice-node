@@ -8,14 +8,14 @@ swift test
 
 The suites are grouped by the boundary they actually cross:
 
-- `NodeStoreTests`: atomic admission, crash recovery, retained hierarchy evidence,
-  immutable-index audit, and monotone inherited-work raw-fact durability.
+- `NodeStoreTests`: atomic admission, crash recovery, retained hierarchy
+  evidence, immutable-index audit, and Volume ownership.
 - `ChainProcessTests`: one-path admission, restart, child bootstrap, proof composition, cancellation, and explicit local-versus-network acquisition boundaries.
 - `NetworkTrustTests`: real-network integration tests, not E2E. They exercise
   overlay/fact-plane separation, bounded/canonical wire input, real
   peer-to-runtime async delegate delivery, root-scoped content attribution,
-  per-connection hierarchy authorization, lifecycle fencing, and inherited-work
-  fragment retry/high-cardinality packing.
+  per-connection hierarchy authorization, lifecycle fencing, proof
+  distribution, and continuity-certificate authentication.
 - `MultichainInvariantTests`: direct-parent-only package acceptance, ancestor-path rejection, and durable exact-edge recovery across process reopen.
 - `ChainServiceTests`: transaction, child-deploy, template, work-submission, reconciliation ordering, and publication despite optional hierarchy availability failures.
 - `DaemonHTTPTests`: real loopback HTTP route contracts.
@@ -27,8 +27,8 @@ The suites are grouped by the boundary they actually cross:
   `ChainProcess`, mutate stores, install runtime callbacks, or seed internal
   consensus state. They exercise direct-child
   bootstrap/restart, same-chain portable genesis and continuity recovery with
-  the parent offline while consensus remains unavailable, reopen with every source
-  offline, three-level late join, a suspended
+  the parent offline, reopen with every source offline, three-level proof
+  traversal, a suspended
   non-responsive authenticated sibling, durable side-branch bootstrap after a
   reorg, same-path higher-work and segment-base-tie convergence, and a live competing-genesis
   reorg followed by noncanonical parent descendants that must remain at their
@@ -52,9 +52,9 @@ cross-component invariants:
 
 - only traced network admission may acquire remote content; RPC, mining, and
   reconciliation fail locally rather than fetching peers;
-- parent-work readiness gates operational consensus, not validity or
-  availability: an offline child may ingest verified same-chain history while
-  remaining unable to mine, publish work, or activate descendants;
+- securing work comes only from a verified directory proof, while
+  parent-state continuity comes only from an exact authenticated reachability
+  fact; neither data availability nor parent canonicity substitutes for either;
 - each root-scoped acquisition gets an independent cashew coalescer, so one
   candidate cannot inherit another candidate's Ivy attribution;
 - a hierarchy connection cannot read CAS content before its own compatible
@@ -62,15 +62,10 @@ cross-component invariants:
   root and is never persisted;
 - a durable canonical commit reserves reconciliation before a later template,
   transaction, or child intent can observe the new chain state;
-- optional child-proof materialization never suppresses canonical publication
-  or inherited-work refresh;
-- inherited-work storage records one exact child-block location and the
-  greatest raw work observed for each physical grind. Recovery rejects a
-  grind relocated to another block, while replayed or older fragments cannot
-  lose or multiply weight;
-- an outbound inherited-work cursor advances only after every frame is locally
-  queued; transient Ivy/Tally or transport pressure retries the same frame in
-  order without inventing a receiver acknowledgement protocol;
+- optional child-proof materialization never suppresses canonical publication;
+- one physical grind contributes at most its strongest target-derived quantity
+  to one chain-local location; distinct grinds sum, and replay cannot multiply
+  weight;
 - evidence inventories retain their exact cursor across
   transient Ivy/Tally pressure on a live parent session;
 - a failed hierarchy hello or durable evidence hint recycles only that exact
@@ -80,18 +75,16 @@ cross-component invariants:
 - a parent remains child-agnostic: child topology and derived weight stay in
   the child process and are never returned upstream;
 - a child restarted after acknowledging a contextual candidate reservation
-  still serves that exact old parent work from durable Volumes; more than one
+  still serves that exact candidate from durable Volumes; more than one
   offer window of abandoned parent carriers cannot evict an issued candidate,
   and a later exact snapshot releases obsolete offers and reservations;
 - successor attachments received before child genesis wait on their exact
   same-chain predecessor instead of being misclassified as malformed genesis;
 - a suspended authenticated direct child cannot block a healthy sibling's
   bounded root round;
-- every accepted parent branch refreshes inherited work live; restart and
-  reconnect are tested separately as durable catch-up paths, not prerequisites;
-- peer-supplied portable continuity can restore verified history, but only a
-  complete export from the live configured parent session activates consensus;
-  disconnect revokes that activation recursively for descendants;
+- parent-state continuity is reflexive and transitive over connected accepted
+  parent history, including noncanonical branches, and exact signed facts may
+  be relayed by same-chain peers after restart;
 - staged facts and retained Volume roots reopen together, or recovery fails
   closed.
 

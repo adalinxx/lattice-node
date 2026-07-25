@@ -26,7 +26,7 @@ The acquirer owns:
 The acquirer does not own:
 
 - evidence authority or signature verification;
-- inherited work or parent readiness;
+- work totals or parent-state reachability;
 - fork choice or hierarchical GHOST;
 - transaction-pool processing;
 - child-candidate construction;

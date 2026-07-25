@@ -32,9 +32,10 @@ enum NodeNetworkTopic {
         "lattice.hierarchy.child-candidate.reservation.request.v1"
     static let childCandidateReservationResponse =
         "lattice.hierarchy.child-candidate.reservation.response.v1"
-    static let securingWorkRequest = "lattice.hierarchy.securing-work.request.v1"
-    static let securingWorkPush = "lattice.hierarchy.securing-work.push.v1"
-    static let inheritedWorkPush = securingWorkPush
+    static let parentStateContinuityRequest =
+        "lattice.hierarchy.parent-state-continuity.request.v1"
+    static let parentStateContinuityResponse =
+        "lattice.hierarchy.parent-state-continuity.response.v1"
 
     static func plane(for topic: String) -> Plane? {
         switch topic {
@@ -48,8 +49,47 @@ enum NodeNetworkTopic {
              childEvidenceIndexRequest, childEvidenceIndexResponse,
              childCandidateRequest, childCandidateResponse,
              childCandidateReservationRequest, childCandidateReservationResponse,
-             securingWorkRequest, securingWorkPush: .hierarchy
+             parentStateContinuityRequest, parentStateContinuityResponse: .hierarchy
         default: nil
+        }
+    }
+}
+
+struct ParentStateContinuityRequestMessage:
+    NodeJSONMessage, Equatable, Sendable {
+    let requestID: UInt64
+    let childPath: [String]
+    let fromStateCID: String
+    let toStateCID: String
+
+    func validate() throws {
+        guard requestID != 0,
+              _isAbsoluteChainPath(childPath), childPath.count > 1,
+              _isCanonicalWireCID(fromStateCID),
+              _isCanonicalWireCID(toStateCID),
+              fromStateCID != toStateCID else {
+            throw NodeNetworkWireError.malformed
+        }
+    }
+}
+
+struct ParentStateContinuityResponseMessage:
+    NodeJSONMessage, Equatable, Sendable {
+    let requestID: UInt64
+    let childPath: [String]
+    let link: ParentStateContinuityLink
+    let certificate: Data
+
+    func validate() throws {
+        guard requestID != 0,
+              _isAbsoluteChainPath(childPath), childPath.count > 1,
+              link.parentPath == Array(childPath.dropLast()),
+              _isCanonicalWireCID(link.fromStateCID),
+              _isCanonicalWireCID(link.toStateCID),
+              link.fromStateCID != link.toStateCID,
+              certificate.count
+                == ParentStateContinuityCertificateV1.maximumEncodedSize else {
+            throw NodeNetworkWireError.malformed
         }
     }
 }
@@ -780,64 +820,6 @@ struct ChildCandidateResponseMessage: Sendable {
             return nil
         }
         return (search, deployment)
-    }
-}
-
-/// A child-independent fragment of the configured parent's securing-work
-/// graph. The exact hierarchy session already binds its destination, so the
-/// payload deliberately carries no child path. An empty delta is the ordered
-/// completion marker for its revision.
-struct InheritedWorkRequestMessage: NodeJSONMessage, Equatable, Sendable {
-    let sourceID: String?
-    let revision: UInt64?
-
-    func validate() throws {
-        guard (sourceID == nil) == (revision == nil),
-              sourceID.map({ UUID(uuidString: $0) != nil }) ?? true else {
-            throw NodeNetworkWireError.malformed
-        }
-    }
-}
-
-struct InheritedWorkPushMessage: NodeJSONMessage, Equatable, Sendable {
-    static let maximumFacts = 256
-    static let maximumEncodedBytes = _maximumNodeMessageSize
-    static let legacySourceID = "00000000-0000-0000-0000-000000000000"
-
-    let sourceID: String
-    let baseRevision: UInt64?
-    let snapshot: InheritedWorkSnapshot
-
-    init(
-        sourceID: String = Self.legacySourceID,
-        baseRevision: UInt64? = nil,
-        snapshot: InheritedWorkSnapshot
-    ) {
-        self.sourceID = sourceID
-        self.baseRevision = baseRevision
-        self.snapshot = snapshot
-    }
-
-    func validate() throws {
-        let factCount = snapshot.blockCIDs.reduce(0) {
-            $0 + snapshot.sourceWork(forBlock: $1).grindIDs.count
-        }
-        guard UUID(uuidString: sourceID) != nil,
-              snapshot.revision > 0,
-              baseRevision.map({ $0 <= snapshot.revision }) ?? true,
-              factCount <= Self.maximumFacts,
-              snapshot.hasUniqueGrindLocations,
-              snapshot.blockCIDs.allSatisfy({ blockCID in
-                  _isCanonicalWireCID(blockCID)
-                    && !snapshot.sourceWork(forBlock: blockCID).isEmpty
-                    && snapshot.sourceWork(forBlock: blockCID).grindIDs.allSatisfy {
-                        _isCanonicalWireCID($0)
-                            && snapshot.sourceWork(forBlock: blockCID)
-                                .work(forGrind: $0).map { $0 > .zero } == true
-                    }
-              }) else {
-            throw NodeNetworkWireError.malformed
-        }
     }
 }
 

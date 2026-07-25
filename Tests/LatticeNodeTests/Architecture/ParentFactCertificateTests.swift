@@ -11,6 +11,7 @@ final class ParentFactCertificateTests: XCTestCase {
         let authority = try XCTUnwrap(ParentProcessKey(parent.processPublicKey))
         let carrier = try carrierLink()
         let genesis = try genesisLink()
+        let continuity = try continuityLink()
 
         let firstCarrier = try ParentCarrierCertificateV1(
             link: carrier,
@@ -46,6 +47,22 @@ final class ParentFactCertificateTests: XCTestCase {
             firstGenesis.signature,
             "fact kinds must use distinct signature domains"
         )
+
+        let firstContinuity = try ParentStateContinuityCertificateV1(
+            link: continuity,
+            signedBy: parent
+        )
+        let decodedContinuity = try ParentStateContinuityCertificateV1.decode(
+            firstContinuity.encode()
+        )
+        XCTAssertTrue(decodedContinuity.verifies(
+            link: continuity,
+            authorityKey: authority,
+            expectedNexusGenesisCID: NexusGenesis.expectedBlockHash,
+            expectedParentPath: ["Nexus"]
+        ))
+        XCTAssertNotEqual(firstCarrier.signature, firstContinuity.signature)
+        XCTAssertNotEqual(firstGenesis.signature, firstContinuity.signature)
     }
 
     func testTamperingAndWrongAuthorityFailVerification() throws {
@@ -151,6 +168,56 @@ final class ParentFactCertificateTests: XCTestCase {
         }
     }
 
+    func testPortableGateAcceptsProofOnlyAndRequiresExactContinuityCertificate()
+        throws {
+        let parent = try configuration(seed: 8)
+        let authority = try XCTUnwrap(ParentProcessKey(parent.processPublicKey))
+        let gate = try AuthenticatedParentFactGate(
+            childPath: ["Nexus", "Payments"],
+            configuredParentIvyPeerKey: parent.processPublicKey
+        )
+
+        let proofOnly = try ChildValidationPackageEnvelope(proof: proof())
+        XCTAssertNoThrow(try gate.acceptPortable(
+            proofOnly,
+            durableParentProcessKey: authority
+        ))
+
+        let link = try continuityLink()
+        let package = ChildValidationPackage(
+            proof: proof(),
+            parentStateContinuityLink: link
+        )
+        let signed = try ChildValidationPackageEnvelope(
+            package,
+            certificatesSignedBy: parent
+        )
+        XCTAssertNoThrow(try gate.acceptPortable(
+            try ChildValidationPackageEnvelope.decode(signed.encode()),
+            durableParentProcessKey: authority
+        ))
+        XCTAssertThrowsError(try gate.acceptPortable(
+            ChildValidationPackageEnvelope(package),
+            durableParentProcessKey: authority
+        )) { error in
+            XCTAssertEqual(
+                error as? AuthenticatedParentFactGateError,
+                .missingPortableCertificate
+            )
+        }
+
+        let differentLink = try continuityLink(
+            from: link.toStateCID,
+            to: link.fromStateCID
+        )
+        XCTAssertFalse(signed.parentStateContinuityCertificate!.verifies(
+            link: differentLink,
+            authorityKey: authority,
+            expectedNexusGenesisCID: NexusGenesis.expectedBlockHash,
+            expectedParentPath: ["Nexus"]
+        ))
+    }
+
     func testLiveGateAcceptsUnsignedFactsButRejectsInvalidPortableSignature() throws {
         let parent = try configuration(seed: 6)
         let package = ChildValidationPackage(
@@ -173,13 +240,12 @@ final class ParentFactCertificateTests: XCTestCase {
             from: peer
         ))
 
-        var tampered = try ChildValidationPackageEnvelope(
+        let otherParent = try configuration(seed: 7)
+        let wronglySigned = try ChildValidationPackageEnvelope(
             package,
-            certificatesSignedBy: parent
-        ).encode()
-        tampered[tampered.index(before: tampered.endIndex)] ^= 1
-        let decoded = try ChildValidationPackageEnvelope.decode(tampered)
-        XCTAssertThrowsError(try gate.accept(decoded, from: peer)) { error in
+            certificatesSignedBy: otherParent
+        )
+        XCTAssertThrowsError(try gate.accept(wronglySigned, from: peer)) { error in
             XCTAssertEqual(
                 error as? AuthenticatedParentFactGateError,
                 .invalidCertificate
@@ -220,6 +286,18 @@ final class ParentFactCertificateTests: XCTestCase {
         try JSONDecoder().decode(
             ParentGenesisLink.self,
             from: Data(#"{"parentPath":["Nexus"],"directory":"Payments","childGenesisCID":"\#(NexusGenesis.expectedBlockHash)"}"#.utf8)
+        )
+    }
+
+    private func continuityLink(
+        from: String = NexusGenesis.expectedBlockHash,
+        to: String = LatticeState.emptyHeader.rawCID
+    ) throws -> ParentStateContinuityLink {
+        try JSONDecoder().decode(
+            ParentStateContinuityLink.self,
+            from: Data(
+                #"{"parentPath":["Nexus"],"fromStateCID":"\#(from)","toStateCID":"\#(to)"}"#.utf8
+            )
         )
     }
 }

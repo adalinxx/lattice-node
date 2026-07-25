@@ -98,10 +98,11 @@ The planes are deliberately separate:
    absolute chain path. It carries block and transaction
    Volume inventories plus content-addressed retrieval.
 2. The private hierarchy plane has no relay role. It carries direct-child
-   candidate requests, parent-issued proofs, generic parent work, and genesis links. A
-   configured parent key gates parent facts; a claimed path alone grants no
-   authority. Exact-CID exchange is explicitly enabled on this plane, but only
-   a connection that completed its own compatible hierarchy hello may use it.
+   candidate requests, parent-issued proofs, genesis links, and exact
+   parent-state continuity answers. A configured parent key gates parent facts;
+   a claimed path alone grants no authority. Exact-CID exchange is explicitly
+   enabled on this plane, but only a connection that completed its own
+   compatible hierarchy hello may use it.
 
 Hierarchy CAS reads are bounded, exact selections rather than database access:
 there is no enumeration or mutation API, the bytes are non-secret availability,
@@ -140,7 +141,7 @@ restarts at zero. Validated attachments enter a durable,
 VolumeBroker-retained inbox before the cursor advances and leave it only after
 admission owns the same Volume. Evidence published while the index is in flight is
 queued after its final page and before the child's exact reservation replay, so
-neither a page race nor a slow child can stall or under-retain parent work.
+neither a page race nor a slow child can stall or under-retain issued evidence.
 Child timestamps derive from the immutable parent carrier, so an unchanged
 request is CID-stable and refreshes one offer instead of consuming another.
 
@@ -155,20 +156,17 @@ request is CID-stable and refreshes one offer instead of consuming another.
 4. External mining commits that transaction and child block in a parent
    carrier.
 5. The parent durably prepares and publishes the direct-child proof. The child
-   verifies the authenticated link and bootstraps into `awaitingParent`.
-6. The same live authenticated parent streams its complete current inherited
-   work and an ordered completion marker. Only then does the child become
-   `active` and make its fork choice operational.
+   verifies the authenticated link, derives the child's work from the proof,
+   and becomes `active`.
 
 There is no opaque genesis byte channel. The parent retains the complete Cashew
 Volumes it created for genesis and is the fresh child's preferred source. An
 exact same-chain advertiser may supply the same CID-verified Volumes when the
-parent cannot; parent authentication still supplies authority and consensus.
-The same rule applies after genesis: an `awaitingParent` process keeps
-validating and durably ingesting peer-supplied same-chain history. Its displayed
-tip is only a replaceable local projection. Mining, work publication, and
-descendant consensus remain disabled until the configured parent completes a
-live inherited-work pass.
+parent cannot; the signed genesis link still supplies authority. After genesis,
+same-chain peers may likewise supply proof Volumes and portable signed
+parent-state continuity certificates. A parent need only be reachable when a
+new continuity fact has not already been acquired. Previously verified history
+and fork choice do not depend on a live session.
 
 The process that directly parents an edge retains only its sparse commitment
 proof. Ordinary child validation Volumes remain child-chain data. Admission stages a
@@ -183,8 +181,8 @@ at different moments. The semantic direct edge is indexed in SQLite and derived
 from that proof when read; it is not stored again as a second Volume. The parent
 retains the edge it issued; the child retains the edge it validated and may
 relay signed root attachments to same-chain peers.
-The child never returns topology to its parent. Parent work remains generic and
-child-specific projection remains entirely inside the child process.
+The child never returns topology or derived work to its parent. Work is derived
+from the child proof and remains entirely inside the child process.
 
 An evidence Volume is one complete, one-entry Volume whose canonical manifest
 contains the child CID and proof envelope. Parent-created genesis retention

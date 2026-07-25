@@ -599,6 +599,10 @@ struct CandidateAcquirer {
               left.parentGenesisLink == nil
                 || right.parentGenesisLink == nil
                 || left.parentGenesisLink == right.parentGenesisLink,
+              left.parentStateContinuityLink == nil
+                || right.parentStateContinuityLink == nil
+                || left.parentStateContinuityLink
+                    == right.parentStateContinuityLink,
               current.parentCarrierCertificate == nil
                 || received.parentCarrierCertificate == nil
                 || current.parentCarrierCertificate
@@ -606,7 +610,11 @@ struct CandidateAcquirer {
               current.parentGenesisCertificate == nil
                 || received.parentGenesisCertificate == nil
                 || current.parentGenesisCertificate
-                    == received.parentGenesisCertificate else {
+                    == received.parentGenesisCertificate,
+              current.parentStateContinuityCertificate == nil
+                || received.parentStateContinuityCertificate == nil
+                || current.parentStateContinuityCertificate
+                    == received.parentStateContinuityCertificate else {
             return nil
         }
         return AuthenticatedChildPackage(
@@ -615,12 +623,18 @@ struct CandidateAcquirer {
                 parentCarrierLink:
                     left.parentCarrierLink ?? right.parentCarrierLink,
                 parentGenesisLink:
-                    left.parentGenesisLink ?? right.parentGenesisLink
+                    left.parentGenesisLink ?? right.parentGenesisLink,
+                parentStateContinuityLink:
+                    left.parentStateContinuityLink
+                        ?? right.parentStateContinuityLink
             ),
             parentCarrierCertificate: current.parentCarrierCertificate
                 ?? received.parentCarrierCertificate,
             parentGenesisCertificate: current.parentGenesisCertificate
-                ?? received.parentGenesisCertificate
+                ?? received.parentGenesisCertificate,
+            parentStateContinuityCertificate:
+                current.parentStateContinuityCertificate
+                    ?? received.parentStateContinuityCertificate
         )
     }
 
@@ -637,9 +651,13 @@ struct CandidateAcquirer {
                 == right.package.parentCarrierLink
             && left.package.parentGenesisLink
                 == right.package.parentGenesisLink
+            && left.package.parentStateContinuityLink
+                == right.package.parentStateContinuityLink
             && left.parentCarrierCertificate
                 == right.parentCarrierCertificate
             && left.parentGenesisCertificate
                 == right.parentGenesisCertificate
+            && left.parentStateContinuityCertificate
+                == right.parentStateContinuityCertificate
     }
 }

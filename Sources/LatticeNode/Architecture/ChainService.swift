@@ -211,7 +211,6 @@ public typealias ChildProofPublisher = @Sendable (
     DirectChildProofPublication
 ) async throws -> Void
 public typealias AcceptedBlockPublisher = @Sendable (_ blockCID: String) async throws -> Void
-public typealias SecuringWorkPublisher = @Sendable () async -> Void
 public typealias AcceptedTransactionPublisher = @Sendable (
     _ volumeRootCID: String
 ) async throws -> Void
@@ -298,7 +297,6 @@ public struct ChildDeployIntentResponse: Codable, Sendable {
 
 public enum ChainServicePhase: String, Codable, Sendable {
     case awaitingGenesis
-    case awaitingParent
     case active
 }
 
@@ -309,7 +307,6 @@ public struct ChainServiceStatusResponse: Codable, Sendable, Equatable {
     public let tipCID: String?
     public let height: UInt64?
     public let revision: UInt64?
-    public let parentWorkRevision: UInt64?
     public let mempoolCount: Int
     public let mempoolBytes: Int
     public let pendingChildIntents: Int
@@ -400,7 +397,6 @@ public actor ChainService {
         ChildCandidateReservationReconciler
     private let childProofPublisher: ChildProofPublisher
     private let acceptedBlockPublisher: AcceptedBlockPublisher
-    private let securingWorkPublisher: SecuringWorkPublisher
     private let acceptedTransactionPublisher: AcceptedTransactionPublisher
     private let maximumChildCandidates: Int
     private var childIntents: [String: ChildIntent] = [:]
@@ -414,7 +410,6 @@ public actor ChainService {
     private var canonicalCommitWorkerReserved = false
     private var transactionPublications = Set<String>()
     private var transactionPublicationWorker: Task<Void, Never>?
-    private var parentWorkReady: Bool
 
     // This actor calls other actors and is therefore reentrant. Keep its pool,
     // template cache, and pending intents in one externally observable order.
@@ -428,7 +423,6 @@ public actor ChainService {
             @escaping ChildCandidateReservationReconciler = { $0.isEmpty },
         childProofPublisher: @escaping ChildProofPublisher,
         acceptedBlockPublisher: @escaping AcceptedBlockPublisher,
-        securingWorkPublisher: @escaping SecuringWorkPublisher,
         acceptedTransactionPublisher: @escaping AcceptedTransactionPublisher = { _ in },
         mempoolMaxCount: Int = 10_000,
         mempoolMaxNonReadyPerSigner: Int = 64,
@@ -444,7 +438,6 @@ public actor ChainService {
             childCandidateReservationReconciler
         self.childProofPublisher = childProofPublisher
         self.acceptedBlockPublisher = acceptedBlockPublisher
-        self.securingWorkPublisher = securingWorkPublisher
         self.acceptedTransactionPublisher = acceptedTransactionPublisher
         self.pool = TransactionPool(
             maxCount: mempoolMaxCount,
@@ -458,19 +451,6 @@ public actor ChainService {
             capacity: Self.templateCapacity
         )
         self.maximumChildCandidates = maximumChildCandidates
-        self.parentWorkReady = process.configuration.address.isNexus
-    }
-
-    /// A child may retain and exchange immutable facts while disconnected, but
-    /// only a complete live work sync makes its own fork choice actionable.
-    /// This flag never represents the parent's canonical choice. Nexus starts
-    /// ready because it has no inherited work.
-    public func setParentWorkReady(_ ready: Bool) async {
-        await acquireOperation()
-        defer { releaseOperation() }
-        guard parentWorkReady != ready else { return }
-        parentWorkReady = ready
-        await invalidateTemplatesLocked()
     }
 
     public func status() async -> ChainServiceStatusResponse {
@@ -484,13 +464,9 @@ public actor ChainService {
                 parentStateCID: tip.postState.rawCID
             )
         }
-        let phase: ChainServicePhase = if status.phase != .active {
-            .awaitingGenesis
-        } else if parentWorkReady {
-            .active
-        } else {
-            .awaitingParent
-        }
+        let phase: ChainServicePhase = status.phase == .active
+            ? .active
+            : .awaitingGenesis
         return ChainServiceStatusResponse(
             phase: phase,
             chainPath: status.chainPath,
@@ -498,7 +474,6 @@ public actor ChainService {
             tipCID: status.tipCID,
             height: status.height,
             revision: status.revision,
-            parentWorkRevision: status.parentWorkRevision,
             mempoolCount: mempoolAvailable ? await pool.count : 0,
             mempoolBytes: mempoolAvailable ? await pool.byteCount : 0,
             pendingChildIntents: childIntents.count
@@ -520,75 +495,6 @@ public actor ChainService {
         return receipt
     }
 
-    /// Apply the immediate parent's monotone work facts and reconcile every
-    /// service-owned projection before the runtime announces a resulting
-    /// reorg. The runtime authenticates the route; this actor owns pool,
-    /// template, and child-intent consistency.
-    @discardableResult
-    public func applyInheritedWorkSnapshot(
-        _ snapshot: InheritedWorkSnapshot,
-        from parentProcessKey: String
-    ) async throws -> ChainCommit? {
-        try await applyInheritedWork(
-            snapshot,
-            from: parentProcessKey,
-            sourceID: nil,
-            baseRevision: nil
-        )
-    }
-
-    @discardableResult
-    public func applyInheritedWorkExport(
-        _ snapshot: InheritedWorkSnapshot,
-        sourceID: String,
-        baseRevision: UInt64?,
-        from parentProcessKey: String
-    ) async throws -> ChainCommit? {
-        try await applyInheritedWork(
-            snapshot,
-            from: parentProcessKey,
-            sourceID: sourceID,
-            baseRevision: baseRevision
-        )
-    }
-
-    private func applyInheritedWork(
-        _ snapshot: InheritedWorkSnapshot,
-        from parentProcessKey: String,
-        sourceID: String?,
-        baseRevision: UInt64?
-    ) async throws -> ChainCommit? {
-        await acquireOperation()
-        var ownsOperation = true
-        defer {
-            if ownsOperation { releaseOperation() }
-        }
-        let update = try await process.applyInheritedWorkSnapshot(
-            snapshot,
-            from: parentProcessKey,
-            sourceID: sourceID,
-            baseRevision: baseRevision,
-            canonicalCommitPublisher: { [self] commit in
-                await enqueueCanonicalCommit(commit)
-            }
-        )
-        // The work relation is durable now. Relay it before optional
-        // service-owned canonical projections such as mempool reconciliation.
-        await securingWorkPublisher()
-        guard let commit = update.commit,
-              commit.canonicalChanged,
-              let receipt = update.canonicalCommitReceipt else {
-            return update.commit
-        }
-
-        // The process reserved this receipt before it released its mutation
-        // order, so a ready network admission cannot overtake this reorg.
-        releaseOperation()
-        ownsOperation = false
-        await receipt.wait()
-        return commit
-    }
-
     /// The only production ingress for a candidate acquired by the network.
     /// The process reserves canonical reconciliation before it releases its
     /// mutation order; this method then waits behind that reservation before
@@ -608,7 +514,6 @@ public actor ChainService {
                 await enqueueCanonicalCommit(commit)
             }
         )
-        await publishCarrierWorkIfNeeded(outcome)
         guard let block = await locallyStoredBlock(header) else {
             // A target-miss carrier is intentionally not local chain state,
             // but its authenticated path can still carry an accepted direct
@@ -892,7 +797,6 @@ public actor ChainService {
     ) async throws -> ChildDeployIntentResponse {
         await acquireOperation()
         defer { releaseOperation() }
-        guard parentWorkReady else { throw ChainServiceError.parentUnavailable }
         guard StateAtomLimits.isDirectory(request.directory),
               let childAddress = ChainAddress(
                   process.configuration.chainPath + [request.directory]
@@ -995,7 +899,6 @@ public actor ChainService {
     ) async throws -> MiningTemplateResponse {
         await acquireOperation()
         defer { releaseOperation() }
-        guard parentWorkReady else { throw ChainServiceError.parentUnavailable }
         try await prepareMempoolLocked()
         guard process.configuration.address.isNexus else {
             throw ChainServiceError.parentCarrierRequired
@@ -1104,7 +1007,6 @@ public actor ChainService {
     ) async throws -> DirectChildCandidate {
         await acquireOperation()
         defer { releaseOperation() }
-        guard parentWorkReady else { throw ChainServiceError.parentUnavailable }
         try await prepareMempoolLocked()
         guard !process.configuration.address.isNexus,
               (try? BlockHeader(node: parentCarrier)) != nil else {
@@ -1466,7 +1368,6 @@ public actor ChainService {
         defer {
             if ownsOperation { releaseOperation() }
         }
-        guard parentWorkReady else { throw ChainServiceError.parentUnavailable }
         guard process.configuration.address.isNexus else {
             throw ChainServiceError.parentCarrierRequired
         }
@@ -1491,7 +1392,6 @@ public actor ChainService {
                 await enqueueCanonicalCommit(commit)
             }
         )
-        await publishCarrierWorkIfNeeded(outcome)
         let effects = await applyAdmissionEffects(
             block: candidate,
             header: header,
@@ -1543,15 +1443,6 @@ public actor ChainService {
             header: header,
             outcome: outcome
         )
-    }
-
-    private func publishCarrierWorkIfNeeded(
-        _ outcome: NodeAdmissionOutcome
-    ) async {
-        guard case .carrier = outcome.decision else { return }
-        // A target-miss carrier can activate inherited work without being
-        // retained or announced as same-chain block state.
-        await securingWorkPublisher()
     }
 
     private func handleCarrierAdmission(
@@ -1623,7 +1514,7 @@ public actor ChainService {
     ) async -> AdmissionEffects {
         // Visibility of accepted work is independent from optional child
         // materialization. A missing child payload must not suppress the
-        // canonical announcement or inherited-work refresh.
+        // canonical announcement.
         switch outcome.decision {
         case .canonicalized(let commit):
             if outcome.canonicalCommitReceipt == nil {
