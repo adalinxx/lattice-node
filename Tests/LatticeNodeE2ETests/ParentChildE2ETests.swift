@@ -752,12 +752,12 @@ final class ParentChildE2ETests: XCTestCase {
         _ = try XCTUnwrap(bProgress)
 
         try a.start()
-        let firstTipCID = try await waitForReplicaConvergence(
+        let firstTip = try await waitForReplicaConvergenceStatus(
             a,
             b,
             excluding: intent.genesisCID
         )
-        let firstTip = try await a.waitForStatus { $0.tipCID == firstTipCID }
+        let firstTipCID = try XCTUnwrap(firstTip.tipCID)
 
         try await b.stop()
         let _: SubmitTransactionResponse = try await a.post(
@@ -3369,6 +3369,19 @@ final class ParentChildE2ETests: XCTestCase {
         _ second: E2ENode,
         excluding excludedCID: String
     ) async throws -> String {
+        let status = try await waitForReplicaConvergenceStatus(
+            first,
+            second,
+            excluding: excludedCID
+        )
+        return try XCTUnwrap(status.tipCID)
+    }
+
+    private func waitForReplicaConvergenceStatus(
+        _ first: E2ENode,
+        _ second: E2ENode,
+        excluding excludedCID: String
+    ) async throws -> ChainServiceStatusResponse {
         let clock = ContinuousClock()
         let deadline = clock.now + .seconds(30)
         while clock.now < deadline {
@@ -3380,10 +3393,11 @@ final class ParentChildE2ETests: XCTestCase {
                 timeout: .seconds(1),
                 where: { $0.phase == .active }
             )
-            if let firstTip = firstStatus?.tipCID,
+            if let firstStatus,
+               let firstTip = firstStatus.tipCID,
                firstTip != excludedCID,
                firstTip == secondStatus?.tipCID {
-                return firstTip
+                return firstStatus
             }
             try await Task.sleep(for: .milliseconds(50))
         }
