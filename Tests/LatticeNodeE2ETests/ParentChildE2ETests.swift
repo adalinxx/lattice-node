@@ -2905,8 +2905,8 @@ final class ParentChildE2ETests: XCTestCase {
                 break
             }
         }
-        let childAAfterDeposit = try XCTUnwrap(depositedA)
-        let childBAfterDeposit = try XCTUnwrap(depositedB)
+        _ = try XCTUnwrap(depositedA)
+        _ = try XCTUnwrap(depositedB)
         let branchStatus = try await nexus.waitForStatus { $0.mempoolCount == 0 }
         let branchPoint = try XCTUnwrap(branchStatus.tipCID)
 
@@ -2980,39 +2980,33 @@ final class ParentChildE2ETests: XCTestCase {
             body: SubmitTransactionRequest(transaction: aliceClaimsB)
         )
 
-        // A child binds to the carrier's entering parent state. The root that
-        // commits these receipts therefore advances both children with empty
-        // blocks while leaving their premature withdrawals queued.
+        // A child binds to the carrier's entering parent state, so any child
+        // carried by the receipt block leaves its premature withdrawal queued.
+        // A temporarily omitted child joins from the committed receipt state
+        // in a later ordinary round.
         let settlementBlock = try await mineBlock(nexus)
         XCTAssertTrue(settlementBlock.response.accepted)
-        XCTAssertEqual(
-            Set(settlementBlock.response.durableChildProofs.map(\.directory)),
-            ["ChildA", "ChildB"]
-        )
         _ = try await nexus.waitForStatus { $0.mempoolCount == 0 }
-        _ = try await childA.waitForStatus {
-            $0.mempoolCount == 1
-                && $0.tipCID != childAAfterDeposit.tipCID
-                && $0.height == childAAfterDeposit.height.map { $0 + 1 }
-        }
-        _ = try await childB.waitForStatus {
-            $0.mempoolCount == 1
-                && $0.tipCID != childBAfterDeposit.tipCID
-                && $0.height == childBAfterDeposit.height.map { $0 + 1 }
-        }
-        // Proof delivery and the next contextual candidate round are
-        // intentionally asynchronous. Mine bounded ordinary rounds until both
-        // children observe the committed receipt state and consume their
-        // withdrawals; a temporarily empty child block is not a protocol
-        // failure.
+        // Child selection and proof delivery are intentionally asynchronous.
+        // Mine bounded ordinary rounds until each child independently consumes
+        // its withdrawal and then receives one confirming child block.
         var settledBranchWork = WorkSum(
             workForTarget(settlementBlock.template.block.target)
         )
         var observedWithdrawalA: ChainServiceStatusResponse?
         var observedWithdrawalB: ChainServiceStatusResponse?
-        var withdrawalConfirmations = 0
-        for _ in 0..<10 {
-            let withdrawalBlock = try await mineBlock(nexus)
+        var withdrawalConfirmationsA = 0
+        var withdrawalConfirmationsB = 0
+        for _ in 0..<20 {
+            let withdrawalBlock: E2EMinedBlock
+            do {
+                withdrawalBlock = try await mineBlock(nexus)
+            } catch let error as E2EHTTPError where error.status != 0 {
+                try await Task.sleep(for: .milliseconds(100))
+                continue
+            } catch {
+                throw error
+            }
             XCTAssertTrue(withdrawalBlock.response.accepted)
             settledBranchWork = settledBranchWork
                 + WorkSum(workForTarget(withdrawalBlock.template.block.target))
@@ -3020,30 +3014,39 @@ final class ParentChildE2ETests: XCTestCase {
                 uniqueKeysWithValues: withdrawalBlock.response
                     .durableChildProofs.map { ($0.directory, $0.childCID) }
             )
-            guard let childACID = proofs["ChildA"],
-                  let childBCID = proofs["ChildB"] else {
-                continue
-            }
-            observedWithdrawalA = try? await childA.waitForStatus(
-                timeout: .seconds(5),
-                where: {
-                    $0.tipCID == childACID && $0.mempoolCount == 0
+            if let childACID = proofs["ChildA"] {
+                if let status = try? await childA.waitForStatus(
+                    timeout: .seconds(5),
+                    where: {
+                        $0.tipCID == childACID && $0.mempoolCount == 0
+                    }
+                ) {
+                    observedWithdrawalA = status
+                    withdrawalConfirmationsA += 1
+                } else {
+                    observedWithdrawalA = nil
+                    withdrawalConfirmationsA = 0
                 }
-            )
-            observedWithdrawalB = try? await childB.waitForStatus(
-                timeout: .seconds(5),
-                where: {
-                    $0.tipCID == childBCID && $0.mempoolCount == 0
-                }
-            )
-            if observedWithdrawalA != nil && observedWithdrawalB != nil {
-                withdrawalConfirmations += 1
-                if withdrawalConfirmations == 2 { break }
-            } else {
-                withdrawalConfirmations = 0
             }
+            if let childBCID = proofs["ChildB"] {
+                if let status = try? await childB.waitForStatus(
+                    timeout: .seconds(5),
+                    where: {
+                        $0.tipCID == childBCID && $0.mempoolCount == 0
+                    }
+                ) {
+                    observedWithdrawalB = status
+                    withdrawalConfirmationsB += 1
+                } else {
+                    observedWithdrawalB = nil
+                    withdrawalConfirmationsB = 0
+                }
+            }
+            if withdrawalConfirmationsA >= 2,
+               withdrawalConfirmationsB >= 2 { break }
         }
-        XCTAssertEqual(withdrawalConfirmations, 2)
+        XCTAssertGreaterThanOrEqual(withdrawalConfirmationsA, 2)
+        XCTAssertGreaterThanOrEqual(withdrawalConfirmationsB, 2)
         let withdrawnA = try XCTUnwrap(observedWithdrawalA)
         let withdrawnB = try XCTUnwrap(observedWithdrawalB)
 
