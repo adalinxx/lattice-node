@@ -2099,7 +2099,8 @@ final class NodeStoreTests: XCTestCase {
             path: childPath,
             chainPath: ["Nexus", "Child"],
             spawningParentKey: parentIdentity.processPublicKey,
-            broker: childBroker
+            broker: childBroker,
+            parentEvidenceInboxCapacity: 1
         )
         try await child!.storeParentEvidenceInbox(
             sourceID: scan.sourceID,
@@ -2134,7 +2135,8 @@ final class NodeStoreTests: XCTestCase {
             path: childPath,
             chainPath: ["Nexus", "Child"],
             spawningParentKey: parentIdentity.processPublicKey,
-            broker: childBroker
+            broker: childBroker,
+            parentEvidenceInboxCapacity: 1
         )
         let recoveredInbox = try await child!.parentEvidenceInbox()
         XCTAssertEqual(recoveredInbox.count, 1)
@@ -2145,6 +2147,28 @@ final class NodeStoreTests: XCTestCase {
             retainedBeforeAdmission,
             [attachment.rawCID]
         )
+        do {
+            try await child!.storeParentEvidenceInbox(
+                sourceID: scan.sourceID,
+                ordinal: advancedScan.throughOrdinal,
+                attachment: secondAttachment,
+                package: secondPackage,
+                advanceScan: true
+            )
+            XCTFail("a full inbox advanced past unstored parent evidence")
+        } catch {
+            XCTAssertEqual(
+                error as? NodeStoreError,
+                .parentEvidenceInboxFull
+            )
+        }
+        let backpressuredCursor = try await child!
+            .parentEvidenceScanCursor()
+        XCTAssertEqual(backpressuredCursor, scannedCursor)
+        let rejectedVolume = await childBroker.fetchVolumeLocal(
+            root: secondAttachment.rawCID
+        )
+        XCTAssertNil(rejectedVolume)
 
         try await child!.stage(
             blockBatch(
@@ -2404,7 +2428,8 @@ final class NodeStoreTests: XCTestCase {
         chainPath: [String] = ["Nexus"],
         spawningParentKey: String? = nil,
         issuingAuthorityKey: String? = nil,
-        broker suppliedBroker: (any RetainedRootMergeBroker)? = nil
+        broker suppliedBroker: (any RetainedRootMergeBroker)? = nil,
+        parentEvidenceInboxCapacity: Int = 64
     ) throws -> NodeStore {
         let path = path ?? temporaryDirectory().appendingPathComponent("state.db")
         let broker: any RetainedRootMergeBroker
@@ -2433,6 +2458,7 @@ final class NodeStoreTests: XCTestCase {
             recoveryVolumeBroker: broker,
             issuedRecoveryRetentionScope: "test:issued-hierarchy",
             preparedRecoveryRetentionScope: "test:prepared-hierarchy",
+            parentEvidenceInboxCapacity: parentEvidenceInboxCapacity,
             contextualCandidateOwner: "test:contextual-candidates"
         )
     }

@@ -120,6 +120,12 @@ prevents admission of the child block.
 - Gossip, sync, acquisition, and persistence may run asynchronously.
   Chain insertion and fork choice consume only complete, durable admission
   batches.
+- A child advances its parent-evidence scan cursor only through evidence it
+  has admitted or durably retained. Its node-local inbox capacity applies
+  backpressure without eviction, cursor advance, or peer punishment.
+- Committing a reserved child candidate atomically transfers that exact
+  candidate from reservation to durable handoff ownership. Other outstanding
+  templates cannot reserve the handed-off candidate in the same update.
 
 Unknown-child proofs are bounded per peer and globally. Triggered sync is
 rate- and concurrency-limited. A valid proof for a child that has not yet

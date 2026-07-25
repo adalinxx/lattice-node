@@ -25,6 +25,23 @@ durable facts directly. Transaction gossip uses discovery, acquisition,
 validation, and mempool retention without touching consensus. Parent evidence
 uses hierarchy routing and validation without importing parent state.
 
+## Orchestration state
+
+The network actor owns transport ordering, but independent semantic state
+machines remain small reducers:
+
+- `CandidateAcquirer` owns candidate/provider/dependency scheduling.
+- `ParentEvidenceFlow` owns session-local evidence ordering, backpressure, and
+  reservation fencing.
+- `ChildCandidateOwnership` derives one disjoint reservation/handoff transfer
+  from all outstanding templates.
+
+These reducers perform neither Ivy I/O nor Lattice consensus. The parent
+evidence inbox row and scan watermark intentionally remain one NodeStore
+transaction: splitting that durability boundary would permit a crash to skip
+evidence. Reservation and handoff likewise remain distinct phases because the
+handoff is the atomic transfer from speculative to durable ownership.
+
 ## Content boundary
 
 Ivy and VolumeBroker form the IPFS-like boundary for Lattice:

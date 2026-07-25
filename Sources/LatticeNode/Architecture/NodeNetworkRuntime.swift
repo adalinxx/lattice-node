@@ -254,6 +254,8 @@ public actor NodeNetworkRuntime: IvyDelegate {
     private typealias CandidateSeed = CandidateAcquirer.Seed
     private typealias CandidateWaitReason = CandidateAcquirer.WaitReason
     private typealias DurableDescendant = CandidateAcquirer.DurableDescendant
+    private typealias ParentEvidenceResult = ParentEvidenceFlow.Result
+    private typealias ParentEvidenceSession = ParentEvidenceFlow.Session
 
     enum HierarchyPeer: Equatable {
         case parent
@@ -365,11 +367,6 @@ public actor NodeNetworkRuntime: IvyDelegate {
         case hierarchy
     }
 
-    private struct ParentEvidenceTail {
-        let token: UInt64
-        let task: Task<Bool, Never>
-    }
-
     private static let maximumPendingRequests = 1_024
     /// Each suspended hierarchy stage is capped.
     private static let maximumEvidenceCandidates = 64
@@ -449,15 +446,9 @@ public actor NodeNetworkRuntime: IvyDelegate {
         [EvidenceVolumeLease: PortableEvidenceWork] = [:]
     private var portableEvidenceRecycle: [PeerKey: AuthenticatedPeer] = [:]
     private var portableEvidenceWorker: Task<Void, Never>?
-    /// Evidence from one exact parent session is authenticated in wire order.
-    /// A later reservation request awaits the tail it observed, so cleanup can
-    /// never overtake the durable handoff established by earlier evidence.
-    private var parentEvidenceTails:
-        [ChildEvidenceSession: ParentEvidenceTail] = [:]
-    private var failedParentEvidenceSessions: Set<ChildEvidenceSession> = []
-    private var activeParentCandidateReservations: Set<ChildEvidenceSession> = []
-    private var parentEvidenceOperationCount = 0
-    private var nextParentEvidenceToken: UInt64 = 0
+    /// Orders parent evidence and reservation transfer within one authenticated
+    /// session. Transport effects remain in this actor.
+    private var parentEvidence = ParentEvidenceFlow()
     private var handlers: NodeNetworkHandlers?
     private var pendingChildCandidates: [UInt64: PendingChildCandidateRequest] = [:]
     private var childCandidateBuilds: [UInt64: ChildCandidateBuild] = [:]
@@ -816,11 +807,7 @@ public actor NodeNetworkRuntime: IvyDelegate {
         portableEvidenceOrder.removeAll()
         portableEvidenceWork.removeAll()
         portableEvidenceRecycle.removeAll()
-        for tail in parentEvidenceTails.values { tail.task.cancel() }
-        parentEvidenceTails.removeAll()
-        failedParentEvidenceSessions.removeAll()
-        activeParentCandidateReservations.removeAll()
-        parentEvidenceOperationCount = 0
+        parentEvidence.reset()
         let pendingChildCandidates = Array(self.pendingChildCandidates.values)
         self.pendingChildCandidates.removeAll()
         for pending in pendingChildCandidates {
@@ -1256,11 +1243,11 @@ public actor NodeNetworkRuntime: IvyDelegate {
 
     private func parentEvidenceSession(
         for peer: AuthenticatedPeer
-    ) -> ChildEvidenceSession? {
+    ) -> ParentEvidenceSession? {
         guard hierarchySessions[peer.key]?.sessionID == peer.sessionID,
               hierarchyPeers[peer.key] == .parent else { return nil }
-        return ChildEvidenceSession(
-            peerKey: peer.key,
+        return ParentEvidenceSession(
+            peerID: peer.key.hex,
             sessionID: peer.sessionID
         )
     }
@@ -1272,35 +1259,31 @@ public actor NodeNetworkRuntime: IvyDelegate {
         from peer: AuthenticatedPeer,
         generation: UInt64,
         process: ChainProcess
-    ) -> Task<Bool, Never>? {
+    ) -> Task<ParentEvidenceResult, Never>? {
         guard !summaries.isEmpty else { return nil }
         guard isCurrentRuntime(generation: generation, process: process),
-              let session = parentEvidenceSession(for: peer),
-              !failedParentEvidenceSessions.contains(session) else {
+              let session = parentEvidenceSession(for: peer) else {
             return nil
         }
         let activePortable = activeEvidenceVolumes.lazy.filter {
             $0.plane == .overlay
         }.count
-        guard parentEvidenceOperationCount + portableEvidenceWork.count
-                + activePortable < Self.maximumEvidenceCandidates else {
-            failedParentEvidenceSessions.insert(session)
-            return nil
-        }
-        nextParentEvidenceToken &+= 1
-        let token = nextParentEvidenceToken
-        let predecessor = parentEvidenceTails[session]?.task
-        parentEvidenceOperationCount += 1
+        guard let append = parentEvidence.beginAppend(
+            for: session,
+            competingOperationCount: portableEvidenceWork.count
+                + activePortable,
+            capacity: Self.maximumEvidenceCandidates
+        ) else { return nil }
         let task = Task { [weak self] in
-            guard let self else { return false }
-            let predecessorHandled = if let predecessor {
+            guard let self else { return ParentEvidenceResult.failed }
+            var result = if let predecessor = append.predecessor {
                 await predecessor.value
             } else {
-                true
+                ParentEvidenceResult.handled
             }
-            var handled = predecessorHandled && !Task.isCancelled
-            for summary in summaries where handled {
-                handled = await self.recoverParentEvidence(
+            if Task.isCancelled { result = .failed }
+            for summary in summaries where result == .handled {
+                result = await self.recoverParentEvidence(
                     summary,
                     sourceID: sourceID,
                     advanceScan: advanceScan,
@@ -1311,25 +1294,26 @@ public actor NodeNetworkRuntime: IvyDelegate {
             }
             await self.finishParentEvidence(
                 session: session,
-                token: token,
-                handled: handled,
+                token: append.token,
+                result: result,
                 peer: peer,
                 generation: generation,
                 process: process
             )
-            return handled
+            return result
         }
-        parentEvidenceTails[session] = ParentEvidenceTail(
-            token: token,
-            task: task
+        parentEvidence.install(
+            task,
+            token: append.token,
+            for: session
         )
         return task
     }
 
     private func finishParentEvidence(
-        session: ChildEvidenceSession,
+        session: ParentEvidenceSession,
         token: UInt64,
-        handled: Bool,
+        result: ParentEvidenceResult,
         peer: AuthenticatedPeer,
         generation: UInt64,
         process: ChainProcess
@@ -1337,13 +1321,13 @@ public actor NodeNetworkRuntime: IvyDelegate {
         guard isCurrentRuntime(generation: generation, process: process) else {
             return
         }
-        parentEvidenceOperationCount -= 1
-        if parentEvidenceTails[session]?.token == token {
-            parentEvidenceTails.removeValue(forKey: session)
-        }
+        let shouldRecycle = parentEvidence.finish(
+            token: token,
+            result: result,
+            for: session
+        )
         guard parentEvidenceSession(for: peer) == session else { return }
-        if !handled {
-            failedParentEvidenceSessions.insert(session)
+        if shouldRecycle {
             await hierarchy.recycleSession(ifCurrent: peer)
         }
     }
@@ -1351,26 +1335,33 @@ public actor NodeNetworkRuntime: IvyDelegate {
     private func respondToCandidateReservation(
         _ request: ChildCandidateReservationRequestMessage,
         from peer: AuthenticatedPeer,
-        session: ChildEvidenceSession,
-        after evidenceTail: Task<Bool, Never>?,
+        session: ParentEvidenceSession,
+        after evidenceTail: Task<ParentEvidenceResult, Never>?,
         generation: UInt64,
         process: ChainProcess
     ) async {
-        defer { activeParentCandidateReservations.remove(session) }
-        let evidenceHandled = await evidenceTail?.value ?? true
-        guard evidenceHandled,
+        defer { parentEvidence.finishReservation(for: session) }
+        let evidenceResult = await evidenceTail?.value ?? .handled
+        guard evidenceResult != .failed,
               isCurrentRuntime(generation: generation, process: process),
               parentEvidenceSession(for: peer) == session,
-              !failedParentEvidenceSessions.contains(session) else {
+              !parentEvidence.isFailed(session) else {
             await hierarchy.recycleSession(ifCurrent: peer)
             return
         }
-        let accepted = await handlers?.candidateReservations?(
-            NetworkCandidateReservationUpdate(
-                candidateCIDs: request.candidateCIDs,
-                handoffCIDs: request.handoffCIDs
-            )
-        ) ?? false
+        let accepted = if parentEvidence.allowsReservation(
+            for: session,
+            after: evidenceResult
+        ) {
+            await handlers?.candidateReservations?(
+                NetworkCandidateReservationUpdate(
+                    candidateCIDs: request.candidateCIDs,
+                    handoffCIDs: request.handoffCIDs
+                )
+            ) ?? false
+        } else {
+            false
+        }
         guard isCurrentRuntime(generation: generation, process: process),
               parentEvidenceSession(for: peer) == session,
               let payload = try? ChildCandidateReservationResponseMessage(
@@ -1386,15 +1377,7 @@ public actor NodeNetworkRuntime: IvyDelegate {
     }
 
     private func cancelParentEvidence(for key: PeerKey) {
-        let sessions = parentEvidenceTails.keys.filter { $0.peerKey == key }
-        for session in sessions {
-            parentEvidenceTails.removeValue(forKey: session)?.task.cancel()
-        }
-        failedParentEvidenceSessions = failedParentEvidenceSessions.filter {
-            $0.peerKey != key
-        }
-        activeParentCandidateReservations =
-            activeParentCandidateReservations.filter { $0.peerKey != key }
+        parentEvidence.cancel(peerID: key.hex)
     }
 
     private func waitForChildEvidenceReady(
@@ -2651,7 +2634,7 @@ public actor NodeNetworkRuntime: IvyDelegate {
         let activePortable = activeEvidenceVolumes.lazy.filter {
             $0.plane == .overlay
         }.count
-        guard portableEvidenceWork.count + parentEvidenceOperationCount
+        guard portableEvidenceWork.count + parentEvidence.activeOperationCount
                 + activePortable
                 < Self.maximumEvidenceCandidates - 1 else {
             portableEvidenceRecycle[peer.key] = peer
@@ -2862,7 +2845,7 @@ public actor NodeNetworkRuntime: IvyDelegate {
         generation: UInt64,
         process: ChainProcess
     ) {
-        let tail: Task<Bool, Never>?
+        let tail: Task<ParentEvidenceResult, Never>?
         if response.entries.isEmpty {
             tail = nil
         } else {
@@ -2883,7 +2866,7 @@ public actor NodeNetworkRuntime: IvyDelegate {
         }
         Task { [weak self] in
             guard let self else { return }
-            guard await tail?.value ?? true else { return }
+            guard (await tail?.value ?? .handled) == .handled else { return }
             if response.next < response.through {
                 await self.requestEvidenceIndex(
                     sourceID: response.sourceID,
@@ -2908,18 +2891,18 @@ public actor NodeNetworkRuntime: IvyDelegate {
         from peer: AuthenticatedPeer,
         generation: UInt64,
         process: ChainProcess
-    ) async -> Bool {
+    ) async -> ParentEvidenceResult {
         guard isCurrentRuntime(generation: generation, process: process),
               hierarchySessions[peer.key]?.sessionID == peer.sessionID,
               hierarchyPeers[peer.key] == .parent else {
-            return false
+            return .failed
         }
         let lease = EvidenceVolumeLease(
             plane: .hierarchy,
             sessionID: peer.sessionID,
             attachmentCID: summary.attachmentCID
         )
-        if activeEvidenceVolumes.contains(lease) { return true }
+        if activeEvidenceVolumes.contains(lease) { return .handled }
         while activeEvidenceVolumes.count >= Self.maximumEvidenceCandidates {
             do {
                 try await Task.sleep(
@@ -2928,16 +2911,16 @@ public actor NodeNetworkRuntime: IvyDelegate {
                     )
                 )
             } catch {
-                return true
+                return .handled
             }
             guard isCurrentRuntime(
                 generation: generation,
                 process: process
             ), hierarchySessions[peer.key]?.sessionID == peer.sessionID,
                hierarchyPeers[peer.key] == .parent else {
-                return false
+                return .failed
             }
-            if activeEvidenceVolumes.contains(lease) { return true }
+            if activeEvidenceVolumes.contains(lease) { return .handled }
         }
         activeEvidenceVolumes.insert(lease)
         defer { activeEvidenceVolumes.remove(lease) }
@@ -2974,37 +2957,37 @@ public actor NodeNetworkRuntime: IvyDelegate {
                     )
                 )
             } catch {
-                return false
+                return .failed
             }
             guard isCurrentRuntime(generation: generation, process: process),
                   hierarchySessions[peer.key]?.sessionID == peer.sessionID,
                   hierarchyPeers[peer.key] == .parent else {
-                return false
+                return .failed
             }
         }
         guard let attachment = resolved.value else {
-            return false
+            return .failed
         }
         guard let envelope = try? ChildValidationPackageEnvelope.decode(
             attachment.envelopeBytes,
             maximumEncodedSize:
                 configuration.resourcePolicy.maximumParentWitnessBytes
         ) else {
-            return false
+            return .failed
         }
         guard let gate = parentFactGate,
               let gated = try? gate.accept(envelope, from: peer) else {
-            return false
+            return .failed
         }
         guard gated.package.proof.rootCID == summary.rootCID,
               let directHop = await gated.package.proof.directHop(),
               directHop.childCID == summary.childCID else {
-            return false
+            return .failed
         }
         guard isCurrentRuntime(generation: generation, process: process),
               hierarchySessions[peer.key]?.sessionID == peer.sessionID,
               hierarchyPeers[peer.key] == .parent else {
-            return false
+            return .failed
         }
         do {
             try await process.retainParentEvidence(
@@ -3014,14 +2997,16 @@ public actor NodeNetworkRuntime: IvyDelegate {
                 package: gated,
                 advanceScan: advanceScan
             )
+        } catch NodeStoreError.parentEvidenceInboxFull {
+            return .backpressured
         } catch {
-            return false
+            return .failed
         }
         return await enqueueRetainedParentCandidate(
             CandidateSeed(blockCID: summary.childCID, package: gated),
             generation: generation,
             process: process
-        )
+        ) ? .handled : .failed
     }
 
     private func handleHierarchy(
@@ -3285,19 +3270,19 @@ public actor NodeNetworkRuntime: IvyDelegate {
                     ),
                   request.childPath == configuration.chainPath else { return }
             guard let session = parentEvidenceSession(for: peer),
-                  !failedParentEvidenceSessions.contains(session),
-                  activeParentCandidateReservations.insert(session).inserted
+                  let reservation = parentEvidence.beginReservation(
+                    for: session
+                  )
             else {
                 await hierarchy.recycleSession(ifCurrent: peer)
                 return
             }
-            let evidenceTail = parentEvidenceTails[session]?.task
             Task { [weak self] in
                 await self?.respondToCandidateReservation(
                     request,
                     from: peer,
                     session: session,
-                    after: evidenceTail,
+                    after: reservation.evidenceTail,
                     generation: generation,
                     process: process
                 )
@@ -4059,6 +4044,17 @@ public actor NodeNetworkRuntime: IvyDelegate {
             resolution: resolution,
             deficientProviders: failedOverlayProviders
         )
+        if outcome.decision.isAccepted, authenticatedPackage != nil,
+           (try? await process.parentEvidenceInboxHasCapacity()) == true {
+            if let parent = configuredParentPeer(),
+               let session = parentEvidenceSession(for: parent) {
+                parentEvidence.capacityBecameAvailable(for: session)
+            }
+            await requestEvidenceIndex(
+                generation: generation,
+                process: process
+            )
+        }
     }
 
     private nonisolated static func enforceLocalAdmissionPolicy(

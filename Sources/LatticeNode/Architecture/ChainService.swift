@@ -981,24 +981,16 @@ public actor ChainService {
         handoffs: [ChildCandidateReservationReference] = []
     ) async -> Bool {
         let candidates = await templates.activeChildCandidates()
-        let references: [ChildCandidateReservationReference]
+        let ownership: ChildCandidateOwnership
         do {
-            references = try candidates.compactMap { candidate in
-                guard let peerKey = candidate.advertiserPeerKey else { return nil }
-                return ChildCandidateReservationReference(
-                    peerKey: peerKey,
-                    candidateCID: try BlockHeader(node: candidate.block).rawCID
-                )
-            }
+            ownership = try ChildCandidateOwnership(
+                candidates: candidates,
+                handoffs: handoffs
+            )
         } catch {
             return false
         }
-        return await childCandidateReservationReconciler(
-            ChildCandidateReservationUpdate(
-                reservations: sortedReservationReferences(references),
-                handoffs: sortedReservationReferences(handoffs)
-            )
-        )
+        return await childCandidateReservationReconciler(ownership.update)
     }
 
     private func reconcileRetainedCandidateDescendants() async {
@@ -1409,7 +1401,6 @@ public actor ChainService {
             children: submission.children,
             capacity: Self.templateCapacity
         )
-        let activeChildCandidates = await templates.activeChildCandidates()
         let outcome = try await process.admit(
             header,
             canonicalCommitPublisher: { [self] commit in
@@ -1419,7 +1410,7 @@ public actor ChainService {
         let candidateHandoffs: [ChildCandidateReservationReference]
         if outcome.decision.isAccepted {
             let committedCIDs = Set(preparedChildProofs.map(\.childCID))
-            candidateHandoffs = try activeChildCandidates.compactMap { child in
+            candidateHandoffs = try submission.children.compactMap { child in
                 guard let peerKey = child.advertiserPeerKey else { return nil }
                 let childCID = try BlockHeader(node: child.block).rawCID
                 guard committedCIDs.contains(childCID) else { return nil }
