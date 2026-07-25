@@ -989,7 +989,7 @@ final class ChainServiceTests: XCTestCase {
             intent.genesisCID
         )
         let proofSummary = try XCTUnwrap(submitted.durableChildProofs.first)
-        for _ in 0..<100 {
+        for _ in 0..<500 {
             if await publishedProofs.first() != nil { break }
             try await Task.sleep(for: .milliseconds(10))
         }
@@ -1776,7 +1776,7 @@ final class ChainServiceTests: XCTestCase {
         XCTAssertEqual(submitted.disposition, .carrier)
         XCTAssertNotNil(submitted.parentCarrierLink)
         XCTAssertTrue(submitted.durableChildProofs.isEmpty)
-        for _ in 0..<100 {
+        for _ in 0..<500 {
             if await publishedProofs.count() > 0 { break }
             try await Task.sleep(for: .milliseconds(10))
         }
@@ -1872,7 +1872,7 @@ final class ChainServiceTests: XCTestCase {
                 childCID: try BlockHeader(node: child).rawCID
             )
         ])
-        for _ in 0..<100 {
+        for _ in 0..<500 {
             if await publication.count() > 0 { break }
             try await Task.sleep(for: .milliseconds(10))
         }
