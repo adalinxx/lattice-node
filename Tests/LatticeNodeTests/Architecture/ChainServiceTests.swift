@@ -988,7 +988,11 @@ final class ChainServiceTests: XCTestCase {
             submitted.parentGenesisLinks[0].childGenesisCID,
             intent.genesisCID
         )
-        let proofSummary = try XCTUnwrap(submitted.publishedChildProofs.first)
+        let proofSummary = try XCTUnwrap(submitted.durableChildProofs.first)
+        for _ in 0..<100 {
+            if await publishedProofs.first() != nil { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
         let recordedPublication = await publishedProofs.first()
         let publication = try XCTUnwrap(recordedPublication)
         XCTAssertEqual(proofSummary.directory, "Sandbox")
@@ -1771,7 +1775,7 @@ final class ChainServiceTests: XCTestCase {
         XCTAssertFalse(submitted.accepted)
         XCTAssertEqual(submitted.disposition, .carrier)
         XCTAssertNotNil(submitted.parentCarrierLink)
-        XCTAssertTrue(submitted.publishedChildProofs.isEmpty)
+        XCTAssertTrue(submitted.durableChildProofs.isEmpty)
         for _ in 0..<100 {
             if await publishedProofs.count() > 0 { break }
             try await Task.sleep(for: .milliseconds(10))
@@ -1862,12 +1866,16 @@ final class ChainServiceTests: XCTestCase {
             nonce: 0
         ))
         XCTAssertTrue(submitted.accepted)
-        XCTAssertEqual(submitted.publishedChildProofs, [
+        XCTAssertEqual(submitted.durableChildProofs, [
             DirectChildProofSummary(
                 directory: "Existing",
                 childCID: try BlockHeader(node: child).rawCID
             )
         ])
+        for _ in 0..<100 {
+            if await publication.count() > 0 { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
         let publicationCount = await publication.count()
         XCTAssertEqual(publicationCount, 1)
     }
@@ -2380,8 +2388,8 @@ final class ChainServiceTests: XCTestCase {
                     advertiserPeerKey: peer
                 )]
             },
-            childCandidateReservationReconciler: { references in
-                await recorder.reconcile(references)
+            childCandidateReservationReconciler: { update in
+                await recorder.reconcile(update)
             }
         )
 
@@ -2446,8 +2454,8 @@ final class ChainServiceTests: XCTestCase {
                 }
                 return candidates
             },
-            childCandidateReservationReconciler: { references in
-                !references.contains { $0.peerKey == failedPeer }
+            childCandidateReservationReconciler: { update in
+                !update.reservations.contains { $0.peerKey == failedPeer }
             }
         )
 
@@ -2506,17 +2514,26 @@ final class ChainServiceTests: XCTestCase {
         let leafService = makeService(process: leafProcess)
         let middleService = makeService(
             process: middleProcess,
-            childCandidateReservationReconciler: { references in
-                guard references.allSatisfy({ $0.peerKey == leafPeer }) else {
+            childCandidateReservationReconciler: { update in
+                guard update.reservations.allSatisfy({
+                    $0.peerKey == leafPeer
+                }) else {
                     return false
                 }
                 return await leafService.replaceIssuedCandidateReservations(
-                    references.map(\.candidateCID)
+                    NetworkCandidateReservationUpdate(
+                        candidateCIDs:
+                            update.reservations.map(\.candidateCID),
+                        handoffCIDs: update.handoffs.map(\.candidateCID)
+                    )
                 )
             }
         )
         let reserved = await middleService.replaceIssuedCandidateReservations(
-            [middleHeader.rawCID]
+            NetworkCandidateReservationUpdate(
+                candidateCIDs: [middleHeader.rawCID],
+                handoffCIDs: []
+            )
         )
         XCTAssertTrue(reserved)
 
@@ -2540,7 +2557,12 @@ final class ChainServiceTests: XCTestCase {
         XCTAssertEqual(middleIssued, [middleHeader.rawCID])
         XCTAssertEqual(leafIssued, [leafHeader.rawCID])
 
-        let released = await middleService.replaceIssuedCandidateReservations([])
+        let released = await middleService.replaceIssuedCandidateReservations(
+            NetworkCandidateReservationUpdate(
+                candidateCIDs: [],
+                handoffCIDs: []
+            )
+        )
         XCTAssertTrue(released)
         for _ in 0..<100 {
             if try await middleStore.issuedContextualCandidateCIDs().isEmpty,
@@ -2574,7 +2596,9 @@ final class ChainServiceTests: XCTestCase {
         process: ChainProcess,
         childCandidateProvider: @escaping ChildCandidateProvider = { _ in [] },
         childCandidateReservationReconciler:
-            @escaping ChildCandidateReservationReconciler = { $0.isEmpty },
+            @escaping ChildCandidateReservationReconciler = {
+                $0.reservations.isEmpty && $0.handoffs.isEmpty
+            },
         childProofPublisher: @escaping ChildProofPublisher = { _ in },
         acceptedBlockPublisher: @escaping AcceptedBlockPublisher = { _ in },
         acceptedTransactionPublisher:
@@ -2816,11 +2840,12 @@ private actor ReservationRecorder {
     }
 
     func reconcile(
-        _ references: [ChildCandidateReservationReference]
+        _ update: ChildCandidateReservationUpdate
     ) -> Bool {
+        let references = update.reservations
         values.append(references)
         currentValue = Set(references)
-        return references.isEmpty || accept
+        return (references.isEmpty && update.handoffs.isEmpty) || accept
     }
 
     func snapshots() -> [[ChildCandidateReservationReference]] { values }

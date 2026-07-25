@@ -47,9 +47,11 @@ child offers use a separate durable bounded LRU: new roots are pinned before
 the index changes and offer eviction never touches issued ownership. An exact,
 authenticated parent snapshot recursively reserves descendants and atomically
 replaces the issued set before acknowledgement. Removal acknowledgements never
-gate parent progress. A prior authenticated parent proof first promotes the candidate into
-a durable admission handoff; admission then transfers the roots before that
-handoff is released. Failed or idle cleanup can safely over-retain until an
+gate parent progress. The authenticated removal update names committed
+candidates as handoffs; the child atomically acquires durable handoff ownership
+before releasing their issued ownership, recursively through the hierarchy.
+Proof acquisition is independent. Admission then transfers the roots before
+the handoff is released. Failed or idle cleanup can safely over-retain until an
 exact snapshot or startup rebuild reconciles ownership before garbage
 collection. Canonicity never changes retention or validity; accepted, shared,
 and independently retained roots remain owned.

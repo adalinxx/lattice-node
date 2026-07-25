@@ -158,7 +158,7 @@ public struct SubmitWorkResponse: Codable, Sendable {
     public let tipCID: String?
     public let parentCarrierLink: ParentCarrierLink?
     public let parentGenesisLinks: [ParentGenesisLink]
-    public let publishedChildProofs: [DirectChildProofSummary]
+    public let durableChildProofs: [DirectChildProofSummary]
 }
 
 /// Bounded miner-facing acknowledgement. Proof bytes stay on the authenticated
@@ -205,7 +205,7 @@ public typealias ChildCandidateProvider = @Sendable (
 ) async throws
     -> [DirectChildCandidate]
 public typealias ChildCandidateReservationReconciler = @Sendable (
-    [ChildCandidateReservationReference]
+    ChildCandidateReservationUpdate
 ) async -> Bool
 public typealias ChildProofPublisher = @Sendable (
     DirectChildProofPublication
@@ -217,7 +217,6 @@ public typealias AcceptedTransactionPublisher = @Sendable (
 
 private struct AdmissionEffects: Sendable {
     let parentGenesisLinks: [ParentGenesisLink]
-    let publishedChildProofs: [DirectChildProofSummary]
 }
 
 /// Creates an ordinary direct-child genesis bound to the current parent state.
@@ -420,7 +419,9 @@ public actor ChainService {
         process: ChainProcess,
         childCandidateProvider: @escaping ChildCandidateProvider,
         childCandidateReservationReconciler:
-            @escaping ChildCandidateReservationReconciler = { $0.isEmpty },
+            @escaping ChildCandidateReservationReconciler = {
+                $0.reservations.isEmpty && $0.handoffs.isEmpty
+            },
         childProofPublisher: @escaping ChildProofPublisher,
         acceptedBlockPublisher: @escaping AcceptedBlockPublisher,
         acceptedTransactionPublisher: @escaping AcceptedTransactionPublisher = { _ in },
@@ -945,26 +946,40 @@ public actor ChainService {
     /// Applies one exact parent-issued snapshot only after recursively making
     /// every committed direct-child candidate durable at its exact process.
     public func replaceIssuedCandidateReservations(
-        _ candidateCIDs: [String]
+        _ update: NetworkCandidateReservationUpdate
     ) async -> Bool {
         await acquireOperation()
         defer { releaseOperation() }
-        let desired = Set(candidateCIDs)
-        guard desired.count == candidateCIDs.count,
-              desired.count <= Self.templateCapacity,
-              let children = try? await process.contextualCandidateChildren(
+        let desired = Set(update.candidateCIDs)
+        let handoffs = Set(update.handoffCIDs)
+        guard desired.count == update.candidateCIDs.count,
+              handoffs.count == update.handoffCIDs.count,
+              desired.count + handoffs.count <= Self.templateCapacity,
+              desired.isDisjoint(with: handoffs),
+              let reservedChildren = try? await process
+                .contextualCandidateChildren(
                 candidateCIDs: desired
               ),
-              await childCandidateReservationReconciler(children) else {
+              let handoffChildren = try? await process
+                .contextualCandidateChildren(candidateCIDs: handoffs),
+              await childCandidateReservationReconciler(
+                ChildCandidateReservationUpdate(
+                    reservations: reservedChildren,
+                    handoffs: handoffChildren
+                )
+              ) else {
             return false
         }
         return (try? await process.replaceIssuedContextualCandidates(
             desired,
+            handoffs: handoffs,
             capacity: Self.templateCapacity
         )) == true
     }
 
-    private func reconcileCurrentCandidateReservations() async -> Bool {
+    private func reconcileCurrentCandidateReservations(
+        handoffs: [ChildCandidateReservationReference] = []
+    ) async -> Bool {
         let candidates = await templates.activeChildCandidates()
         let references: [ChildCandidateReservationReference]
         do {
@@ -979,10 +994,10 @@ public actor ChainService {
             return false
         }
         return await childCandidateReservationReconciler(
-            Array(Set(references)).sorted {
-                ($0.peerKey.description, $0.candidateCID)
-                    < ($1.peerKey.description, $1.candidateCID)
-            }
+            ChildCandidateReservationUpdate(
+                reservations: sortedReservationReferences(references),
+                handoffs: sortedReservationReferences(handoffs)
+            )
         )
     }
 
@@ -990,11 +1005,19 @@ public actor ChainService {
         guard let references = try? await process
             .currentContextualCandidateChildren() else { return }
         _ = await childCandidateReservationReconciler(
-            Array(Set(references)).sorted {
-                ($0.peerKey.description, $0.candidateCID)
-                    < ($1.peerKey.description, $1.candidateCID)
-            }
+            ChildCandidateReservationUpdate(
+                reservations: sortedReservationReferences(references)
+            )
         )
+    }
+
+    private func sortedReservationReferences(
+        _ references: [ChildCandidateReservationReference]
+    ) -> [ChildCandidateReservationReference] {
+        Array(Set(references)).sorted {
+            ($0.peerKey.description, $0.candidateCID)
+                < ($1.peerKey.description, $1.candidateCID)
+        }
     }
 
     /// Hierarchy-only child candidate construction. The authenticated parent
@@ -1381,24 +1404,40 @@ public actor ChainService {
         )
         let candidate = submission.block
         let header = try BlockHeader(node: candidate)
-        _ = try await process.prepareChildProofs(
+        let preparedChildProofs = try await process.prepareChildProofs(
             for: candidate,
             children: submission.children,
             capacity: Self.templateCapacity
         )
+        let activeChildCandidates = await templates.activeChildCandidates()
         let outcome = try await process.admit(
             header,
             canonicalCommitPublisher: { [self] commit in
                 await enqueueCanonicalCommit(commit)
             }
         )
+        let candidateHandoffs: [ChildCandidateReservationReference]
+        if outcome.decision.isAccepted {
+            let committedCIDs = Set(preparedChildProofs.map(\.childCID))
+            candidateHandoffs = try activeChildCandidates.compactMap { child in
+                guard let peerKey = child.advertiserPeerKey else { return nil }
+                let childCID = try BlockHeader(node: child.block).rawCID
+                guard committedCIDs.contains(childCID) else { return nil }
+                return ChildCandidateReservationReference(
+                    peerKey: peerKey,
+                    candidateCID: childCID
+                )
+            }
+        } else {
+            candidateHandoffs = []
+        }
         let effects = await applyAdmissionEffects(
             block: candidate,
             header: header,
-            outcome: outcome
+            outcome: outcome,
+            candidateHandoffs: candidateHandoffs
         )
         await templates.discard(workID: request.workID)
-        _ = await reconcileCurrentCandidateReservations()
 
         // The process enqueued this commit while preserving its own mutation
         // order. Release our gate before waiting because reconciliation must
@@ -1423,7 +1462,14 @@ public actor ChainService {
             tipCID: status.tipCID,
             parentCarrierLink: outcome.parentCarrierLink,
             parentGenesisLinks: effects.parentGenesisLinks,
-            publishedChildProofs: effects.publishedChildProofs
+            durableChildProofs: outcome.decision.isAccepted
+                ? preparedChildProofs.map {
+                    DirectChildProofSummary(
+                        directory: $0.directory,
+                        childCID: $0.childCID
+                    )
+                }
+                : []
         )
     }
 
@@ -1510,7 +1556,8 @@ public actor ChainService {
     private func applyAdmissionEffects(
         block: Block,
         header: BlockHeader,
-        outcome: NodeAdmissionOutcome
+        outcome: NodeAdmissionOutcome,
+        candidateHandoffs: [ChildCandidateReservationReference]? = nil
     ) async -> AdmissionEffects {
         // Visibility of accepted work is independent from optional child
         // materialization. A missing child payload must not suppress the
@@ -1554,11 +1601,12 @@ public actor ChainService {
             break
         }
 
-        let publishedChildProofs = await publishCarrierChildProofs(
+        await publishCarrierChildProofs(
             header: header,
-            outcome: outcome
+            outcome: outcome,
+            candidateHandoffs: candidateHandoffs
         )
-        if outcome.decision.isAccepted {
+        if outcome.decision.isAccepted, candidateHandoffs == nil {
             Task { [weak self] in
                 await self?.reconcileRetainedCandidateDescendants()
             }
@@ -1566,44 +1614,65 @@ public actor ChainService {
         return AdmissionEffects(
             parentGenesisLinks: genesisLinks.sorted {
                 $0.directory < $1.directory
-            },
-            publishedChildProofs: publishedChildProofs
+            }
         )
     }
 
     private func publishCarrierChildProofs(
         header: BlockHeader,
-        outcome: NodeAdmissionOutcome
-    ) async -> [DirectChildProofSummary] {
-        guard let link = outcome.parentCarrierLink else { return [] }
-        // Work was already published. This eager retry only improves proof
-        // latency; durable pending routes make failure and restart harmless.
-        _ = try? await process.retryPendingChildProofs(
-            carrierCID: header.rawCID
-        )
+        outcome: NodeAdmissionOutcome,
+        candidateHandoffs: [ChildCandidateReservationReference]? = nil
+    ) async {
+        guard let link = outcome.parentCarrierLink else {
+            if let candidateHandoffs {
+                Task { [weak self] in
+                    _ = await self?.reconcileCurrentCandidateReservations(
+                        handoffs: candidateHandoffs
+                    )
+                }
+            }
+            return
+        }
+        // Admission and the miner response depend only on the durable proof,
+        // never on child availability. Delivery is an asynchronous hint; the
+        // retained route remains pullable and retryable after failure/restart.
+        // The following reservation update carries the committed candidate as
+        // a handoff, so the child retains it atomically before releasing its
+        // speculative reservation. Proof acquisition remains independent.
+        Task { [weak self] in
+            guard let self else { return }
+            if let candidateHandoffs {
+                _ = await self.reconcileCurrentCandidateReservations(
+                    handoffs: candidateHandoffs
+                )
+            }
+            await self.deliverCarrierChildProofs(
+                carrierCID: header.rawCID,
+                rootCID: link.rootCID
+            )
+        }
+    }
+
+    private func deliverCarrierChildProofs(
+        carrierCID: String,
+        rootCID: String
+    ) async {
+        _ = try? await process.retryPendingChildProofs(carrierCID: carrierCID)
         let durableProofs = (try? await process.durableDirectChildProofs(
-            carrierCID: header.rawCID,
-            rootCID: link.rootCID
+            carrierCID: carrierCID,
+            rootCID: rootCID
         )) ?? []
-        var published: [DirectChildProofSummary] = []
         for durable in durableProofs {
             let publication = DirectChildProofPublication(
                 directory: durable.directory,
                 childCID: durable.childCID,
                 proof: durable.proof
             )
-            do {
-                try await childProofPublisher(publication)
-                published.append(DirectChildProofSummary(
-                    directory: publication.directory,
-                    childCID: publication.childCID
-                ))
-            } catch {
+            do { try await childProofPublisher(publication) } catch {
                 // Proofs and links are durable; hierarchy pull/reconnect can
                 // retry a failed eager publication.
             }
         }
-        return published
     }
 
     private func locallyStoredBlock(_ header: BlockHeader) async -> Block? {

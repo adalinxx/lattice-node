@@ -412,13 +412,30 @@ struct ChildCandidateReservationRequestMessage:
     let requestID: UInt64
     let childPath: [String]
     let candidateCIDs: [String]
+    let handoffCIDs: [String]
+
+    init(
+        requestID: UInt64,
+        childPath: [String],
+        candidateCIDs: [String],
+        handoffCIDs: [String] = []
+    ) {
+        self.requestID = requestID
+        self.childPath = childPath
+        self.candidateCIDs = candidateCIDs
+        self.handoffCIDs = handoffCIDs
+    }
 
     func validate() throws {
         guard requestID != 0,
               _isAbsoluteChainPath(childPath), childPath.count > 1,
-              candidateCIDs.count <= Self.maximumCandidateCIDs,
+              candidateCIDs.count + handoffCIDs.count
+                <= Self.maximumCandidateCIDs,
               candidateCIDs == Array(Set(candidateCIDs)).sorted(),
-              candidateCIDs.allSatisfy(_isCanonicalWireCID) else {
+              handoffCIDs == Array(Set(handoffCIDs)).sorted(),
+              Set(candidateCIDs).isDisjoint(with: handoffCIDs),
+              candidateCIDs.allSatisfy(_isCanonicalWireCID),
+              handoffCIDs.allSatisfy(_isCanonicalWireCID) else {
             throw NodeNetworkWireError.malformed
         }
     }

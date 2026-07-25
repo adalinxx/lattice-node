@@ -149,10 +149,13 @@ template book; an empty set releases all offers and issued reservations.
 Requests and acknowledgements are accepted only on the authenticated direct
 parent/child session for the exact child path. Removal delivery is serialized
 but asynchronous because over-retention is safe and a child must never stall
-parent consensus. Before applying a removal, a child durably fences any earlier
-parent-proof notification into admission handoff ownership. Expired idle work
-may remain over-retained until the next template, submission, invalidation, or
-reconnect boundary; this is bounded and never makes expired work valid.
+parent consensus. A removal may name committed candidates as handoffs; the
+child atomically installs their durable admission-handoff ownership before
+replacing the issued set, and applies the same transition recursively to
+committed descendants. Parent-proof acquisition is a separate retryable path.
+Expired idle work may remain over-retained until the next template, submission,
+invalidation, or reconnect boundary; this is bounded and never makes expired
+work valid.
 
 Each candidate-root content session uses the node's `NodeResourcePolicy` for
 archive bytes, Volume count, and member count. `ChainSpec.maxBlockSize` remains

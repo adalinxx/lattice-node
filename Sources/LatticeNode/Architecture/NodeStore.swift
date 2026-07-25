@@ -53,6 +53,19 @@ public struct ChildCandidateReservationReference: Hashable, Sendable {
     }
 }
 
+public struct ChildCandidateReservationUpdate: Sendable {
+    public let reservations: [ChildCandidateReservationReference]
+    public let handoffs: [ChildCandidateReservationReference]
+
+    public init(
+        reservations: [ChildCandidateReservationReference],
+        handoffs: [ChildCandidateReservationReference] = []
+    ) {
+        self.reservations = reservations
+        self.handoffs = handoffs
+    }
+}
+
 struct LocalMempoolTransactionRecord: Sendable, Equatable {
     let transactionCID: String
     let addedAt: Int64
@@ -2183,6 +2196,9 @@ actor NodeStore {
                         ]
                     )
                 }
+                _ = try markContextualCandidateHandoff(
+                    candidateCID: directHop.childCID
+                )
                 if advanceScan {
                     try persistParentEvidenceScan(
                         sourceID: sourceID,
@@ -2640,6 +2656,12 @@ actor NodeStore {
         }
         await acquirePreparedMutation()
         defer { releasePreparedMutation() }
+        return try markContextualCandidateHandoff(candidateCID: candidateCID)
+    }
+
+    private func markContextualCandidateHandoff(
+        candidateCID: String
+    ) throws -> Bool {
         guard try !database.query(
             "SELECT 1 FROM contextual_candidates AS candidate WHERE candidate.candidate_cid = ?1 AND EXISTS (SELECT 1 FROM contextual_candidate_roots AS roots WHERE roots.candidate_cid = candidate.candidate_cid)",
             params: [.text(candidateCID)]
@@ -2653,10 +2675,13 @@ actor NodeStore {
 
     func replaceIssuedContextualCandidates(
         _ desired: Set<String>,
+        handoffs: Set<String> = [],
         capacity: Int
     ) async throws -> Bool {
-        guard capacity > 0, desired.count <= capacity,
-              desired.allSatisfy(CIDIdentity.isCanonical) else {
+        guard capacity > 0,
+              desired.count + handoffs.count <= capacity,
+              desired.isDisjoint(with: handoffs),
+              desired.union(handoffs).allSatisfy(CIDIdentity.isCanonical) else {
             throw NodeStoreError.invalidConfiguration(
                 "issued contextual candidate set is malformed"
             )
@@ -2669,8 +2694,19 @@ actor NodeStore {
                 params: [.text(candidateCID)]
             ).isEmpty else { return false }
         }
+        for candidateCID in handoffs {
+            guard try !database.query(
+                "SELECT 1 FROM contextual_candidates AS candidate WHERE candidate.candidate_cid = ?1 AND EXISTS (SELECT 1 FROM contextual_candidate_roots AS roots WHERE roots.candidate_cid = candidate.candidate_cid)",
+                params: [.text(candidateCID)]
+            ).isEmpty else { return false }
+        }
         var releasedRoots: [String] = []
         try database.transaction {
+            for candidateCID in handoffs {
+                _ = try markContextualCandidateHandoff(
+                    candidateCID: candidateCID
+                )
+            }
             let candidates = try database.query(
                 "SELECT candidate_cid, handoff FROM contextual_candidates ORDER BY candidate_cid"
             )
