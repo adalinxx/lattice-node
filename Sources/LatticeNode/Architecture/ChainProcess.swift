@@ -213,6 +213,8 @@ public actor ChainProcess: ContentSource, Fetcher, VolumeStorer {
             preparedRecoveryRetentionScope: preparedHierarchyRetentionScope,
             parentEvidenceInboxRetentionScope:
                 parentEvidenceInboxRetentionScope,
+            parentEvidenceInboxCapacity:
+                configuration.resourcePolicy.maximumPendingParentEvidence,
             contextualCandidateOwner: contextualCandidateOwner
         )
 
@@ -1384,6 +1386,10 @@ public actor ChainProcess: ContentSource, Fetcher, VolumeStorer {
 
     func parentEvidenceInbox() async throws -> [ParentEvidenceInboxItem] {
         try await store.parentEvidenceInbox()
+    }
+
+    func parentEvidenceInboxHasCapacity() async throws -> Bool {
+        try await store.parentEvidenceInboxHasCapacity()
     }
 
     func retainParentEvidence(

@@ -940,31 +940,59 @@ final class ParentChildE2ETests: XCTestCase {
         _ = try await b.waitForStatus { $0.mempoolCount == 1 }
 
         // Two miners obtain competing parent templates before either submits
-        // work. The parent's real child scheduler rotates across the two
-        // isolated replicas, so each template carries that replica's private
-        // transaction on a sibling child block.
+        // work. Make the responding replica explicit through ordinary
+        // stop/start operations; distinct timestamped candidates from one
+        // replica are not evidence that both replicas answered.
         let emptyChildrenCID =
             try HeaderImpl<MerkleDictionaryImpl<VolumeImpl<Block>>>(
                 node: MerkleDictionaryImpl<VolumeImpl<Block>>()
             ).rawCID
-        var seenChildren = Set<String>()
-        var competingTemplates: [MiningTemplateResponse] = []
-        for _ in 0..<200 {
+        try await b.stop()
+        var firstTemplateResponse: MiningTemplateResponse?
+        for _ in 0..<20 {
             let template: MiningTemplateResponse = try await nexus.post(
                 "/v1/mining/templates",
                 body: MiningTemplateRequest()
             )
-            let childrenCID = template.block.children.rawCID
-            if childrenCID != emptyChildrenCID,
-               seenChildren.insert(childrenCID).inserted {
-                competingTemplates.append(template)
+            if template.block.children.rawCID != emptyChildrenCID {
+                firstTemplateResponse = template
+                break
             }
-            if competingTemplates.count == 2 { break }
             try await Task.sleep(for: .milliseconds(100))
         }
-        XCTAssertEqual(competingTemplates.count, 2)
-        let firstTemplate = try XCTUnwrap(competingTemplates.first)
-        let secondTemplate = try XCTUnwrap(competingTemplates.dropFirst().first)
+        let firstTemplate = try XCTUnwrap(firstTemplateResponse)
+
+        try await a.stop()
+        try b.start()
+        _ = try await b.waitForStatus {
+            $0.phase == .active
+                && $0.tipCID == intent.genesisCID
+                && $0.mempoolCount == 1
+        }
+        var secondTemplateResponse: MiningTemplateResponse?
+        for _ in 0..<20 {
+            let template: MiningTemplateResponse = try await nexus.post(
+                "/v1/mining/templates",
+                body: MiningTemplateRequest()
+            )
+            if template.block.children.rawCID != emptyChildrenCID {
+                secondTemplateResponse = template
+                break
+            }
+            try await Task.sleep(for: .milliseconds(100))
+        }
+        let secondTemplate = try XCTUnwrap(secondTemplateResponse)
+        XCTAssertNotEqual(
+            firstTemplate.block.children.rawCID,
+            secondTemplate.block.children.rawCID
+        )
+
+        try a.start()
+        _ = try await a.waitForStatus {
+            $0.phase == .active
+                && $0.tipCID == intent.genesisCID
+                && $0.mempoolCount == 1
+        }
 
         let firstWork: SubmitWorkResponse
         do {

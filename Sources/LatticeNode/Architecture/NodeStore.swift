@@ -13,6 +13,7 @@ enum NodeStoreError: Error, Equatable, LocalizedError {
     case conflictingIssuedParentFact
     case conflictingIssuedChildProof
     case invalidIssuedChildProof(String)
+    case parentEvidenceInboxFull
     case corrupt(String)
 
     var errorDescription: String? {
@@ -31,6 +32,8 @@ enum NodeStoreError: Error, Equatable, LocalizedError {
             "A locally issued child proof was replayed with different bytes."
         case .invalidIssuedChildProof(let childCID):
             "The proof cached for child \(childCID) does not prove that child from this chain path."
+        case .parentEvidenceInboxFull:
+            "The pending parent-evidence inbox is full."
         case .corrupt(let reason):
             "The node store is corrupt: \(reason)"
         }
@@ -235,6 +238,7 @@ actor NodeStore {
     private let issuedRecoveryRetentionScope: String
     private let preparedRecoveryRetentionScope: String
     private let parentEvidenceInboxRetentionScope: String
+    private let parentEvidenceInboxCapacity: Int
     private let contextualCandidateOwner: String
     private var preparedMutationInFlight = false
     private var preparedMutationWaiters: [CheckedContinuation<Void, Never>] = []
@@ -249,6 +253,7 @@ actor NodeStore {
         issuedRecoveryRetentionScope: String,
         preparedRecoveryRetentionScope: String,
         parentEvidenceInboxRetentionScope: String = "parent-evidence-inbox",
+        parentEvidenceInboxCapacity: Int = 64,
         contextualCandidateOwner: String
     ) throws {
         guard !nexusGenesisCID.isEmpty else {
@@ -260,6 +265,7 @@ actor NodeStore {
         guard !issuedRecoveryRetentionScope.isEmpty,
               !preparedRecoveryRetentionScope.isEmpty,
               !parentEvidenceInboxRetentionScope.isEmpty,
+              parentEvidenceInboxCapacity > 0,
               issuedRecoveryRetentionScope != preparedRecoveryRetentionScope,
               issuedRecoveryRetentionScope != parentEvidenceInboxRetentionScope,
               preparedRecoveryRetentionScope != parentEvidenceInboxRetentionScope,
@@ -331,6 +337,7 @@ actor NodeStore {
         self.preparedRecoveryRetentionScope = preparedRecoveryRetentionScope
         self.parentEvidenceInboxRetentionScope =
             parentEvidenceInboxRetentionScope
+        self.parentEvidenceInboxCapacity = parentEvidenceInboxCapacity
         self.contextualCandidateOwner = contextualCandidateOwner
     }
 
@@ -2145,12 +2152,37 @@ actor NodeStore {
             expectedChildCIDs: [directHop.childCID],
             expectedRootCID: package.package.proof.rootCID
         )
-        try await attachment.store(storer: recoveryVolumeBroker)
+        let existing = try database.query(
+            "SELECT child_cid, root_cid, attachment_cid FROM parent_evidence_inbox WHERE source_id = ?1 AND ordinal = ?2",
+            params: [.text(sourceID), .int(sqlOrdinal)]
+        )
+        if let row = existing.first {
+            guard row["child_cid"]?.textValue == directHop.childCID,
+                  row["root_cid"]?.textValue
+                    == package.package.proof.rootCID,
+                  row["attachment_cid"]?.textValue
+                    == attachment.rawCID else {
+                throw NodeStoreError.corrupt(
+                    "parent-evidence ordinal changed"
+                )
+            }
+        }
         let alreadyAdmitted = try admittedCarrierEvidenceExists(
             attachmentCID: attachment.rawCID,
             childCID: directHop.childCID,
             rootCID: package.package.proof.rootCID
         )
+        if !alreadyAdmitted, existing.isEmpty {
+            let count = try database.query(
+                "SELECT COUNT(*) AS count FROM parent_evidence_inbox"
+            ).first?["count"]?.intValue
+            guard count.map({
+                $0 < Int64(parentEvidenceInboxCapacity)
+            }) == true else {
+                throw NodeStoreError.parentEvidenceInboxFull
+            }
+        }
+        try await attachment.store(storer: recoveryVolumeBroker)
         if !alreadyAdmitted {
             try await mergeRecoveryRetention(
                 scope: parentEvidenceInboxRetentionScope,
@@ -2160,11 +2192,11 @@ actor NodeStore {
         let admittedDuringStore: Bool
         do {
             admittedDuringStore = try database.transaction {
-                let existing = try database.query(
+                let transactionalExisting = try database.query(
                     "SELECT child_cid, root_cid, attachment_cid FROM parent_evidence_inbox WHERE source_id = ?1 AND ordinal = ?2",
                     params: [.text(sourceID), .int(sqlOrdinal)]
                 )
-                if let row = existing.first {
+                if let row = transactionalExisting.first {
                     guard row["child_cid"]?.textValue == directHop.childCID,
                           row["root_cid"]?.textValue
                             == package.package.proof.rootCID,
@@ -2185,7 +2217,15 @@ actor NodeStore {
                         "DELETE FROM parent_evidence_inbox WHERE attachment_cid = ?1",
                         params: [.text(attachment.rawCID)]
                     )
-                } else if existing.isEmpty {
+                } else if transactionalExisting.isEmpty {
+                    let count = try database.query(
+                        "SELECT COUNT(*) AS count FROM parent_evidence_inbox"
+                    ).first?["count"]?.intValue
+                    guard count.map({
+                        $0 < Int64(parentEvidenceInboxCapacity)
+                    }) == true else {
+                        throw NodeStoreError.parentEvidenceInboxFull
+                    }
                     try database.execute(
                         "INSERT INTO parent_evidence_inbox (source_id, ordinal, child_cid, root_cid, attachment_cid) VALUES (?1, ?2, ?3, ?4, ?5)",
                         params: [
@@ -2292,7 +2332,19 @@ actor NodeStore {
             SELECT DISTINCT attachment_cid AS cid
             FROM parent_evidence_inbox
             ORDER BY cid
-            """)
+        """)
+    }
+
+    func parentEvidenceInboxHasCapacity() throws -> Bool {
+        let count = try database.query(
+            "SELECT COUNT(*) AS count FROM parent_evidence_inbox"
+        ).first?["count"]?.intValue
+        guard let count else {
+            throw NodeStoreError.corrupt(
+                "parent-evidence inbox count is malformed"
+            )
+        }
+        return count < Int64(parentEvidenceInboxCapacity)
     }
 
     func parentEvidenceInbox() async throws -> [ParentEvidenceInboxItem] {

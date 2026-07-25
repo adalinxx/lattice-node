@@ -2578,6 +2578,37 @@ final class ChainServiceTests: XCTestCase {
         XCTAssertTrue(leafReleased.isEmpty)
     }
 
+    func testCommittedHandoffIsExcludedFromEveryOutstandingReservation()
+        async throws
+    {
+        let process = try await nexusProcess()
+        let block = try await process.canonicalTipBlock()
+        let peer = try PeerKey(
+            rawRepresentation: Data(
+                repeating: 0x72,
+                count: PeerKey.byteCount
+            )
+        )
+        let candidate = DirectChildCandidate(
+            directory: "Child",
+            block: block,
+            parentCreatedGenesis: false,
+            advertiserPeerKey: peer
+        )
+        let handoff = ChildCandidateReservationReference(
+            peerKey: peer,
+            candidateCID: try BlockHeader(node: block).rawCID
+        )
+
+        let ownership = try ChildCandidateOwnership(
+            candidates: [candidate, candidate],
+            handoffs: [handoff]
+        )
+
+        XCTAssertTrue(ownership.reservations.isEmpty)
+        XCTAssertEqual(ownership.handoffs, [handoff])
+    }
+
     private func nexusProcess() async throws -> ChainProcess {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("lattice-chain-service-\(UUID().uuidString)")

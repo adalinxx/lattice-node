@@ -5,6 +5,7 @@ public struct NodeResourcePolicy: Sendable, Equatable {
 
     public let maximumChainSpecBytes: Int
     public let maximumParentWitnessBytes: Int
+    public let maximumPendingParentEvidence: Int
     public let maximumWasmPolicies: Int
     public let maximumAcquisitionVolumes: Int
     public let maximumAcquisitionMembers: Int
@@ -14,6 +15,7 @@ public struct NodeResourcePolicy: Sendable, Equatable {
         maximumChainSpecBytes: Int = 1 * 1_024 * 1_024,
         maximumParentWitnessBytes: Int =
             Int(IvyConfig.protocolMaxFrameSize) - 1_024,
+        maximumPendingParentEvidence: Int = 64,
         maximumWasmPolicies: Int = 64,
         maximumAcquisitionVolumes: Int = 20_548,
         maximumAcquisitionMembers: Int = Int(UInt16.max),
@@ -22,6 +24,7 @@ public struct NodeResourcePolicy: Sendable, Equatable {
         precondition(
             maximumChainSpecBytes > 0
                 && maximumParentWitnessBytes > 0
+                && maximumPendingParentEvidence > 0
                 && maximumWasmPolicies > 0
                 && maximumAcquisitionVolumes > 0
                 && maximumAcquisitionMembers > 0
@@ -29,6 +32,7 @@ public struct NodeResourcePolicy: Sendable, Equatable {
         )
         self.maximumChainSpecBytes = maximumChainSpecBytes
         self.maximumParentWitnessBytes = maximumParentWitnessBytes
+        self.maximumPendingParentEvidence = maximumPendingParentEvidence
         self.maximumWasmPolicies = maximumWasmPolicies
         self.maximumAcquisitionVolumes = maximumAcquisitionVolumes
         self.maximumAcquisitionMembers = maximumAcquisitionMembers
