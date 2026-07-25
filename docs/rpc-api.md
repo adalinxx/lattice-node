@@ -146,7 +146,9 @@ Response fields:
 ```
 
 Response fields are `accepted`, `disposition`, `tipCID`,
-`parentCarrierLink`, `parentGenesisLinks`, and `publishedChildProofs`.
+`parentCarrierLink`, `parentGenesisLinks`, and `durableChildProofs`. Child-proof
+delivery is asynchronous; this field acknowledges local durability, not remote
+receipt.
 Possible dispositions are `canonicalized`, `acceptedSide`, `carrier`,
 `duplicate`, `unavailable`, `temporarilyInvalid`, `invalid`, `localFailure`,
 and `storageFailed`.

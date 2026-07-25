@@ -940,24 +940,16 @@ public actor ChainProcess: ContentSource, Fetcher, VolumeStorer {
         try await store.currentContextualCandidateChildren()
     }
 
-    func beginContextualCandidateHandoff(
-        candidateCID: String
-    ) async throws -> Bool {
-        try await acquireMutationOperation()
-        defer { releaseOperation() }
-        return try await store.beginContextualCandidateHandoff(
-            candidateCID: candidateCID
-        )
-    }
-
     func replaceIssuedContextualCandidates(
         _ candidateCIDs: Set<String>,
+        handoffs: Set<String> = [],
         capacity: Int
     ) async throws -> Bool {
         try await acquireMutationOperation()
         defer { releaseOperation() }
         return try await store.replaceIssuedContextualCandidates(
             candidateCIDs,
+            handoffs: handoffs,
             capacity: capacity
         )
     }

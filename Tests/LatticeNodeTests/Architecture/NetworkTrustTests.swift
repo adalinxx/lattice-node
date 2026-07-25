@@ -778,20 +778,27 @@ private final class BlockingProvisionalBroker: VolumeBroker {
 }
 
 private actor CandidateReservationAckGate {
-    private let apply: @Sendable ([String]) async -> Bool
+    private let apply: @Sendable (NetworkCandidateReservationUpdate) async -> Bool
     private var snapshots: [[String]] = []
+    private var handoffSnapshots: [[String]] = []
     private var rejections: [[String]] = []
     private var holdAnyNonempty = true
     private var heldCandidateCIDs: Set<String>?
     private var blocking = false
     private var waiters: [CheckedContinuation<Void, Never>] = []
 
-    init(apply: @escaping @Sendable ([String]) async -> Bool) {
+    init(
+        apply: @escaping @Sendable (
+            NetworkCandidateReservationUpdate
+        ) async -> Bool
+    ) {
         self.apply = apply
     }
 
-    func handle(_ candidateCIDs: [String]) async -> Bool {
+    func handle(_ update: NetworkCandidateReservationUpdate) async -> Bool {
+        let candidateCIDs = update.candidateCIDs
         snapshots.append(candidateCIDs)
+        handoffSnapshots.append(update.handoffCIDs)
         let shouldBlock = !blocking && (
             holdAnyNonempty && !candidateCIDs.isEmpty
                 || heldCandidateCIDs == Set(candidateCIDs)
@@ -800,7 +807,7 @@ private actor CandidateReservationAckGate {
             blocking = true
             await withCheckedContinuation { waiters.append($0) }
         }
-        let result = await apply(candidateCIDs)
+        let result = await apply(update)
         if !result {
             rejections.append(candidateCIDs)
         }
@@ -808,6 +815,7 @@ private actor CandidateReservationAckGate {
     }
 
     func snapshot() -> [[String]] { snapshots }
+    func handoffSnapshot() -> [[String]] { handoffSnapshots }
     func rejectionSnapshot() -> [[String]] { rejections }
 
     func holdNext(_ candidateCIDs: Set<String>) {
@@ -4863,11 +4871,12 @@ final class NetworkTrustTests: XCTestCase {
         let candidateHeader = try BlockHeader(node: candidateBlock)
         let reservations = NetworkEventRecorder()
         let childHandlers = NodeNetworkHandlers(
-            candidateReservations: { candidateCIDs in
+            candidateReservations: { update in
                 await reservations.append("called")
                 return (try? await fixture.childProcess
                     .replaceIssuedContextualCandidates(
-                        Set(candidateCIDs),
+                        Set(update.candidateCIDs),
+                        handoffs: Set(update.handoffCIDs),
                         capacity: 16
                     )) == true
             },
@@ -4949,8 +4958,8 @@ final class NetworkTrustTests: XCTestCase {
         let fixture = try await provisionalRootFixture(keyByte: 0x95)
         let reservationGate = CandidateReservationAckGate { _ in true }
         let childHandlers = NodeNetworkHandlers(
-            candidateReservations: { candidateCIDs in
-                await reservationGate.handle(candidateCIDs)
+            candidateReservations: { update in
+                await reservationGate.handle(update)
             },
             admission: { _ in throw CancellationError() }
         )
@@ -5030,10 +5039,10 @@ final class NetworkTrustTests: XCTestCase {
             runtime: fixture.childRuntime
         )
         let reservationGate = CandidateReservationAckGate {
-            [weak childService] candidateCIDs in
+            [weak childService] update in
             guard let childService else { return false }
             return await childService.replaceIssuedCandidateReservations(
-                candidateCIDs
+                update
             )
         }
         await reservationGate.holdNext([])
@@ -5045,10 +5054,13 @@ final class NetworkTrustTests: XCTestCase {
                 return await runtime.directChildCandidates(context)
             },
             childCandidateReservationReconciler: {
-                [weak runtime = fixture.parentRuntime] references in
-                guard let runtime else { return references.isEmpty }
+                [weak runtime = fixture.parentRuntime] update in
+                guard let runtime else {
+                    return update.reservations.isEmpty
+                        && update.handoffs.isEmpty
+                }
                 return await runtime.reconcileChildCandidateReservations(
-                    references
+                    update
                 )
             },
             childProofPublisher: {
@@ -5072,9 +5084,9 @@ final class NetworkTrustTests: XCTestCase {
                     mode: context.mode
                 )
             },
-            candidateReservations: { [weak reservationGate] candidateCIDs in
+            candidateReservations: { [weak reservationGate] update in
                 guard let reservationGate else { return false }
-                return await reservationGate.handle(candidateCIDs)
+                return await reservationGate.handle(update)
             },
             admission: { _ in throw CancellationError() }
         )
@@ -5212,16 +5224,34 @@ final class NetworkTrustTests: XCTestCase {
                 ["returned"],
                 "a child withholding a release ACK must not stall its parent"
             )
+            // Mining acknowledges durable parent-side proof construction, not
+            // live delivery. The release update itself must transfer the CID
+            // into durable handoff ownership before discarding the speculative
+            // reservation.
+            for _ in 0..<250 {
+                if try await !store.parentEvidenceInbox().isEmpty {
+                    break
+                }
+                try await Task.sleep(for: .milliseconds(20))
+            }
+            let deliveredEvidence = try await store.parentEvidenceInbox()
+            XCTAssertFalse(deliveredEvidence.isEmpty)
             await reservationGate.release()
             let submission = try await submissionTask.value
             XCTAssertTrue(submission.accepted)
             let snapshotsAfterSubmission =
                 await reservationGate.snapshot()
+            let handoffsAfterSubmission =
+                await reservationGate.handoffSnapshot()
             XCTAssertGreaterThan(
                 snapshotsAfterSubmission.count,
                 snapshotsBeforeSubmission
             )
             XCTAssertEqual(snapshotsAfterSubmission.last, [])
+            XCTAssertTrue(
+                handoffsAfterSubmission.contains([childCID]),
+                "missing committed-candidate handoff: \(handoffsAfterSubmission)"
+            )
             for _ in 0..<250 {
                 if try await store.issuedContextualCandidateCIDs().isEmpty {
                     break
@@ -5261,15 +5291,15 @@ final class NetworkTrustTests: XCTestCase {
         let fixture = try await provisionalRootFixture(keyByte: 0x94)
         let issued = IssuedCandidateSet()
         let reservationGate = CandidateReservationAckGate {
-            [weak issued] candidateCIDs in
+            [weak issued] update in
             guard let issued else { return false }
-            return await issued.replace(with: candidateCIDs)
+            return await issued.replace(with: update.candidateCIDs)
         }
         await reservationGate.release()
         let childHandlers = NodeNetworkHandlers(
-            candidateReservations: { [weak reservationGate] candidateCIDs in
+            candidateReservations: { [weak reservationGate] update in
                 guard let reservationGate else { return false }
-                return await reservationGate.handle(candidateCIDs)
+                return await reservationGate.handle(update)
             },
             admission: { _ in throw CancellationError() }
         )
@@ -5302,7 +5332,9 @@ final class NetworkTrustTests: XCTestCase {
             var initiallyApplied = false
             for _ in 0..<250 {
                 if await fixture.parentRuntime
-                    .reconcileChildCandidateReservations([first]) {
+                    .reconcileChildCandidateReservations(
+                        ChildCandidateReservationUpdate(reservations: [first])
+                    ) {
                     initiallyApplied = true
                     break
                 }
@@ -5334,7 +5366,9 @@ final class NetworkTrustTests: XCTestCase {
             let completion = NetworkEventRecorder()
             let reconciliation = Task {
                 let accepted = await fixture.parentRuntime
-                    .reconcileChildCandidateReservations(newer)
+                    .reconcileChildCandidateReservations(
+                        ChildCandidateReservationUpdate(reservations: newer)
+                    )
                 await completion.append(accepted ? "accepted" : "rejected")
                 return accepted
             }
@@ -5381,15 +5415,15 @@ final class NetworkTrustTests: XCTestCase {
         let fixture = try await provisionalRootFixture(keyByte: 0x9a)
         let applied = IssuedCandidateSet()
         let reservationGate = CandidateReservationAckGate {
-            [weak applied] candidateCIDs in
+            [weak applied] update in
             guard let applied else { return false }
-            return await applied.replace(with: candidateCIDs)
+            return await applied.replace(with: update.candidateCIDs)
         }
         await reservationGate.release()
         let childHandlers = NodeNetworkHandlers(
-            candidateReservations: { [weak reservationGate] candidateCIDs in
+            candidateReservations: { [weak reservationGate] update in
                 guard let reservationGate else { return false }
-                return await reservationGate.handle(candidateCIDs)
+                return await reservationGate.handle(update)
             },
             admission: { _ in throw CancellationError() }
         )
@@ -5422,7 +5456,9 @@ final class NetworkTrustTests: XCTestCase {
             var initiallyApplied = false
             for _ in 0..<250 {
                 if await fixture.parentRuntime
-                    .reconcileChildCandidateReservations([first]) {
+                    .reconcileChildCandidateReservations(
+                        ChildCandidateReservationUpdate(reservations: [first])
+                    ) {
                     initiallyApplied = true
                     break
                 }
@@ -5435,7 +5471,9 @@ final class NetworkTrustTests: XCTestCase {
             )
             let expandedTask = Task {
                 await fixture.parentRuntime
-                    .reconcileChildCandidateReservations(expanded)
+                    .reconcileChildCandidateReservations(
+                        ChildCandidateReservationUpdate(reservations: expanded)
+                    )
             }
             for _ in 0..<250 {
                 if Set(await reservationGate.snapshot().last ?? [])
@@ -5453,7 +5491,9 @@ final class NetworkTrustTests: XCTestCase {
             let restored = NetworkEventRecorder()
             let restoreTask = Task {
                 let accepted = await fixture.parentRuntime
-                    .reconcileChildCandidateReservations([first])
+                    .reconcileChildCandidateReservations(
+                        ChildCandidateReservationUpdate(reservations: [first])
+                    )
                 await restored.append(accepted ? "accepted" : "rejected")
                 return accepted
             }
@@ -5500,15 +5540,15 @@ final class NetworkTrustTests: XCTestCase {
         let fixture = try await provisionalRootFixture(keyByte: 0x96)
         let applied = IssuedCandidateSet()
         let reservationGate = CandidateReservationAckGate {
-            [weak applied] candidateCIDs in
+            [weak applied] update in
             guard let applied else { return false }
-            return await applied.replace(with: candidateCIDs)
+            return await applied.replace(with: update.candidateCIDs)
         }
         await reservationGate.release()
         let childHandlers = NodeNetworkHandlers(
-            candidateReservations: { [weak reservationGate] candidateCIDs in
+            candidateReservations: { [weak reservationGate] update in
                 guard let reservationGate else { return false }
-                return await reservationGate.handle(candidateCIDs)
+                return await reservationGate.handle(update)
             },
             admission: { _ in throw CancellationError() }
         )
@@ -5546,7 +5586,9 @@ final class NetworkTrustTests: XCTestCase {
             var initiallyApplied = false
             for _ in 0..<250 {
                 if await fixture.parentRuntime
-                    .reconcileChildCandidateReservations([first]) {
+                    .reconcileChildCandidateReservations(
+                        ChildCandidateReservationUpdate(reservations: [first])
+                    ) {
                     initiallyApplied = true
                     break
                 }
@@ -5559,7 +5601,9 @@ final class NetworkTrustTests: XCTestCase {
             )
             let staleReconciliation = Task {
                 await fixture.parentRuntime
-                    .reconcileChildCandidateReservations(stale)
+                    .reconcileChildCandidateReservations(
+                        ChildCandidateReservationUpdate(reservations: stale)
+                    )
             }
             for _ in 0..<250 {
                 if Set(await reservationGate.snapshot().last ?? [])
@@ -5598,7 +5642,9 @@ final class NetworkTrustTests: XCTestCase {
             XCTAssertEqual(Set(reconnectedSnapshot ?? []), [first.candidateCID])
 
             let replacementAccepted = await fixture.parentRuntime
-                .reconcileChildCandidateReservations(replacement)
+                .reconcileChildCandidateReservations(
+                    ChildCandidateReservationUpdate(reservations: replacement)
+                )
             XCTAssertTrue(replacementAccepted)
             let replacementSnapshot = await reservationGate.snapshot().last
             XCTAssertEqual(
@@ -5621,7 +5667,9 @@ final class NetworkTrustTests: XCTestCase {
                 ),
             ]
             let finalAccepted = await fixture.parentRuntime
-                .reconcileChildCandidateReservations(final)
+                .reconcileChildCandidateReservations(
+                    ChildCandidateReservationUpdate(reservations: final)
+                )
             XCTAssertTrue(finalAccepted)
             let finalSnapshot = await reservationGate.snapshot().last
             XCTAssertEqual(

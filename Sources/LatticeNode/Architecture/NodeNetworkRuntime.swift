@@ -39,8 +39,18 @@ public typealias NetworkTransactionHandler = @Sendable (
 ) async throws -> Bool
 
 public typealias TransactionInventoryProvider = @Sendable () async -> [String]
+public struct NetworkCandidateReservationUpdate: Sendable {
+    public let candidateCIDs: [String]
+    public let handoffCIDs: [String]
+
+    public init(candidateCIDs: [String], handoffCIDs: [String]) {
+        self.candidateCIDs = candidateCIDs
+        self.handoffCIDs = handoffCIDs
+    }
+}
+
 public typealias NetworkCandidateReservationHandler = @Sendable (
-    _ candidateCIDs: [String]
+    _ update: NetworkCandidateReservationUpdate
 ) async -> Bool
 
 /// All service callbacks used by one network-runtime generation. Supplying the
@@ -707,9 +717,6 @@ public actor NodeNetworkRuntime: IvyDelegate {
                     "durable parent evidence could not be replayed"
                 )
             }
-            _ = try await process.beginContextualCandidateHandoff(
-                candidateCID: childCID
-            )
             candidates.append(CandidateSeed(
                 blockCID: childCID,
                 package: item.package
@@ -1016,11 +1023,13 @@ public actor NodeNetworkRuntime: IvyDelegate {
     /// direct-child process. Additions require a durable authenticated ack;
     /// disconnected removals are retried on the next session.
     public func reconcileChildCandidateReservations(
-        _ references: [ChildCandidateReservationReference]
+        _ update: ChildCandidateReservationUpdate
     ) async -> Bool {
-        guard isRunning else { return references.isEmpty }
+        guard isRunning else {
+            return update.reservations.isEmpty && update.handoffs.isEmpty
+        }
         var desired: [PeerKey: Set<String>] = [:]
-        for reference in Set(references) {
+        for reference in Set(update.reservations) {
             desired[reference.peerKey, default: []].insert(
                 reference.candidateCID
             )
@@ -1028,13 +1037,26 @@ public actor NodeNetworkRuntime: IvyDelegate {
                     <= ChildCandidateReservationRequestMessage.maximumCandidateCIDs
             else { return false }
         }
+        var handoffs: [PeerKey: Set<String>] = [:]
+        for reference in Set(update.handoffs) {
+            handoffs[reference.peerKey, default: []].insert(
+                reference.candidateCID
+            )
+            guard (desired[reference.peerKey]?.count ?? 0)
+                    + handoffs[reference.peerKey]!.count
+                    <= ChildCandidateReservationRequestMessage.maximumCandidateCIDs,
+                  desired[reference.peerKey]?.contains(reference.candidateCID)
+                    != true
+            else { return false }
+        }
         let currentPeers = Set(desiredCandidateReservations.keys)
-            .union(desired.keys)
+            .union(desired.keys).union(handoffs.keys)
         let alreadyTargeted = currentPeers.allSatisfy {
             (desired[$0] ?? []) == (desiredCandidateReservations[$0] ?? [])
         }
         if !candidateReservationReconciliationInFlight,
            alreadyTargeted,
+           handoffs.isEmpty,
            dirtyCandidateReservationPeers.allSatisfy({
                candidateReservationRemovalFlushes[$0] != nil
            }) {
@@ -1042,14 +1064,17 @@ public actor NodeNetworkRuntime: IvyDelegate {
         }
         await acquireCandidateReservationReconciliation()
         defer { releaseCandidateReservationReconciliation() }
-        guard isRunning, let process else { return references.isEmpty }
+        guard isRunning, let process else {
+            return update.reservations.isEmpty && update.handoffs.isEmpty
+        }
         let peers = Set(desiredCandidateReservations.keys)
-            .union(desired.keys)
+            .union(desired.keys).union(handoffs.keys)
             .sorted()
         let changedPeers = peers.filter { peerKey in
             let next = desired[peerKey] ?? []
             let previous = desiredCandidateReservations[peerKey] ?? []
             return next != previous
+                || !(handoffs[peerKey] ?? []).isEmpty
                 || dirtyCandidateReservationPeers.contains(peerKey)
         }
         let removalTargets = Dictionary(uniqueKeysWithValues:
@@ -1068,6 +1093,7 @@ public actor NodeNetworkRuntime: IvyDelegate {
         var requests: [(
             peerKey: PeerKey,
             target: Set<String>,
+            handoffs: Set<String>,
             childPath: [String],
             peer: AuthenticatedPeer
         )] = []
@@ -1085,7 +1111,10 @@ public actor NodeNetworkRuntime: IvyDelegate {
                 guard isCurrentRuntime(
                     generation: generation,
                     process: process
-                ) else { return references.isEmpty }
+                ) else {
+                    return update.reservations.isEmpty
+                        && update.handoffs.isEmpty
+                }
             }
             guard case .child(let childPath)? = hierarchyPeers[peerKey],
                   let peer = hierarchySessions[peerKey],
@@ -1099,7 +1128,13 @@ public actor NodeNetworkRuntime: IvyDelegate {
                 dirtyCandidateReservationPeers.insert(peerKey)
                 continue
             }
-            requests.append((peerKey, next, childPath, peer))
+            requests.append((
+                peerKey,
+                next,
+                handoffs[peerKey] ?? [],
+                childPath,
+                peer
+            ))
         }
         await withTaskGroup(of: CandidateReservationAttempt.self) { group in
             for request in requests {
@@ -1109,6 +1144,7 @@ public actor NodeNetworkRuntime: IvyDelegate {
                         target: request.target,
                         accepted: await self.requestCandidateReservation(
                             candidateCIDs: request.target.sorted(),
+                            handoffCIDs: request.handoffs.sorted(),
                             childPath: request.childPath,
                             peer: request.peer,
                             generation: generation,
@@ -1131,6 +1167,7 @@ public actor NodeNetworkRuntime: IvyDelegate {
             scheduleCandidateReservationRemoval(
                 peerKey: peerKey,
                 target: target,
+                handoffs: handoffs[peerKey] ?? [],
                 generation: generation,
                 process: process
             )
@@ -1141,6 +1178,7 @@ public actor NodeNetworkRuntime: IvyDelegate {
     private func scheduleCandidateReservationRemoval(
         peerKey: PeerKey,
         target: Set<String>,
+        handoffs: Set<String>,
         generation: UInt64,
         process: ChainProcess
     ) {
@@ -1152,6 +1190,7 @@ public actor NodeNetworkRuntime: IvyDelegate {
             await self?.flushCandidateReservationRemoval(
                 peerKey: peerKey,
                 target: target,
+                handoffs: handoffs,
                 token: token,
                 generation: generation,
                 process: process
@@ -1164,6 +1203,7 @@ public actor NodeNetworkRuntime: IvyDelegate {
     private func flushCandidateReservationRemoval(
         peerKey: PeerKey,
         target: Set<String>,
+        handoffs: Set<String>,
         token: UInt64,
         generation: UInt64,
         process: ChainProcess
@@ -1176,12 +1216,16 @@ public actor NodeNetworkRuntime: IvyDelegate {
         guard isCurrentRuntime(generation: generation, process: process) else {
             return
         }
-        guard desiredCandidateReservations[peerKey] == target,
-              case .child(let childPath)? = hierarchyPeers[peerKey],
+        // Flush every transition in order, even if a newer target arrived
+        // before this task started. A committed handoff belongs to this exact
+        // release and must never be collapsed away; the queued newer update
+        // will replace this target afterward.
+        guard case .child(let childPath)? = hierarchyPeers[peerKey],
               let peer = hierarchySessions[peerKey],
               childEvidenceReadyPeers.contains(peerKey) else { return }
         let accepted = await requestCandidateReservation(
             candidateCIDs: target.sorted(),
+            handoffCIDs: handoffs.sorted(),
             childPath: childPath,
             peer: peer,
             generation: generation,
@@ -1322,7 +1366,10 @@ public actor NodeNetworkRuntime: IvyDelegate {
             return
         }
         let accepted = await handlers?.candidateReservations?(
-            request.candidateCIDs
+            NetworkCandidateReservationUpdate(
+                candidateCIDs: request.candidateCIDs,
+                handoffCIDs: request.handoffCIDs
+            )
         ) ?? false
         guard isCurrentRuntime(generation: generation, process: process),
               parentEvidenceSession(for: peer) == session,
@@ -2966,9 +3013,6 @@ public actor NodeNetworkRuntime: IvyDelegate {
                 attachment: attachment,
                 package: gated,
                 advanceScan: advanceScan
-            )
-            _ = try await process.beginContextualCandidateHandoff(
-                candidateCID: summary.childCID
             )
         } catch {
             return false
@@ -4624,6 +4668,7 @@ public actor NodeNetworkRuntime: IvyDelegate {
 
     private func requestCandidateReservation(
         candidateCIDs: [String],
+        handoffCIDs: [String] = [],
         childPath: [String],
         peer: AuthenticatedPeer,
         generation: UInt64,
@@ -4636,7 +4681,8 @@ public actor NodeNetworkRuntime: IvyDelegate {
         let request = ChildCandidateReservationRequestMessage(
             requestID: makeRequestID(),
             childPath: childPath,
-            candidateCIDs: candidateCIDs
+            candidateCIDs: candidateCIDs,
+            handoffCIDs: handoffCIDs
         )
         guard let payload = try? request.encoded() else { return false }
         let accepted = await withCheckedContinuation { continuation in

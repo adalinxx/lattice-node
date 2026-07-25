@@ -78,6 +78,9 @@ cross-component invariants:
   still serves that exact candidate from durable Volumes; more than one
   offer window of abandoned parent carriers cannot evict an issued candidate,
   and a later exact snapshot releases obsolete offers and reservations;
+- parent admission hands each committed child CID off in the authenticated
+  reservation update before release, so asynchronous proof delivery and
+  garbage collection cannot race away the candidate;
 - successor attachments received before child genesis wait on their exact
   same-chain predecessor instead of being misclassified as malformed genesis;
 - a suspended authenticated direct child cannot block a healthy sibling's

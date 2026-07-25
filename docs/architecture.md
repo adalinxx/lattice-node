@@ -128,11 +128,14 @@ referenced by its live template book and receives a durable acknowledgement.
 The child recursively reserves its own descendants, atomically replaces its
 issued set, and then releases every unselected offer. Additions require the
 durable acknowledgement; removals run in order without making parent progress
-wait on a child. On parent-proof receipt, the child first moves the referenced
-candidate into a durable admission handoff, so reservation release cannot race
-proof recovery or garbage collection. Offer churn can evict only offers; it
-cannot evict issued or handoff candidates. Lost acknowledgements can therefore
-over-retain, never under-retain, and the next exact snapshot reconciles the set.
+wait on a child. When a parent commits a candidate, its next authenticated
+reservation update atomically moves that CID into durable admission-handoff
+ownership before releasing the speculative reservation. The same update
+recursively hands off committed descendants. Parent-proof delivery and recovery
+remain independent, so neither a delayed announcement nor garbage collection
+can lose committed content. Offer churn can evict only offers; it cannot evict
+issued or handoff candidates. Lost acknowledgements can therefore over-retain,
+never under-retain, and the next exact snapshot reconciles the set.
 Every hierarchy level applies the same rule. A reconnecting child is omitted
 from candidate selection until the final page of its durable evidence index is
 ordered into that session. The index resumes from a durable

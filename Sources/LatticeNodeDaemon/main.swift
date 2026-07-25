@@ -112,10 +112,13 @@ struct LatticeNodeCommand: AsyncParsableCommand {
                 guard let network else { return [] }
                 return await network.directChildCandidates(context)
             },
-            childCandidateReservationReconciler: { [weak network] references in
-                guard let network else { return references.isEmpty }
+            childCandidateReservationReconciler: { [weak network] update in
+                guard let network else {
+                    return update.reservations.isEmpty
+                        && update.handoffs.isEmpty
+                }
                 return await network.reconcileChildCandidateReservations(
-                    references
+                    update
                 )
             },
             childProofPublisher: { [weak network] publication in
@@ -146,10 +149,10 @@ struct LatticeNodeCommand: AsyncParsableCommand {
                     mode: context.mode
                 )
             },
-            candidateReservations: { [weak service] candidateCIDs in
+            candidateReservations: { [weak service] update in
                 guard let service else { return false }
                 return await service.replaceIssuedCandidateReservations(
-                    candidateCIDs
+                    update
                 )
             },
             admission: { [weak service] admission in
