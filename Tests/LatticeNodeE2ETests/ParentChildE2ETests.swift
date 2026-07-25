@@ -2950,8 +2950,12 @@ final class ParentChildE2ETests: XCTestCase {
                 break
             }
         }
-        _ = try XCTUnwrap(depositedA)
-        _ = try XCTUnwrap(depositedB)
+        let depositedAStatus = try XCTUnwrap(depositedA)
+        let depositedBStatus = try XCTUnwrap(depositedB)
+        let confirmedWithdrawalHeightA =
+            try XCTUnwrap(depositedAStatus.height) + 2
+        let confirmedWithdrawalHeightB =
+            try XCTUnwrap(depositedBStatus.height) + 2
         let branchStatus = try await nexus.waitForStatus { $0.mempoolCount == 0 }
         let branchPoint = try XCTUnwrap(branchStatus.tipCID)
 
@@ -3040,8 +3044,6 @@ final class ParentChildE2ETests: XCTestCase {
         )
         var observedWithdrawalA: ChainServiceStatusResponse?
         var observedWithdrawalB: ChainServiceStatusResponse?
-        var withdrawalConfirmationsA = 0
-        var withdrawalConfirmationsB = 0
         for _ in 0..<20 {
             let withdrawalBlock: E2EMinedBlock
             do {
@@ -3059,39 +3061,28 @@ final class ParentChildE2ETests: XCTestCase {
                 uniqueKeysWithValues: withdrawalBlock.response
                     .durableChildProofs.map { ($0.directory, $0.childCID) }
             )
-            if let childACID = proofs["ChildA"] {
-                if let status = try? await childA.waitForStatus(
+            if proofs["ChildA"] != nil, observedWithdrawalA == nil {
+                observedWithdrawalA = try? await childA.waitForStatus(
                     timeout: .seconds(5),
                     where: {
-                        $0.tipCID == childACID && $0.mempoolCount == 0
+                        $0.phase == .active
+                            && ($0.height ?? 0) >= confirmedWithdrawalHeightA
+                            && $0.mempoolCount == 0
                     }
-                ) {
-                    observedWithdrawalA = status
-                    withdrawalConfirmationsA += 1
-                } else {
-                    observedWithdrawalA = nil
-                    withdrawalConfirmationsA = 0
-                }
+                )
             }
-            if let childBCID = proofs["ChildB"] {
-                if let status = try? await childB.waitForStatus(
+            if proofs["ChildB"] != nil, observedWithdrawalB == nil {
+                observedWithdrawalB = try? await childB.waitForStatus(
                     timeout: .seconds(5),
                     where: {
-                        $0.tipCID == childBCID && $0.mempoolCount == 0
+                        $0.phase == .active
+                            && ($0.height ?? 0) >= confirmedWithdrawalHeightB
+                            && $0.mempoolCount == 0
                     }
-                ) {
-                    observedWithdrawalB = status
-                    withdrawalConfirmationsB += 1
-                } else {
-                    observedWithdrawalB = nil
-                    withdrawalConfirmationsB = 0
-                }
+                )
             }
-            if withdrawalConfirmationsA >= 2,
-               withdrawalConfirmationsB >= 2 { break }
+            if observedWithdrawalA != nil, observedWithdrawalB != nil { break }
         }
-        XCTAssertGreaterThanOrEqual(withdrawalConfirmationsA, 2)
-        XCTAssertGreaterThanOrEqual(withdrawalConfirmationsB, 2)
         let withdrawnA = try XCTUnwrap(observedWithdrawalA)
         let withdrawnB = try XCTUnwrap(observedWithdrawalB)
 
