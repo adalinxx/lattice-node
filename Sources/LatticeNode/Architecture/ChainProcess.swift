@@ -1152,10 +1152,6 @@ public actor ChainProcess: ContentSource, Fetcher, VolumeStorer {
         )
     }
 
-    public func hasIssuedChildDirectory(_ directory: String) async throws -> Bool {
-        try await store.hasIssuedChildDirectory(directory)
-    }
-
     func prepareChildProofs(
         for candidate: Block,
         children selectedChildren: [DirectChildCandidate] = [],

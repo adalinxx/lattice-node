@@ -923,7 +923,9 @@ final class NodeStoreTests: XCTestCase {
             throughOrdinal: UInt64(Int64.max),
             limit: 2
         )
-        XCTAssertTrue(betaSummaries.isEmpty)
+        XCTAssertEqual(betaSummaries.count, 1)
+        XCTAssertEqual(betaSummaries.first?.childCID, childCID)
+        XCTAssertEqual(betaSummaries.first?.rootCID, carrierHeader.rawCID)
     }
 
     func testIssuedCarrierEvidencePersistsProofAndLinkTogether() async throws {
