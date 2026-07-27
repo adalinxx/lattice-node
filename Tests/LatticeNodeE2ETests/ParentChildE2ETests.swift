@@ -2786,7 +2786,7 @@ final class ParentChildE2ETests: XCTestCase {
         passed = true
     }
 
-    func testTwoChildExchangeStateDoesNotCrossHeavierNexusFork() async throws {
+    func testSidewaysParentForkStateDoesNotAdmitChildWithdrawals() async throws {
         let workspace = try E2EWorkspace()
         let cluster = E2ECluster()
         var passed = false
@@ -3243,6 +3243,372 @@ final class ParentChildE2ETests: XCTestCase {
         passed = true
     }
 
+    func testTransitiveParentContinuityAdmitsWithdrawal() async throws {
+        let workspace = try E2EWorkspace()
+        let cluster = E2ECluster()
+        var passed = false
+        defer {
+            cluster.forceTerminateAll()
+            if passed {
+                try? workspace.remove()
+            } else {
+                print("lattice-node E2E artifacts retained at \(workspace.url.path)")
+            }
+        }
+
+        let binary = try E2EBinary.latticeNode()
+        let parentIdentity = try workspace.makeIdentity(named: "nexus")
+        let childIdentity = try workspace.makeIdentity(named: "market")
+        let parentKey = try PeerKey(parentIdentity.publicKey)
+        let ports = try E2EPorts.allocate(count: 6)
+        let parent = nexusNode(
+            binary: binary,
+            workspace: workspace,
+            name: "nexus",
+            identity: parentIdentity,
+            overlayPort: ports[0],
+            factPort: ports[1],
+            rpcPort: ports[2]
+        )
+        let child = childNode(
+            binary: binary,
+            workspace: workspace,
+            name: "market",
+            directory: "Market",
+            identity: childIdentity,
+            parentPublicKey: parentKey.hex,
+            parentFactPort: ports[1],
+            overlayPort: ports[3],
+            factPort: ports[4],
+            rpcPort: ports[5]
+        )
+        cluster.add(parent)
+        cluster.add(child)
+
+        try parent.start()
+        try child.start()
+        _ = try await waitForNexus(parent)
+        _ = try await child.waitForStatus { $0.phase == .awaitingGenesis }
+
+        let seller = CryptoUtils.generateKeyPair()
+        let buyer = CryptoUtils.generateKeyPair()
+        let sellerAddress = CryptoUtils.createAddress(from: seller.publicKey)
+        let buyerAddress = CryptoUtils.createAddress(from: buyer.publicKey)
+        let childPath = ["Nexus", "Market"]
+        let depositAmount: UInt64 = 100
+        let demandAmount: UInt64 = 250
+        let exchangeNonce: UInt128 = 7
+        let intent = try await fundedChildIntent(
+            on: parent,
+            directory: "Market",
+            owner: seller,
+            premine: 1_000,
+            timestamp: 1
+        )
+        try await submitGenesisAnchor(
+            on: parent,
+            intent: intent,
+            chainPath: ["Nexus"]
+        )
+        let buyerFunding = try signedTransaction(
+            key: buyer,
+            chainPath: ["Nexus"],
+            accountActions: [
+                AccountAction(owner: buyerAddress, delta: Int64(demandAmount)),
+            ],
+            nonce: 0
+        )
+        let deployment = try await mineBlock(
+            parent,
+            rewards: [
+                MiningReward(
+                    chainPath: ["Nexus"],
+                    transaction: buyerFunding
+                ),
+            ],
+            mode: .deployment
+        )
+        XCTAssertTrue(deployment.response.accepted)
+        _ = try await waitForTip(child, intent.genesisCID)
+
+        let deposit = try signedTransaction(
+            key: seller,
+            chainPath: childPath,
+            accountActions: [
+                AccountAction(
+                    owner: sellerAddress,
+                    delta: -Int64(depositAmount)
+                ),
+            ],
+            depositActions: [
+                DepositAction(
+                    nonce: exchangeNonce,
+                    demander: sellerAddress,
+                    amountDemanded: demandAmount,
+                    amountDeposited: depositAmount
+                ),
+            ],
+            nonce: 0
+        )
+        let _: SubmitTransactionResponse = try await child.post(
+            "/v1/transactions",
+            body: SubmitTransactionRequest(transaction: deposit)
+        )
+        var deposited: ChainServiceStatusResponse?
+        for _ in 0..<5 {
+            let work = try await mine(parent)
+            XCTAssertTrue(work.accepted)
+            deposited = try? await child.waitForStatus(
+                timeout: .seconds(2),
+                where: {
+                    $0.mempoolCount == 0 && ($0.height ?? 0) > 0
+                }
+            )
+            if deposited != nil { break }
+        }
+        let depositedStatus = try XCTUnwrap(deposited)
+        let depositedTip = try XCTUnwrap(depositedStatus.tipCID)
+        let depositedHeight = try XCTUnwrap(depositedStatus.height)
+        let parentBeforeAdvance = try await parent.waitForStatus {
+            $0.phase == .active && $0.mempoolCount == 0
+        }
+        let parentHeightBeforeAdvance = try XCTUnwrap(parentBeforeAdvance.height)
+
+        let receipt = try signedTransaction(
+            key: buyer,
+            chainPath: ["Nexus"],
+            receiptActions: [
+                ReceiptAction(
+                    withdrawer: buyerAddress,
+                    nonce: exchangeNonce,
+                    demander: sellerAddress,
+                    amountDemanded: demandAmount,
+                    directory: "Market"
+                ),
+            ],
+            nonce: 1
+        )
+        let _: SubmitTransactionResponse = try await parent.post(
+            "/v1/transactions",
+            body: SubmitTransactionRequest(transaction: receipt)
+        )
+
+        // Keep the child idle while the receipt and two further parent blocks
+        // commit. Its next block must prove a multi-edge parent-state path.
+        try await child.stop()
+        for _ in 0..<3 {
+            let work = try await mine(parent)
+            XCTAssertTrue(work.accepted)
+        }
+        let advancedParent = try await parent.waitForStatus {
+            $0.phase == .active && $0.mempoolCount == 0
+        }
+        XCTAssertGreaterThanOrEqual(
+            try XCTUnwrap(advancedParent.height),
+            parentHeightBeforeAdvance + 3
+        )
+
+        try child.start()
+        _ = try await waitForTip(child, depositedTip)
+        let withdrawal = try signedTransaction(
+            key: buyer,
+            chainPath: childPath,
+            accountActions: [
+                AccountAction(
+                    owner: buyerAddress,
+                    delta: Int64(depositAmount)
+                ),
+            ],
+            withdrawalActions: [
+                WithdrawalAction(
+                    withdrawer: buyerAddress,
+                    nonce: exchangeNonce,
+                    demander: sellerAddress,
+                    amountDemanded: demandAmount,
+                    amountWithdrawn: depositAmount
+                ),
+            ],
+            nonce: 0
+        )
+        let _: SubmitTransactionResponse = try await child.post(
+            "/v1/transactions",
+            body: SubmitTransactionRequest(transaction: withdrawal)
+        )
+        var withdrawn: ChainServiceStatusResponse?
+        for _ in 0..<5 {
+            let work = try await mine(parent)
+            XCTAssertTrue(work.accepted)
+            withdrawn = try? await child.waitForStatus(
+                timeout: .seconds(3),
+                where: {
+                    $0.mempoolCount == 0
+                        && ($0.height ?? 0) > depositedHeight
+                }
+            )
+            if withdrawn != nil { break }
+        }
+        XCTAssertNotEqual(try XCTUnwrap(withdrawn).tipCID, depositedTip)
+
+        try await cluster.stopAll()
+        passed = true
+    }
+
+    func testParentOfflineContinuityDefersAndRequeuesReplicaCandidate()
+        async throws {
+        let workspace = try E2EWorkspace()
+        let cluster = E2ECluster()
+        var passed = false
+        let ports = try E2EPorts.allocate(count: 10)
+        E2EPorts.release([ports[9]])
+        let parentProxy = LoopbackTCPFaultProxy(
+            listenPort: ports[9],
+            targetPort: ports[1]
+        )
+        defer {
+            parentProxy.stop()
+            try? E2EPorts.reserve([ports[9]])
+            cluster.forceTerminateAll()
+            if passed {
+                try? workspace.remove()
+            } else {
+                print("lattice-node E2E artifacts retained at \(workspace.url.path)")
+            }
+        }
+
+        let binary = try E2EBinary.latticeNode()
+        let parentIdentity = try workspace.makeIdentity(named: "nexus")
+        let aIdentity = try workspace.makeIdentity(named: "payments-a")
+        let bIdentity = try workspace.makeIdentity(named: "payments-b")
+        let parentKey = try PeerKey(parentIdentity.publicKey)
+        let aPeer = try overlayPeer(identity: aIdentity, port: ports[3])
+        let bPeer = try overlayPeer(identity: bIdentity, port: ports[6])
+        let parent = nexusNode(
+            binary: binary,
+            workspace: workspace,
+            name: "nexus",
+            identity: parentIdentity,
+            overlayPort: ports[0],
+            factPort: ports[1],
+            rpcPort: ports[2]
+        )
+        let a = childNode(
+            binary: binary,
+            workspace: workspace,
+            name: "payments-a",
+            directory: "Payments",
+            identity: aIdentity,
+            parentPublicKey: parentKey.hex,
+            parentFactPort: ports[1],
+            overlayPort: ports[3],
+            factPort: ports[4],
+            rpcPort: ports[5],
+            overlayPeers: [bPeer]
+        )
+        let b = childNode(
+            binary: binary,
+            workspace: workspace,
+            name: "payments-b",
+            directory: "Payments",
+            identity: bIdentity,
+            parentPublicKey: parentKey.hex,
+            parentFactPort: ports[9],
+            overlayPort: ports[6],
+            factPort: ports[7],
+            rpcPort: ports[8],
+            overlayPeers: [aPeer]
+        )
+        cluster.add(parent)
+        cluster.add(a)
+        cluster.add(b)
+
+        try parentProxy.start()
+        try parent.start()
+        try a.start()
+        try b.start()
+        _ = try await waitForNexus(parent)
+        try await parentProxy.waitForConnections(1)
+        let owner = CryptoUtils.generateKeyPair()
+        let ownerAddress = CryptoUtils.createAddress(from: owner.publicKey)
+        let sinkAddress = CryptoUtils.createAddress(
+            from: CryptoUtils.generateKeyPair().publicKey
+        )
+        let intent = try await fundedChildIntent(
+            on: parent,
+            directory: "Payments",
+            owner: owner,
+            premine: 1_000,
+            timestamp: 1
+        )
+        try await submitGenesisAnchor(
+            on: parent,
+            intent: intent,
+            chainPath: ["Nexus"]
+        )
+        let deployment = try await mine(parent, mode: .deployment)
+        XCTAssertTrue(deployment.accepted)
+        _ = try await waitForTip(a, intent.genesisCID)
+        _ = try await waitForTip(b, intent.genesisCID)
+
+        try await b.stop()
+        try await a.stop()
+        for _ in 0..<3 {
+            let work = try await mine(parent)
+            XCTAssertTrue(work.accepted)
+        }
+        try a.start()
+        try b.start()
+        _ = try await waitForTip(a, intent.genesisCID)
+        _ = try await waitForTip(b, intent.genesisCID)
+        try await parentProxy.waitForConnections(2)
+
+        let transfer = try signedTransaction(
+            key: owner,
+            chainPath: ["Nexus", "Payments"],
+            accountActions: [
+                AccountAction(owner: ownerAddress, delta: -1),
+                AccountAction(owner: sinkAddress, delta: 1),
+            ],
+            nonce: 0
+        )
+        let _: SubmitTransactionResponse = try await a.post(
+            "/v1/transactions",
+            body: SubmitTransactionRequest(transaction: transfer)
+        )
+        _ = try await a.waitForStatus { $0.mempoolCount == 1 }
+        _ = try await b.waitForStatus { $0.mempoolCount == 1 }
+
+        parentProxy.cut()
+        try await parentProxy.waitForNoActiveConnections()
+        var admittedByA: ChainServiceStatusResponse?
+        for _ in 0..<5 {
+            let work = try await mine(parent)
+            XCTAssertTrue(work.accepted)
+            admittedByA = try? await a.waitForStatus(
+                timeout: .seconds(3),
+                where: {
+                    $0.tipCID != intent.genesisCID
+                        && $0.mempoolCount == 0
+                }
+            )
+            if admittedByA != nil { break }
+        }
+        let admitted = try XCTUnwrap(admittedByA)
+        let deferred = try await b.waitForStatus {
+            $0.tipCID == intent.genesisCID && $0.mempoolCount == 1
+        }
+        XCTAssertEqual(deferred.height, 0)
+
+        parentProxy.heal()
+        try await parentProxy.waitForConnections(3)
+        let replayed = try await b.waitForStatus {
+            $0.tipCID == admitted.tipCID && $0.mempoolCount == 0
+        }
+        XCTAssertEqual(replayed.height, admitted.height)
+
+        try await cluster.stopAll()
+        passed = true
+    }
+
     private func nexusNode(
         binary: URL,
         workspace: E2EWorkspace,
@@ -3277,7 +3643,8 @@ final class ParentChildE2ETests: XCTestCase {
         parentFactPort: UInt16,
         overlayPort: UInt16,
         factPort: UInt16,
-        rpcPort: UInt16
+        rpcPort: UInt16,
+        overlayPeers: [E2ENode.OverlayPeer] = []
     ) -> E2ENode {
         E2ENode(
             binary: binary,
@@ -3289,6 +3656,7 @@ final class ParentChildE2ETests: XCTestCase {
                 overlayPort: overlayPort,
                 factPort: factPort,
                 rpcPort: rpcPort,
+                overlayPeers: overlayPeers,
                 parent: .init(publicKey: parentPublicKey, factPort: parentFactPort)
             ),
             logDirectory: workspace.logs

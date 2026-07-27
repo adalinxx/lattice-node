@@ -393,6 +393,7 @@ public actor NodeNetworkRuntime: IvyDelegate {
     private static let maximumDirectChildren = 64
     private static let maximumConcurrentChildBuilds = 8
     private static let maximumConcurrentParentStateQueries = 64
+    private static let maximumParentStateContinuityBlockVisits = 4_096
     private static let maximumPeersPerChildPath = 4
     private static let maximumReconnectEvidenceAnnouncements = 64
     private static let maximumReconnectCarrierRoots = 64
@@ -3054,7 +3055,9 @@ public actor NodeNetworkRuntime: IvyDelegate {
             case .continuity(let fromStateCID, let toStateCID):
                 found = await process.hasParentStateContinuity(
                     from: fromStateCID,
-                    to: toStateCID
+                    to: toStateCID,
+                    maximumBlockVisits:
+                        Self.maximumParentStateContinuityBlockVisits
                 )
             }
             guard found else { return }
