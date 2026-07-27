@@ -1105,12 +1105,14 @@ public actor ChainProcess: ContentSource, Fetcher, VolumeStorer {
     /// Query this process's recovered graph of connected, validated blocks.
     func hasParentStateContinuity(
         from fromStateCID: String,
-        to toStateCID: String
+        to toStateCID: String,
+        maximumBlockVisits: Int
     ) async -> Bool {
         guard case .active(let level) = runtimePhase else { return false }
         return await level.chain.hasStateContinuity(
             from: fromStateCID,
-            to: toStateCID
+            to: toStateCID,
+            maximumBlockVisits: maximumBlockVisits
         )
     }
 
