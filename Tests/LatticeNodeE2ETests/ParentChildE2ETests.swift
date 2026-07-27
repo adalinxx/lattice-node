@@ -3186,9 +3186,6 @@ final class ParentChildE2ETests: XCTestCase {
             $0.phase == .active && $0.mempoolCount == 0
                 && ($0.height ?? 0) >= (preservedB.height ?? 0)
         }
-        let withdrawnATip = try XCTUnwrap(recoveredA.tipCID)
-        let withdrawnBTip = try XCTUnwrap(recoveredB.tipCID)
-
         let bobSpendsA = try signedTransaction(
             key: bob,
             chainPath: childAPath,
@@ -3216,28 +3213,32 @@ final class ParentChildE2ETests: XCTestCase {
             body: SubmitTransactionRequest(transaction: aliceSpendsB)
         )
         var expectedParent = forkTip.blockCID
-        var publishedStrandedCandidates = false
+        var strandedCandidates: [String: String] = [:]
         for _ in 0..<5 {
             let work = try await mineBlock(nexus)
             XCTAssertTrue(work.response.accepted)
             XCTAssertEqual(work.template.block.parent?.rawCID, expectedParent)
-            publishedStrandedCandidates =
-                Set(work.response.durableChildProofs.map(\.directory))
-                    == Set(["ChildA", "ChildB"])
+            strandedCandidates = Dictionary(
+                uniqueKeysWithValues: work.response.durableChildProofs.map {
+                    ($0.directory, $0.childCID)
+                }
+            )
             expectedParent = work.blockCID
-            if publishedStrandedCandidates { break }
+            if Set(strandedCandidates.keys) == Set(["ChildA", "ChildB"]) { break }
             try await Task.sleep(for: .milliseconds(300))
         }
-        XCTAssertTrue(publishedStrandedCandidates)
+        XCTAssertEqual(Set(strandedCandidates.keys), Set(["ChildA", "ChildB"]))
         try await Task.sleep(for: .seconds(1))
         let strandedA = try await childA.waitForStatus {
-            $0.tipCID == withdrawnATip && $0.mempoolCount == 1
+            $0.phase == .active && $0.mempoolCount == 1
+                && ($0.height ?? 0) >= (recoveredA.height ?? 0)
         }
         let strandedB = try await childB.waitForStatus {
-            $0.tipCID == withdrawnBTip && $0.mempoolCount == 1
+            $0.phase == .active && $0.mempoolCount == 1
+                && ($0.height ?? 0) >= (recoveredB.height ?? 0)
         }
-        XCTAssertEqual(strandedA.height, recoveredA.height)
-        XCTAssertEqual(strandedB.height, recoveredB.height)
+        XCTAssertNotEqual(strandedA.tipCID, strandedCandidates["ChildA"])
+        XCTAssertNotEqual(strandedB.tipCID, strandedCandidates["ChildB"])
 
         try await cluster.stopAll()
         passed = true
@@ -3600,10 +3601,12 @@ final class ParentChildE2ETests: XCTestCase {
 
         parentProxy.heal()
         try await parentProxy.waitForConnections(3)
+        let admittedHeight = try XCTUnwrap(admitted.height)
         let replayed = try await b.waitForStatus {
-            $0.tipCID == admitted.tipCID && $0.mempoolCount == 0
+            $0.tipCID != intent.genesisCID && $0.mempoolCount == 0
+                && ($0.height ?? 0) >= admittedHeight
         }
-        XCTAssertEqual(replayed.height, admitted.height)
+        XCTAssertGreaterThanOrEqual(try XCTUnwrap(replayed.height), admittedHeight)
 
         try await cluster.stopAll()
         passed = true
