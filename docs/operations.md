@@ -80,12 +80,13 @@ lattice-node \
   --rpc-port 8180
 ```
 
-The parent endpoint is an authority boundary, not merely a bootstrap hint. Back
-up the configured parent key and child process identity as operational secrets.
-Same-chain peers can relay parent-signed genesis and continuity facts, so losing
-the live parent does not revoke already verified history or fork choice. A child
-needs its configured parent, directly or through a portable signed fact, only
-when admission requires a new parent-state continuity or genesis authorization.
+The parent endpoint is a live verdict boundary, not merely a bootstrap hint.
+Back up the configured parent key and child process identity as operational
+secrets. Losing the live parent does not revoke already admitted history or
+fork choice, but new child admissions that change parent state wait until the
+authenticated immediate parent can acknowledge the exact continuity or genesis
+query. Same-chain peers may restore the required Volumes; they cannot relay the
+parent's unsigned session-bound answer.
 
 For application testing, deploy a normal child with test-oriented parameters.
 Nexus retains its one pinned genesis.
@@ -174,6 +175,6 @@ matched backup pair or wipe the entire process directory and resync.
 - Keep process private keys mode `0600`; startup rejects broader permissions.
 - Keep RPC loopback-only. Authenticate any proxy that exposes it beyond the
   host.
-- Treat `--parent` as a pinned authority configuration.
+- Treat `--parent` as a pinned live-verdict configuration.
 - Firewall the hierarchy plane to intended parent/child hosts where possible.
 - Use distinct storage and identity paths per chain process.

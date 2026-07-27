@@ -158,18 +158,17 @@ request is CID-stable and refreshes one offer instead of consuming another.
    `GenesisAction`, then submit it to `POST /v1/transactions`.
 4. External mining commits that transaction and child block in a parent
    carrier.
-5. The parent durably prepares and publishes the direct-child proof. The child
-   verifies the authenticated link, derives the child's work from the proof,
-   and becomes `active`.
+5. The parent durably prepares and publishes the direct-child proof. It also
+   acknowledges the exact deployment fact from its accepted graph. The child
+   verifies the proof, requires its `parentState` to equal the deployment
+   block's entering state, and becomes `active`.
 
 There is no opaque genesis byte channel. The parent retains the complete Cashew
-Volumes it created for genesis and is the fresh child's preferred source. An
-exact same-chain advertiser may supply the same CID-verified Volumes when the
-parent cannot; the signed genesis link still supplies authority. After genesis,
-same-chain peers may likewise supply proof Volumes and portable signed
-parent-state continuity certificates. A parent need only be reachable when a
-new continuity fact has not already been acquired. Previously verified history
-and fork choice do not depend on a live session.
+Volumes it created for genesis, while any exact same-chain advertiser may
+supply the same CID-verified Volumes. The authenticated immediate-parent process
+alone acknowledges the exact accepted deployment tuple and later forward
+parent-state movements from its recovered validated graph. These positive
+acknowledgements are unsigned, session-bound, and non-portable.
 
 The process that directly parents an edge retains only its sparse commitment
 proof. Ordinary child validation Volumes remain child-chain data. Admission stages a
@@ -183,7 +182,7 @@ Parent and child retain the same child-evidence proof attachment, but acquire it
 at different moments. The semantic direct edge is indexed in SQLite and derived
 from that proof when read; it is not stored again as a second Volume. The parent
 retains the edge it issued; the child retains the edge it validated and may
-relay signed root attachments to same-chain peers.
+relay complete content-verified root Volumes to same-chain peers.
 The child never returns topology or derived work to its parent. Work is derived
 from the child proof and remains entirely inside the child process.
 

@@ -206,8 +206,6 @@ public actor ChainProcess: ContentSource, Fetcher, VolumeStorer {
             databasePath: configuration.storagePath.appendingPathComponent("state.db"),
             nexusGenesisCID: configuration.nexusGenesisCID,
             chainPath: configuration.chainPath,
-            spawningParentKey: configuration.parentEndpoint?.publicKey ?? "",
-            issuingAuthorityKey: configuration.processPublicKey,
             recoveryVolumeBroker: broker,
             issuedRecoveryRetentionScope: issuedHierarchyRetentionScope,
             preparedRecoveryRetentionScope: preparedHierarchyRetentionScope,
@@ -475,9 +473,40 @@ public actor ChainProcess: ContentSource, Fetcher, VolumeStorer {
             fetcher: attemptFetcher
         )
         if let predecessorCID = bootstrapCandidate.parent?.rawCID {
+            let relayLink: ParentCarrierLink
+            switch await package.verifiedCarrierLink(
+                child: bootstrapCandidate,
+                chainPath: configuration.chainPath
+            ) {
+            case .success(let link):
+                relayLink = link
+            case .failure(.crossChainEvidenceRequired(let requirement)):
+                return NodeAdmissionOutcome(
+                    decision: .unavailable(requirement),
+                    parentCarrierLink: nil,
+                    sameChainPredecessor: nil
+                )
+            case .failure(.malformedEvidence),
+                 .failure(.protocolInvalid):
+                return NodeAdmissionOutcome(
+                    decision: .invalid,
+                    parentCarrierLink: nil,
+                    sameChainPredecessor: nil
+                )
+            }
+            let evidence = try await Self.canonicalCarrierEvidence(
+                blockHeader,
+                authenticatedPackage: authenticatedChildPackage,
+                fetcher: attemptFetcher
+            )
+            try await persistHierarchyArtifacts(
+                relayLink,
+                carrierEvidence: evidence,
+                pendingChildProofRoutes: pendingChildProofRoutes
+            )
             return NodeAdmissionOutcome(
                 decision: .unavailable(nil),
-                parentCarrierLink: nil,
+                parentCarrierLink: relayLink,
                 sameChainPredecessor: SameChainPredecessorRequirement(
                     descendantCID: blockHeader.rawCID,
                     predecessorCID: predecessorCID
@@ -596,13 +625,7 @@ public actor ChainProcess: ContentSource, Fetcher, VolumeStorer {
             return nil
         }
         return AuthenticatedChildPackage(
-            package: ChildValidationPackage(
-                proof: evidence.proof,
-                parentCarrierLink: evidence.parentCarrierLink,
-                parentGenesisLink: evidence.parentGenesisLink
-            ),
-            parentCarrierCertificate: evidence.parentCarrierCertificate,
-            parentGenesisCertificate: evidence.parentGenesisCertificate
+            package: ChildValidationPackage(proof: evidence.proof)
         )
     }
 
@@ -726,13 +749,20 @@ public actor ChainProcess: ContentSource, Fetcher, VolumeStorer {
 
         let decision = NodeAdmissionDecision(result)
         let admissionStaged = result.commit != nil
-        if !admissionStaged,
+        // A disconnected accepted block is not yet a parent-fact issuer, but
+        // its content-verified carrier remains valid relay data for deeper
+        // chains. Persist that relay with no genesis facts; a later duplicate
+        // retry promotes the exact genesis facts after the predecessor connects.
+        if (!admissionStaged || result.sameChainPredecessor != nil),
            let link = result.parentCarrierLink {
             try await store.persistIssuedHierarchyArtifacts(
                 AdmissionHierarchyArtifacts(
                     carrierLink: link,
                     carrierEvidence: carrierEvidence,
-                    parentGenesisLinks: directParentGenesisLinks
+                    parentGenesisLinks: decision.isAccepted
+                        && result.sameChainPredecessor == nil
+                        ? directParentGenesisLinks
+                        : []
                 ),
                 pendingChildProofRoutes: Self.pendingChildProofRoutes(
                     carrierCID: blockHeader.rawCID,
@@ -1072,20 +1102,16 @@ public actor ChainProcess: ContentSource, Fetcher, VolumeStorer {
         )
     }
 
-    /// Answer one generic state-reachability query from an immediate child.
-    /// The query contains no child block identity and creates no child state.
-    func parentStateContinuityLink(
+    /// Query this process's recovered graph of connected, validated blocks.
+    func hasParentStateContinuity(
         from fromStateCID: String,
         to toStateCID: String
-    ) async -> ParentStateContinuityLink? {
-        guard case .active(let level) = runtimePhase else { return nil }
-        switch await level.parentStateContinuityLink(
+    ) async -> Bool {
+        guard case .active(let level) = runtimePhase else { return false }
+        return await level.chain.hasStateContinuity(
             from: fromStateCID,
             to: toStateCID
-        ) {
-        case .success(let link): return link
-        case .failure: return nil
-        }
+        )
     }
 
     /// Pages authenticated root contexts for one local carrier. Nexus is its
@@ -1116,11 +1142,13 @@ public actor ChainProcess: ContentSource, Fetcher, VolumeStorer {
 
     public func issuedParentGenesisLink(
         directory: String,
-        childGenesisCID: String
+        childGenesisCID: String,
+        parentStateCID: String
     ) async throws -> ParentGenesisLink? {
         try await store.issuedParentGenesisLink(
             directory: directory,
-            childGenesisCID: childGenesisCID
+            childGenesisCID: childGenesisCID,
+            parentStateCID: parentStateCID
         )
     }
 
@@ -1322,15 +1350,13 @@ public actor ChainProcess: ContentSource, Fetcher, VolumeStorer {
         scope: IssuedChildProofScope,
         directory: String,
         after: ChildRootAttachmentSummary?,
-        limit: Int,
-        portableOnly: Bool = false
+        limit: Int
     ) async throws -> [ChildRootAttachmentSummary] {
         try await store.childRootAttachmentSummaries(
             scope: scope,
             directory: directory,
             after: after,
-            limit: limit,
-            portableOnly: portableOnly
+            limit: limit
         )
     }
 
@@ -1613,13 +1639,7 @@ public actor ChainProcess: ContentSource, Fetcher, VolumeStorer {
         return AdmissionCarrierEvidence(
             proof: package.proof,
             childCID: try BlockHeader(node: child).rawCID,
-            isChildGenesis: child.parent == nil,
-            parentCarrierLink: package.parentCarrierLink,
-            parentGenesisLink: package.parentGenesisLink,
-            parentCarrierCertificate:
-                authenticatedPackage.parentCarrierCertificate,
-            parentGenesisCertificate:
-                authenticatedPackage.parentGenesisCertificate
+            isChildGenesis: child.parent == nil
         )
     }
 
@@ -1799,9 +1819,12 @@ public actor ChainProcess: ContentSource, Fetcher, VolumeStorer {
             $0.directory < $1.directory
         }) {
             if prepared.isChildGenesis,
+               let parentStateCID = await prepared.proof.directHop()?
+                    .parentStateCID,
                try await store.issuedParentGenesisLink(
                     directory: prepared.directory,
-                    childGenesisCID: prepared.childCID
+                    childGenesisCID: prepared.childCID,
+                    parentStateCID: parentStateCID
                ) == nil {
                 continue
             }
@@ -1817,10 +1840,10 @@ public actor ChainProcess: ContentSource, Fetcher, VolumeStorer {
                 }
                 proof = upstreamProof.composing(hop: prepared.proof)
             }
-            guard let carrierLink = try await store.issuedParentCarrierLink(
+            guard try await store.issuedParentCarrierLink(
                 carrierCID: carrierCID,
                 rootCID: proof.rootCID
-            ) else {
+            ) != nil else {
                 throw ChainProcessError.malformedAuthenticatedChildProof
             }
             if try await store.issuedChildEvidence(
@@ -1834,31 +1857,7 @@ public actor ChainProcess: ContentSource, Fetcher, VolumeStorer {
                 )
                 continue
             }
-            let genesisLink: ParentGenesisLink?
-            if prepared.isChildGenesis {
-                guard let link = try await store.issuedParentGenesisLink(
-                    directory: prepared.directory,
-                    childGenesisCID: prepared.childCID
-                ) else {
-                    throw ChainProcessError.malformedAuthenticatedChildProof
-                }
-                genesisLink = link
-            } else {
-                genesisLink = nil
-            }
-            let rootEnvelope = try ChildValidationPackageEnvelope(
-                ChildValidationPackage(
-                    proof: proof,
-                    parentCarrierLink: carrierLink,
-                    parentGenesisLink: genesisLink
-                ),
-                certificatesSignedBy: configuration
-            )
-            guard let rootAuthorityKey = ParentProcessKey(
-                configuration.processPublicKey
-            ) else {
-                throw ChainProcessError.malformedAuthenticatedChildProof
-            }
+            let rootEnvelope = try ChildValidationPackageEnvelope(proof: proof)
             try Task.checkCancellation()
             try await store.persistIssuedChildProof(
                 proof,
@@ -1866,8 +1865,7 @@ public actor ChainProcess: ContentSource, Fetcher, VolumeStorer {
                 isChildGenesis: prepared.isChildGenesis,
                 bootstrapRoots: prepared.bootstrapRoots,
                 parentCarrierCID: carrierCID,
-                rootEnvelope: rootEnvelope,
-                rootAuthorityKey: rootAuthorityKey
+                rootEnvelope: rootEnvelope
             )
             // The permanent direct edge now contains everything needed to
             // compose future roots. The preparation row was only a crash bridge.

@@ -94,15 +94,33 @@ The terminal directory carrier must separately bind
 valid parent block: its entering state must simply be a state the parent
 legitimately reached.
 
-Lattice owns the value
-`ParentStateContinuityLink(parentPath, fromStateCID, toStateCID)`. The
-configured immediate-parent process signs a portable certificate over the
-domain, Nexus genesis, exact parent path, and exact state pair after querying
-its accepted graph. Any peer may relay that certificate. Equal-state movement
-needs no link. Child genesis continues to use `ParentGenesisLink`.
+Each chain process already durably records every connected block only after
+semantic validation. That recovered `ChainBlockFact` graph is the transition
+store; no second delta database or header replay protocol exists.
 
-A bad continuity certificate never invalidates a valid work proof. It only
-prevents admission of the child block.
+Equal-state movement needs no fact. Otherwise the child sends the exact
+`(old, new)` pair over its authenticated immediate-parent session. The parent
+answers positively only when its own recovered graph contains the forward path.
+The child then constructs the non-Codable
+`ParentStateContinuityLink(parentPath, old, new)` locally for this admission
+attempt. The acknowledgement is unsigned, session-bound, and not portable.
+Silence or timeout means retryable unavailability.
+
+Grandparent validity follows by induction. A parent block cannot enter the
+parent process's durable graph until that process has applied the same rule
+against its immediate parent. The child never receives the grandparent tree,
+header path, or verdict. Nexus terminates the induction.
+
+Child genesis uses the same narrow boundary. The parent answers only when an
+accepted parent block contains the exact `GenesisAction(directory, childCID)`.
+The fact also binds `deploymentBlock.prevState`, and the child requires
+`childGenesis.parentState` to equal it. A structural carrier that was not
+accepted on the parent chain can prove work but cannot authorize deployment.
+
+Arbitrary peers may supply any required content-addressed Volume. They never
+supply a validity verdict. A configured remote parent can lie, so production
+deployments should run and validate their own chain processes recursively to
+Nexus; otherwise that remote process is an explicit operational trust boundary.
 
 ## Data and process boundaries
 
@@ -110,8 +128,9 @@ prevents admission of the child block.
   `ChildValidationPackageEnvelope` carry securing-work evidence.
 - `ChildEvidenceVolume` remains the one canonical Volume boundary. Ivy and
   VolumeBroker move Volumes, not loose CIDs or a second local CAS.
-- Authenticated parent facts are extracted and processed independently from
-  proof bytes.
+- Each chain derives validity from its own acquired Volumes. Cross-chain
+  continuity and deployment use only an exact positive acknowledgement from
+  the authenticated immediate-parent process's recovered validated graph.
 - Temporary acquired Volumes may be resolved in memory and discarded. Durable
   facts retain every Volume needed to replay or regenerate their verification.
 - Proofs are regenerated from retained root, intermediate carrier, children
@@ -140,7 +159,6 @@ Reuse:
 - `VerifiedChildEvidence`, `VerifiedWorkContribution`
 - `WorkMeasure`, `WorkSum`, segment GHOST
 - `ChildEvidenceVolume`, `ChildValidationPackageEnvelope`
-- the existing parent-certificate authentication pattern
 - `CandidateAcquirer`, fixed-cut inventory, NodeStore atomic batches
 - Ivy routing and VolumeBroker storage
 
@@ -201,8 +219,8 @@ keeps the trusted feed in place.
    add the transitive parent-state continuity value, flatten contributions, and
    add reference/differential tests.
 3. In lattice-node, add the proof-only Volume constructor, independent work and
-   state-fact admission, parent reachability issuance, certificate
-   authentication, and atomic durability.
+   recursive ancestor-validity admission, source-agnostic path acquisition, and
+   atomic durability.
 4. Add same-chain proof distribution, bounded pending acquisition, replay, and
    exact comparison with the independent reference model.
 5. Run the quantitative adversarial gate.
@@ -216,7 +234,9 @@ keeps the trusted feed in place.
 
 The work is complete when a clean node can create and follow parent, child, and
 grandchild chains; accept proof-derived work from any honest Volume provider;
-enforce transitive immediate-parent state continuity; reproduce the same tip
-after restart; recover from malformed or unavailable providers; resist bounded
-unknown-child floods; match the reference model; pass the declared security
-gate; and run with no trusted inherited-work protocol or persistence remaining.
+enforce transitive immediate-parent state continuity through the exact parent
+process boundary; reproduce the same tip and transition graph after restart;
+recover from malformed or unavailable providers; resist bounded unknown-child
+floods; match the reference model; pass the declared security gate; and run
+with no inherited-work feed, portable validity certificate, recursive
+child-side parent validator, or duplicate validated-delta store.

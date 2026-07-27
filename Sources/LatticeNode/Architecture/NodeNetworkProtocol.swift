@@ -32,10 +32,10 @@ enum NodeNetworkTopic {
         "lattice.hierarchy.child-candidate.reservation.request.v1"
     static let childCandidateReservationResponse =
         "lattice.hierarchy.child-candidate.reservation.response.v1"
-    static let parentStateContinuityRequest =
-        "lattice.hierarchy.parent-state-continuity.request.v1"
-    static let parentStateContinuityResponse =
-        "lattice.hierarchy.parent-state-continuity.response.v1"
+    static let parentChainFactRequest =
+        "lattice.hierarchy.parent-chain-fact.request.v1"
+    static let parentChainFactResponse =
+        "lattice.hierarchy.parent-chain-fact.response.v1"
 
     static func plane(for topic: String) -> Plane? {
         switch topic {
@@ -49,47 +49,40 @@ enum NodeNetworkTopic {
              childEvidenceIndexRequest, childEvidenceIndexResponse,
              childCandidateRequest, childCandidateResponse,
              childCandidateReservationRequest, childCandidateReservationResponse,
-             parentStateContinuityRequest, parentStateContinuityResponse: .hierarchy
+             parentChainFactRequest, parentChainFactResponse: .hierarchy
         default: nil
         }
     }
 }
 
-struct ParentStateContinuityRequestMessage:
-    NodeJSONMessage, Equatable, Sendable {
-    let requestID: UInt64
-    let childPath: [String]
-    let fromStateCID: String
-    let toStateCID: String
-
-    func validate() throws {
-        guard requestID != 0,
-              _isAbsoluteChainPath(childPath), childPath.count > 1,
-              _isCanonicalWireCID(fromStateCID),
-              _isCanonicalWireCID(toStateCID),
-              fromStateCID != toStateCID else {
-            throw NodeNetworkWireError.malformed
-        }
-    }
+enum ParentChainFact: Codable, Equatable, Sendable {
+    case genesis(childGenesisCID: String, parentStateCID: String)
+    case continuity(fromStateCID: String, toStateCID: String)
 }
 
-struct ParentStateContinuityResponseMessage:
-    NodeJSONMessage, Equatable, Sendable {
+/// A child asks only its authenticated immediate-parent process whether a fact
+/// exists in that parent's locally validated, recovered graph. A successful
+/// response echoes this exact canonical message.
+struct ParentChainFactMessage: NodeJSONMessage, Equatable, Sendable {
     let requestID: UInt64
-    let childPath: [String]
-    let link: ParentStateContinuityLink
-    let certificate: Data
+    let fact: ParentChainFact
 
     func validate() throws {
-        guard requestID != 0,
-              _isAbsoluteChainPath(childPath), childPath.count > 1,
-              link.parentPath == Array(childPath.dropLast()),
-              _isCanonicalWireCID(link.fromStateCID),
-              _isCanonicalWireCID(link.toStateCID),
-              link.fromStateCID != link.toStateCID,
-              certificate.count
-                == ParentStateContinuityCertificateV1.maximumEncodedSize else {
+        guard requestID != 0 else {
             throw NodeNetworkWireError.malformed
+        }
+        switch fact {
+        case .genesis(let childGenesisCID, let parentStateCID):
+            guard _isCanonicalWireCID(childGenesisCID),
+                  _isCanonicalWireCID(parentStateCID) else {
+                throw NodeNetworkWireError.malformed
+            }
+        case .continuity(let fromStateCID, let toStateCID):
+            guard _isCanonicalWireCID(fromStateCID),
+                  _isCanonicalWireCID(toStateCID),
+                  fromStateCID != toStateCID else {
+                throw NodeNetworkWireError.malformed
+            }
         }
     }
 }

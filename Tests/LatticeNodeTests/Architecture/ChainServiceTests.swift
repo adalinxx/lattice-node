@@ -1710,13 +1710,9 @@ final class ChainServiceTests: XCTestCase {
         )
         let process = try await ChainProcess.open(configuration: configuration)
         let genesis = try await process.canonicalTipBlock()
-        let parentAuthority = try XCTUnwrap(
-            ParentProcessKey(process.configuration.processPublicKey)
-        )
         let activeChild = try await anchoredChildGenesis(
             parent: process,
             parentGenesis: genesis,
-            parentAuthority: parentAuthority,
             transactions: [],
             childTimestamp: 1,
             carrierNonce: 0
@@ -2139,10 +2135,11 @@ final class ChainServiceTests: XCTestCase {
         )
         let firstCarrierHeader = try BlockHeader(node: firstCarrier)
         let parentOutcome = try await parentProcess.admit(firstCarrierHeader)
-        let carrierLink = try XCTUnwrap(parentOutcome.parentCarrierLink)
+        XCTAssertNotNil(parentOutcome.parentCarrierLink)
         let issuedGenesisLink = try await parentProcess.issuedParentGenesisLink(
             directory: "Payments",
-            childGenesisCID: childHeader.rawCID
+            childGenesisCID: childHeader.rawCID,
+            parentStateCID: firstCarrier.prevState.rawCID
         )
         let genesisLink = try XCTUnwrap(issuedGenesisLink)
         let proof = try await ChildBlockProof.generate(
@@ -2175,7 +2172,6 @@ final class ChainServiceTests: XCTestCase {
             authenticatedChildPackage: AuthenticatedChildPackage(
                 package: ChildValidationPackage(
                     proof: proof,
-                    parentCarrierLink: carrierLink,
                     parentGenesisLink: genesisLink
                 )
             )
@@ -2731,13 +2727,9 @@ final class ChainServiceTests: XCTestCase {
     ) async throws -> ActiveChildServiceFixture {
         let parent = try await nexusProcess()
         let parentGenesis = try await parent.canonicalTipBlock()
-        let parentAuthority = try XCTUnwrap(
-            ParentProcessKey(parent.configuration.processPublicKey)
-        )
         let child = try await anchoredChildGenesis(
             parent: parent,
             parentGenesis: parentGenesis,
-            parentAuthority: parentAuthority,
             transactions: [],
             childTimestamp: 1,
             carrierNonce: 0,
@@ -2785,7 +2777,6 @@ final class ChainServiceTests: XCTestCase {
     private func anchoredChildGenesis(
         parent: ChainProcess,
         parentGenesis: Block,
-        parentAuthority: ParentProcessKey,
         transactions: [Transaction],
         childTimestamp: Int64,
         carrierNonce: UInt64,
@@ -2826,10 +2817,11 @@ final class ChainServiceTests: XCTestCase {
         )
         let carrierHeader = try BlockHeader(node: carrier)
         let parentAdmission = try await parent.admit(carrierHeader)
-        let carrierLink = try XCTUnwrap(parentAdmission.parentCarrierLink)
+        XCTAssertNotNil(parentAdmission.parentCarrierLink)
         let issuedGenesisLink = try await parent.issuedParentGenesisLink(
             directory: "Payments",
-            childGenesisCID: header.rawCID
+            childGenesisCID: header.rawCID,
+            parentStateCID: carrier.prevState.rawCID
         )
         let genesisLink = try XCTUnwrap(issuedGenesisLink)
         let proof = try await ChildBlockProof.generate(
@@ -2844,7 +2836,6 @@ final class ChainServiceTests: XCTestCase {
             package: AuthenticatedChildPackage(
                 package: ChildValidationPackage(
                     proof: proof,
-                    parentCarrierLink: carrierLink,
                     parentGenesisLink: genesisLink
                 )
             )

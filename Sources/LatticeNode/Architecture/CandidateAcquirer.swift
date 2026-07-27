@@ -238,6 +238,31 @@ struct CandidateAcquirer {
         return (accepted, key)
     }
 
+    /// Re-observe a candidate after an external dependency was interrupted.
+    /// If admission is active, its completion sees the revision change and
+    /// retries. Otherwise the exact attempt becomes ready immediately.
+    @discardableResult
+    mutating func requeue(_ seed: Seed) -> Bool {
+        guard let key = observe(seed).key,
+              var record = records[key.blockCID],
+              var attempt = record.attempts[key.rootCID] else {
+            return false
+        }
+        attempt.revision &+= 1
+        if case .active = attempt.state {
+            record.attempts[key.rootCID] = attempt
+            records[key.blockCID] = record
+            return true
+        }
+        attempt.expiresAt = nil
+        attempt.state = .ready
+        record.attempts[key.rootCID] = attempt
+        records[key.blockCID] = record
+        let accepted = scheduleIfReady(key)
+        fillReadyCapacity()
+        return accepted
+    }
+
     mutating func disconnect(_ provider: CandidateProvider) {
         for blockCID in Array(records.keys) {
             guard var record = records[blockCID],
@@ -593,48 +618,24 @@ struct CandidateAcquirer {
         guard let leftProof = try? left.proof.serialize(),
               let rightProof = try? right.proof.serialize(),
               leftProof == rightProof,
-              left.parentCarrierLink == nil
-                || right.parentCarrierLink == nil
-                || left.parentCarrierLink == right.parentCarrierLink,
               left.parentGenesisLink == nil
                 || right.parentGenesisLink == nil
                 || left.parentGenesisLink == right.parentGenesisLink,
               left.parentStateContinuityLink == nil
                 || right.parentStateContinuityLink == nil
                 || left.parentStateContinuityLink
-                    == right.parentStateContinuityLink,
-              current.parentCarrierCertificate == nil
-                || received.parentCarrierCertificate == nil
-                || current.parentCarrierCertificate
-                    == received.parentCarrierCertificate,
-              current.parentGenesisCertificate == nil
-                || received.parentGenesisCertificate == nil
-                || current.parentGenesisCertificate
-                    == received.parentGenesisCertificate,
-              current.parentStateContinuityCertificate == nil
-                || received.parentStateContinuityCertificate == nil
-                || current.parentStateContinuityCertificate
-                    == received.parentStateContinuityCertificate else {
+                    == right.parentStateContinuityLink else {
             return nil
         }
         return AuthenticatedChildPackage(
             package: ChildValidationPackage(
                 proof: left.proof,
-                parentCarrierLink:
-                    left.parentCarrierLink ?? right.parentCarrierLink,
                 parentGenesisLink:
                     left.parentGenesisLink ?? right.parentGenesisLink,
                 parentStateContinuityLink:
                     left.parentStateContinuityLink
                         ?? right.parentStateContinuityLink
-            ),
-            parentCarrierCertificate: current.parentCarrierCertificate
-                ?? received.parentCarrierCertificate,
-            parentGenesisCertificate: current.parentGenesisCertificate
-                ?? received.parentGenesisCertificate,
-            parentStateContinuityCertificate:
-                current.parentStateContinuityCertificate
-                    ?? received.parentStateContinuityCertificate
+            )
         )
     }
 
@@ -647,17 +648,9 @@ struct CandidateAcquirer {
             return false
         }
         return leftProof == rightProof
-            && left.package.parentCarrierLink
-                == right.package.parentCarrierLink
             && left.package.parentGenesisLink
                 == right.package.parentGenesisLink
             && left.package.parentStateContinuityLink
                 == right.package.parentStateContinuityLink
-            && left.parentCarrierCertificate
-                == right.parentCarrierCertificate
-            && left.parentGenesisCertificate
-                == right.parentGenesisCertificate
-            && left.parentStateContinuityCertificate
-                == right.parentStateContinuityCertificate
     }
 }

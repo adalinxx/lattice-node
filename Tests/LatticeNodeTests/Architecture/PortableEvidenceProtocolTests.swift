@@ -128,6 +128,52 @@ final class PortableEvidenceProtocolTests: XCTestCase {
         }
     }
 
+    func testParentChainFactsAreExactSessionBoundQueries() throws {
+        let genesis = ParentChainFactMessage(
+            requestID: 1,
+            fact: .genesis(
+                childGenesisCID: protocolCID("child-genesis"),
+                parentStateCID: protocolCID("deployment-parent-state")
+            )
+        )
+        XCTAssertEqual(
+            try ParentChainFactMessage.decoded(genesis.encoded()),
+            genesis
+        )
+
+        let continuity = ParentChainFactMessage(
+            requestID: 2,
+            fact: .continuity(
+                fromStateCID: protocolCID("from-state"),
+                toStateCID: protocolCID("to-state")
+            )
+        )
+        XCTAssertEqual(
+            try ParentChainFactMessage.decoded(continuity.encoded()),
+            continuity
+        )
+        XCTAssertEqual(
+            NodeNetworkTopic.plane(for: NodeNetworkTopic.parentChainFactRequest),
+            .hierarchy
+        )
+        XCTAssertEqual(
+            NodeNetworkTopic.plane(for: NodeNetworkTopic.parentChainFactResponse),
+            .hierarchy
+        )
+
+        XCTAssertThrowsError(try ParentChainFactMessage(
+            requestID: 0,
+            fact: genesis.fact
+        ).encoded())
+        XCTAssertThrowsError(try ParentChainFactMessage(
+            requestID: 4,
+            fact: .continuity(
+                fromStateCID: protocolCID("same-state"),
+                toStateCID: protocolCID("same-state")
+            )
+        ).encoded())
+    }
+
     func testChildCandidateReservationSnapshotIsCanonicalAndBounded() throws {
         let childPath = ["Nexus", "Payments"]
         let candidates = (0..<ChildCandidateReservationRequestMessage

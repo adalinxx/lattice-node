@@ -19,7 +19,7 @@ authority. An accepted direct relationship may request an exact set of CAS
 objects by CID; those read-only bytes are protocol availability, not access to
 the process's storage interface.
 
-## Configured parent authority
+## Configured parent route
 
 A non-Nexus process must be started with both:
 
@@ -27,22 +27,29 @@ A non-Nexus process must be started with both:
 - its immediate parent fact endpoint, such as
   `<nexus-process-key>@parent.example:4002`.
 
-The configured process public key pins which authenticated Ivy peer may provide
-parent facts. A path claim by itself is not authority. Nexus rejects a parent
-configuration because it is the single root.
+The configured endpoint is the authenticated immediate-parent process. It
+serves two narrow local verdicts from its recovered graph of connected,
+validated blocks: exact child deployment and forward state continuity. Those
+verdicts are session-bound acknowledgements, not signed or portable
+certificates. Nexus rejects a parent configuration because it is the single
+root.
 
 ## Verify content independently
 
-Parent authorization and content validity answer different questions:
+Transport identity and content validity answer different questions:
 
-- The configured key answers: "which process is allowed to speak as my
-  immediate parent?"
-- CIDs, proof of work, child-inclusion proofs, state continuity, and consensus
-  validation answer: "are these facts valid?"
+- The configured key answers: "did this local parent-chain verdict come from my
+  configured immediate-parent process?"
+- CIDs, proof of work, child-inclusion proofs, recursively validated state
+  transitions, and consensus validation answer: "are these bytes valid?"
 
-The first never bypasses the second. A correctly authenticated parent can
-provide availability and lineage facts, but cannot force invalid bytes into
-child state or dictate the child's fork choice.
+Arbitrary peers provide only content-addressed Volumes. They cannot provide a
+parent verdict. The parent process derives a verdict only after validating its
+own connected chain; the child never accepts a peer's claim that data was
+validated. A deployment should normally run and validate its own parent process
+recursively to Nexus. If an operator instead configures a remote parent process,
+that process is an explicit trust boundary: authentication proves identity, not
+honesty.
 
 ## Separate planes
 
@@ -82,8 +89,8 @@ Tally-gated.
 A direct parent-child commitment has one root-independent identity: parent
 carrier CID, child directory, child CID, and canonical one-hop sparse proof.
 The parent retains an edge when it issues that commitment. The child retains the
-incoming edge after validation and may relay complete parent-signed root
-attachments to same-chain peers.
+incoming edge after validation and may relay complete content-verified root
+Volumes to same-chain peers.
 
 No child sends an edge inventory, accepted topology, coverage claim, or work
 back to its parent. The parent is child-agnostic outside bounded candidate and
@@ -97,12 +104,13 @@ Nexus has no parent, so its genesis is constructed locally and pinned by CID:
 
 The CID is checked before configured root bootstrap, never used as a
 peer-admission signature permit. Every child genesis is ordinary content bound
-to a parent state. A prepared child intent becomes authoritative only after a
-separately signed parent `GenesisAction` transaction is accepted in a carrier
-and the child verifies the resulting parent genesis link. The action and link
-identify only the child directory and exact genesis CID. Parent-process trust
-is local configuration authenticated by Ivy; it is not committed in the child
-`ChainSpec` and can rotate without changing blockchain content.
+to a parent state. A prepared child intent becomes authoritative only after an
+accepted parent block stores the exact `GenesisAction(directory, childCID)`.
+The authenticated immediate-parent process acknowledges the exact tuple
+`(directory, childCID, deploymentBlock.prevState)` from its durable accepted
+facts, and the child requires its genesis `parentState` to equal that entering
+state. The acknowledgement is unsigned, non-portable, and never persisted by
+the child as peer authority.
 
 Signature and signer fields inside a genesis block carry no authority and need
 no special empty shape. The exact genesis CID is the authorization: local
@@ -111,12 +119,20 @@ transactions after genesis remain signature-strict.
 
 ## Parent-state continuity and work
 
-The immediate parent answers one authority question for a non-genesis child
-candidate: is the new parent-state reference equal to, or transitively reachable
-from, the predecessor's reference through connected accepted parent blocks?
-The answer is signed over the Nexus genesis, exact parent path, and exact state
-pair. It is immutable and portable, so any peer may relay it. Parent canonicity
-does not affect this reachability fact.
+For a non-genesis child candidate, equal parent-state references need no fact.
+Otherwise the child asks its authenticated immediate-parent process whether the
+new reference is transitively reachable from the predecessor's reference in
+that process's connected, validated block graph. Parent canonicity does not
+affect this immutable reachability fact. The response is a positive,
+session-bound acknowledgement of the exact request; silence or timeout remains
+retryable unavailability.
+
+Grandparent validity is induction, not evidence relay. A parent block enters the
+parent's durable graph only after the parent process has applied this same rule
+against its own immediate parent. The child therefore never receives a
+grandparent path or verdict. Recovery replays node-owned immutable
+`ChainBlockFact`s and recomputes fork choice; it never restores a remote
+certificate.
 
 Work is not a parent assertion. Lattice derives it from the candidate's
 content-addressed directory proof: the root grind must beat the terminal target
@@ -126,12 +142,12 @@ fork choice only after the terminal child is accepted and connected.
 
 The parent therefore publishes no work totals, revisions, readiness marker, or
 child topology. Data availability remains separate: Ivy and VolumeBroker move
-the proof and certificate Volumes, while Lattice independently verifies the
-facts they contain.
+proof Volumes, while each chain process independently validates its own blocks.
 ## Operational consequence
 
-Treat `--parent` as security configuration and preferred live authority, not as
-the only possible data source. Changing it changes who may issue new parent
-facts. Keep process identity keys stable, restrict the fact-plane port to
-intended relationships, and back up identity separately from wipeable chain
-storage.
+Treat `--parent` as the authenticated process boundary for immediate-parent
+validity and as one route for availability. Other peers may supply identical
+Volumes, but they cannot replace the live parent verdict needed for a new
+parent-state movement. Keep process identity keys stable, restrict the hierarchy
+port to intended relationships, and back up identity separately from wipeable
+chain storage.

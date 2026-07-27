@@ -13,10 +13,7 @@ private func testCID(_ seed: String) -> String {
 
 final class NodeStoreTests: XCTestCase {
     private let genesisCID = NexusGenesis.expectedBlockHash
-    private let parentProcessKey = String(
-        repeating: "a",
-        count: ParentProcessKey.encodedByteCount
-    )
+    private let parentProcessKey = String(repeating: "a", count: 64)
 
     func testLegacyDatabaseFailsBeforeNewDDL() throws {
         let directory = temporaryDirectory()
@@ -71,10 +68,6 @@ final class NodeStoreTests: XCTestCase {
         for attempt in [
             { try self.makeStore(path: path, genesisCID: "different-root") },
             { try self.makeStore(path: path, chainPath: ["Nexus", "Payments"]) },
-            { try self.makeStore(
-                path: path,
-                issuingAuthorityKey: String(repeating: "b", count: 64)
-            ) },
         ] {
             XCTAssertThrowsError(try attempt()) { error in
                 guard case NodeStoreError.wipeRequired = error else {
@@ -268,7 +261,7 @@ final class NodeStoreTests: XCTestCase {
             {"parentPath":["Nexus"],"carrierCID":"carrier","rootCID":"carrier"}
             """)
         let genesis = try decode(ParentGenesisLink.self, json: """
-            {"parentPath":["Nexus"],"directory":"Payments","childGenesisCID":"child-genesis"}
+            {"parentPath":["Nexus"],"directory":"Payments","childGenesisCID":"child-genesis","parentStateCID":"parent-state"}
             """)
         let artifacts = AdmissionHierarchyArtifacts(
             carrierLink: carrier,
@@ -288,7 +281,8 @@ final class NodeStoreTests: XCTestCase {
         )
         let storedGenesis = try await store.issuedParentGenesisLink(
             directory: "Payments",
-            childGenesisCID: "child-genesis"
+            childGenesisCID: "child-genesis",
+            parentStateCID: "parent-state"
         )
         let staged = try await store.stagedAdmissions()
         XCTAssertEqual(storedCarrier, carrier)
@@ -494,11 +488,13 @@ final class NodeStoreTests: XCTestCase {
             {"parentPath":["Nexus"],"carrierCID":"carrier","rootCID":"carrier"}
             """)
         let genesis = try decode(ParentGenesisLink.self, json: """
-            {"parentPath":["Nexus"],"directory":"Child","childGenesisCID":"genesis"}
+            {"parentPath":["Nexus"],"directory":"Child","childGenesisCID":"genesis","parentStateCID":"parent-state"}
             """)
 
-        try await store!.persistIssuedHierarchyArtifacts(
-            AdmissionHierarchyArtifacts(
+        try await store!.stage(
+            blockBatch(postStateCID: "state", blockHash: "carrier"),
+            volumeRoots: [],
+            hierarchyArtifacts: AdmissionHierarchyArtifacts(
                 carrierLink: carrier,
                 carrierEvidence: nil,
                 parentGenesisLinks: [genesis]
@@ -513,10 +509,133 @@ final class NodeStoreTests: XCTestCase {
         )
         let storedGenesis = try await store!.issuedParentGenesisLink(
             directory: "Child",
-            childGenesisCID: "genesis"
+            childGenesisCID: "genesis",
+            parentStateCID: "parent-state"
         )
         XCTAssertEqual(storedCarrier, carrier)
         XCTAssertEqual(storedGenesis, genesis)
+    }
+
+    func testCompetingGenesisFactsShareDeploymentStateWithoutCollision()
+        async throws
+    {
+        let store = try makeStore()
+        let state = "shared-parent-state"
+        for (carrierCID, childCID) in [
+            ("carrier-a", "child-a"),
+            ("carrier-b", "child-b"),
+        ] {
+            let carrier = try decode(ParentCarrierLink.self, json: """
+                {"parentPath":["Nexus"],"carrierCID":"\(carrierCID)","rootCID":"\(carrierCID)"}
+                """)
+            let genesis = try decode(ParentGenesisLink.self, json: """
+                {"parentPath":["Nexus"],"directory":"Child","childGenesisCID":"\(childCID)","parentStateCID":"\(state)"}
+                """)
+            try await store.stage(
+                blockBatch(postStateCID: "state", blockHash: carrierCID),
+                volumeRoots: [],
+                hierarchyArtifacts: AdmissionHierarchyArtifacts(
+                    carrierLink: carrier,
+                    carrierEvidence: nil,
+                    parentGenesisLinks: [genesis]
+                )
+            )
+        }
+
+        for childCID in ["child-a", "child-b"] {
+            let link = try await store.issuedParentGenesisLink(
+                directory: "Child",
+                childGenesisCID: childCID,
+                parentStateCID: state
+            )
+            XCTAssertEqual(link?.childGenesisCID, childCID)
+        }
+    }
+
+    func testUnacceptedCarrierCannotAuthorizeGenesis() async throws {
+        let store = try makeStore()
+        let carrierCID = testCID("unaccepted-genesis-carrier")
+        let carrier = try decode(ParentCarrierLink.self, json: """
+            {"parentPath":["Nexus"],"carrierCID":"\(carrierCID)","rootCID":"\(carrierCID)"}
+            """)
+        let genesis = try decode(ParentGenesisLink.self, json: """
+            {"parentPath":["Nexus"],"directory":"Child","childGenesisCID":"child","parentStateCID":"state"}
+            """)
+
+        await XCTAssertThrowsErrorAsync(
+            try await store.persistIssuedHierarchyArtifacts(
+                AdmissionHierarchyArtifacts(
+                    carrierLink: carrier,
+                    carrierEvidence: nil,
+                    parentGenesisLinks: [genesis]
+                )
+            )
+        ) { error in
+            guard case NodeStoreError.invalidConfiguration = error else {
+                return XCTFail("expected accepted-parent guard, got \(error)")
+            }
+        }
+    }
+
+    func testDisconnectedAcceptedCarrierCannotAuthorizeGenesis()
+        async throws
+    {
+        let store = try makeStore()
+        let rootCID = testCID("connected-root")
+        let missingCID = testCID("missing-parent")
+        let carrierCID = testCID("disconnected-carrier")
+        try await store.stage(
+            blockBatch(postStateCID: "root-state", blockHash: rootCID),
+            volumeRoots: []
+        )
+        try await store.stage(
+            blockBatch(
+                postStateCID: "orphan-state",
+                blockHash: carrierCID,
+                parentBlockHash: missingCID,
+                blockHeight: 2
+            ),
+            volumeRoots: []
+        )
+        let carrier = try decode(ParentCarrierLink.self, json: """
+            {"parentPath":["Nexus"],"carrierCID":"\(carrierCID)","rootCID":"\(carrierCID)"}
+            """)
+        let genesis = try decode(ParentGenesisLink.self, json: """
+            {"parentPath":["Nexus"],"directory":"Child","childGenesisCID":"child","parentStateCID":"state"}
+            """)
+
+        await XCTAssertThrowsErrorAsync(
+            try await store.persistIssuedHierarchyArtifacts(
+                AdmissionHierarchyArtifacts(
+                    carrierLink: carrier,
+                    carrierEvidence: nil,
+                    parentGenesisLinks: [genesis]
+                )
+            )
+        ) { error in
+            guard case NodeStoreError.invalidConfiguration = error else {
+                return XCTFail("expected connected-parent guard, got \(error)")
+            }
+        }
+        try await store.persistIssuedHierarchyArtifacts(
+            AdmissionHierarchyArtifacts(
+                carrierLink: carrier,
+                carrierEvidence: nil,
+                parentGenesisLinks: []
+            )
+        )
+        let storedCarrier = try await store.issuedParentCarrierLink(
+            carrierCID: carrierCID,
+            rootCID: carrierCID
+        )
+        XCTAssertEqual(storedCarrier, carrier)
+        let storedGenesis = try await store.issuedParentGenesisLink(
+            directory: "Child",
+            childGenesisCID: "child",
+            parentStateCID: "state"
+        )
+        XCTAssertNil(storedGenesis)
+        try await store.auditNormalizedIndexes()
     }
 
     func testIssuedChildProofsAreSetValuedContentBoundAndDurable() async throws {
@@ -656,13 +775,7 @@ final class NodeStoreTests: XCTestCase {
         )
         let evidence = try XCTUnwrap(storedEvidence)
         let expectedEnvelope = try ChildValidationPackageEnvelope(
-            ChildValidationPackage(
-                proof: evidence.proof,
-                parentCarrierLink: evidence.parentCarrierLink,
-                parentGenesisLink: evidence.parentGenesisLink
-            ),
-            parentCarrierCertificate: evidence.parentCarrierCertificate,
-            parentGenesisCertificate: evidence.parentGenesisCertificate
+            ChildValidationPackage(proof: evidence.proof)
         )
         let expectedVolume = try ChildEvidenceVolume(
             envelopeBytes: try expectedEnvelope.encode(),
@@ -773,16 +886,23 @@ final class NodeStoreTests: XCTestCase {
             [carrierHeader.rawCID]
         )
 
-        let historicalAlpha = try decode(ParentGenesisLink.self, json: """
-            {"parentPath":["Nexus"],"directory":"Alpha","childGenesisCID":"historical-alpha-genesis"}
-            """)
-        try await store.persistIssuedHierarchyArtifacts(
-            AdmissionHierarchyArtifacts(
+        try await store.stage(
+            blockBatch(
+                postStateCID: "state",
+                blockHash: carrierHeader.rawCID
+            ),
+            volumeRoots: [],
+            hierarchyArtifacts: AdmissionHierarchyArtifacts(
                 carrierLink: try decode(ParentCarrierLink.self, json: """
                     {"parentPath":["Nexus"],"carrierCID":"\(carrierHeader.rawCID)","rootCID":"\(carrierHeader.rawCID)"}
-                    """),
+                """),
                 carrierEvidence: nil,
-                parentGenesisLinks: [historicalAlpha]
+                parentGenesisLinks: [try decode(
+                    ParentGenesisLink.self,
+                    json: """
+                    {"parentPath":["Nexus"],"directory":"Alpha","childGenesisCID":"historical-alpha-genesis","parentStateCID":"historical-parent-state"}
+                    """
+                )]
             )
         )
         let alphaSummaries = try await store.issuedChildEvidenceSummaries(
@@ -982,18 +1102,10 @@ final class NodeStoreTests: XCTestCase {
             after: nil,
             limit: 3
         )
-        let portableAttachments = try await child.childRootAttachmentSummaries(
-            scope: .incomingCarrier,
-            directory: "A",
-            after: nil,
-            limit: 3,
-            portableOnly: true
-        )
         XCTAssertEqual(
             parentAttachments.map { [$0.edgeCID, $0.rootCID] },
             childAttachments.map { [$0.edgeCID, $0.rootCID] }
         )
-        XCTAssertTrue(portableAttachments.isEmpty)
         XCTAssertEqual(parentAttachments.count, 2)
         XCTAssertEqual(Set(parentAttachments.map(\.edgeCID)).count, 1)
         XCTAssertEqual(
@@ -1048,8 +1160,7 @@ final class NodeStoreTests: XCTestCase {
             Set(try database.query("PRAGMA table_info(issued_child_proofs)")
                 .compactMap { $0["name"]?.textValue }),
             Set([
-                "scope", "edge_cid", "root_cid", "is_portable",
-                "attachment_cid", "ordinal",
+                "scope", "edge_cid", "root_cid", "attachment_cid", "ordinal",
             ])
         )
 
@@ -1163,8 +1274,13 @@ final class NodeStoreTests: XCTestCase {
         let outgoing = incoming.composing(hop: direct)
         let store = try makeStore(chainPath: ["Nexus", "A"])
 
-        try await store.persistIssuedHierarchyArtifacts(
-            AdmissionHierarchyArtifacts(
+        try await store.stage(
+            blockBatch(
+                postStateCID: "state",
+                blockHash: carrierHeader.rawCID
+            ),
+            volumeRoots: [],
+            hierarchyArtifacts: AdmissionHierarchyArtifacts(
                 carrierLink: try decode(ParentCarrierLink.self, json: """
                     {"parentPath":["Nexus","A"],"carrierCID":"\(carrierHeader.rawCID)","rootCID":"\(rootHeader.rawCID)"}
                     """),
@@ -1173,9 +1289,12 @@ final class NodeStoreTests: XCTestCase {
                     childCID: carrierHeader.rawCID,
                     isChildGenesis: true
                 ),
-                parentGenesisLinks: [try decode(ParentGenesisLink.self, json: """
-                    {"parentPath":["Nexus","A"],"directory":"A","childGenesisCID":"\(leafCID)"}
-                    """)]
+                parentGenesisLinks: [try decode(
+                    ParentGenesisLink.self,
+                    json: """
+                    {"parentPath":["Nexus","A"],"directory":"A","childGenesisCID":"\(leafCID)","parentStateCID":"parent-state"}
+                    """
+                )]
             )
         )
         try await persistIssuedChildProof(
@@ -1215,63 +1334,6 @@ final class NodeStoreTests: XCTestCase {
         XCTAssertTrue(summaries.first.map {
             CIDIdentity.isCanonical($0.attachmentCID)
         } ?? false)
-    }
-
-    func testOutgoingCertificateIsReverifiedFromDurableVolume() async throws {
-        let directory = temporaryDirectory()
-        let path = directory.appendingPathComponent("state.db")
-        let store = try makeStore(path: path)
-        let fixture = try await childProofFixture()
-        try await persistIssuedChildProof(
-            in: store,
-            fixture.first,
-            childCID: fixture.childCID
-        )
-        let storedEvidence = try await store.issuedChildEvidence(
-            childCID: fixture.childCID,
-            directory: "Child",
-            rootCID: fixture.first.rootCID
-        )
-        let evidence = try XCTUnwrap(storedEvidence)
-
-        var signature = try XCTUnwrap(
-            evidence.parentCarrierCertificate
-        ).encode()
-        signature[signature.startIndex] ^= 1
-        let invalidCertificate = try ParentCarrierCertificateV1.decode(signature)
-        let envelope = try ChildValidationPackageEnvelope(
-            ChildValidationPackage(
-                proof: evidence.proof,
-                parentCarrierLink: evidence.parentCarrierLink,
-                parentGenesisLink: evidence.parentGenesisLink
-            ),
-            parentCarrierCertificate: invalidCertificate,
-            parentGenesisCertificate: evidence.parentGenesisCertificate
-        )
-        let invalidAttachment = try ChildEvidenceVolume(
-            envelopeBytes: try envelope.encode(),
-            childCID: fixture.childCID
-        )
-        let broker = try DiskBroker(
-            path: directory.appendingPathComponent("volumes.db").path
-        )
-        try await invalidAttachment.store(storer: broker)
-        try NodeSQLite(path: path.path).execute(
-            "UPDATE issued_child_proofs SET attachment_cid = ?1 WHERE scope = ?2 AND edge_cid = ?3 AND root_cid = ?4",
-            params: [
-                .text(invalidAttachment.rawCID),
-                .text(IssuedChildProofScope.outgoingDirectChild.rawValue),
-                .text(evidence.edgeCID),
-                .text(fixture.first.rootCID),
-            ]
-        )
-
-        await XCTAssertThrowsErrorAsync(try await store.auditNormalizedIndexes()) {
-            error in
-            guard case NodeStoreError.corrupt = error else {
-                return XCTFail("expected invalid durable certificate, got \(error)")
-            }
-        }
     }
 
     func testPreparedChildProofsAreDurableAndBoundedByCarrier() async throws {
@@ -1995,12 +2057,6 @@ final class NodeStoreTests: XCTestCase {
         let childBroker = try DiskBroker(
             path: directory.appendingPathComponent("child-volumes.db").path
         )
-        let parentIdentity = try NodeConfiguration(
-            chainPath: ["Nexus"],
-            minimumRootWork: UInt256(1),
-            storagePath: temporaryDirectory(),
-            privateKeyHex: String(repeating: "7a", count: 32)
-        )
         let parent = try makeStore(
             path: directory.appendingPathComponent("parent.db"),
             broker: parentBroker
@@ -2011,17 +2067,23 @@ final class NodeStoreTests: XCTestCase {
             fixture.first,
             childCID: fixture.childCID
         )
-        try await parent.persistIssuedHierarchyArtifacts(
-            AdmissionHierarchyArtifacts(
+        try await parent.stage(
+            blockBatch(
+                postStateCID: "state",
+                blockHash: fixture.first.rootCID
+            ),
+            volumeRoots: [],
+            hierarchyArtifacts: AdmissionHierarchyArtifacts(
                 carrierLink: try decode(ParentCarrierLink.self, json: """
                     {"parentPath":["Nexus"],"carrierCID":"\(fixture.first.rootCID)","rootCID":"\(fixture.first.rootCID)"}
-                    """),
+                """),
                 carrierEvidence: nil,
-                parentGenesisLinks: [
-                    try decode(ParentGenesisLink.self, json: """
-                        {"parentPath":["Nexus"],"directory":"Child","childGenesisCID":"\(fixture.childCID)"}
-                        """)
-                ]
+                parentGenesisLinks: [try decode(
+                    ParentGenesisLink.self,
+                    json: """
+                    {"parentPath":["Nexus"],"directory":"Child","childGenesisCID":"\(fixture.childCID)","parentStateCID":"parent-state"}
+                    """
+                )]
             )
         )
         let scan = try await parent.issuedChildEvidenceScanHead(
@@ -2053,19 +2115,11 @@ final class NodeStoreTests: XCTestCase {
         )
         let issued = try XCTUnwrap(storedIssued)
         let package = AuthenticatedChildPackage(
-            package: ChildValidationPackage(
-                proof: issued.proof,
-                parentCarrierLink: issued.parentCarrierLink,
-                parentGenesisLink: issued.parentGenesisLink
-            ),
-            parentCarrierCertificate: issued.parentCarrierCertificate,
-            parentGenesisCertificate: issued.parentGenesisCertificate
+            package: ChildValidationPackage(proof: issued.proof)
         )
         let attachment = try ChildEvidenceVolume(
             envelopeBytes: try ChildValidationPackageEnvelope(
-                package.package,
-                parentCarrierCertificate: package.parentCarrierCertificate,
-                parentGenesisCertificate: package.parentGenesisCertificate
+                package.package
             ).encode(),
             childCID: fixture.childCID
         )
@@ -2076,21 +2130,11 @@ final class NodeStoreTests: XCTestCase {
         )
         let secondIssued = try XCTUnwrap(storedSecondIssued)
         let secondPackage = AuthenticatedChildPackage(
-            package: ChildValidationPackage(
-                proof: secondIssued.proof,
-                parentCarrierLink: secondIssued.parentCarrierLink,
-                parentGenesisLink: secondIssued.parentGenesisLink
-            ),
-            parentCarrierCertificate: secondIssued.parentCarrierCertificate,
-            parentGenesisCertificate: secondIssued.parentGenesisCertificate
+            package: ChildValidationPackage(proof: secondIssued.proof)
         )
         let secondAttachment = try ChildEvidenceVolume(
             envelopeBytes: try ChildValidationPackageEnvelope(
-                secondPackage.package,
-                parentCarrierCertificate:
-                    secondPackage.parentCarrierCertificate,
-                parentGenesisCertificate:
-                    secondPackage.parentGenesisCertificate
+                secondPackage.package
             ).encode(),
             childCID: fixture.childCID
         )
@@ -2098,7 +2142,6 @@ final class NodeStoreTests: XCTestCase {
         var child: NodeStore? = try makeStore(
             path: childPath,
             chainPath: ["Nexus", "Child"],
-            spawningParentKey: parentIdentity.processPublicKey,
             broker: childBroker,
             parentEvidenceInboxCapacity: 1
         )
@@ -2134,7 +2177,6 @@ final class NodeStoreTests: XCTestCase {
         child = try makeStore(
             path: childPath,
             chainPath: ["Nexus", "Child"],
-            spawningParentKey: parentIdentity.processPublicKey,
             broker: childBroker,
             parentEvidenceInboxCapacity: 1
         )
@@ -2179,11 +2221,7 @@ final class NodeStoreTests: XCTestCase {
             incomingCarrierEvidence: AdmissionCarrierEvidence(
                 proof: package.package.proof,
                 childCID: fixture.childCID,
-                isChildGenesis: true,
-                parentCarrierLink: package.package.parentCarrierLink,
-                parentGenesisLink: package.package.parentGenesisLink,
-                parentCarrierCertificate: package.parentCarrierCertificate,
-                parentGenesisCertificate: package.parentGenesisCertificate
+                isChildGenesis: true
             )
         )
         let admittedInbox = try await child!.parentEvidenceInbox()
@@ -2248,15 +2286,7 @@ final class NodeStoreTests: XCTestCase {
                 carrierEvidence: AdmissionCarrierEvidence(
                     proof: secondPackage.package.proof,
                     childCID: fixture.childCID,
-                    isChildGenesis: true,
-                    parentCarrierLink:
-                        secondPackage.package.parentCarrierLink,
-                    parentGenesisLink:
-                        secondPackage.package.parentGenesisLink,
-                    parentCarrierCertificate:
-                        secondPackage.parentCarrierCertificate,
-                    parentGenesisCertificate:
-                        secondPackage.parentGenesisCertificate
+                    isChildGenesis: true
                 ),
                 parentGenesisLinks: []
             )
@@ -2426,8 +2456,6 @@ final class NodeStoreTests: XCTestCase {
         path: URL? = nil,
         genesisCID: String? = nil,
         chainPath: [String] = ["Nexus"],
-        spawningParentKey: String? = nil,
-        issuingAuthorityKey: String? = nil,
         broker suppliedBroker: (any RetainedRootMergeBroker)? = nil,
         parentEvidenceInboxCapacity: Int = 64
     ) throws -> NodeStore {
@@ -2441,20 +2469,10 @@ final class NodeStoreTests: XCTestCase {
                     .appendingPathComponent("volumes.db").path
             )
         }
-        let issuer = try NodeConfiguration(
-            chainPath: ["Nexus"],
-            minimumRootWork: UInt256(1),
-            storagePath: path.deletingLastPathComponent(),
-            privateKeyHex: String(repeating: "7a", count: 32)
-        )
         return try NodeStore(
             databasePath: path,
             nexusGenesisCID: genesisCID ?? self.genesisCID,
             chainPath: chainPath,
-            spawningParentKey: spawningParentKey ?? (chainPath.count == 1
-                ? ""
-                : String(repeating: "a", count: ParentProcessKey.encodedByteCount)),
-            issuingAuthorityKey: issuingAuthorityKey ?? issuer.processPublicKey,
             recoveryVolumeBroker: broker,
             issuedRecoveryRetentionScope: "test:issued-hierarchy",
             preparedRecoveryRetentionScope: "test:prepared-hierarchy",
@@ -2471,48 +2489,8 @@ final class NodeStoreTests: XCTestCase {
         bootstrapRoots: [String]? = nil,
         parentCarrierCID: String? = nil
     ) async throws {
-        let chainPath = ["Nexus"] + Array(proof.directoryPath.dropLast())
-        let parentIdentity = try NodeConfiguration(
-            chainPath: ["Nexus"],
-            minimumRootWork: UInt256(1),
-            storagePath: temporaryDirectory(),
-            privateKeyHex: String(repeating: "7b", count: 32)
-        )
-        let configuration = try NodeConfiguration(
-            chainPath: Array(chainPath),
-            minimumRootWork: UInt256(1),
-            storagePath: temporaryDirectory(),
-            privateKeyHex: String(repeating: "7a", count: 32),
-            parentEndpoint: chainPath.count == 1 ? nil : ParentEndpoint(
-                publicKey: parentIdentity.processPublicKey,
-                host: "127.0.0.1",
-                port: 4002
-            )
-        )
-        let derivedEdge = await DirectChildEdge.derive(from: proof)
-        let edge = try XCTUnwrap(derivedEdge)
-        let pathJSON = String(
-            data: try JSONEncoder().encode(chainPath),
-            encoding: .utf8
-        )!
-        let carrierLink = try decode(ParentCarrierLink.self, json: """
-            {"parentPath":\(pathJSON),"carrierCID":"\(edge.parentCarrierCID)","rootCID":"\(proof.rootCID)"}
-            """)
-        let genesisLink: ParentGenesisLink?
-        if isChildGenesis {
-            genesisLink = try decode(ParentGenesisLink.self, json: """
-                {"parentPath":\(pathJSON),"directory":"\(edge.directory)","childGenesisCID":"\(childCID)"}
-                """)
-        } else {
-            genesisLink = nil
-        }
         let envelope = try ChildValidationPackageEnvelope(
-            ChildValidationPackage(
-                proof: proof,
-                parentCarrierLink: carrierLink,
-                parentGenesisLink: genesisLink
-            ),
-            certificatesSignedBy: configuration
+            ChildValidationPackage(proof: proof)
         )
         try await store.persistIssuedChildProof(
             proof,
@@ -2520,10 +2498,7 @@ final class NodeStoreTests: XCTestCase {
             isChildGenesis: isChildGenesis,
             bootstrapRoots: bootstrapRoots ?? [],
             parentCarrierCID: parentCarrierCID,
-            rootEnvelope: envelope,
-            rootAuthorityKey: try XCTUnwrap(ParentProcessKey(
-                configuration.processPublicKey
-            ))
+            rootEnvelope: envelope
         )
     }
 

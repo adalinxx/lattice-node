@@ -100,7 +100,8 @@ final class MultichainInvariantTests: XCTestCase {
         let carrierLink = try XCTUnwrap(reopenedCarrierLink)
         let reopenedGenesisLink = try await parent!.issuedParentGenesisLink(
             directory: "Payments",
-            childGenesisCID: childHeader.rawCID
+            childGenesisCID: childHeader.rawCID,
+            parentStateCID: carrier.prevState.rawCID
         )
         let genesisLink = try XCTUnwrap(reopenedGenesisLink)
         XCTAssertEqual(carrierLink.parentPath, ["Nexus"])
@@ -119,7 +120,6 @@ final class MultichainInvariantTests: XCTestCase {
         let package = AuthenticatedChildPackage(
             package: ChildValidationPackage(
                 proof: evidence.proof,
-                parentCarrierLink: carrierLink,
                 parentGenesisLink: genesisLink
             )
         )

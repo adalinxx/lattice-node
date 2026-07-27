@@ -1576,7 +1576,8 @@ public actor ChainService {
             for anchor in blockAnchors {
                 if let link = try? await process.issuedParentGenesisLink(
                     directory: anchor.directory,
-                    childGenesisCID: anchor.genesisCID
+                    childGenesisCID: anchor.genesisCID,
+                    parentStateCID: block.prevState.rawCID
                 ) {
                     genesisLinks.append(link)
                     if childIntents[anchor.directory]?.genesisCID == anchor.genesisCID {
