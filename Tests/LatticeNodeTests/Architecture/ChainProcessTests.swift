@@ -638,6 +638,54 @@ final class ChainProcessTests: XCTestCase {
         XCTAssertNil(status.height)
     }
 
+    func testMissingParentFactDoesNotOverrideContextualCandidateRetention()
+        async throws {
+        let fixture = try await childBootstrapFixture()
+        let process = try await ChainProcess.open(
+            configuration: fixture.configuration
+        )
+        try await process.storeContextualCandidate(
+            fixture.childHeader,
+            fetcher: fixture.source,
+            capacity: 1
+        )
+        let owner = [
+            fixture.configuration.nexusGenesisCID,
+            fixture.configuration.address.key,
+        ].joined(separator: ":") + ":contextual-candidates"
+        let store = try testNodeStore(
+            databasePath: fixture.configuration.storagePath
+                .appendingPathComponent("state.db"),
+            nexusGenesisCID: fixture.configuration.nexusGenesisCID,
+            chainPath: fixture.configuration.chainPath,
+            issuingAuthorityKey: fixture.configuration.processPublicKey,
+            contextualCandidateOwner: owner
+        )
+        let retainedBefore = try await store.contextualCandidateVolumeRoots()
+        XCTAssertTrue(retainedBefore.contains(fixture.childHeader.rawCID))
+        XCTAssertGreaterThan(retainedBefore.count, 1)
+
+        let missingFactPackage = AuthenticatedChildPackage(
+            package: ChildValidationPackage(proof: fixture.proof)
+        )
+        let outcome = try await process.admit(
+            fixture.childHeader,
+            authenticatedChildPackage: missingFactPackage,
+            remoteSource: fixture.source
+        )
+        guard case .unavailable(.parentGenesis(
+            parentPath: _,
+            directory: "Payments",
+            childGenesisCID: fixture.childHeader.rawCID,
+            parentStateCID: _
+        )) = outcome.decision else {
+            return XCTFail("expected missing parent genesis fact")
+        }
+
+        let retainedAfter = try await store.contextualCandidateVolumeRoots()
+        XCTAssertEqual(retainedAfter, retainedBefore)
+    }
+
     func testSuccessorAttachmentWaitsForChildGenesis() async throws {
         let fixture = try await childBootstrapFixture()
         let parentSource = fixture.source

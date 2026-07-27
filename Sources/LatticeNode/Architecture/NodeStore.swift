@@ -1359,30 +1359,6 @@ actor NodeStore {
         return link
     }
 
-    func hasIssuedChildDirectory(_ directory: String) throws -> Bool {
-        let rows = try database.query(
-            "SELECT payload FROM issued_parent_facts WHERE kind = 'genesis' AND key_a = ?1 ORDER BY key_b",
-            params: [.text(directory)]
-        )
-        for row in rows {
-            guard let payload = row["payload"]?.blobValue else {
-                throw NodeStoreError.corrupt(
-                    "malformed locally issued child-directory index"
-                )
-            }
-            let link = try Self.decode(ParentGenesisLink.self, from: payload)
-            guard link.parentPath == chainPath,
-                  link.directory == directory,
-                  !link.childGenesisCID.isEmpty,
-                  !link.parentStateCID.isEmpty else {
-                throw NodeStoreError.corrupt(
-                    "malformed locally issued child-directory link"
-                )
-            }
-        }
-        return !rows.isEmpty
-    }
-
     /// Persists content-authenticated proof material used to serve a direct
     /// child. Different Nexus roots and directories for the same child are
     /// distinct valid evidence, so the cache is set-valued by
@@ -1812,9 +1788,6 @@ actor NodeStore {
             throw NodeStoreError.invalidConfiguration(
                 "child-evidence page must be bounded"
             )
-        }
-        guard try hasIssuedChildDirectory(directory) else {
-            return []
         }
         let rows = try database.query(
             "SELECT p.ordinal, e.child_cid, p.root_cid, p.attachment_cid FROM issued_child_proofs AS p INNER JOIN issued_child_edges AS e ON e.edge_cid = p.edge_cid WHERE p.scope = ?1 AND e.directory = ?2 AND p.ordinal > ?3 AND p.ordinal <= ?4 ORDER BY p.ordinal LIMIT ?5",

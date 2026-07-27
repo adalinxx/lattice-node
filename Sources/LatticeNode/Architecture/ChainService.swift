@@ -188,15 +188,18 @@ public struct ChildCandidateRequestContext: Sendable {
     public let parentCarrier: Block
     public let rewards: [MiningReward]
     public let mode: MiningMode
+    public let excludedDirectories: Set<String>
 
     public init(
         parentCarrier: Block,
         rewards: [MiningReward],
-        mode: MiningMode = .normal
+        mode: MiningMode = .normal,
+        excludedDirectories: Set<String> = []
     ) {
         self.parentCarrier = parentCarrier
         self.rewards = rewards
         self.mode = mode
+        self.excludedDirectories = excludedDirectories
     }
 }
 
@@ -1197,6 +1200,10 @@ public actor ChainService {
                 in: provisional.block
             )
             let selectedAnchors = anchors(in: selectedTransactions)
+            let localChildren = eligibleChildren(
+                parentStateCID: previous.postState.rawCID,
+                anchors: selectedAnchors
+            )
             let localDeploymentIncluded = selectedDeploymentIndex.map {
                 anchors(in: [pooled[$0]]).isSubset(of: selectedAnchors)
             } ?? false
@@ -1206,7 +1213,8 @@ public actor ChainService {
                     rewards: rewardPlan.descendants,
                     mode: mode == .deployment && !localDeploymentIncluded
                         ? .deployment
-                        : .normal
+                        : .normal,
+                    excludedDirectories: Set(localChildren.map(\.directory))
                 ),
                 deploymentCursor: childDeploymentCursor
             )
@@ -1231,10 +1239,6 @@ public actor ChainService {
                !providedDeployment {
                 throw ChainServiceError.noDeploymentAvailable
             }
-            let localChildren = eligibleChildren(
-                parentStateCID: previous.postState.rawCID,
-                anchors: selectedAnchors
-            )
             let children = try combineChildren(
                 providedChildren,
                 localChildren

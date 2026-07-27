@@ -4,6 +4,26 @@ import XCTest
 @testable import LatticeNode
 
 final class CandidateAcquirerTests: XCTestCase {
+    func testParentFactTimeoutRetriesExactUnchangedEvidence() throws {
+        let blockCID = "parent-fact-timeout"
+        let rootCID = "parent-fact-root"
+        var acquirer = CandidateAcquirer()
+        XCTAssertTrue(acquirer.observe(.init(
+            blockCID: blockCID,
+            package: nil,
+            recoveryRootCID: rootCID
+        )).accepted)
+        let ticket = try XCTUnwrap(acquirer.next())
+        XCTAssertTrue(acquirer.complete(
+            ticket.ticket,
+            resolution: .wait(.evidence)
+        ))
+
+        acquirer.retryExternalDependency(blockCID: blockCID, rootCID: rootCID)
+
+        XCTAssertEqual(acquirer.next()?.blockCID, blockCID)
+    }
+
     private func provider(
         _ publicKey: String,
         session: UInt8

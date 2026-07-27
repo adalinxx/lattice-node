@@ -103,6 +103,24 @@ struct AcceptedLeavesCursor: Sendable, Equatable {
     let snapshotSequence: Int64?
 }
 
+struct ParentStateQueryGuard {
+    let capacity: Int
+    private(set) var peers = Set<PeerKey>()
+
+    mutating func acquire(_ peer: PeerKey) -> Bool {
+        guard peers.count < capacity else { return false }
+        return peers.insert(peer).inserted
+    }
+
+    mutating func release(_ peer: PeerKey) {
+        peers.remove(peer)
+    }
+
+    mutating func removeAll() {
+        peers.removeAll()
+    }
+}
+
 private enum NodePolicyDecline: Error {
     case belowMinimumRootWork
     case chainSpecTooLarge
@@ -436,8 +454,9 @@ public actor NodeNetworkRuntime: IvyDelegate {
     private var pendingEvidenceIndexes: [UInt64: PendingChildEvidenceIndex] = [:]
     private var pendingParentChainFacts:
         [UInt64: PendingParentChainFact] = [:]
-    private var activeParentStateQueries = 0
-    private var activeParentStateQueryPeers = Set<PeerKey>()
+    private var parentStateQueryGuard = ParentStateQueryGuard(
+        capacity: NodeNetworkRuntime.maximumConcurrentParentStateQueries
+    )
     private var pendingPortableAttachmentIndexes:
         [UInt64: PendingPortableAttachmentIndex] = [:]
     private var activeEvidenceVolumes = Set<EvidenceVolumeLease>()
@@ -793,8 +812,7 @@ public actor NodeNetworkRuntime: IvyDelegate {
         )
         pendingEvidenceIndexes.removeAll()
         pendingParentChainFacts.removeAll()
-        activeParentStateQueries = 0
-        activeParentStateQueryPeers.removeAll()
+        parentStateQueryGuard.removeAll()
         pendingPortableAttachmentIndexes.removeAll()
         activeEvidenceVolumes.removeAll()
         portableEvidenceWorker?.cancel()
@@ -959,7 +977,10 @@ public actor NodeNetworkRuntime: IvyDelegate {
             parentVolume,
             generation: generation
         ) else { return [] }
-        let children = selectedChildPeers()
+        let children = selectedChildPeers().filter {
+            guard let directory = $0.2.last else { return false }
+            return !context.excludedDirectories.contains(directory)
+        }
 
         var candidates: [(Int, DirectChildCandidate)] = []
         await withTaskGroup(of: (Int, DirectChildCandidate?).self) { group in
@@ -1882,10 +1903,7 @@ public actor NodeNetworkRuntime: IvyDelegate {
                 $0.value.peer.key != key
             }
             for pending in interrupted {
-                _ = requeueCandidate(CandidateSeed(
-                    blockCID: pending.blockCID,
-                    package: pending.package
-                ))
+                retryParentFactCandidate(pending)
             }
         }
         cancelChildCandidateWork(for: key)
@@ -3017,20 +3035,12 @@ public actor NodeNetworkRuntime: IvyDelegate {
         switch (message.topic, role) {
         case (NodeNetworkTopic.parentChainFactRequest,
               .child(let childPath)):
-            guard activeParentStateQueries
-                    < Self.maximumConcurrentParentStateQueries,
-                  activeParentStateQueryPeers.insert(peer.key).inserted,
-                  let request = try?
-                    ParentChainFactMessage.decoded(
-                        message.payload
-                    ) else {
-                activeParentStateQueryPeers.remove(peer.key)
-                return
-            }
-            activeParentStateQueries += 1
+            guard let request = try?
+                    ParentChainFactMessage.decoded(message.payload),
+                  parentStateQueryGuard.acquire(peer.key)
+            else { return }
             defer {
-                activeParentStateQueries -= 1
-                activeParentStateQueryPeers.remove(peer.key)
+                parentStateQueryGuard.release(peer.key)
             }
             let found: Bool
             switch request.fact {
@@ -3296,27 +3306,6 @@ public actor NodeNetworkRuntime: IvyDelegate {
             return
         }
 
-        if case .child(let path) = role {
-            guard let directory = path.last else {
-                await hierarchy.disconnectSession(ifCurrent: peer)
-                return
-            }
-            guard (try? await process.hasIssuedChildDirectory(directory)) == true else {
-                guard isCurrentRuntime(generation: generation, process: process) else {
-                    return
-                }
-                // A compatible immediate child may start before its
-                // deployment carrier is accepted. Close this session without
-                // suppressing its next inbound attempt; the directory gate is
-                // checked again on the replacement session.
-                await hierarchy.recycleSession(ifCurrent: peer)
-                return
-            }
-            guard isCurrentRuntime(generation: generation, process: process),
-                  expectsHierarchyHello(from: peer) else {
-                return
-            }
-        }
         guard isCurrentRuntime(generation: generation, process: process),
               expectsHierarchyHello(from: peer) else {
             return
@@ -4020,6 +4009,10 @@ public actor NodeNetworkRuntime: IvyDelegate {
                         || attempt.attribution.localCapacityUnavailable
                   ) {
             resolution = .wait(.content)
+        } else if case .unavailable(.parentGenesis?) = outcome.decision {
+            resolution = .wait(.later)
+        } else if case .unavailable(.parentStateContinuity?) = outcome.decision {
+            resolution = .wait(.later)
         } else if outcome.decision.shouldRetryWhenEvidenceChanges {
             resolution = .wait(.evidence)
         } else if outcome.decision.shouldRetryLater {
@@ -4509,10 +4502,19 @@ public actor NodeNetworkRuntime: IvyDelegate {
               let pending = pendingParentChainFacts.removeValue(
                 forKey: requestID
               ) else { return }
-        _ = enqueueCandidate(CandidateSeed(
+        retryParentFactCandidate(pending)
+    }
+
+    private func retryParentFactCandidate(_ pending: PendingParentChainFact) {
+        _ = candidateAcquirer.observe(CandidateSeed(
             blockCID: pending.blockCID,
             package: pending.package
         ))
+        candidateAcquirer.retryExternalDependency(
+            blockCID: pending.blockCID,
+            rootCID: pending.package.package.proof.rootCID
+        )
+        serviceCandidateAcquirer()
     }
 
     private func requestEvidenceIndex(

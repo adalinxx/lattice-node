@@ -988,6 +988,24 @@ private enum NetworkTransportTestPorts {
 }
 
 final class NetworkTrustTests: XCTestCase {
+    func testDuplicateParentQueryCannotReleaseActivePeerSlot() throws {
+        let first = try PeerKey(
+            rawRepresentation: Data(repeating: 1, count: PeerKey.byteCount)
+        )
+        let second = try PeerKey(
+            rawRepresentation: Data(repeating: 2, count: PeerKey.byteCount)
+        )
+        var guardState = ParentStateQueryGuard(capacity: 1)
+
+        XCTAssertTrue(guardState.acquire(first))
+        XCTAssertFalse(guardState.acquire(first))
+        XCTAssertFalse(guardState.acquire(second))
+        XCTAssertEqual(guardState.peers, [first])
+
+        guardState.release(first)
+        XCTAssertTrue(guardState.acquire(second))
+    }
+
     private let nexusCID = "bafyreiaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     private let minimumRootWork = String(repeating: "0", count: 63) + "1"
     private func overlayRuntime(

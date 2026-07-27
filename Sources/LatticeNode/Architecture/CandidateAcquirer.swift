@@ -461,6 +461,18 @@ struct CandidateAcquirer {
         fillReadyCapacity()
     }
 
+    mutating func retryExternalDependency(blockCID: String, rootCID: String?) {
+        let key = AttemptKey(blockCID: blockCID, rootCID: rootCID)
+        guard var record = records[blockCID],
+              var attempt = record.attempts[rootCID],
+              case .waiting(let reason, _) = attempt.state,
+              reason == .evidence || reason == .later else { return }
+        attempt.state = .ready
+        record.attempts[rootCID] = attempt
+        records[blockCID] = record
+        _ = scheduleIfReady(key)
+    }
+
     mutating func takeInventoryRestart() -> Bool {
         defer { inventoryRestartNeeded = false }
         return inventoryRestartNeeded
