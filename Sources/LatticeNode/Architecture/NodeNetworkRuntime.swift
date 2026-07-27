@@ -267,9 +267,9 @@ public actor NodeNetworkRuntime: IvyDelegate {
         let request: ChildEvidenceIndexRequestMessage
     }
 
-    private struct PendingParentStateContinuity: Sendable {
+    private struct PendingParentChainFact: Sendable {
         let peer: AuthenticatedPeer
-        let request: ParentStateContinuityRequestMessage
+        let request: ParentChainFactMessage
         let blockCID: String
         let package: AuthenticatedChildPackage
     }
@@ -390,7 +390,6 @@ public actor NodeNetworkRuntime: IvyDelegate {
     private let configuration: NodeConfiguration
     private let overlay: Ivy
     private let hello: ChainHello
-    private let parentFactGate: AuthenticatedParentFactGate?
 
     private var lifecycleTail: Task<Void, Never>?
     /// Nonzero only while a process is the active runtime. Delegate callbacks
@@ -435,9 +434,10 @@ public actor NodeNetworkRuntime: IvyDelegate {
     private var candidateWorker: Task<Void, Never>?
     private var candidateWorkerGeneration: UInt64?
     private var pendingEvidenceIndexes: [UInt64: PendingChildEvidenceIndex] = [:]
-    private var pendingParentStateContinuity:
-        [UInt64: PendingParentStateContinuity] = [:]
+    private var pendingParentChainFacts:
+        [UInt64: PendingParentChainFact] = [:]
     private var activeParentStateQueries = 0
+    private var activeParentStateQueryPeers = Set<PeerKey>()
     private var pendingPortableAttachmentIndexes:
         [UInt64: PendingPortableAttachmentIndex] = [:]
     private var activeEvidenceVolumes = Set<EvidenceVolumeLease>()
@@ -558,12 +558,6 @@ public actor NodeNetworkRuntime: IvyDelegate {
             nexusGenesisCID: configuration.nexusGenesisCID,
             chainPath: configuration.chainPath
         )
-        parentFactGate = try configuration.parentEndpoint.map {
-            try AuthenticatedParentFactGate(
-                childPath: configuration.chainPath,
-                configuredParentIvyPeerKey: $0.publicKey
-            )
-        }
     }
 
     /// Installs both delegates and the recovered process's local content source
@@ -798,8 +792,9 @@ public actor NodeNetworkRuntime: IvyDelegate {
                 * Self.maximumCandidateWaitTicks
         )
         pendingEvidenceIndexes.removeAll()
-        pendingParentStateContinuity.removeAll()
+        pendingParentChainFacts.removeAll()
         activeParentStateQueries = 0
+        activeParentStateQueryPeers.removeAll()
         pendingPortableAttachmentIndexes.removeAll()
         activeEvidenceVolumes.removeAll()
         portableEvidenceWorker?.cancel()
@@ -1880,8 +1875,17 @@ public actor NodeNetworkRuntime: IvyDelegate {
         )
         if case .parent? = removedRole {
             pendingEvidenceIndexes.removeAll()
-            pendingParentStateContinuity = pendingParentStateContinuity.filter {
+            let interrupted = pendingParentChainFacts.values.filter {
+                $0.peer.key == key
+            }
+            pendingParentChainFacts = pendingParentChainFacts.filter {
                 $0.value.peer.key != key
+            }
+            for pending in interrupted {
+                _ = requeueCandidate(CandidateSeed(
+                    blockCID: pending.blockCID,
+                    package: pending.package
+                ))
             }
         }
         cancelChildCandidateWork(for: key)
@@ -2535,8 +2539,7 @@ public actor NodeNetworkRuntime: IvyDelegate {
             scope: .incomingCarrier,
             directory: configuration.address.directory,
             after: after,
-            limit: PortableAttachmentIndexResponseMessage.maximumEntries + 1,
-            portableOnly: true
+            limit: PortableAttachmentIndexResponseMessage.maximumEntries + 1
         ), isCurrentRuntime(generation: generation, process: process) else {
             return
         }
@@ -2735,15 +2738,7 @@ public actor NodeNetworkRuntime: IvyDelegate {
             return enqueueCandidate(CandidateSeed(
                 blockCID: evidence.edge.childCID,
                 package: AuthenticatedChildPackage(
-                    package: ChildValidationPackage(
-                        proof: evidence.proof,
-                        parentCarrierLink: evidence.parentCarrierLink,
-                        parentGenesisLink: evidence.parentGenesisLink
-                    ),
-                    parentCarrierCertificate:
-                        evidence.parentCarrierCertificate,
-                    parentGenesisCertificate:
-                        evidence.parentGenesisCertificate
+                    package: ChildValidationPackage(proof: evidence.proof)
                 )
             ))
         }
@@ -2795,18 +2790,9 @@ public actor NodeNetworkRuntime: IvyDelegate {
                 maximumEncodedSize:
                     configuration.resourcePolicy.maximumParentWitnessBytes
               ),
-              envelope.parentCarrierLink != nil,
-              envelope.parentCarrierCertificate != nil,
-              let gate = parentFactGate,
-              let authority = configuration.parentEndpoint.flatMap({
-                  ParentProcessKey($0.publicKey)
-              }),
-              let gated = try? gate.acceptPortable(
-                envelope,
-                durableParentProcessKey: authority
-              ),
-              gated.package.proof.rootCID == summary.rootCID,
-              let edge = await DirectChildEdge.derive(from: gated.package.proof),
+              let package = try? envelope.makeValidationPackage(),
+              package.proof.rootCID == summary.rootCID,
+              let edge = await DirectChildEdge.derive(from: package.proof),
               edge.edgeCID == summary.edgeCID,
               isCurrentRuntime(generation: generation, process: process),
               overlayPeers[peer.key]?.sessionID == peer.sessionID else {
@@ -2819,6 +2805,7 @@ public actor NodeNetworkRuntime: IvyDelegate {
             }
             return false
         }
+        let gated = AuthenticatedChildPackage(package: package)
         return enqueueCandidate(CandidateSeed(
             blockCID: edge.childCID,
             package: gated
@@ -2975,10 +2962,10 @@ public actor NodeNetworkRuntime: IvyDelegate {
         ) else {
             return .failed
         }
-        guard let gate = parentFactGate,
-              let gated = try? gate.accept(envelope, from: peer) else {
+        guard let package = try? envelope.makeValidationPackage() else {
             return .failed
         }
+        let gated = AuthenticatedChildPackage(package: package)
         guard gated.package.proof.rootCID == summary.rootCID,
               let directHop = await gated.package.proof.directHop(),
               directHop.childCID == summary.childCID else {
@@ -3028,94 +3015,66 @@ public actor NodeNetworkRuntime: IvyDelegate {
               let role = hierarchyPeers[peer.key] else { return }
 
         switch (message.topic, role) {
-        case (NodeNetworkTopic.parentStateContinuityRequest,
+        case (NodeNetworkTopic.parentChainFactRequest,
               .child(let childPath)):
             guard activeParentStateQueries
                     < Self.maximumConcurrentParentStateQueries,
+                  activeParentStateQueryPeers.insert(peer.key).inserted,
                   let request = try?
-                    ParentStateContinuityRequestMessage.decoded(
+                    ParentChainFactMessage.decoded(
                         message.payload
-                    ),
-                  request.childPath == childPath else { return }
-            activeParentStateQueries += 1
-            defer { activeParentStateQueries -= 1 }
-            guard let link = await process.parentStateContinuityLink(
-                    from: request.fromStateCID,
-                    to: request.toStateCID
-                  ),
-                  let certificate = try?
-                    ParentStateContinuityCertificateV1(
-                        link: link,
-                        signedBy: configuration
-                    ).encode(),
-                  let payload = try?
-                    ParentStateContinuityResponseMessage(
-                        requestID: request.requestID,
-                        childPath: childPath,
-                        link: link,
-                        certificate: certificate
-                    ).encoded() else {
+                    ) else {
+                activeParentStateQueryPeers.remove(peer.key)
                 return
             }
+            activeParentStateQueries += 1
+            defer {
+                activeParentStateQueries -= 1
+                activeParentStateQueryPeers.remove(peer.key)
+            }
+            let found: Bool
+            switch request.fact {
+            case .genesis(let childGenesisCID, let parentStateCID):
+                guard let directory = childPath.last else { return }
+                found = (try? await process.issuedParentGenesisLink(
+                    directory: directory,
+                    childGenesisCID: childGenesisCID,
+                    parentStateCID: parentStateCID
+                )) != nil
+            case .continuity(let fromStateCID, let toStateCID):
+                found = await process.hasParentStateContinuity(
+                    from: fromStateCID,
+                    to: toStateCID
+                )
+            }
+            guard found else { return }
             _ = await hierarchy.sendMessage(
                 to: peer,
-                topic: NodeNetworkTopic.parentStateContinuityResponse,
-                payload: payload
+                topic: NodeNetworkTopic.parentChainFactResponse,
+                payload: message.payload
             )
 
-        case (NodeNetworkTopic.parentStateContinuityResponse, .parent):
+        case (NodeNetworkTopic.parentChainFactResponse, .parent):
             guard let response = try?
-                    ParentStateContinuityResponseMessage.decoded(
+                    ParentChainFactMessage.decoded(
                         message.payload
                     ),
-                  let pending = pendingParentStateContinuity[
+                  let pending = pendingParentChainFacts[
                     response.requestID
                   ],
                   pending.peer.key == peer.key,
                   pending.peer.sessionID == peer.sessionID,
-                  response.childPath == configuration.chainPath,
-                  response.childPath == pending.request.childPath,
-                  response.link.fromStateCID
-                    == pending.request.fromStateCID,
-                  response.link.toStateCID == pending.request.toStateCID,
-                  let authority = ParentProcessKey(
-                    configuration.parentEndpoint?.publicKey ?? ""
-                  ),
-                  let certificate = try?
-                    ParentStateContinuityCertificateV1.decode(
-                        response.certificate
-                    ),
-                  certificate.verifies(
-                    link: response.link,
-                    authorityKey: authority,
-                    expectedNexusGenesisCID: configuration.nexusGenesisCID,
-                    expectedParentPath:
-                        Array(configuration.chainPath.dropLast())
-                  ) else {
+                  response == pending.request else {
                 return
             }
-            pendingParentStateContinuity.removeValue(
+            pendingParentChainFacts.removeValue(
                 forKey: response.requestID
             )
-            let current = pending.package
-            let enriched = AuthenticatedChildPackage(
-                package: ChildValidationPackage(
-                    proof: current.package.proof,
-                    parentCarrierLink: current.package.parentCarrierLink,
-                    parentGenesisLink: current.package.parentGenesisLink,
-                    parentStateContinuityLink: response.link
-                ),
-                parentCarrierCertificate:
-                    current.parentCarrierCertificate,
-                parentGenesisCertificate:
-                    current.parentGenesisCertificate,
-                parentStateContinuityCertificate: certificate
+            await acceptParentChainFact(
+                pending: pending,
+                generation: generation,
+                process: process
             )
-            _ = candidateAcquirer.observe(CandidateSeed(
-                blockCID: pending.blockCID,
-                package: enriched
-            ))
-            serviceCandidateAcquirer()
 
         case (NodeNetworkTopic.childEvidenceAvailable, .parent):
             guard
@@ -3619,6 +3578,14 @@ public actor NodeNetworkRuntime: IvyDelegate {
         return result.accepted
     }
 
+    @discardableResult
+    private func requeueCandidate(_ seed: CandidateSeed) -> Bool {
+        guard isRunning else { return false }
+        let accepted = candidateAcquirer.requeue(seed)
+        serviceCandidateAcquirer()
+        return accepted
+    }
+
     private func candidateProvider(
         _ peer: AuthenticatedPeer
     ) -> CandidateProvider {
@@ -3764,7 +3731,7 @@ public actor NodeNetworkRuntime: IvyDelegate {
             )
         }
         exactSources = []
-        if authenticatedPackage?.package.parentGenesisLink != nil,
+        if authenticatedPackage != nil,
            let parent = configuredParentPeer() {
             exactSources.append((
                 parent,
@@ -3866,12 +3833,13 @@ public actor NodeNetworkRuntime: IvyDelegate {
                         source: session,
                         configuration: configuration
                     )
-                    return try await admissionHandler(NetworkCandidateAdmission(
+                    let admitted = try await admissionHandler(NetworkCandidateAdmission(
                         header: header,
                         authenticatedChildPackage: authenticatedPackage,
                         preparingChildDirectories: childDirectories,
                         contentSource: session
                     ))
+                    return admitted
                 }
                 await reportDeficientVolumes(resolved.attribution)
                 // Admission durably records any unresolved direct-child
@@ -3972,10 +3940,7 @@ public actor NodeNetworkRuntime: IvyDelegate {
                let edge = await DirectChildEdge.derive(
                     from: authenticated.package.proof
                ), let edgeCID = edge.edgeCID {
-                if authenticated.parentCarrierCertificate != nil,
-                   authenticated.package.parentGenesisLink == nil
-                        || authenticated.parentGenesisCertificate != nil,
-                   let portableAttachmentCID = try? await process
+                if let portableAttachmentCID = try? await process
                         .portableEvidenceVolumeCID(
                             scope: .incomingCarrier,
                             edgeCID: edgeCID,
@@ -4004,23 +3969,46 @@ public actor NodeNetworkRuntime: IvyDelegate {
                 )
             }
         }
-        if case .unavailable(.parentStateContinuity(
-            let parentPath,
-            let fromStateCID,
-            let toStateCID
-        )) = outcome.decision,
-           parentPath == Array(configuration.chainPath.dropLast()),
+        if case .unavailable(let requirement?) = outcome.decision,
            let authenticatedPackage {
-            await requestParentStateContinuity(
-                from: fromStateCID,
-                to: toStateCID,
-                for: candidate.blockCID,
-                package: authenticatedPackage,
-                generation: generation,
-                process: process
-            )
+            let parentPath = Array(configuration.chainPath.dropLast())
+            switch requirement {
+            case .parentGenesis(
+                let requiredPath,
+                let directory,
+                let childGenesisCID,
+                let parentStateCID
+            ) where requiredPath == parentPath
+                    && directory == configuration.address.directory:
+                await requestParentChainFact(
+                    .genesis(
+                        childGenesisCID: childGenesisCID,
+                        parentStateCID: parentStateCID
+                    ),
+                    for: candidate.blockCID,
+                    package: authenticatedPackage,
+                    generation: generation,
+                    process: process
+                )
+            case .parentStateContinuity(
+                let requiredPath,
+                let fromStateCID,
+                let toStateCID
+            ) where requiredPath == parentPath:
+                await requestParentChainFact(
+                    .continuity(
+                        fromStateCID: fromStateCID,
+                        toStateCID: toStateCID
+                    ),
+                    for: candidate.blockCID,
+                    package: authenticatedPackage,
+                    generation: generation,
+                    process: process
+                )
+            default:
+                break
+            }
         }
-
         let resolution: CandidateAcquirer.Resolution
         if let predecessor = outcome.sameChainPredecessor {
             resolution = .predecessor(predecessor.predecessorCID)
@@ -4413,9 +4401,8 @@ public actor NodeNetworkRuntime: IvyDelegate {
         )
     }
 
-    private func requestParentStateContinuity(
-        from fromStateCID: String,
-        to toStateCID: String,
+    private func requestParentChainFact(
+        _ fact: ParentChainFact,
         for blockCID: String,
         package: AuthenticatedChildPackage,
         generation: UInt64,
@@ -4423,62 +4410,109 @@ public actor NodeNetworkRuntime: IvyDelegate {
     ) async {
         guard !configuration.address.isNexus,
               isCurrentRuntime(generation: generation, process: process),
-              pendingParentStateContinuity.count
+              pendingParentChainFacts.count
                 < Self.maximumPendingRequests,
-              !pendingParentStateContinuity.values.contains(where: {
+              !pendingParentChainFacts.values.contains(where: {
                   $0.blockCID == blockCID
-                    && $0.request.fromStateCID == fromStateCID
-                    && $0.request.toStateCID == toStateCID
+                    && $0.request.fact == fact
               }),
               let parent = configuredParentPeer() else {
             return
         }
-        let request = ParentStateContinuityRequestMessage(
+        let request = ParentChainFactMessage(
             requestID: makeRequestID(),
-            childPath: configuration.chainPath,
-            fromStateCID: fromStateCID,
-            toStateCID: toStateCID
+            fact: fact
         )
         guard let payload = try? request.encoded() else { return }
-        pendingParentStateContinuity[request.requestID] =
-            PendingParentStateContinuity(
+        pendingParentChainFacts[request.requestID] =
+            PendingParentChainFact(
                 peer: parent,
                 request: request,
                 blockCID: blockCID,
                 package: package
             )
-        let result = await hierarchy.sendMessage(
+        _ = await hierarchy.sendMessage(
             to: parent,
-            topic: NodeNetworkTopic.parentStateContinuityRequest,
+            topic: NodeNetworkTopic.parentChainFactRequest,
             payload: payload
         )
         guard isCurrentRuntime(
             generation: generation,
             process: process
-        ), case .enqueued = result else {
-            pendingParentStateContinuity.removeValue(
+        ) else {
+            pendingParentChainFacts.removeValue(
                 forKey: request.requestID
             )
             return
         }
+        // A failed enqueue is transient. Keep the request until the same
+        // timeout used for an unanswered parent response requeues the
+        // candidate; a disconnect requeues it sooner.
         let delay = Self.nanoseconds(
             planeConfigurations.hierarchy.requestTimeout
         )
         Task { [weak self] in
             try? await Task.sleep(nanoseconds: delay)
-            await self?.parentStateContinuityRequestTimedOut(
+            await self?.parentChainFactRequestTimedOut(
                 request.requestID,
                 generation: generation
             )
         }
     }
 
-    private func parentStateContinuityRequestTimedOut(
+    private func acceptParentChainFact(
+        pending: PendingParentChainFact,
+        generation: UInt64,
+        process: ChainProcess
+    ) async {
+        guard isCurrentRuntime(generation: generation, process: process) else {
+            return
+        }
+        let parentPath = Array(configuration.chainPath.dropLast())
+        let localFact: AuthenticatedChildPackage
+        switch pending.request.fact {
+        case .genesis(let childGenesisCID, let parentStateCID):
+            localFact = AuthenticatedChildPackage(package: ChildValidationPackage(
+                proof: pending.package.package.proof,
+                parentGenesisLink: ParentGenesisLink(
+                    parentPath: parentPath,
+                    directory: configuration.address.directory,
+                    childGenesisCID: childGenesisCID,
+                    parentStateCID: parentStateCID
+                )
+            ))
+        case .continuity(let fromStateCID, let toStateCID):
+            localFact = AuthenticatedChildPackage(package: ChildValidationPackage(
+                proof: pending.package.package.proof,
+                parentStateContinuityLink: ParentStateContinuityLink(
+                    parentPath: parentPath,
+                    fromStateCID: fromStateCID,
+                    toStateCID: toStateCID
+                )
+            ))
+        }
+        guard let merged = CandidateAcquirer.mergePackages(
+            pending.package,
+            localFact
+        ) else { return }
+        _ = enqueueCandidate(CandidateSeed(
+            blockCID: pending.blockCID,
+            package: merged
+        ))
+    }
+
+    private func parentChainFactRequestTimedOut(
         _ requestID: UInt64,
         generation: UInt64
     ) {
-        guard isCurrentGeneration(generation) else { return }
-        pendingParentStateContinuity.removeValue(forKey: requestID)
+        guard isCurrentGeneration(generation),
+              let pending = pendingParentChainFacts.removeValue(
+                forKey: requestID
+              ) else { return }
+        _ = enqueueCandidate(CandidateSeed(
+            blockCID: pending.blockCID,
+            package: pending.package
+        ))
     }
 
     private func requestEvidenceIndex(

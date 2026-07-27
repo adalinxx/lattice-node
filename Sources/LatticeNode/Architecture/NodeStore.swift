@@ -84,10 +84,6 @@ struct IssuedChildEvidence: Sendable {
     let attachmentCID: String
     let edge: DirectChildEdge
     let proof: ChildBlockProof
-    let parentCarrierLink: ParentCarrierLink?
-    let parentGenesisLink: ParentGenesisLink?
-    let parentCarrierCertificate: ParentCarrierCertificateV1?
-    let parentGenesisCertificate: ParentGenesisCertificateV1?
 }
 
 /// Evidence verified by Lattice that the node must commit with the admission
@@ -97,27 +93,15 @@ struct AdmissionCarrierEvidence: Sendable {
     let proof: ChildBlockProof
     let childCID: String
     let isChildGenesis: Bool
-    let parentCarrierLink: ParentCarrierLink?
-    let parentGenesisLink: ParentGenesisLink?
-    let parentCarrierCertificate: ParentCarrierCertificateV1?
-    let parentGenesisCertificate: ParentGenesisCertificateV1?
 
     init(
         proof: ChildBlockProof,
         childCID: String,
-        isChildGenesis: Bool,
-        parentCarrierLink: ParentCarrierLink? = nil,
-        parentGenesisLink: ParentGenesisLink? = nil,
-        parentCarrierCertificate: ParentCarrierCertificateV1? = nil,
-        parentGenesisCertificate: ParentGenesisCertificateV1? = nil
+        isChildGenesis: Bool
     ) {
         self.proof = proof
         self.childCID = childCID
         self.isChildGenesis = isChildGenesis
-        self.parentCarrierLink = parentCarrierLink
-        self.parentGenesisLink = parentGenesisLink
-        self.parentCarrierCertificate = parentCarrierCertificate
-        self.parentGenesisCertificate = parentGenesisCertificate
     }
 }
 
@@ -185,7 +169,6 @@ struct PendingChildProofRoute: Sendable, Hashable {
 private struct PreparedAdmissionCarrierEvidence {
     let edge: DirectChildEdge
     let rootCID: String
-    let isPortable: Bool
     let proofAttachment: ChildEvidenceVolume
 }
 
@@ -225,15 +208,30 @@ enum IssuedChildProofScope: String, Sendable {
 
 /// Node-owned immutable facts and availability indexes for one absolute path.
 actor NodeStore {
-    /// Epoch 34 removes the redundant inherited-work feed. Older stores must be
+    /// Epoch 36 binds child deployment facts to their parent-state anchor.
+    /// Older stores must be
     /// wiped; Nexus deterministically recreates the configured exact genesis.
-    static let currentSchemaEpoch: Int64 = 34
+    static let currentSchemaEpoch: Int64 = 36
+
+    private static func parentGenesisFactKey(
+        _ link: ParentGenesisLink
+    ) -> String {
+        parentGenesisFactKey(
+            childGenesisCID: link.childGenesisCID,
+            parentStateCID: link.parentStateCID
+        )
+    }
+
+    private static func parentGenesisFactKey(
+        childGenesisCID: String,
+        parentStateCID: String
+    ) -> String {
+        "\(parentStateCID.utf8.count):\(parentStateCID)\(childGenesisCID)"
+    }
 
     private let database: NodeSQLite
     private let nexusGenesisCID: String
     private let chainPath: [String]
-    private let parentProcessKey: ParentProcessKey?
-    private let issuingParentProcessKey: ParentProcessKey
     private let recoveryVolumeBroker: any RetainedRootMergeBroker
     private let issuedRecoveryRetentionScope: String
     private let preparedRecoveryRetentionScope: String
@@ -247,8 +245,6 @@ actor NodeStore {
         databasePath: URL,
         nexusGenesisCID: String,
         chainPath: [String],
-        spawningParentKey: String = "",
-        issuingAuthorityKey: String,
         recoveryVolumeBroker: any RetainedRootMergeBroker,
         issuedRecoveryRetentionScope: String,
         preparedRecoveryRetentionScope: String,
@@ -274,29 +270,6 @@ actor NodeStore {
                 "hierarchy retention scopes must be nonempty and distinct"
             )
         }
-        guard let issuingParentProcessKey = ParentProcessKey(
-            issuingAuthorityKey
-        ) else {
-            throw NodeStoreError.invalidConfiguration(
-                "issuing parent-work authority key is malformed"
-            )
-        }
-        let parentProcessKey: ParentProcessKey?
-        if chainPath.count == 1 {
-            guard spawningParentKey.isEmpty else {
-                throw NodeStoreError.invalidConfiguration(
-                    "Nexus cannot have a spawning parent key"
-                )
-            }
-            parentProcessKey = nil
-        } else {
-            guard let authority = ParentProcessKey(spawningParentKey) else {
-                throw NodeStoreError.invalidConfiguration(
-                    "a child chain requires a canonical Ed25519 parent key"
-                )
-            }
-            parentProcessKey = authority
-        }
         let database = try NodeSQLite(path: databasePath.path)
         let pathData = try Self.encode(chainPath)
         let tables = try database.query(
@@ -309,8 +282,7 @@ actor NodeStore {
                 in: database,
                 schemaEpoch: Self.currentSchemaEpoch,
                 nexusGenesisCID: nexusGenesisCID,
-                chainPath: pathData,
-                issuingAuthorityKey: issuingAuthorityKey
+                chainPath: pathData
             )
         } else {
             try Self.validateMetadata(
@@ -318,8 +290,7 @@ actor NodeStore {
                 tableNames: tableNames,
                 schemaEpoch: Self.currentSchemaEpoch,
                 nexusGenesisCID: nexusGenesisCID,
-                chainPath: pathData,
-                issuingAuthorityKey: issuingAuthorityKey
+                chainPath: pathData
             )
             guard tableNames == Self.expectedTables else {
                 throw NodeStoreError.wipeRequired("schema tables are missing or unexpected")
@@ -330,8 +301,6 @@ actor NodeStore {
         self.database = database
         self.nexusGenesisCID = nexusGenesisCID
         self.chainPath = chainPath
-        self.parentProcessKey = parentProcessKey
-        self.issuingParentProcessKey = issuingParentProcessKey
         self.recoveryVolumeBroker = recoveryVolumeBroker
         self.issuedRecoveryRetentionScope = issuedRecoveryRetentionScope
         self.preparedRecoveryRetentionScope = preparedRecoveryRetentionScope
@@ -709,6 +678,24 @@ actor NodeStore {
                 "accepted-block index does not match immutable batches"
             )
         }
+        var connectedAcceptedBlocks = Set(
+            actualAcceptedBlocks.values.compactMap {
+                $0.parentCID == nil ? $0.blockCID : nil
+            }
+        )
+        var childrenByParent: [String: [String]] = [:]
+        for block in actualAcceptedBlocks.values {
+            if let parentCID = block.parentCID {
+                childrenByParent[parentCID, default: []].append(block.blockCID)
+            }
+        }
+        var connectedQueue = Array(connectedAcceptedBlocks)
+        while let parentCID = connectedQueue.popLast() {
+            for childCID in childrenByParent[parentCID] ?? []
+            where connectedAcceptedBlocks.insert(childCID).inserted {
+                connectedQueue.append(childCID)
+            }
+        }
 
         var expectedParentFacts: [IssuedParentFactKey: Data] = [:]
         for row in try database.query(
@@ -731,15 +718,20 @@ actor NodeStore {
                 throw NodeStoreError.corrupt("invalid parent-fact source")
             }
             let sortedGenesis = Array(Set(source.parentGenesisLinks)).sorted {
-                ($0.directory, $0.childGenesisCID)
-                    < ($1.directory, $1.childGenesisCID)
+                ($0.directory, $0.childGenesisCID, $0.parentStateCID)
+                    < ($1.directory, $1.childGenesisCID, $1.parentStateCID)
             }
             guard source.parentGenesisLinks == sortedGenesis,
                   source.parentGenesisLinks.allSatisfy({
                       $0.parentPath == chainPath
                           && !$0.directory.isEmpty
                           && !$0.childGenesisCID.isEmpty
-                  }) else {
+                          && !$0.parentStateCID.isEmpty
+                  }),
+                  source.parentGenesisLinks.isEmpty
+                    || connectedAcceptedBlocks.contains(
+                        source.carrierLink.carrierCID
+                    ) else {
                 throw NodeStoreError.corrupt("invalid genesis-fact source")
             }
             try Self.addExpectedParentFact(
@@ -756,7 +748,7 @@ actor NodeStore {
                     key: IssuedParentFactKey(
                         kind: "genesis",
                         keyA: link.directory,
-                        keyB: link.childGenesisCID
+                        keyB: Self.parentGenesisFactKey(link)
                     ),
                     payload: try Self.encode(link),
                     to: &expectedParentFacts
@@ -960,6 +952,31 @@ actor NodeStore {
         ).isEmpty
     }
 
+    private func hasConnectedAcceptedBlock(_ blockCID: String) throws -> Bool {
+        guard CIDIdentity.isCanonical(blockCID) else {
+            throw NodeStoreError.corrupt("invalid connected block lookup")
+        }
+        return try !database.query(
+            """
+            WITH RECURSIVE connected(block_cid) AS (
+                SELECT block_cid
+                FROM accepted_blocks
+                WHERE parent_cid IS NULL
+                UNION
+                SELECT child.block_cid
+                FROM accepted_blocks AS child
+                JOIN connected AS parent
+                  ON child.parent_cid = parent.block_cid
+            )
+            SELECT 1
+            FROM connected
+            WHERE block_cid = ?1
+            LIMIT 1
+            """,
+            params: [.text(blockCID)]
+        ).isEmpty
+    }
+
     func hasIncomingCarrierEdge(_ edgeCID: String) throws -> Bool {
         guard CIDIdentity.isCanonical(edgeCID) else {
             throw NodeStoreError.corrupt("invalid incoming edge lookup")
@@ -1140,62 +1157,12 @@ actor NodeStore {
               edge.directory == directory else {
             throw NodeStoreError.invalidIssuedChildProof(childCID)
         }
-        let expectedParentPath = Array(chainPath.dropLast())
-        if let parentLink = evidence.parentCarrierLink {
-            guard parentLink.parentPath == expectedParentPath,
-                  parentLink.carrierCID == edge.parentCarrierCID,
-                  parentLink.rootCID == evidence.proof.rootCID else {
-                throw NodeStoreError.invalidIssuedChildProof(childCID)
-            }
-        }
-        if let genesisLink = evidence.parentGenesisLink {
-            guard genesisLink.parentPath == expectedParentPath,
-                  genesisLink.directory == chainPath.last,
-                  genesisLink.childGenesisCID == childCID else {
-                throw NodeStoreError.invalidIssuedChildProof(childCID)
-            }
-        }
-        if let certificate = evidence.parentCarrierCertificate {
-            guard let parentLink = evidence.parentCarrierLink,
-                  let authority = parentProcessKey,
-                  certificate.verifies(
-                    link: parentLink,
-                    authorityKey: authority,
-                    expectedNexusGenesisCID: nexusGenesisCID,
-                    expectedParentPath: expectedParentPath
-                  ) else {
-                throw NodeStoreError.invalidIssuedChildProof(childCID)
-            }
-        }
-        if let certificate = evidence.parentGenesisCertificate {
-            guard let genesisLink = evidence.parentGenesisLink,
-                  let authority = parentProcessKey,
-                  certificate.verifies(
-                    link: genesisLink,
-                    authorityKey: authority,
-                    expectedNexusGenesisCID: nexusGenesisCID,
-                    expectedParentPath: expectedParentPath
-                  ) else {
-                throw NodeStoreError.invalidIssuedChildProof(childCID)
-            }
-        }
         guard edge.edgeCID != nil else {
             throw NodeStoreError.invalidIssuedChildProof(childCID)
         }
         let portableEnvelopePayload = try ChildValidationPackageEnvelope(
-            ChildValidationPackage(
-                proof: evidence.proof,
-                parentCarrierLink: evidence.parentCarrierLink,
-                parentGenesisLink: evidence.parentGenesisLink
-            ),
-            parentCarrierCertificate: evidence.parentCarrierCertificate,
-            parentGenesisCertificate: evidence.parentGenesisCertificate
+            proof: evidence.proof
         ).encode()
-        let hasPortableGenesis = evidence.isChildGenesis
-            ? evidence.parentGenesisLink != nil
-                && evidence.parentGenesisCertificate != nil
-            : evidence.parentGenesisLink == nil
-                && evidence.parentGenesisCertificate == nil
         let proofAttachment = try ChildEvidenceVolume(
             envelopeBytes: portableEnvelopePayload,
             childCID: childCID
@@ -1203,9 +1170,6 @@ actor NodeStore {
         return PreparedAdmissionCarrierEvidence(
             edge: edge,
             rootCID: evidence.proof.rootCID,
-            isPortable: evidence.parentCarrierLink != nil
-                && evidence.parentCarrierCertificate != nil
-                && hasPortableGenesis,
             proofAttachment: proofAttachment
         )
     }
@@ -1214,13 +1178,14 @@ actor NodeStore {
         _ links: [ParentGenesisLink]
     ) throws -> [(link: ParentGenesisLink, payload: Data)] {
         let links = Array(Set(links)).sorted {
-            ($0.directory, $0.childGenesisCID)
-                < ($1.directory, $1.childGenesisCID)
+            ($0.directory, $0.childGenesisCID, $0.parentStateCID)
+                < ($1.directory, $1.childGenesisCID, $1.parentStateCID)
         }
         guard links.allSatisfy({ link in
             link.parentPath == chainPath
                 && !link.directory.isEmpty
                 && !link.childGenesisCID.isEmpty
+                && !link.parentStateCID.isEmpty
         }) else {
             throw NodeStoreError.invalidConfiguration(
                 "issued genesis link belongs to a different chain path"
@@ -1253,7 +1218,6 @@ actor NodeStore {
             scope: .incomingCarrier,
             edgeCID: edgeCID,
             rootCID: evidence.rootCID,
-            isPortable: evidence.isPortable,
             attachmentCID: evidence.proofAttachment.rawCID
         )
     }
@@ -1290,7 +1254,7 @@ actor NodeStore {
             try persistIssuedParentFact(
                 kind: "genesis",
                 keyA: genesis.link.directory,
-                keyB: genesis.link.childGenesisCID,
+                keyB: Self.parentGenesisFactKey(genesis.link),
                 payload: genesis.payload
             )
         }
@@ -1302,6 +1266,12 @@ actor NodeStore {
         pendingChildProofCapacity: Int = 16
     ) async throws {
         let link = artifacts.carrierLink
+        if !artifacts.parentGenesisLinks.isEmpty,
+           try !hasConnectedAcceptedBlock(link.carrierCID) {
+            throw NodeStoreError.invalidConfiguration(
+                "genesis authority requires a connected parent block"
+            )
+        }
         guard pendingChildProofRoutes.allSatisfy({
             $0.carrierCID == link.carrierCID && !$0.directory.isEmpty
         }) else {
@@ -1368,17 +1338,22 @@ actor NodeStore {
 
     func issuedParentGenesisLink(
         directory: String,
-        childGenesisCID: String
+        childGenesisCID: String,
+        parentStateCID: String
     ) async throws -> ParentGenesisLink? {
         guard let payload = try issuedParentFact(
             kind: "genesis",
             keyA: directory,
-            keyB: childGenesisCID
+            keyB: Self.parentGenesisFactKey(
+                childGenesisCID: childGenesisCID,
+                parentStateCID: parentStateCID
+            )
         ) else { return nil }
         let link = try Self.decode(ParentGenesisLink.self, from: payload)
         guard link.parentPath == chainPath,
               link.directory == directory,
-              link.childGenesisCID == childGenesisCID else {
+              link.childGenesisCID == childGenesisCID,
+              link.parentStateCID == parentStateCID else {
             throw NodeStoreError.corrupt("malformed locally issued genesis link")
         }
         return link
@@ -1386,12 +1361,11 @@ actor NodeStore {
 
     func hasIssuedChildDirectory(_ directory: String) throws -> Bool {
         let rows = try database.query(
-            "SELECT key_b, payload FROM issued_parent_facts WHERE kind = 'genesis' AND key_a = ?1 ORDER BY key_b",
+            "SELECT payload FROM issued_parent_facts WHERE kind = 'genesis' AND key_a = ?1 ORDER BY key_b",
             params: [.text(directory)]
         )
         for row in rows {
-            guard let childGenesisCID = row["key_b"]?.textValue,
-                  let payload = row["payload"]?.blobValue else {
+            guard let payload = row["payload"]?.blobValue else {
                 throw NodeStoreError.corrupt(
                     "malformed locally issued child-directory index"
                 )
@@ -1399,7 +1373,8 @@ actor NodeStore {
             let link = try Self.decode(ParentGenesisLink.self, from: payload)
             guard link.parentPath == chainPath,
                   link.directory == directory,
-                  link.childGenesisCID == childGenesisCID else {
+                  !link.childGenesisCID.isEmpty,
+                  !link.parentStateCID.isEmpty else {
                 throw NodeStoreError.corrupt(
                     "malformed locally issued child-directory link"
                 )
@@ -1418,8 +1393,7 @@ actor NodeStore {
         isChildGenesis: Bool,
         bootstrapRoots: [String],
         parentCarrierCID: String? = nil,
-        rootEnvelope: ChildValidationPackageEnvelope,
-        rootAuthorityKey: ParentProcessKey
+        rootEnvelope: ChildValidationPackageEnvelope
     ) async throws {
         guard let directory = proof.directoryPath.last,
               isChildGenesis || bootstrapRoots.isEmpty,
@@ -1441,36 +1415,7 @@ actor NodeStore {
         guard let edgeCID = edge.edgeCID else {
             throw NodeStoreError.invalidIssuedChildProof(childCID)
         }
-        guard rootEnvelope.proofBytes == (try? proof.serialize()),
-              let carrierLink = rootEnvelope.parentCarrierLink,
-              carrierLink.parentPath == chainPath,
-              carrierLink.carrierCID == edge.parentCarrierCID,
-              carrierLink.rootCID == proof.rootCID,
-              let carrierCertificate = rootEnvelope.parentCarrierCertificate,
-              carrierCertificate.verifies(
-                link: carrierLink,
-                authorityKey: rootAuthorityKey,
-                expectedNexusGenesisCID: nexusGenesisCID,
-                expectedParentPath: chainPath
-              ) else {
-            throw NodeStoreError.invalidIssuedChildProof(childCID)
-        }
-        if isChildGenesis {
-            guard let genesisLink = rootEnvelope.parentGenesisLink,
-                  genesisLink.parentPath == chainPath,
-                  genesisLink.directory == directory,
-                  genesisLink.childGenesisCID == childCID,
-                  let genesisCertificate = rootEnvelope.parentGenesisCertificate,
-                  genesisCertificate.verifies(
-                    link: genesisLink,
-                    authorityKey: rootAuthorityKey,
-                    expectedNexusGenesisCID: nexusGenesisCID,
-                    expectedParentPath: chainPath
-                  ) else {
-                throw NodeStoreError.invalidIssuedChildProof(childCID)
-            }
-        } else if rootEnvelope.parentGenesisLink != nil
-                    || rootEnvelope.parentGenesisCertificate != nil {
+        guard rootEnvelope.proofBytes == (try? proof.serialize()) else {
             throw NodeStoreError.invalidIssuedChildProof(childCID)
         }
         let proofAttachment = try ChildEvidenceVolume(
@@ -1498,7 +1443,6 @@ actor NodeStore {
                 scope: .outgoingDirectChild,
                 edgeCID: edgeCID,
                 rootCID: proof.rootCID,
-                isPortable: true,
                 attachmentCID: proofAttachment.rawCID
             )
         }
@@ -1589,18 +1533,16 @@ actor NodeStore {
         scope: IssuedChildProofScope,
         edgeCID: String,
         rootCID: String,
-        isPortable: Bool,
         attachmentCID: String
     ) throws {
         let rows = try database.query(
-            "SELECT is_portable, attachment_cid, ordinal FROM issued_child_proofs WHERE scope = ?1 AND edge_cid = ?2 AND root_cid = ?3",
+            "SELECT attachment_cid, ordinal FROM issued_child_proofs WHERE scope = ?1 AND edge_cid = ?2 AND root_cid = ?3",
             params: [
                 .text(scope.rawValue), .text(edgeCID), .text(rootCID),
             ]
         )
         if let row = rows.first {
-            guard row["is_portable"]?.intValue == (isPortable ? 1 : 0),
-                  row["attachment_cid"]?.textValue == attachmentCID,
+            guard row["attachment_cid"]?.textValue == attachmentCID,
                   scope == .outgoingDirectChild
                     ? row["ordinal"]?.intValue != nil
                     : row["ordinal"]?.intValue == nil else {
@@ -1623,10 +1565,9 @@ actor NodeStore {
             ordinal = .null
         }
         try database.execute(
-            "INSERT INTO issued_child_proofs (scope, edge_cid, root_cid, is_portable, attachment_cid, ordinal) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO issued_child_proofs (scope, edge_cid, root_cid, attachment_cid, ordinal) VALUES (?1, ?2, ?3, ?4, ?5)",
             params: [
                 .text(scope.rawValue), .text(edgeCID), .text(rootCID),
-                .int(isPortable ? 1 : 0),
                 .text(attachmentCID),
                 ordinal,
             ]
@@ -1718,7 +1659,7 @@ actor NodeStore {
         let rows: [[String: NodeSQLiteValue]]
         if let rootCID, let exactEdgeCID {
             rows = try database.query(
-                "SELECT p.edge_cid, p.root_cid, p.attachment_cid, p.is_portable, e.parent_carrier_cid, e.directory, e.child_cid FROM issued_child_proofs AS p INNER JOIN issued_child_edges AS e ON e.edge_cid = p.edge_cid WHERE p.scope = ?1 AND p.edge_cid = ?2 AND e.child_cid = ?3 AND e.directory = ?4 AND p.root_cid = ?5 LIMIT 1",
+                "SELECT p.edge_cid, p.root_cid, p.attachment_cid, e.parent_carrier_cid, e.directory, e.child_cid FROM issued_child_proofs AS p INNER JOIN issued_child_edges AS e ON e.edge_cid = p.edge_cid WHERE p.scope = ?1 AND p.edge_cid = ?2 AND e.child_cid = ?3 AND e.directory = ?4 AND p.root_cid = ?5 LIMIT 1",
                 params: [
                     .text(scope.rawValue), .text(exactEdgeCID),
                     .text(childCID), .text(directory), .text(rootCID),
@@ -1726,7 +1667,7 @@ actor NodeStore {
             )
         } else if let rootCID {
             rows = try database.query(
-                "SELECT p.edge_cid, p.root_cid, p.attachment_cid, p.is_portable, e.parent_carrier_cid, e.directory, e.child_cid FROM issued_child_proofs AS p INNER JOIN issued_child_edges AS e ON e.edge_cid = p.edge_cid WHERE p.scope = ?1 AND e.child_cid = ?2 AND e.directory = ?3 AND p.root_cid = ?4 LIMIT 1",
+                "SELECT p.edge_cid, p.root_cid, p.attachment_cid, e.parent_carrier_cid, e.directory, e.child_cid FROM issued_child_proofs AS p INNER JOIN issued_child_edges AS e ON e.edge_cid = p.edge_cid WHERE p.scope = ?1 AND e.child_cid = ?2 AND e.directory = ?3 AND p.root_cid = ?4 LIMIT 1",
                 params: [
                     .text(scope.rawValue), .text(childCID), .text(directory),
                     .text(rootCID),
@@ -1734,7 +1675,7 @@ actor NodeStore {
             )
         } else {
             rows = try database.query(
-                "SELECT p.edge_cid, p.root_cid, p.attachment_cid, p.is_portable, e.parent_carrier_cid, e.directory, e.child_cid FROM issued_child_proofs AS p INNER JOIN issued_child_edges AS e ON e.edge_cid = p.edge_cid WHERE p.scope = ?1 AND e.child_cid = ?2 AND e.directory = ?3 ORDER BY p.root_cid, p.edge_cid LIMIT 1",
+                "SELECT p.edge_cid, p.root_cid, p.attachment_cid, e.parent_carrier_cid, e.directory, e.child_cid FROM issued_child_proofs AS p INNER JOIN issued_child_edges AS e ON e.edge_cid = p.edge_cid WHERE p.scope = ?1 AND e.child_cid = ?2 AND e.directory = ?3 ORDER BY p.root_cid, p.edge_cid LIMIT 1",
                 params: [
                     .text(scope.rawValue), .text(childCID), .text(directory),
                 ]
@@ -1745,9 +1686,7 @@ actor NodeStore {
               let directory = row["directory"]?.textValue,
               let storedRoot = row["root_cid"]?.textValue,
               let attachmentCID = row["attachment_cid"]?.textValue,
-              let parentCarrierCID = row["parent_carrier_cid"]?.textValue,
-              let isPortable = row["is_portable"]?.intValue,
-              isPortable == 0 || isPortable == 1 else {
+              let parentCarrierCID = row["parent_carrier_cid"]?.textValue else {
             throw NodeStoreError.corrupt("malformed locally issued child proof")
         }
         let attachment = try await recoveryVolume(
@@ -1778,62 +1717,11 @@ actor NodeStore {
               edge.directory == directory else {
             throw NodeStoreError.corrupt("malformed locally issued child proof")
         }
-        let parentCarrierLink = envelope.parentCarrierLink
-        let parentGenesisLink = envelope.parentGenesisLink
-        let parentCarrierCertificate = envelope.parentCarrierCertificate
-        let parentGenesisCertificate = envelope.parentGenesisCertificate
-        let expectedParentPath = scope == .incomingCarrier
-            ? Array(chainPath.dropLast())
-            : chainPath
-        let certificateAuthority = scope == .incomingCarrier
-            ? parentProcessKey
-            : issuingParentProcessKey
-        guard parentCarrierLink.map({ link in
-                  link.parentPath == expectedParentPath
-                    && link.carrierCID == edge.parentCarrierCID
-                    && link.rootCID == storedRoot
-              }) ?? true,
-              parentGenesisLink.map({ link in
-                  link.parentPath == expectedParentPath
-                    && link.directory == directory
-                    && link.childGenesisCID == childCID
-              }) ?? true,
-              parentCarrierCertificate.map({ certificate in
-                  guard let link = parentCarrierLink,
-                        let authority = certificateAuthority else { return false }
-                  return certificate.verifies(
-                    link: link,
-                    authorityKey: authority,
-                    expectedNexusGenesisCID: nexusGenesisCID,
-                    expectedParentPath: expectedParentPath
-                  )
-              }) ?? true,
-              parentGenesisCertificate.map({ certificate in
-                  guard let link = parentGenesisLink,
-                        let authority = certificateAuthority else { return false }
-                  return certificate.verifies(
-                    link: link,
-                    authorityKey: authority,
-                    expectedNexusGenesisCID: nexusGenesisCID,
-                    expectedParentPath: expectedParentPath
-                  )
-              }) ?? true,
-              (isPortable == 1)
-                == (parentCarrierLink != nil
-                    && parentCarrierCertificate != nil
-                    && (parentGenesisLink == nil)
-                        == (parentGenesisCertificate == nil)) else {
-            throw NodeStoreError.corrupt("invalid portable parent attachment")
-        }
         return IssuedChildEvidence(
             edgeCID: edgeCID,
             attachmentCID: attachmentCID,
             edge: edge,
-            proof: proof,
-            parentCarrierLink: parentCarrierLink,
-            parentGenesisLink: parentGenesisLink,
-            parentCarrierCertificate: parentCarrierCertificate,
-            parentGenesisCertificate: parentGenesisCertificate
+            proof: proof
         )
     }
 
@@ -2017,23 +1905,18 @@ actor NodeStore {
         scope: IssuedChildProofScope,
         directory: String,
         after: ChildRootAttachmentSummary?,
-        limit: Int,
-        portableOnly: Bool = false
+        limit: Int
     ) async throws -> [ChildRootAttachmentSummary] {
         guard !directory.isEmpty, limit > 0,
-              !portableOnly || scope == .incomingCarrier,
               let sqlLimit = Int64(exactly: limit) else {
             throw NodeStoreError.invalidConfiguration(
                 "child root-attachment page must be bounded"
             )
         }
-        let portablePredicate = portableOnly
-            ? " AND p.is_portable = 1"
-            : ""
         let rows: [[String: NodeSQLiteValue]]
         if let after {
             rows = try database.query(
-                "SELECT p.edge_cid, e.child_cid, p.root_cid, p.attachment_cid FROM issued_child_proofs AS p INNER JOIN issued_child_edges AS e ON e.edge_cid = p.edge_cid WHERE p.scope = ?1 AND e.directory = ?2\(portablePredicate) AND (p.edge_cid > ?3 OR (p.edge_cid = ?3 AND p.root_cid > ?4)) ORDER BY p.edge_cid, p.root_cid LIMIT ?5",
+                "SELECT p.edge_cid, e.child_cid, p.root_cid, p.attachment_cid FROM issued_child_proofs AS p INNER JOIN issued_child_edges AS e ON e.edge_cid = p.edge_cid WHERE p.scope = ?1 AND e.directory = ?2 AND (p.edge_cid > ?3 OR (p.edge_cid = ?3 AND p.root_cid > ?4)) ORDER BY p.edge_cid, p.root_cid LIMIT ?5",
                 params: [
                     .text(scope.rawValue), .text(directory), .text(after.edgeCID),
                     .text(after.rootCID), .int(sqlLimit),
@@ -2041,7 +1924,7 @@ actor NodeStore {
             )
         } else {
             rows = try database.query(
-                "SELECT p.edge_cid, e.child_cid, p.root_cid, p.attachment_cid FROM issued_child_proofs AS p INNER JOIN issued_child_edges AS e ON e.edge_cid = p.edge_cid WHERE p.scope = ?1 AND e.directory = ?2\(portablePredicate) ORDER BY p.edge_cid, p.root_cid LIMIT ?3",
+                "SELECT p.edge_cid, e.child_cid, p.root_cid, p.attachment_cid FROM issued_child_proofs AS p INNER JOIN issued_child_edges AS e ON e.edge_cid = p.edge_cid WHERE p.scope = ?1 AND e.directory = ?2 ORDER BY p.edge_cid, p.root_cid LIMIT ?3",
                 params: [
                     .text(scope.rawValue), .text(directory), .int(sqlLimit),
                 ]
@@ -2132,9 +2015,7 @@ actor NodeStore {
             )
         }
         let envelope = try ChildValidationPackageEnvelope(
-            package.package,
-            parentCarrierCertificate: package.parentCarrierCertificate,
-            parentGenesisCertificate: package.parentGenesisCertificate
+            package.package
         ).encode()
         guard envelope == attachment.envelopeBytes else {
             throw NodeStoreError.invalidIssuedChildProof(directHop.childCID)
@@ -2143,11 +2024,7 @@ actor NodeStore {
             AdmissionCarrierEvidence(
                 proof: package.package.proof,
                 childCID: directHop.childCID,
-                isChildGenesis: package.package.parentGenesisLink != nil,
-                parentCarrierLink: package.package.parentCarrierLink,
-                parentGenesisLink: package.package.parentGenesisLink,
-                parentCarrierCertificate: package.parentCarrierCertificate,
-                parentGenesisCertificate: package.parentGenesisCertificate
+                isChildGenesis: package.package.parentGenesisLink != nil
             ),
             expectedChildCIDs: [directHop.childCID],
             expectedRootCID: package.package.proof.rootCID
@@ -2379,23 +2256,13 @@ actor NodeStore {
                 )
             }
             let package = AuthenticatedChildPackage(
-                package: ChildValidationPackage(
-                    proof: proof,
-                    parentCarrierLink: envelope.parentCarrierLink,
-                    parentGenesisLink: envelope.parentGenesisLink
-                ),
-                parentCarrierCertificate: envelope.parentCarrierCertificate,
-                parentGenesisCertificate: envelope.parentGenesisCertificate
+                package: ChildValidationPackage(proof: proof)
             )
             _ = try await prepareCarrierEvidence(
                 AdmissionCarrierEvidence(
                     proof: proof,
                     childCID: childCID,
-                    isChildGenesis: envelope.parentGenesisLink != nil,
-                    parentCarrierLink: envelope.parentCarrierLink,
-                    parentGenesisLink: envelope.parentGenesisLink,
-                    parentCarrierCertificate: envelope.parentCarrierCertificate,
-                    parentGenesisCertificate: envelope.parentGenesisCertificate
+                    isChildGenesis: false
                 ),
                 expectedChildCIDs: [childCID],
                 expectedRootCID: rootCID
@@ -2951,7 +2818,7 @@ actor NodeStore {
         rootCID: String
     ) throws -> String? {
         let rows = try database.query(
-            "SELECT attachment_cid FROM issued_child_proofs WHERE scope = ?1 AND edge_cid = ?2 AND root_cid = ?3 AND is_portable = 1",
+            "SELECT attachment_cid FROM issued_child_proofs WHERE scope = ?1 AND edge_cid = ?2 AND root_cid = ?3",
             params: [
                 .text(scope.rawValue), .text(edgeCID), .text(rootCID),
             ]
@@ -2988,13 +2855,14 @@ actor NodeStore {
                   ), let proof = evidence.edge.proof else {
                 throw NodeStoreError.corrupt("malformed retained direct-child edge")
             }
+            let bootstrapRoots = try childGenesisVolumeRoots(
+                childCID: evidence.edge.childCID
+            )
             proofs.append(try PreparedChildProof(
                 directory: evidence.edge.directory,
                 childCID: evidence.edge.childCID,
-                isChildGenesis: evidence.parentGenesisLink != nil,
-                bootstrapRoots: try childGenesisVolumeRoots(
-                    childCID: evidence.edge.childCID
-                ),
+                isChildGenesis: !bootstrapRoots.isEmpty,
+                bootstrapRoots: bootstrapRoots,
                 proof: proof
             ))
         }
@@ -3513,8 +3381,7 @@ actor NodeStore {
         tableNames: Set<String>,
         schemaEpoch: Int64,
         nexusGenesisCID: String,
-        chainPath: Data,
-        issuingAuthorityKey: String
+        chainPath: Data
     ) throws {
         guard tableNames.contains("node_metadata") else {
             throw NodeStoreError.wipeRequired("missing schema metadata")
@@ -3522,7 +3389,7 @@ actor NodeStore {
         let rows: [[String: NodeSQLiteValue]]
         do {
             rows = try database.query(
-                "SELECT schema_epoch, nexus_genesis_cid, chain_path, issuing_authority_key, sync_source_id FROM node_metadata WHERE singleton = 1"
+                "SELECT schema_epoch, nexus_genesis_cid, chain_path, sync_source_id FROM node_metadata WHERE singleton = 1"
             )
         } catch {
             throw NodeStoreError.wipeRequired("unreadable schema metadata")
@@ -3531,12 +3398,10 @@ actor NodeStore {
               rows[0]["schema_epoch"]?.intValue == schemaEpoch,
               rows[0]["nexus_genesis_cid"]?.textValue == nexusGenesisCID,
               rows[0]["chain_path"]?.blobValue == chainPath,
-              rows[0]["issuing_authority_key"]?.textValue
-                == issuingAuthorityKey,
               let syncSourceID = rows[0]["sync_source_id"]?.textValue,
               UUID(uuidString: syncSourceID) != nil else {
             throw NodeStoreError.wipeRequired(
-                "schema epoch, Nexus genesis, chain path, or issuing authority changed"
+                "schema epoch, Nexus genesis, or chain path changed"
             )
         }
     }
@@ -3566,8 +3431,7 @@ actor NodeStore {
         in database: NodeSQLite,
         schemaEpoch: Int64,
         nexusGenesisCID: String,
-        chainPath: Data,
-        issuingAuthorityKey: String
+        chainPath: Data
     ) throws {
         try database.transaction {
             try database.execute("""
@@ -3576,17 +3440,15 @@ actor NodeStore {
                     schema_epoch INTEGER NOT NULL,
                     nexus_genesis_cid TEXT NOT NULL,
                     chain_path BLOB NOT NULL,
-                    issuing_authority_key TEXT NOT NULL,
                     sync_source_id TEXT NOT NULL
                 )
                 """)
             try database.execute(
-                "INSERT INTO node_metadata (singleton, schema_epoch, nexus_genesis_cid, chain_path, issuing_authority_key, sync_source_id) VALUES (1, ?1, ?2, ?3, ?4, ?5)",
+                "INSERT INTO node_metadata (singleton, schema_epoch, nexus_genesis_cid, chain_path, sync_source_id) VALUES (1, ?1, ?2, ?3, ?4)",
                 params: [
                     .int(schemaEpoch),
                     .text(nexusGenesisCID),
                     .blob(chainPath),
-                    .text(issuingAuthorityKey),
                     .text(UUID().uuidString.lowercased()),
                 ]
             )
@@ -3655,7 +3517,6 @@ actor NodeStore {
                 scope TEXT NOT NULL,
                 edge_cid TEXT NOT NULL,
                 root_cid TEXT NOT NULL,
-                is_portable INTEGER NOT NULL CHECK (is_portable IN (0, 1)),
                 attachment_cid TEXT NOT NULL,
                 ordinal INTEGER UNIQUE CHECK (ordinal IS NULL OR ordinal > 0),
                 CHECK (

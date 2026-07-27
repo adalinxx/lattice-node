@@ -15,7 +15,7 @@ The suites are grouped by the boundary they actually cross:
   overlay/fact-plane separation, bounded/canonical wire input, real
   peer-to-runtime async delegate delivery, root-scoped content attribution,
   per-connection hierarchy authorization, lifecycle fencing, proof
-  distribution, and continuity-certificate authentication.
+  distribution, and session-bound immediate-parent fact authentication.
 - `MultichainInvariantTests`: direct-parent-only package acceptance, ancestor-path rejection, and durable exact-edge recovery across process reopen.
 - `ChainServiceTests`: transaction, child-deploy, template, work-submission, reconciliation ordering, and publication despite optional hierarchy availability failures.
 - `DaemonHTTPTests`: real loopback HTTP route contracts.
@@ -26,8 +26,8 @@ The suites are grouped by the boundary they actually cross:
   inspecting or altering its protocol bytes. Tests never instantiate
   `ChainProcess`, mutate stores, install runtime callbacks, or seed internal
   consensus state. They exercise direct-child
-  bootstrap/restart, same-chain portable genesis and continuity recovery with
-  the parent offline, reopen with every source offline, three-level proof
+  bootstrap/restart, proof availability from same-chain peers, parent-fact
+  retry across disconnect, reopen with every source offline, three-level proof
   traversal, a suspended
   non-responsive authenticated sibling, durable side-branch bootstrap after a
   reorg, same-path higher-work and segment-base-tie convergence, and a live competing-genesis
@@ -86,7 +86,7 @@ cross-component invariants:
 - a suspended authenticated direct child cannot block a healthy sibling's
   bounded root round;
 - parent-state continuity is reflexive and transitive over connected accepted
-  parent history, including noncanonical branches, and exact signed facts may
+  parent history, including noncanonical branches, and exact parent facts may
   be relayed by same-chain peers after restart;
 - staged facts and retained Volume roots reopen together, or recovery fails
   closed.

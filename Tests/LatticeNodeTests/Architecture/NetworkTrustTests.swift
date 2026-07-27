@@ -990,10 +990,6 @@ private enum NetworkTransportTestPorts {
 final class NetworkTrustTests: XCTestCase {
     private let nexusCID = "bafyreiaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     private let minimumRootWork = String(repeating: "0", count: 63) + "1"
-    private static let fixtureParentProcessKey = ParentProcessKey(
-        String(repeating: "a", count: ParentProcessKey.encodedByteCount)
-    )!
-
     private func overlayRuntime(
         keyByte: UInt8,
         requestTimeout: Duration,
@@ -1131,21 +1127,15 @@ final class NetworkTrustTests: XCTestCase {
 
     func testChildValidationPackageEnvelopeRoundTripsAndRejectsTrailingBytes() throws {
         let package = ChildValidationPackage(
-            proof: proof(),
-            parentCarrierLink: try carrierLink(
-                parentPath: ["Nexus"], carrierCID: "carrier", rootCID: "root"
-            ),
-            parentGenesisLink: try genesisLink(
-                parentPath: ["Nexus"], directory: "Payments", cid: "child-genesis"
-            )
+            proof: proof()
         )
         let encoded = try ChildValidationPackageEnvelope(package).encode()
         let decoded = try ChildValidationPackageEnvelope.decode(encoded)
             .makeValidationPackage()
 
         XCTAssertEqual(try decoded.proof.serialize(), try package.proof.serialize())
-        XCTAssertEqual(decoded.parentCarrierLink, package.parentCarrierLink)
-        XCTAssertEqual(decoded.parentGenesisLink, package.parentGenesisLink)
+        XCTAssertNil(decoded.parentGenesisLink)
+        XCTAssertNil(decoded.parentStateContinuityLink)
 
         var trailing = encoded
         trailing.append(0)
@@ -1164,50 +1154,6 @@ final class NetworkTrustTests: XCTestCase {
             Data(repeating: 0, count: ChildValidationPackageEnvelope.maximumEncodedSize + 1)
         )) { error in
             XCTAssertEqual(error as? ChildValidationPackageEnvelopeError, .oversized)
-        }
-    }
-
-    func testParentFactGateRequiresConfiguredImmediateParentAndExactEmbeddedPath() throws {
-        let nexus = signingKey(31)
-        let other = signingKey(32)
-        let gate = try AuthenticatedParentFactGate(
-            childPath: ["Nexus", "Payments"],
-            configuredParentIvyPeerKey: peerKey(nexus).hex
-        )
-        let validEnvelope = try envelope(parentPath: ["Nexus"])
-
-        XCTAssertNoThrow(try gate.accept(
-            validEnvelope,
-            from: authenticatedPeer(nexus, role: .endpoint)
-        ))
-
-        XCTAssertThrowsError(try gate.accept(
-            validEnvelope,
-            from: authenticatedPeer(other, role: .endpoint)
-        )) { error in
-            XCTAssertEqual(error as? AuthenticatedParentFactGateError, .unauthenticatedParent)
-        }
-
-        XCTAssertThrowsError(try gate.accept(
-            try envelope(parentPath: ["Nexus", "Other"]),
-            from: authenticatedPeer(nexus, role: .endpoint)
-        )) { error in
-            XCTAssertEqual(error as? AuthenticatedParentFactGateError, .wrongParentPath)
-        }
-
-        XCTAssertThrowsError(try gate.accept(
-            validEnvelope,
-            from: AuthenticatedPeer(
-                key: peerKey(nexus),
-                role: .carrier,
-                route: .direct,
-                metadata: PeerMetadata()
-            )
-        )) { error in
-            XCTAssertEqual(
-                error as? AuthenticatedParentFactGateError,
-                .unauthenticatedParent
-            )
         }
     }
 
@@ -1640,31 +1586,20 @@ final class NetworkTrustTests: XCTestCase {
         )
     }
 
-    func testEvidenceMergeAccumulatesCarrierAndGenesisWithoutAlternating() throws {
+    func testEvidenceMergeAddsLocallyValidatedGenesisFact() throws {
         let proof = proof()
-        let carrier = try carrierLink(
-            parentPath: ["Nexus"], carrierCID: "carrier", rootCID: "root"
-        )
         let genesis = try genesisLink(
             parentPath: ["Nexus"], directory: "Payments", cid: "child-genesis"
         )
         let proofOnly = AuthenticatedChildPackage(package: ChildValidationPackage(
             proof: proof
         ))
-        let carrierOnly = AuthenticatedChildPackage(package: ChildValidationPackage(
-            proof: proof,
-            parentCarrierLink: carrier
-        ))
         let genesisOnly = AuthenticatedChildPackage(package: ChildValidationPackage(
             proof: proof,
             parentGenesisLink: genesis
         ))
 
-        let withCarrier = NodeNetworkRuntime.merging(proofOnly, with: carrierOnly)
-        let complete = withCarrier.flatMap {
-            NodeNetworkRuntime.merging($0, with: genesisOnly)
-        }
-        XCTAssertEqual(complete?.package.parentCarrierLink, carrier)
+        let complete = NodeNetworkRuntime.merging(proofOnly, with: genesisOnly)
         XCTAssertEqual(complete?.package.parentGenesisLink, genesis)
     }
 
@@ -2234,9 +2169,7 @@ final class NetworkTrustTests: XCTestCase {
         )
         addTeardownBlock { try? FileManager.default.removeItem(at: storage) }
         let rootKey = signingKey(0x73)
-        let rootAuthority = try XCTUnwrap(
-            ParentProcessKey(peerKey(rootKey).hex)
-        )
+        let rootPeerKey = peerKey(rootKey).hex
         let middleConfiguration = try NodeConfiguration(
             chainPath: ["Nexus", "Middle"],
             minimumRootWork: UInt256(1),
@@ -2246,14 +2179,12 @@ final class NetworkTrustTests: XCTestCase {
             factListenPort: NetworkTransportTestPorts.allocate(),
             rpcPort: NetworkTransportTestPorts.allocate(),
             parentEndpoint: ParentEndpoint(
-                publicKey: rootAuthority.value,
+                publicKey: rootPeerKey,
                 host: "127.0.0.1",
                 port: NetworkTransportTestPorts.allocate()
             )
         )
-        let middleAuthority = try XCTUnwrap(
-            ParentProcessKey(middleConfiguration.processPublicKey)
-        )
+        let middlePeerKey = middleConfiguration.processPublicKey
         let overlayPort = NetworkTransportTestPorts.allocate()
         let hierarchyPort = NetworkTransportTestPorts.allocate()
         let parentPort = NetworkTransportTestPorts.allocate()
@@ -2266,7 +2197,7 @@ final class NetworkTrustTests: XCTestCase {
             factListenPort: hierarchyPort,
             rpcPort: NetworkTransportTestPorts.allocate(),
             parentEndpoint: ParentEndpoint(
-                publicKey: middleAuthority.value,
+                publicKey: middlePeerKey,
                 host: "127.0.0.1",
                 port: parentPort
             )
@@ -2329,27 +2260,12 @@ final class NetworkTrustTests: XCTestCase {
         XCTAssertEqual(Set(edges.compactMap(\.edgeCID)).count, 1)
         XCTAssertEqual(Set(proofs.map(\.rootCID)).count, 2)
 
-        let genesisLink = try genesisLink(
-            parentPath: ["Nexus", "Middle"],
-            directory: "Leaf",
-            cid: leafHeader.rawCID
-        )
         var attachments: [PortableAttachmentTestPayload] = []
         for (proof, edge) in zip(proofs, edges) {
-            let carrierLink = try carrierLink(
-                parentPath: ["Nexus", "Middle"],
-                carrierCID: middleHeader.rawCID,
-                rootCID: proof.rootCID
-            )
             let package = ChildValidationPackage(
-                proof: proof,
-                parentCarrierLink: carrierLink,
-                parentGenesisLink: genesisLink
+                proof: proof
             )
-            let envelope = try ChildValidationPackageEnvelope(
-                package,
-                certificatesSignedBy: middleConfiguration
-            )
+            let envelope = try ChildValidationPackageEnvelope(package)
             let attachment = try ChildEvidenceVolume(
                 envelopeBytes: try envelope.encode(),
                 childCID: leafHeader.rawCID
@@ -2373,7 +2289,7 @@ final class NetworkTrustTests: XCTestCase {
                 content: attachment.serialized.entries
             ))
         }
-        let parentPeerKey = try PeerKey(middleAuthority.value)
+        let parentPeerKey = try PeerKey(middlePeerKey)
         let runtime = try NodeNetworkRuntime(
             configuration: targetConfiguration,
             planeConfigurations: try NodeNetworkPlaneConfigurations(
@@ -2389,7 +2305,7 @@ final class NetworkTrustTests: XCTestCase {
                     signingKey: targetConfiguration.signingKey,
                     listenPort: hierarchyPort,
                     bootstrapPeers: [PeerEndpoint(
-                        publicKey: middleAuthority.value,
+                        publicKey: middlePeerKey,
                         host: "127.0.0.1",
                         port: targetConfiguration.parentEndpoint!.port
                     )],
@@ -4335,7 +4251,6 @@ final class NetworkTrustTests: XCTestCase {
         )
         addTeardownBlock { try? FileManager.default.removeItem(at: storage) }
         let parentPeer = peerKey(signingKey(0x97))
-        let parentAuthority = try XCTUnwrap(ParentProcessKey(parentPeer.hex))
         let overlayPort = NetworkTransportTestPorts.allocate()
         let configuration = try NodeConfiguration(
             chainPath: ["Nexus", "Payments"],
@@ -4354,7 +4269,6 @@ final class NetworkTrustTests: XCTestCase {
         let source = NetworkTestContentStore()
         try await LatticeState.emptyHeader.storeRecursively(storer: source)
         let genesisCandidate = try await networkChildGenesisCandidate(
-            parentAuthority: parentAuthority,
             timestamp: 1,
             source: source
         )
@@ -4416,11 +4330,6 @@ final class NetworkTrustTests: XCTestCase {
                 AuthenticatedChildPackage(
                     package: ChildValidationPackage(
                         proof: proof,
-                        parentCarrierLink: try carrierLink(
-                            parentPath: ["Nexus"],
-                            carrierCID: carrierHeader.rawCID,
-                            rootCID: carrierHeader.rawCID
-                        ),
                         parentGenesisLink: nil
                     )
                 ),
@@ -4455,13 +4364,19 @@ final class NetworkTrustTests: XCTestCase {
             descendantCID: orphanHeader.rawCID,
             predecessorCID: predecessorHeader.rawCID
         ))
-        XCTAssertNil(detached.parentCarrierLink)
+        XCTAssertEqual(
+            detached.parentCarrierLink?.rootCID,
+            orphanCarrierA
+        )
         let secondRoot = try await process!.admit(
             orphanHeader,
             authenticatedChildPackage: orphanPackageB
         )
         XCTAssertEqual(secondRoot.sameChainPredecessor, detached.sameChainPredecessor)
-        XCTAssertNil(secondRoot.parentCarrierLink)
+        XCTAssertEqual(
+            secondRoot.parentCarrierLink?.rootCID,
+            orphanCarrierB
+        )
 
         let remoteContent = NetworkTestContentStore()
         try await predecessorHeader.storeBlock(
@@ -5177,11 +5092,6 @@ final class NetworkTrustTests: XCTestCase {
                     .appendingPathComponent("state.db"),
                 nexusGenesisCID: fixture.childConfiguration.nexusGenesisCID,
                 chainPath: fixture.childConfiguration.chainPath,
-                spawningParentKey: try XCTUnwrap(
-                    fixture.childConfiguration.parentEndpoint
-                ).publicKey,
-                issuingAuthorityKey:
-                    fixture.childConfiguration.processPublicKey,
                 contextualCandidateOwner:
                     retentionScope + ":contextual-candidates"
             )
@@ -5882,7 +5792,8 @@ final class NetworkTrustTests: XCTestCase {
             carrierCID: carrierHeader.rawCID,
             rootCID: carrierHeader.rawCID,
             directory: "Payments",
-            childCID: childHeader.rawCID
+            childCID: childHeader.rawCID,
+            parentStateCID: carrier.prevState.rawCID
         )
         let childBootstrap = try await childProcess.admit(
             childHeader,
@@ -5941,7 +5852,6 @@ final class NetworkTrustTests: XCTestCase {
     }
 
     private func networkChildGenesisCandidate(
-        parentAuthority: ParentProcessKey,
         timestamp: Int64,
         source: NetworkTestContentStore
     ) async throws -> NetworkChildGenesisCandidate {
@@ -5976,15 +5886,11 @@ final class NetworkTrustTests: XCTestCase {
             package: AuthenticatedChildPackage(
                 package: ChildValidationPackage(
                     proof: proof,
-                    parentCarrierLink: try carrierLink(
-                        parentPath: ["Nexus"],
-                        carrierCID: carrierHeader.rawCID,
-                        rootCID: carrierHeader.rawCID
-                    ),
                     parentGenesisLink: try genesisLink(
                         parentPath: ["Nexus"],
                         directory: "Payments",
-                        cid: header.rawCID
+                        cid: header.rawCID,
+                        parentStateCID: child.parentState.rawCID
                     )
                 )
             )
@@ -5993,13 +5899,7 @@ final class NetworkTrustTests: XCTestCase {
 
     private func envelope(parentPath: [String]) throws -> ChildValidationPackageEnvelope {
         try ChildValidationPackageEnvelope(ChildValidationPackage(
-            proof: proof(),
-            parentCarrierLink: try carrierLink(
-                parentPath: parentPath, carrierCID: "carrier", rootCID: "root"
-            ),
-            parentGenesisLink: try genesisLink(
-                parentPath: parentPath, directory: "Payments", cid: "child-genesis"
-            )
+            proof: proof()
         ))
     }
 
@@ -6261,14 +6161,16 @@ final class NetworkTrustTests: XCTestCase {
         carrierCID: String,
         rootCID: String,
         directory: String,
-        childCID: String
+        childCID: String,
+        parentStateCID: String
     ) async throws -> AuthenticatedChildPackage {
-        guard let carrierLink = try await parent.issuedParentCarrierLink(
+        guard try await parent.issuedParentCarrierLink(
             carrierCID: carrierCID,
             rootCID: rootCID
-        ), let genesisLink = try await parent.issuedParentGenesisLink(
+        ) != nil, let genesisLink = try await parent.issuedParentGenesisLink(
             directory: directory,
-            childGenesisCID: childCID
+            childGenesisCID: childCID,
+            parentStateCID: parentStateCID
         ) else {
             throw NetworkTestError.failedStart
         }
@@ -6287,7 +6189,6 @@ final class NetworkTrustTests: XCTestCase {
         return AuthenticatedChildPackage(
             package: ChildValidationPackage(
                 proof: proof.proof,
-                parentCarrierLink: carrierLink,
                 parentGenesisLink: genesisLink
             )
         )
@@ -6677,19 +6578,22 @@ final class NetworkTrustTests: XCTestCase {
     private func genesisLink(
         parentPath: [String],
         directory: String,
-        cid: String
+        cid: String,
+        parentStateCID: String = testCID("genesis-parent-state")
     ) throws -> ParentGenesisLink {
         struct Wire: Encodable {
             let parentPath: [String]
             let directory: String
             let childGenesisCID: String
+            let parentStateCID: String
         }
         return try JSONDecoder().decode(
             ParentGenesisLink.self,
             from: JSONEncoder().encode(Wire(
                 parentPath: parentPath,
                 directory: directory,
-                childGenesisCID: cid
+                childGenesisCID: cid,
+                parentStateCID: parentStateCID
             ))
         )
     }

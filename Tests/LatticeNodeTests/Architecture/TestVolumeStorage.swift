@@ -19,8 +19,6 @@ func testNodeStore(
         databasePath: databasePath,
         nexusGenesisCID: nexusGenesisCID,
         chainPath: chainPath,
-        spawningParentKey: spawningParentKey,
-        issuingAuthorityKey: issuingAuthorityKey,
         recoveryVolumeBroker: broker,
         issuedRecoveryRetentionScope: "test:issued-hierarchy",
         preparedRecoveryRetentionScope: "test:prepared-hierarchy",

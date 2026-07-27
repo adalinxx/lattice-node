@@ -84,10 +84,11 @@ genesis and parent-state continuity facts; it cannot declare the child valid,
 assign work, or choose the child's tip. Continuity is transitive: for consecutive
 child blocks, the new parent-state CID must equal or be reachable through the
 parent's connected accepted same-chain graph from the predecessor's parent-state
-CID. A signed continuity link is portable through same-chain peers. Thus a
-restarted child can recompute fork choice entirely from durable accepted blocks
-and proof-derived work, while contacting its configured parent only when it
-needs a genuinely new parent-authorized continuity or genesis fact.
+CID. A restarted child can recompute fork choice entirely from durable accepted
+blocks and proof-derived work. When admission needs a new genesis or continuity
+fact, the child asks its authenticated immediate-parent process. A positive
+answer is an unsigned acknowledgement bound to that live session and exact
+request; peers cannot relay it.
 
 `parentState` commits the carrier's `prevState`. It is not a parent-block
 backlink and is never inverted to discover ancestry.
@@ -123,12 +124,12 @@ The node uses two Ivy sessions:
 
 - the public same-chain overlay exchanges announcements and same-path content;
 - the private hierarchy plane connects one configured immediate parent with its
-  direct children and carries contextual candidates, signed parent-state
-  continuity facts, and root-bound proof facts.
+  direct children and carries contextual candidates, exact parent-fact queries,
+  and root-bound proof facts.
 
-Both planes currently require node protocol version 4. Portable signed parent
-facts are versioned wire semantics, so mixed-version peers refuse the session
-and must be upgraded together.
+Both planes currently require node protocol version 4. Parent-fact
+request/response semantics are versioned, so mixed-version peers refuse the
+session and must be upgraded together.
 
 Peer content exchange is Volume-native. An announcer names one complete Volume
 by its root CID and must serve that Volume from the exact authenticated session
@@ -184,14 +185,10 @@ persists the edge when it issues the child commitment; a child persists the
 incoming edge when it validates that commitment. Children never return edge
 inventories or topology to parents.
 
-On the same-chain overlay, a child can advertise a child-evidence Volume whose
-envelope contains the complete proof plus any detached parent carrier, genesis,
-or state-continuity certificates. Each
-certificate is bound to the Nexus genesis, absolute parent path, fact fields,
-and configured Ed25519 parent authority. It authenticates only the immutable
-parent fact; Lattice still derives work and validates the child. A genesis
-attachment requires both certificates. Nexus neither requests nor accepts
-portable attachments.
+On the same-chain overlay, a child advertises a child-evidence Volume whose
+envelope contains only the complete structural work proof. Parent validity
+verdicts are never serialized into the Volume. Nexus neither requests nor
+accepts portable attachments.
 
 Both inventories are cursor-bound and name one exact Volume at a time. Ivy
 streams each complete Volume as an ordered, bounded sequence of frames;
@@ -217,13 +214,13 @@ Admission transfers ownership to ordinary chain recovery before releasing the
 inbox root. Multiple roots for one child are separate summaries. No proof-root
 pagination or evidence request/response layer exists beneath this inventory.
 
-For a non-genesis child candidate, the configured immediate parent answers only
-an exact state-reachability question: whether the candidate's parent-state
-reference is equal to, or a transitive accepted same-chain successor of, its
-predecessor's reference. The parent signs the exact state pair, parent path,
-and Nexus genesis. Any same-chain peer may later relay that immutable
-certificate. Parent canonicity does not affect reachability, and the
-certificate carries no work total.
+For child genesis, the configured immediate parent positively acknowledges only
+an exact `(directory, child CID, deployment prevState)` tuple derived from an
+accepted parent block. For a non-genesis candidate, equal parent-state
+references need no request; otherwise the parent positively acknowledges only
+an exact transitive reachability pair from its recovered validated graph.
+Responses are unsigned, bound to the current authenticated session and pending
+request, and never portable. Parent canonicity does not affect reachability.
 
 Child work is derived directly from the candidate's content-addressed directory
 proof. A carrier need not be admitted or valid on its own chain: the root grind

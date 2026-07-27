@@ -16,25 +16,14 @@ final class CandidateAcquirerTests: XCTestCase {
 
     private func childPackage(
         rootCID: String,
-        carrier: Bool = false,
         genesis: Bool = false
     ) throws -> AuthenticatedChildPackage {
-        struct CarrierWire: Encodable {
-            let parentPath = ["Nexus"]
-            let carrierCID = "carrier"
-            let rootCID: String
-        }
         struct GenesisWire: Encodable {
             let parentPath = ["Nexus"]
             let directory = "Payments"
             let childGenesisCID = "genesis"
+            let parentStateCID = "parent-state"
         }
-        let carrierLink = carrier
-            ? try JSONDecoder().decode(
-                ParentCarrierLink.self,
-                from: JSONEncoder().encode(CarrierWire(rootCID: rootCID))
-            )
-            : nil
         let genesisLink = genesis
             ? try JSONDecoder().decode(
                 ParentGenesisLink.self,
@@ -47,7 +36,6 @@ final class CandidateAcquirerTests: XCTestCase {
                 directoryPath: ["Payments"],
                 entries: []
             ),
-            parentCarrierLink: carrierLink,
             parentGenesisLink: genesisLink
         ))
     }
@@ -139,6 +127,26 @@ final class CandidateAcquirerTests: XCTestCase {
         XCTAssertNil(acquirer.next())
     }
 
+    func testInterruptedExternalDependencyRequeuesActiveAttempt() throws {
+        let package = try childPackage(rootCID: "root")
+        let seed = CandidateAcquirer.Seed(
+            blockCID: "block",
+            package: package
+        )
+        var acquirer = CandidateAcquirer()
+        XCTAssertTrue(acquirer.observe(seed).accepted)
+        let active = try XCTUnwrap(acquirer.next())
+
+        XCTAssertTrue(acquirer.requeue(seed))
+        XCTAssertTrue(acquirer.complete(
+            active.ticket,
+            resolution: .wait(.evidence)
+        ))
+        let retry = try XCTUnwrap(acquirer.next())
+        XCTAssertEqual(retry.blockCID, "block")
+        XCTAssertEqual(retry.recoveryRootCID, "root")
+    }
+
     func testEvidenceEnrichmentDuringAdmissionSchedulesMergedFollowUp()
         throws
     {
@@ -146,8 +154,7 @@ final class CandidateAcquirerTests: XCTestCase {
         XCTAssertTrue(acquirer.observe(.init(
             blockCID: "block",
             package: try childPackage(
-                rootCID: "root",
-                carrier: true
+                rootCID: "root"
             )
         )).accepted)
         let active = try XCTUnwrap(acquirer.next())
@@ -164,7 +171,6 @@ final class CandidateAcquirerTests: XCTestCase {
         ))
 
         let enriched = try XCTUnwrap(acquirer.next())
-        XCTAssertNotNil(enriched.package?.package.parentCarrierLink)
         XCTAssertNotNil(enriched.package?.package.parentGenesisLink)
     }
 

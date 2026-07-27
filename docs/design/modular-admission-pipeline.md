@@ -54,9 +54,10 @@ Ivy and VolumeBroker form the IPFS-like boundary for Lattice:
 - validation bytes have no second local CAS.
 
 Content availability and consensus evidence are independent. Any peer may serve
-content-addressed bytes. Only the configured immediate parent may originate a
-genesis or parent-state continuity fact, and same-chain peers may relay those
-facts with the parent's signature.
+content-addressed bytes. Only the configured immediate-parent session may answer
+an exact genesis or parent-state continuity query. The unsigned answer is
+non-portable; ordinary peers can provide the underlying Volumes but never the
+parent's verdict.
 
 ## Admission boundary
 
@@ -64,7 +65,8 @@ Acquisition produces an immutable candidate attempt containing:
 
 - the candidate block Volume;
 - the sparse root-to-child proof Volume;
-- any parent-signed genesis or continuity fact;
+- any locally constructed genesis or continuity fact acknowledged by the
+  authenticated immediate-parent session;
 - exact provider attribution.
 
 Lattice then verifies:
@@ -105,7 +107,7 @@ The parent remains child-agnostic. It:
 - serves complete committed Volumes;
 - answers whether one parent state is transitively reachable from another in
   its connected accepted graph;
-- signs the exact continuity or genesis fact it verified.
+- acknowledges an exact continuity or genesis query from that graph.
 
 It does not ingest child consensus, child payloads, child provider state, or
 child weights. A grandchild repeats the same immediate-parent rule; no ancestor
@@ -118,7 +120,7 @@ proof protocol or descendant-tree export exists.
 | Provider timeout or partial Volume | Retry another exact advertiser; no blame for absence |
 | Malformed or wrong complete Volume | Penalize the supplier and retry discovery |
 | Missing predecessor | Park the candidate and acquire that predecessor |
-| Missing parent continuity fact | Ask the configured parent or a peer with its signed fact |
+| Missing parent continuity fact | Ask the configured immediate parent; timeout remains retryable |
 | Invalid proof or state transition | Reject that candidate |
 | Crash after durable batch | Replay facts and recompute fork choice |
 | Parent offline after facts are known | Keep verified history and consensus active |
