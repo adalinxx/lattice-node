@@ -3306,7 +3306,6 @@ final class NetworkTrustTests: XCTestCase {
             case .temporarilyInvalid: "temporarilyInvalid"
             case .invalid: "invalid"
             case .localFailure: "localFailure"
-            case .storageFailed: "storageFailed"
             }
             await decisions.append(decision)
             return outcome
