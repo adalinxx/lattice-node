@@ -1823,7 +1823,7 @@ final class NetworkTrustTests: XCTestCase {
 
         XCTAssertThrowsError(try candidate(blockData + Data([0])).encoded())
         XCTAssertThrowsError(try candidate(
-            Data(repeating: 0, count: Int(IvyConfig.protocolMaxFrameSize))
+            Data(repeating: 0, count: Int(IvyConfig.defaultProtocolMaxFrameSize))
         ).encoded())
 
         XCTAssertThrowsError(try ChildEvidenceAvailableMessage(
@@ -3347,8 +3347,11 @@ final class NetworkTrustTests: XCTestCase {
             )
 
             let parent = try await fixture.process.canonicalTipBlock()
+            // Admission is strict (`timestamp <= now`) — Lattice 27.0.0 removed the
+            // central future-drift tolerance. A block 5s ahead is briefly deferred
+            // (notYetAdmissible), then admits once real time reaches its timestamp.
             let timestamp = Int64(Date().timeIntervalSince1970 * 1_000)
-                + 2 * 60 * 60 * 1_000 + 5_000
+                + 5_000
             var nonce: UInt64 = 0
             var future = try await BlockBuilder.buildBlock(
                 previous: parent,

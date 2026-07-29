@@ -253,7 +253,7 @@ final class PortableEvidenceProtocolTests: XCTestCase {
 
         let oversized = Data(
             repeating: 0,
-            count: Int(IvyConfig.protocolMaxFrameSize)
+            count: Int(IvyConfig.defaultProtocolMaxFrameSize)
         )
         XCTAssertThrowsError(
             try ChildCandidateReservationRequestMessage.decoded(oversized)

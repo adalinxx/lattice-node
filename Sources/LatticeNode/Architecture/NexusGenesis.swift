@@ -20,8 +20,7 @@ public enum NexusGenesis {
     )
     public static let config = GenesisConfig(
         spec: spec,
-        timestamp: 0,
-        target: UInt256.max
+        timestamp: 0
     )
 
     /// Canonical identity of the Nexus bootstrap block.
@@ -52,7 +51,9 @@ public enum NexusGenesis {
             spec: spec,
             transactions: [transaction],
             timestamp: config.timestamp,
-            target: config.target,
+            // Genesis target is not configurable — it is canonically the maximum
+            // (easiest) value, which genesis validation requires.
+            target: UInt256.max,
             fetcher: fetcher
         )
     }

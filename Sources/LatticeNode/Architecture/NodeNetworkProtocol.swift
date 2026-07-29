@@ -93,7 +93,7 @@ enum NodeNetworkWireError: Error, Equatable, Sendable {
     case nonCanonical
 }
 
-private let _maximumNodeMessageSize = Int(IvyConfig.protocolMaxFrameSize) - 256
+private let _maximumNodeMessageSize = Int(IvyConfig.defaultProtocolMaxFrameSize) - 256
 
 protocol NodeJSONMessage: Codable {
     func validate() throws

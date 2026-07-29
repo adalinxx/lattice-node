@@ -248,7 +248,7 @@ public actor MiningTemplateBook {
             String: (search: UInt256, deployment: UInt256?)
         ] = [:]
         for child in children {
-            guard StateAtomLimits.isDirectory(child.directory) else {
+            guard _isBoundedDirectoryAtom(child.directory) else {
                 throw MiningTemplateError.invalidChildDirectory
             }
             guard childBlocks[child.directory] == nil else {

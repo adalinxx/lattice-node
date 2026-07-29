@@ -599,7 +599,7 @@ final class ParentChildE2ETests: XCTestCase {
             body: MiningTemplateRequest()
         )
         let maximumPaymentsTarget = hardTarget
-            * UInt256(UInt64(ChainSpec.maxTargetChange))
+            * UInt256(UInt64(ChainSpec.defaultMaxTargetChange))
         let carrierMidstate = ProofOfWork.midstate(for: selectedTemplate.block)
         var carrierNonce: UInt64 = 0
         var rootHash = ProofOfWork.hash(
@@ -1594,12 +1594,13 @@ final class ParentChildE2ETests: XCTestCase {
         }
 
         // On P, Payments A contributes two work per physical root. Receipts A
-        // contributes three on the second root while its middle branch starts
-        // at four.
+        // contributes two on the second root while its middle branch starts
+        // at four. (Work uses the inclusive chainwork formula: workForTarget(max/3)
+        // is floor(2^256/(target+1)) == 2, not the old exclusive 3.)
         let middleATarget = UInt256.max / UInt256(2)
         let leafATarget = UInt256.max / UInt256(3)
         XCTAssertEqual(workForTarget(middleATarget), UInt256(2))
-        XCTAssertEqual(workForTarget(leafATarget), UInt256(3))
+        XCTAssertEqual(workForTarget(leafATarget), UInt256(2))
         let middleA = try await childIntent(
             on: parent,
             directory: "Payments",
@@ -1642,14 +1643,14 @@ final class ParentChildE2ETests: XCTestCase {
         _ = try await waitForTip(parent, qTip)
         try await fork.stop()
 
-        // Payments B contributes five on both of its physical roots. It
-        // therefore becomes the middle tip with weight ten. Its Receipts base
-        // sees only the second root and starts at six, ahead of Receipts A's
-        // three.
+        // Payments B contributes four on both of its physical roots. It
+        // therefore becomes the middle tip with weight eight. Its Receipts base
+        // sees only the second root and starts at five, ahead of Receipts A's
+        // two. (Inclusive chainwork: workForTarget(max/5) == 4.)
         try await leaf.stop()
         try await middle.stop()
         let middleBTarget = UInt256.max / UInt256(5)
-        XCTAssertEqual(workForTarget(middleBTarget), UInt256(5))
+        XCTAssertEqual(workForTarget(middleBTarget), UInt256(4))
         let middleB = try await childIntent(
             on: parent,
             directory: "Payments",
@@ -1669,7 +1670,7 @@ final class ParentChildE2ETests: XCTestCase {
         try leaf.start()
         _ = try await waitForTip(leaf, leafA.genesisCID)
         let leafBTarget = UInt256.max / UInt256(6)
-        XCTAssertEqual(workForTarget(leafBTarget), UInt256(6))
+        XCTAssertEqual(workForTarget(leafBTarget), UInt256(5))
         let leafB = try await childIntent(
             on: middle,
             directory: "Receipts",

@@ -801,7 +801,7 @@ public actor ChainService {
     ) async throws -> ChildDeployIntentResponse {
         await acquireOperation()
         defer { releaseOperation() }
-        guard StateAtomLimits.isDirectory(request.directory),
+        guard _isBoundedDirectoryAtom(request.directory),
               let childAddress = ChainAddress(
                   process.configuration.chainPath + [request.directory]
               ) else {
@@ -833,7 +833,7 @@ public actor ChainService {
         let requestContent = MemoryBroker()
         do {
             for module in request.policyModules {
-                guard module.bytes.count <= WasmPolicyEvaluator.maxModuleBytes
+                guard module.bytes.count <= WasmPolicyResourceLimits.default.maxModuleBytes
                 else {
                     throw ChainServiceError.invalidChildPolicyModules
                 }

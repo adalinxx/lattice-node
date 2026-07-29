@@ -51,7 +51,7 @@ struct LatticeMiner: ParsableCommand {
         let midstate = ProofOfWork.midstate(for: block)
         let nonce = ProofOfWork.searchBatch(
             midstate: midstate,
-            target: max(parsedTarget, ChainSpec.minimumTarget),
+            target: parsedTarget,
             startNonce: startNonce,
             count: count
         )

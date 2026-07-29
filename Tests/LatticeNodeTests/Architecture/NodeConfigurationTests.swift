@@ -12,10 +12,10 @@ final class NodeConfigurationTests: XCTestCase {
             chainPath: address.components
         ).encode())
 
-        XCTAssertNil(ChainAddress([
-            "Nexus",
-            String(repeating: "x", count: 65),
-        ]))
+        // Directory length is now bounded by the proof wire format (a UInt16
+        // field width) rather than a central 64-byte cap, so a 65-char atom is
+        // valid. This test covers the consensus GRAMMAR: printable ASCII, no
+        // separator, and the Nexus-rooted path rule.
         XCTAssertNil(ChainAddress(["Nexus", "日本語-☃"]))
         XCTAssertNil(ChainAddress(["Nexus", "line\nbreak"]))
         XCTAssertNil(ChainAddress(["Nexus", "has/slash"]))
