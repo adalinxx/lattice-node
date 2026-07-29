@@ -149,7 +149,6 @@ public enum WorkDisposition: String, Codable, Sendable {
     case temporarilyInvalid
     case invalid
     case localFailure
-    case storageFailed
 }
 
 public struct SubmitWorkResponse: Codable, Sendable {
@@ -2191,7 +2190,6 @@ private extension WorkDisposition {
         case .temporarilyInvalid: self = .temporarilyInvalid
         case .invalid: self = .invalid
         case .localFailure: self = .localFailure
-        case .storageFailed: self = .storageFailed
         }
     }
 }

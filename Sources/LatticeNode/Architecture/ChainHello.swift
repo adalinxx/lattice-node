@@ -14,6 +14,11 @@ public enum ChainHelloError: Error, Equatable, Sendable {
 public struct ChainHello: Codable, Equatable, Sendable {
     /// Version 4 removes node-local policy from peer compatibility.
     public static let protocolVersion: UInt16 = 4
+    /// Deliberately tight pre-decode guard: `decode` runs on an UNAUTHENTICATED
+    /// peer's bytes, so unlike post-session messages (bounded by the transport
+    /// frame) this caps unauthenticated JSON parse work. A hello is only a version
+    /// + one CID + a short chain path; ~64 KiB is far above any real hello while
+    /// staying well under the frame size. `validateShape()` is the real check.
     public static let maximumEncodedSize = 64 * 1024
 
     public let version: UInt16

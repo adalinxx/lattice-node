@@ -2720,8 +2720,10 @@ public actor NodeNetworkRuntime: IvyDelegate {
             attachmentCID: summary.attachmentCID
         )
         if activeEvidenceVolumes.contains(lease) { return true }
-        // Keep one slot for the live trusted parent so overlay churn cannot
-        // starve consensus-critical hierarchy evidence.
+        // Reserve one slot for the structurally-required parent endpoint (a
+        // connectivity reservation, NOT validation trust — parent facts are still
+        // verified and never vouch for the child transition) so overlay churn
+        // cannot starve consensus-critical hierarchy evidence.
         while activeEvidenceVolumes.count >= Self.maximumEvidenceCandidates - 1 {
             do {
                 try await Task.sleep(
@@ -3948,6 +3950,10 @@ public actor NodeNetworkRuntime: IvyDelegate {
             }
         }
 
+        // Only the peer that supplied a COMPLETE invalid candidate can be blamed
+        // for it, and only when it was the sole remote supplier: parent evidence
+        // authenticates only parent facts and never vouches for the child
+        // transition. "Blame" is a per-root routing suppression, never a ban.
         if outcome.decision == .invalid {
             if attempt.attribution.allResponsesComplete,
                let supplierKey = attempt.attribution.soleRemoteSupplierPublicKey,

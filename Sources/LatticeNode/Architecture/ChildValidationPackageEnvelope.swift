@@ -5,7 +5,6 @@ import Lattice
 public enum ChildValidationPackageEnvelopeError: Error, Equatable, Sendable {
     case oversized
     case malformed
-    case nonCanonical
 }
 
 /// A child package whose cross-chain facts were derived by local validation.
@@ -68,13 +67,13 @@ public struct ChildValidationPackageEnvelope: Sendable {
         guard data.count > magic.count, data.prefix(magic.count) == magic else {
             throw ChildValidationPackageEnvelopeError.malformed
         }
-        let envelope = try ChildValidationPackageEnvelope(
+        // Canonicity is enforced by `init(proofBytes:)` → `validateCanonicalContents`
+        // (`proof.serialize() == proofBytes`). A re-`encode() == data` check would be
+        // tautological here: `encode()` is `magic + proofBytes`, and the magic prefix
+        // is already verified above, so it always equals `data`.
+        return try ChildValidationPackageEnvelope(
             proofBytes: Data(data.dropFirst(magic.count))
         )
-        guard try envelope.encode() == data else {
-            throw ChildValidationPackageEnvelopeError.nonCanonical
-        }
-        return envelope
     }
 
     func makeValidationPackage(
