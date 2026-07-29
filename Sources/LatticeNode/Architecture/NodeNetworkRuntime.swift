@@ -389,6 +389,11 @@ public actor NodeNetworkRuntime: IvyDelegate {
     /// Each suspended hierarchy stage is capped.
     private static let maximumEvidenceCandidates = 64
     private static let maximumCandidateWaitTicks = 64
+    /// Direct advertisers probed (each up to one request timeout) before the
+    /// recovery source. candidate.providers is bounded only by live sessions, so
+    /// an announcement flood could otherwise force O(N) sequential timeouts per
+    /// block; this caps the fan-out to a small constant.
+    private static let maximumExactContentSources = 8
     private static let futureCandidateRetryInterval: Duration = .seconds(1)
     private static let maximumDirectChildren = 64
     private static let maximumConcurrentChildBuilds = 8
@@ -3707,13 +3712,21 @@ public actor NodeNetworkRuntime: IvyDelegate {
             source: IvyRootContentSource,
             plane: CandidateSourcePlane?
         )]
+        // Order the direct advertisers by a per-process-seeded hash of
+        // (publicKey, blockCID) — NOT raw publicKey — so an attacker cannot grind
+        // Sybil keys to sort ahead of the genuine supplier for a given block, and
+        // CAP the fan-out so an announcement flood cannot force O(N) sequential
+        // timeouts before the recovery source (below) is reached. The recovery
+        // source's full pin cascade still reaches the genuine supplier if every
+        // capped slot is a Sybil, so the worst case is bounded, not unbounded.
         let overlaySources: [(
             peer: AuthenticatedPeer?,
             source: IvyRootContentSource,
             plane: CandidateSourcePlane?
-        )] = candidate.providers.compactMap(overlayPeer(for:)).sorted {
-            $0.id.publicKey < $1.id.publicKey
-        }.map {
+        )] = Self.boundedOrderedExactPeers(
+            candidate.providers.compactMap(overlayPeer(for:)),
+            blockCID: candidate.blockCID
+        ).map {
             (
                 peer: $0,
                 source: candidateContentSource(
@@ -4115,6 +4128,36 @@ public actor NodeNetworkRuntime: IvyDelegate {
                 )
             }
         }
+    }
+
+    /// Per-process-seeded ordering key for a candidate's direct advertisers.
+    /// Swift's Hasher is seeded per process, so a remote attacker cannot grind
+    /// Sybil keys to sort ahead of the genuine supplier for a given block; the
+    /// order stays deterministic within a node's lifetime. publicKey breaks ties.
+    private static func exactSourceOrder(
+        _ peer: AuthenticatedPeer,
+        blockCID: String
+    ) -> (Int, String) {
+        var hasher = Hasher()
+        hasher.combine(peer.id.publicKey)
+        hasher.combine(blockCID)
+        return (hasher.finalize(), peer.id.publicKey)
+    }
+
+    /// Direct advertisers to probe before the recovery source: de-ground order
+    /// (see exactSourceOrder) capped to a small constant, so an announcement flood
+    /// cannot force O(N) sequential fetch timeouts per block.
+    static func boundedOrderedExactPeers(
+        _ peers: [AuthenticatedPeer],
+        blockCID: String
+    ) -> [AuthenticatedPeer] {
+        peers
+            .sorted {
+                exactSourceOrder($0, blockCID: blockCID)
+                    < exactSourceOrder($1, blockCID: blockCID)
+            }
+            .prefix(maximumExactContentSources)
+            .map { $0 }
     }
 
     private func candidateContentSource(

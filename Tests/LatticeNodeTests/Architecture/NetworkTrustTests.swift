@@ -6540,6 +6540,23 @@ final class NetworkTrustTests: XCTestCase {
         )
     }
 
+    func testExactSourceFanOutIsCappedIndependentOfProviderCount() {
+        // An announcement flood cannot force O(N) sequential fetch timeouts before
+        // the recovery source: the direct-advertiser fan-out is capped to a small
+        // constant regardless of how many advertisers are injected. The genuine
+        // supplier stays reachable via the uncapped recovery source.
+        func peers(_ n: Int) -> [AuthenticatedPeer] {
+            (0..<n).map { authenticatedPeer(signingKey(UInt8($0)), role: .endpoint) }
+        }
+        let blockCID = "block-under-advertiser-flood"
+        let few = NodeNetworkRuntime.boundedOrderedExactPeers(peers(2), blockCID: blockCID)
+        let flood = NodeNetworkRuntime.boundedOrderedExactPeers(peers(64), blockCID: blockCID)
+        XCTAssertEqual(few.count, 2, "a small provider set is probed in full")
+        XCTAssertEqual(flood.count, 8, "a flood is capped, not scaled with N")
+        let all = peers(64)
+        XCTAssertTrue(flood.allSatisfy { all.contains($0) })
+    }
+
     private func signingKey(_ byte: UInt8) -> Curve25519.Signing.PrivateKey {
         try! Curve25519.Signing.PrivateKey(rawRepresentation: Data(repeating: byte, count: 32))
     }
