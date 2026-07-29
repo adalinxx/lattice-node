@@ -4496,10 +4496,21 @@ public actor NodeNetworkRuntime: IvyDelegate {
             pending.package,
             localFact
         ) else { return }
-        _ = enqueueCandidate(CandidateSeed(
+        // A parent fact that arrives SUCCESSFULLY must re-ready the candidate that
+        // was blocked waiting for it. observe()/enqueueCandidate only flips a
+        // `.waiting(.evidence)` attempt back to `.ready`, never a `.waiting(.later)`
+        // one, so without retryExternalDependency the candidate would wedge until
+        // the wall-clock poll (or 2h expiry). Mirror the timeout path
+        // (retryParentFactCandidate) so the fact's arrival is itself the trigger.
+        _ = candidateAcquirer.observe(CandidateSeed(
             blockCID: pending.blockCID,
             package: merged
         ))
+        candidateAcquirer.retryExternalDependency(
+            blockCID: pending.blockCID,
+            rootCID: pending.package.package.proof.rootCID
+        )
+        serviceCandidateAcquirer()
     }
 
     private func parentChainFactRequestTimedOut(
