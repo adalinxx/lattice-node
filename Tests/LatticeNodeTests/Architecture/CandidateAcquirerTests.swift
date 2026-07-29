@@ -24,6 +24,36 @@ final class CandidateAcquirerTests: XCTestCase {
         XCTAssertEqual(acquirer.next()?.blockCID, blockCID)
     }
 
+    func testLaterWaitIsReadiedByRetryNotByObserveAlone() throws {
+        // Regression for the parent-fact SUCCESS gap: observe() (what
+        // enqueueCandidate does) only re-readies a `.wait(.evidence)` attempt,
+        // never a `.wait(.later)` one. A parent fact arriving successfully must
+        // therefore call retryExternalDependency to re-ready the blocked candidate,
+        // as acceptParentChainFact now does — otherwise it wedges until the poll.
+        let blockCID = "later-wait"
+        let rootCID = "later-root"
+        var acquirer = CandidateAcquirer()
+        XCTAssertTrue(acquirer.observe(.init(
+            blockCID: blockCID,
+            package: nil,
+            recoveryRootCID: rootCID
+        )).accepted)
+        let ticket = try XCTUnwrap(acquirer.next())
+        XCTAssertTrue(acquirer.complete(ticket.ticket, resolution: .wait(.later)))
+
+        // observe() with the (now available) package does NOT re-ready a .later wait.
+        _ = acquirer.observe(.init(
+            blockCID: blockCID,
+            package: try childPackage(rootCID: rootCID),
+            recoveryRootCID: rootCID
+        ))
+        XCTAssertNil(acquirer.next(), "observe alone must not re-ready a .later wait")
+
+        // retryExternalDependency (the call the fix adds) re-readies it.
+        acquirer.retryExternalDependency(blockCID: blockCID, rootCID: rootCID)
+        XCTAssertEqual(acquirer.next()?.blockCID, blockCID)
+    }
+
     private func provider(
         _ publicKey: String,
         session: UInt8
