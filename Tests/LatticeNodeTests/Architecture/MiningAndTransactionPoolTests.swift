@@ -249,7 +249,7 @@ final class MiningTemplateBookTests: XCTestCase {
         XCTAssertEqual(included, [valid.body.rawCID])
     }
 
-    func testTransactionLimitRefillsAfterHigherFeeStateInvalidEntry()
+    func testTemplateFillsWithValidTransactionSkippingStateInvalid()
         async throws
     {
         let fixture = try await chainFixture()
@@ -286,8 +286,8 @@ final class MiningTemplateBookTests: XCTestCase {
             spec: spec,
             fetcher: fixture.store
         )
+        // Served in ascending nonce order (valid n1 before invalid n2), not by fee.
         let ordered = await pool.transactions(limit: .max)
-        XCTAssertEqual(ordered.first?.body.rawCID, invalid.body.rawCID)
 
         let template = try await MiningTemplateBook(
             chainPath: ["Nexus"],
@@ -297,7 +297,7 @@ final class MiningTemplateBookTests: XCTestCase {
             transactions: ordered,
             children: [],
             timestamp: 1,
-            transactionLimit: 1,
+            transactionLimit: 2,
             fetcher: fixture.store
         )
         let included = try XCTUnwrap(template.block.transactions.node)
@@ -655,47 +655,33 @@ final class TransactionPoolArchitectureTests: XCTestCase {
         XCTAssertEqual(count, 1)
     }
 
-    func testFeeRateOrderingUsesExactFullWidthProducts() async throws {
+    func testTransactionsAreServedInAscendingNonceOrderNotByFee() async throws {
         let store = MiningTestStore()
         let pool = TransactionPool()
         let key = CryptoUtils.generateKeyPair()
         let owner = CryptoUtils.createAddress(from: key.publicKey)
-        let mediumFee = UInt64(Int64.max)
-        let highFee = mediumFee * 2
-        let medium = try signedTransaction(
+        // Higher fee on the higher nonce: nonce order still wins. The pool does
+        // not order by fee — with external merged mining there is no fee market.
+        let later = try signedTransaction(
             key: key,
-            accountActions: [AccountAction(owner: owner, delta: -Int64.max)],
-            fee: mediumFee,
-            nonce: 0
-        )
-        let high = try signedTransaction(
-            key: key,
-            accountActions: [
-                AccountAction(owner: owner, delta: -Int64.max),
-                AccountAction(owner: owner, delta: -Int64.max),
-            ],
-            fee: highFee,
+            accountActions: [AccountAction(owner: owner, delta: -1)],
+            fee: 1_000,
             nonce: 1
         )
-        let mediumSize = storedSize(of: medium)
-        let highSize = storedSize(of: high)
-        XCTAssertLessThan(highSize, mediumSize * 2)
-        XCTAssertTrue(highFee.multipliedReportingOverflow(by: UInt64(mediumSize)).overflow)
-        XCTAssertTrue(mediumFee.multipliedReportingOverflow(by: UInt64(highSize)).overflow)
-
-        _ = try await pool.submit(
-            medium,
-            spec: testSpec(),
-            fetcher: store
+        let earlier = try signedTransaction(
+            key: key,
+            accountActions: [AccountAction(owner: owner, delta: -1)],
+            fee: 1,
+            nonce: 0
         )
         _ = try await pool.submit(
-            high,
-            spec: testSpec(),
-            fetcher: store
+            later, spec: testSpec(), fetcher: store, disposition: .future
         )
-
+        _ = try await pool.submit(
+            earlier, spec: testSpec(), fetcher: store
+        )
         let ordered = await pool.transactions(limit: 2).map(\.body.rawCID)
-        XCTAssertEqual(ordered, [high.body.rawCID, medium.body.rawCID])
+        XCTAssertEqual(ordered, [earlier.body.rawCID, later.body.rawCID])
     }
 
     func testFutureNonceBecomesEligibleBehindReadyPredecessor()
@@ -761,7 +747,7 @@ final class TransactionPoolArchitectureTests: XCTestCase {
         XCTAssertEqual(restored, [0, 1])
     }
 
-    func testDependencyFrontierPrefersFeesWithoutBreakingMultiSignerOrder()
+    func testDependencyFrontierPreservesMultiSignerNonceOrder()
         async throws
     {
         let store = MiningTestStore()
@@ -801,15 +787,20 @@ final class TransactionPoolArchitectureTests: XCTestCase {
 
         let selected = await pool.transactions(limit: .max)
         let roots = try selected.map { try VolumeImpl<Transaction>(node: $0).rawCID }
+        // The nonce-1 multi-signer transaction is served after BOTH its nonce-0
+        // predecessors (so the builder can sequence it); within nonce 0 the order
+        // is deterministic (by CID), not by fee.
+        XCTAssertEqual(roots.count, 3)
+        XCTAssertEqual(roots.last, try VolumeImpl<Transaction>(node: joint).rawCID)
         XCTAssertEqual(
-            roots,
-            try [second, first, joint].map {
+            Set(roots.dropLast()),
+            Set(try [first, second].map {
                 try VolumeImpl<Transaction>(node: $0).rawCID
-            }
+            })
         )
     }
 
-    func testSameSignerAndNonceRequiresStrictlyBetterReplacement() async throws {
+    func testSameSignerAndNonceLastWriterWins() async throws {
         let store = MiningTestStore()
         let pool = TransactionPool()
         let key = CryptoUtils.generateKeyPair()
@@ -836,11 +827,16 @@ final class TransactionPoolArchitectureTests: XCTestCase {
             nonce: 0
         )
 
+        // The first submission holds the (signer, nonce) slot...
         _ = try await pool.submit(
             low,
             spec: testSpec(),
             fetcher: store
         )
+        // ...until the SAME signer submits a newer transaction for the same slot,
+        // which replaces it — last-writer-wins, no fee bump (external merged
+        // mining has no fee market; `high`'s larger fee is incidental). Only the
+        // signer can sign that nonce, so this is self-correction, not a front-run.
         let replacement = try await pool.submit(
             high,
             spec: testSpec(),
@@ -849,18 +845,6 @@ final class TransactionPoolArchitectureTests: XCTestCase {
         XCTAssertEqual(replacement.replaced.map(\.cid), [
             try VolumeImpl<Transaction>(node: low).rawCID,
         ])
-        await XCTAssertThrowsErrorAsync(
-            try await pool.submit(
-                low,
-                spec: testSpec(),
-                fetcher: store
-            )
-        ) { error in
-            XCTAssertEqual(
-                error as? TransactionPoolError,
-                .replacementUnderpriced
-            )
-        }
 
         let count = await pool.count
         let selected = await pool.transactions(limit: 1).first
@@ -929,7 +913,7 @@ final class TransactionPoolArchitectureTests: XCTestCase {
         XCTAssertEqual(count, 1)
     }
 
-    func testHigherFeeRateEvictsLowestValueEntryAtCapacity() async throws {
+    func testCapacityKeepsOldestReadyAndRejectsNewer() async throws {
         let store = MiningTestStore()
         let pool = TransactionPool(maxCount: 1)
         let firstKey = CryptoUtils.generateKeyPair()
@@ -937,7 +921,7 @@ final class TransactionPoolArchitectureTests: XCTestCase {
         let recipient = CryptoUtils.createAddress(
             from: CryptoUtils.generateKeyPair().publicKey
         )
-        let low = try signedTransaction(
+        let incumbent = try signedTransaction(
             key: firstKey,
             accountActions: [
                 AccountAction(
@@ -949,7 +933,8 @@ final class TransactionPoolArchitectureTests: XCTestCase {
             fee: 1,
             nonce: 0
         )
-        let high = try signedTransaction(
+        // A newer, higher-fee ready transaction — but fee no longer buys eviction.
+        let newer = try signedTransaction(
             key: secondKey,
             accountActions: [
                 AccountAction(
@@ -958,32 +943,26 @@ final class TransactionPoolArchitectureTests: XCTestCase {
                 ),
                 AccountAction(owner: recipient, delta: 1),
             ],
-            fee: 2,
+            fee: 1_000,
             nonce: 0
         )
 
         _ = try await pool.submit(
-            low,
-            spec: testSpec(),
-            fetcher: store
+            incumbent, spec: testSpec(), fetcher: store, addedAt: Date(timeIntervalSince1970: 1)
         )
-        let mutation = try await pool.submit(
-            high,
-            spec: testSpec(),
-            fetcher: store
-        )
-        XCTAssertEqual(mutation.evicted.map(\.cid), [
-            try VolumeImpl<Transaction>(node: low).rawCID,
-        ])
+        // At capacity, the older ready entry is kept; the newer one is rejected.
+        await XCTAssertThrowsErrorAsync(
+            try await pool.submit(
+                newer, spec: testSpec(), fetcher: store, addedAt: Date(timeIntervalSince1970: 2)
+            )
+        ) { error in
+            XCTAssertEqual(error as? TransactionPoolError, .full)
+        }
 
         let count = await pool.count
         let selected = await pool.transactions(limit: 1).first
         XCTAssertEqual(count, 1)
-        XCTAssertEqual(selected?.body.rawCID, high.body.rawCID)
-
-        await pool.rollback(mutation)
-        let restored = await pool.transactions(limit: 1).first
-        XCTAssertEqual(restored?.body.rawCID, low.body.rawCID)
+        XCTAssertEqual(selected?.body.rawCID, incumbent.body.rawCID)
     }
 
     func testReadyTransactionsOutrankNonReadyFeesAtCapacity() async throws {
@@ -1100,9 +1079,6 @@ final class TransactionPoolArchitectureTests: XCTestCase {
         XCTAssertEqual(byteCount, 0)
     }
 
-    private func storedSize(of transaction: Transaction) -> Int {
-        transaction.toData()!.count + transaction.body.node!.toData()!.count
-    }
 }
 
 private func signedTransaction(
