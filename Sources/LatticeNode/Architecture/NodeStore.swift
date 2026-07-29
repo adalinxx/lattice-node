@@ -92,16 +92,13 @@ struct IssuedChildEvidence: Sendable {
 struct AdmissionCarrierEvidence: Sendable {
     let proof: ChildBlockProof
     let childCID: String
-    let isChildGenesis: Bool
 
     init(
         proof: ChildBlockProof,
-        childCID: String,
-        isChildGenesis: Bool
+        childCID: String
     ) {
         self.proof = proof
         self.childCID = childCID
-        self.isChildGenesis = isChildGenesis
     }
 }
 
@@ -208,10 +205,10 @@ enum IssuedChildProofScope: String, Sendable {
 
 /// Node-owned immutable facts and availability indexes for one absolute path.
 actor NodeStore {
-    /// Epoch 36 binds child deployment facts to their parent-state anchor.
-    /// Older stores must be
+    /// Epoch 37 makes issued and handed-off contextual candidates mutually
+    /// exclusive at the schema level. Older stores must be
     /// wiped; Nexus deterministically recreates the configured exact genesis.
-    static let currentSchemaEpoch: Int64 = 36
+    static let currentSchemaEpoch: Int64 = 37
 
     private static func parentGenesisFactKey(
         _ link: ParentGenesisLink
@@ -848,6 +845,14 @@ actor NodeStore {
         guard malformedContextualCandidates.isEmpty else {
             throw NodeStoreError.corrupt(
                 "contextual candidate index is inconsistent"
+            )
+        }
+        let conflictedContextualCandidates = try database.query(
+            "SELECT 1 FROM contextual_candidates WHERE issued = 1 AND handoff = 1 LIMIT 1"
+        )
+        guard conflictedContextualCandidates.isEmpty else {
+            throw NodeStoreError.corrupt(
+                "contextual candidate is both issued and handed off"
             )
         }
         for row in try database.query(
@@ -1996,8 +2001,7 @@ actor NodeStore {
         _ = try await prepareCarrierEvidence(
             AdmissionCarrierEvidence(
                 proof: package.package.proof,
-                childCID: directHop.childCID,
-                isChildGenesis: package.package.parentGenesisLink != nil
+                childCID: directHop.childCID
             ),
             expectedChildCIDs: [directHop.childCID],
             expectedRootCID: package.package.proof.rootCID
@@ -2140,24 +2144,6 @@ actor NodeStore {
         ).isEmpty == false
     }
 
-    func advanceParentEvidenceScan(
-        sourceID: String,
-        throughOrdinal: UInt64
-    ) throws {
-        guard UUID(uuidString: sourceID) != nil,
-              Int64(exactly: throughOrdinal) != nil else {
-            throw NodeStoreError.invalidConfiguration(
-                "parent-evidence scan completion is malformed"
-            )
-        }
-        try database.transaction {
-            try persistParentEvidenceScan(
-                sourceID: sourceID,
-                ordinal: throughOrdinal
-            )
-        }
-    }
-
     private func persistParentEvidenceScan(
         sourceID: String,
         ordinal: UInt64
@@ -2234,8 +2220,7 @@ actor NodeStore {
             _ = try await prepareCarrierEvidence(
                 AdmissionCarrierEvidence(
                     proof: proof,
-                    childCID: childCID,
-                    isChildGenesis: false
+                    childCID: childCID
                 ),
                 expectedChildCIDs: [childCID],
                 expectedRootCID: rootCID
@@ -2559,7 +2544,7 @@ actor NodeStore {
             params: [.text(candidateCID)]
         ).isEmpty else { return false }
         try database.execute(
-            "UPDATE contextual_candidates SET handoff = 1, offer_seq = NULL WHERE candidate_cid = ?1",
+            "UPDATE contextual_candidates SET handoff = 1, issued = 0, offer_seq = NULL WHERE candidate_cid = ?1",
             params: [.text(candidateCID)]
         )
         return true
@@ -2634,9 +2619,12 @@ actor NodeStore {
                     params: [.text(candidateCID)]
                 )
             }
+            // Durable handoff ownership outlives any later snapshot: a
+            // handed-off candidate is never demoted back to a reservation,
+            // so issued and handoff stay mutually exclusive.
             for candidateCID in desired {
                 try database.execute(
-                    "UPDATE contextual_candidates SET issued = 1, offer_seq = NULL WHERE candidate_cid = ?1",
+                    "UPDATE contextual_candidates SET issued = 1, offer_seq = NULL WHERE candidate_cid = ?1 AND handoff = 0",
                     params: [.text(candidateCID)]
                 )
             }
@@ -2700,11 +2688,6 @@ actor NodeStore {
                 )
                 try database.execute(
                     "DELETE FROM contextual_candidates WHERE candidate_cid = ?1",
-                    params: [.text(candidateCID)]
-                )
-            } else {
-                try database.execute(
-                    "UPDATE contextual_candidates SET handoff = 0 WHERE candidate_cid = ?1",
                     params: [.text(candidateCID)]
                 )
             }
@@ -3566,7 +3549,8 @@ actor NodeStore {
                 issued INTEGER NOT NULL CHECK (issued IN (0, 1)),
                 handoff INTEGER NOT NULL CHECK (handoff IN (0, 1)),
                 CHECK (offer_seq IS NULL OR offer_seq > 0),
-                CHECK (issued = 1 OR handoff = 1 OR offer_seq IS NOT NULL)
+                CHECK (issued = 1 OR handoff = 1 OR offer_seq IS NOT NULL),
+                CHECK (NOT (issued = 1 AND handoff = 1))
             ) WITHOUT ROWID
             """)
         try database.execute("""

@@ -1103,16 +1103,17 @@ public actor ChainProcess: ContentSource, Fetcher, VolumeStorer {
     }
 
     /// Query this process's recovered graph of connected, validated blocks.
+    /// The walk is bounded by this process's own accepted graph and the
+    /// per-peer query guard; an artificial visit ceiling would turn a
+    /// genuinely continuous but distant reference into permanent silence.
     func hasParentStateContinuity(
         from fromStateCID: String,
-        to toStateCID: String,
-        maximumBlockVisits: Int
+        to toStateCID: String
     ) async -> Bool {
         guard case .active(let level) = runtimePhase else { return false }
         return await level.chain.hasStateContinuity(
             from: fromStateCID,
-            to: toStateCID,
-            maximumBlockVisits: maximumBlockVisits
+            to: toStateCID
         )
     }
 
@@ -1434,18 +1435,6 @@ public actor ChainProcess: ContentSource, Fetcher, VolumeStorer {
         )
     }
 
-    func advanceParentEvidenceScan(
-        sourceID: String,
-        throughOrdinal: UInt64
-    ) async throws {
-        try await acquireMutationOperation()
-        defer { releaseOperation() }
-        try await store.advanceParentEvidenceScan(
-            sourceID: sourceID,
-            throughOrdinal: throughOrdinal
-        )
-    }
-
     public func status() async -> ChainProcessStatus {
         await acquireOperation()
         defer { releaseOperation() }
@@ -1636,8 +1625,7 @@ public actor ChainProcess: ContentSource, Fetcher, VolumeStorer {
         let child = try await resolvedCandidate(header, fetcher: fetcher)
         return AdmissionCarrierEvidence(
             proof: package.proof,
-            childCID: try BlockHeader(node: child).rawCID,
-            isChildGenesis: child.parent == nil
+            childCID: try BlockHeader(node: child).rawCID
         )
     }
 

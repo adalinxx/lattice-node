@@ -14,7 +14,6 @@ lattice-node \
   --listen-port 4001 \
   --fact-listen-port 4002 \
   --rpc-port 8080 \
-  --minimum-root-work 1 \
   --minimum-peer-key-bits 0 \
   --peer <public-key>@<host>:4001
 ```
@@ -61,8 +60,7 @@ If block production stalls:
 3. Check coordinator logs for template rejection, expired work, or worker
    failure.
 4. Check the worker executable path and permissions.
-5. Confirm the submitted work satisfies `--minimum-root-work` as well as at
-   least one assembled chain target.
+5. Confirm the submitted work satisfies at least one assembled chain target.
 
 ## Child chains
 
@@ -167,8 +165,7 @@ matched backup pair or wipe the entire process directory and resync.
   deliberately satisfies it. Generated process keys are accepted by the default
   value `0`.
 - Confirm both peers advertise the same Nexus genesis CID and absolute chain
-  path. Root-work floors are independent local policy and are not exchanged in
-  the hello.
+  path.
 
 ## Security
 

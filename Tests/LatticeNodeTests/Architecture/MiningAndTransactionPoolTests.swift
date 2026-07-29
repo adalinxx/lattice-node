@@ -37,12 +37,10 @@ private struct UnavailableMiningFetcher: Fetcher {
 }
 
 final class MiningTemplateBookTests: XCTestCase {
-    func testTemplateUsesSetupFloorAndRejectsDuplicateChildDirectories() async throws {
+    func testTemplateUsesChainTargetAndRejectsDuplicateChildDirectories() async throws {
         let fixture = try await chainFixture()
-        let floor = UInt256(4)
         let book = MiningTemplateBook(
-            chainPath: ["Nexus"],
-            minimumRootWork: floor
+            chainPath: ["Nexus"]
         )
 
         let template = try await book.build(
@@ -52,7 +50,7 @@ final class MiningTemplateBookTests: XCTestCase {
             timestamp: 1,
             fetcher: fixture.store
         )
-        XCTAssertEqual(template.searchTarget, UInt256.max / floor)
+        XCTAssertEqual(template.searchTarget, fixture.genesis.nextTarget)
 
         let child = DirectChildCandidate(
             directory: "Payments",
@@ -94,7 +92,6 @@ final class MiningTemplateBookTests: XCTestCase {
         )
         let middleBook = MiningTemplateBook(
             chainPath: ["Nexus", "Middle"],
-            minimumRootWork: UInt256(1)
         )
         let middle = try await middleBook.build(
             previous: middleGenesis,
@@ -111,7 +108,6 @@ final class MiningTemplateBookTests: XCTestCase {
 
         let rootBook = MiningTemplateBook(
             chainPath: ["Nexus"],
-            minimumRootWork: UInt256(1)
         )
         let root = try await rootBook.build(
             previous: hard.genesis,
@@ -135,7 +131,6 @@ final class MiningTemplateBookTests: XCTestCase {
         let child = try await chainFixture(target: UInt256(8))
         let book = MiningTemplateBook(
             chainPath: ["Nexus"],
-            minimumRootWork: UInt256(1)
         )
         let template = try await book.build(
             previous: parent.genesis,
@@ -187,7 +182,6 @@ final class MiningTemplateBookTests: XCTestCase {
         )
         let book = MiningTemplateBook(
             chainPath: ["Nexus"],
-            minimumRootWork: UInt256(1)
         )
         let template = try await book.build(
             previous: parent.genesis,
@@ -233,7 +227,6 @@ final class MiningTemplateBookTests: XCTestCase {
 
         let template = try await MiningTemplateBook(
             chainPath: ["Nexus"],
-            minimumRootWork: UInt256(1)
         ).build(
             previous: fixture.genesis,
             transactions: [valid, stale],
@@ -291,7 +284,6 @@ final class MiningTemplateBookTests: XCTestCase {
 
         let template = try await MiningTemplateBook(
             chainPath: ["Nexus"],
-            minimumRootWork: UInt256(1)
         ).build(
             previous: fixture.genesis,
             transactions: ordered,
@@ -321,7 +313,6 @@ final class MiningTemplateBookTests: XCTestCase {
         await XCTAssertThrowsErrorAsync(
             try await MiningTemplateBook(
                 chainPath: ["Nexus"],
-                minimumRootWork: UInt256(1)
             ).build(
                 previous: fixture.genesis.withUnresolvedPostState(),
                 transactions: [transaction],
@@ -338,7 +329,6 @@ final class MiningTemplateBookTests: XCTestCase {
         let fixture = try await chainFixture()
         let book = MiningTemplateBook(
             chainPath: ["Nexus"],
-            minimumRootWork: UInt256(1)
         )
         let template = try await book.build(
             previous: fixture.genesis,
@@ -358,7 +348,6 @@ final class MiningTemplateBookTests: XCTestCase {
         let fixture = try await chainFixture()
         let book = MiningTemplateBook(
             chainPath: ["Nexus"],
-            minimumRootWork: UInt256(1),
             capacity: 1
         )
         let issued = try await book.build(
@@ -393,7 +382,6 @@ final class MiningTemplateBookTests: XCTestCase {
         let fixture = try await chainFixture()
         let book = MiningTemplateBook(
             chainPath: ["Nexus"],
-            minimumRootWork: UInt256(1),
             capacity: 2
         )
         func issue(timestamp: Int64) async throws -> MiningTemplate {
@@ -425,7 +413,6 @@ final class MiningTemplateBookTests: XCTestCase {
         let fixture = try await chainFixture(target: UInt256(1))
         let book = MiningTemplateBook(
             chainPath: ["Nexus"],
-            minimumRootWork: UInt256(1)
         )
         let first = try await book.build(
             previous: fixture.genesis,

@@ -187,7 +187,6 @@ final class MultichainInvariantTests: XCTestCase {
     ) throws -> NodeConfiguration {
         try NodeConfiguration(
             chainPath: path,
-            minimumRootWork: UInt256(1),
             storagePath: storage,
             privateKeyHex: privateKeyHex,
             parentEndpoint: parentPublicKey.map {

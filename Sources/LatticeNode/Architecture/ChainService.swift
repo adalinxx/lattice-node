@@ -454,7 +454,6 @@ public actor ChainService {
         )
         self.templates = MiningTemplateBook(
             chainPath: process.configuration.chainPath,
-            minimumRootWork: process.configuration.minimumRootWork,
             lifetime: .seconds(Self.templateLifetimeSeconds),
             capacity: Self.templateCapacity
         )

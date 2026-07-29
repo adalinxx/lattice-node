@@ -122,6 +122,14 @@ supply a validity verdict. A configured remote parent can lie, so production
 deployments should run and validate their own chain processes recursively to
 Nexus; otherwise that remote process is an explicit operational trust boundary.
 
+This is a named residual, not an oversight: the ack is unsigned and
+non-portable, so a Byzantine configured parent can equivocate — answering
+"reachable" to one child node and staying silent to another — and split
+followers of the same child chain with no cryptographic evidence of the
+equivocation. An authenticated parent session proves identity, never honesty.
+A portable equivocation certificate is exactly the light-client artifact this
+design forbids; the protection is running your own parent recursively.
+
 ## Data and process boundaries
 
 - `ChildBlockProof` and its canonical proof-only

@@ -75,9 +75,9 @@ exact child. Lattice verifies the directory path and derives target-qualified
 work directly from the proof. The carrier block need not itself be valid,
 accepted, connected, or canonical: proof-of-work is a physical fact, not a
 parent-consensus claim. Work influences fork choice only after the child block
-is accepted and connected. Before expensive acquisition, each node may
-independently decline roots below its configured work floor; that is local,
-non-punitive policy rather than peer compatibility or validity.
+is accepted and connected. No node-local work floor exists: any filter on work
+that can reach fork choice would be consensus-relevant, so the chain's own
+target is the only work gate.
 
 Parent canonicity never affects work. An authenticated parent process may issue
 genesis and parent-state continuity facts; it cannot declare the child valid,

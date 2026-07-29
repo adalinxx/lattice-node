@@ -1520,7 +1520,6 @@ final class ChainProcessTests: XCTestCase {
         )
         return try NodeConfiguration(
             chainPath: path,
-            minimumRootWork: UInt256(1),
             storagePath: storage,
             privateKeyHex: String(repeating: "01", count: 32),
             parentEndpoint: parentEndpoint

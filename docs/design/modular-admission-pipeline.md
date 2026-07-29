@@ -134,5 +134,8 @@ proof protocol or descendant-tree export exists.
 - Parent continuity is reflexive or transitively forward, never merely
   "different" and never restricted to a direct step.
 - Volume identity is the storage and network boundary.
-- Node policy, including minimum accepted root work and retention depth, is
-  local and non-consensus.
+- Retention depth and serving policy are local and non-consensus.
+- No minimum-work admission floor exists. Any filter on work that can reach
+  fork choice is consensus-relevant — two nodes with different floors could
+  select different tips — so the node ships none: the chain's own target is
+  the only work gate.

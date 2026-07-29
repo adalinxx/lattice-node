@@ -151,3 +151,10 @@ Volumes, but they cannot replace the live parent verdict needed for a new
 parent-state movement. Keep process identity keys stable, restrict the hierarchy
 port to intended relationships, and back up identity separately from wipeable
 chain storage.
+
+The parent acknowledgement authenticates a process identity, not honesty. It
+is unsigned and non-portable by design, so a Byzantine configured parent can
+equivocate between child nodes — reachable to one, silent to another — without
+leaving cryptographic evidence. Accepting that residual is the price of
+refusing light-client certificates; operators who cannot accept it run their
+own parent processes recursively to Nexus.
