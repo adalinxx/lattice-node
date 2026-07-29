@@ -8,7 +8,6 @@ public enum TransactionPoolError: Error, Equatable {
     case full
     case invalidState
     case conflictingNonce
-    case replacementUnderpriced
 }
 
 public enum TransactionPoolDisposition: Sendable, Equatable {
@@ -47,7 +46,6 @@ public actor TransactionPool {
     private struct Entry: Sendable {
         let cid: String
         let transaction: Transaction
-        let fee: UInt64
         let size: Int
         let conflictKey: ConflictKey
         var disposition: TransactionPoolDisposition
@@ -166,13 +164,19 @@ public actor TransactionPool {
         let entry = Entry(
             cid: cid,
             transaction: resolved,
-            fee: body.fee,
             size: storedSize,
             conflictKey: conflictKey,
             disposition: disposition,
             addedAt: addedAt
         )
 
+        // Last-writer-wins on an exact (signers, nonce) match: a signer may
+        // replace their OWN pending transaction with a newer one — this supports
+        // legitimate self-correction/finalization (only the signer can sign for
+        // that nonce, so it is not a cross-user front-run). There is NO fee-bump
+        // gate: external merged mining has no per-chain fee market to bid in, so
+        // replacement is by recency, not fee. A partial signer overlap at the same
+        // nonce is an unresolvable conflict.
         let overlappingCIDs = Set(conflictKey.signers.compactMap {
             signerNonces[SignerNonce(signer: $0, nonce: conflictKey.nonce)]
         })
@@ -186,22 +190,10 @@ public actor TransactionPool {
         } else {
             throw TransactionPoolError.conflictingNonce
         }
-        if let replacedCID, let replaced = entries[replacedCID] {
-            guard entry.fee > replaced.fee,
-                  feeRateComparison(
-                    entry.fee,
-                    entry.size,
-                    replaced.fee,
-                    replaced.size
-                  ) > 0 else {
-                throw TransactionPoolError.replacementUnderpriced
-            }
-        }
         if disposition != .ready {
             var queuedBySigner: [String: Int] = [:]
             for existing in entries.values
-            where existing.cid != replacedCID
-                && existing.disposition != .ready {
+            where existing.cid != replacedCID && existing.disposition != .ready {
                 for signer in existing.conflictKey.signers {
                     queuedBySigner[signer, default: 0] += 1
                 }
@@ -219,9 +211,7 @@ public actor TransactionPool {
         var evictions: [String] = []
         let candidates = entries.values
             .filter { $0.cid != replacedCID }
-            .sorted {
-                retentionComparison($0, $1) < 0
-            }
+            .sorted { retentionComparison($0, $1) < 0 }
         for candidate in candidates
         where prospectiveCount >= maxCount
             || storedSize > maxBytes - prospectiveBytes {
@@ -281,63 +271,41 @@ public actor TransactionPool {
     ) -> [Transaction] {
         let maximum = max(0, limit)
         guard maximum > 0 else { return [] }
-        var remaining = entries.values.filter {
-            $0.disposition == .ready
-                || (includesFuture && $0.disposition == .future)
-                || (includesUnavailable && $0.disposition == .unavailable)
-        }
-        var nextNonce: [String: UInt64] = [:]
-        var selected: [Entry] = []
-        while selected.count < maximum {
-            let eligible = remaining.filter { entry in
-                if entry.disposition == .ready { return true }
-                guard entry.disposition == .future,
-                      !entry.conflictKey.signers.isEmpty else { return false }
-                return entry.conflictKey.signers.allSatisfy {
-                    nextNonce[$0] == entry.conflictKey.nonce
-                }
+        // Serve candidates in ascending (nonce, CID) order and let the sequential
+        // BlockBuilder own sequencing: it includes each signer's runnable nonce
+        // prefix and skips gaps. No fee ordering — with external merged mining the
+        // node is not a fee-maximizing miner, so ordering is deterministic, not
+        // economic. Future entries stay eligible so a burst can still pack in one
+        // block (the builder makes nonce N+1 runnable after including N).
+        return entries.values
+            .filter {
+                $0.disposition == .ready
+                    || (includesFuture && $0.disposition == .future)
+                    || (includesUnavailable && $0.disposition == .unavailable)
             }
-            guard let best = eligible.sorted(by: higherFeePriority).first else {
-                break
-            }
-            selected.append(best)
-            remaining.removeAll { $0.cid == best.cid }
-            if best.conflictKey.nonce < UInt64.max {
-                for signer in best.conflictKey.signers {
-                    nextNonce[signer] = best.conflictKey.nonce + 1
-                }
-            }
-        }
-        if includesUnavailable, selected.count < maximum {
-            // Parent context may turn unavailable entries into a dependency
-            // frontier. Preserve nonce order for Lattice's contextual preflight
-            // and sequential BlockBuilder validation.
-            selected += remaining.sorted {
+            .sorted {
                 if $0.conflictKey.nonce != $1.conflictKey.nonce {
                     return $0.conflictKey.nonce < $1.conflictKey.nonce
                 }
-                return higherFeePriority($0, $1)
-            }.prefix(maximum - selected.count)
-        }
-        return selected.map(\.transaction)
+                return $0.cid < $1.cid
+            }
+            .prefix(maximum)
+            .map(\.transaction)
     }
 
-    private func higherFeePriority(_ lhs: Entry, _ rhs: Entry) -> Bool {
-        let ordering = compareProducts(
-            lhs.fee,
-            UInt64(rhs.size),
-            rhs.fee,
-            UInt64(lhs.size)
-        )
-        if ordering != 0 { return ordering > 0 }
-        return lhs.cid < rhs.cid
-    }
-
+    /// Eviction priority when the pool is full: keep ready over non-ready, and
+    /// among equal readiness keep the OLDEST (first-come-first-served, closest to
+    /// being mined), evicting newest arrivals first; CID breaks exact ties. No fee
+    /// tiebreak — spam is bounded by capacity, min-fee, and per-signer caps.
     private func retentionComparison(_ lhs: Entry, _ rhs: Entry) -> Int {
         let lhsReady = lhs.disposition == .ready
         let rhsReady = rhs.disposition == .ready
         if lhsReady != rhsReady { return lhsReady ? 1 : -1 }
-        return feeRateComparison(lhs.fee, lhs.size, rhs.fee, rhs.size)
+        if lhs.addedAt != rhs.addedAt {
+            return lhs.addedAt < rhs.addedAt ? 1 : -1
+        }
+        if lhs.cid != rhs.cid { return lhs.cid < rhs.cid ? 1 : -1 }
+        return 0
     }
 
     public func snapshot() -> [TransactionPoolItem] {
@@ -441,7 +409,6 @@ public actor TransactionPool {
             insert(Entry(
                 cid: removed.cid,
                 transaction: removed.transaction,
-                fee: body.fee,
                 size: envelope.count + bodyData.count,
                 conflictKey: ConflictKey(
                     signers: Array(Set(body.signers)).sorted(),
@@ -497,29 +464,3 @@ public actor TransactionPool {
     }
 }
 
-private func feeRateComparison(
-    _ lhsFee: UInt64,
-    _ lhsSize: Int,
-    _ rhsFee: UInt64,
-    _ rhsSize: Int
-) -> Int {
-    compareProducts(
-        lhsFee,
-        UInt64(rhsSize),
-        rhsFee,
-        UInt64(lhsSize)
-    )
-}
-
-private func compareProducts(
-    _ leftA: UInt64,
-    _ leftB: UInt64,
-    _ rightA: UInt64,
-    _ rightB: UInt64
-) -> Int {
-    let left = leftA.multipliedFullWidth(by: leftB)
-    let right = rightA.multipliedFullWidth(by: rightB)
-    if left.high != right.high { return left.high > right.high ? 1 : -1 }
-    if left.low != right.low { return left.low > right.low ? 1 : -1 }
-    return 0
-}
