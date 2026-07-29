@@ -624,8 +624,10 @@ final class TransactionPoolArchitectureTests: XCTestCase {
         }
 
         let detached = try HeaderImpl(node: wrongPathBody).removingNode()
+        // The signature-field cap is the wire capacity (UInt16.max), not an
+        // invented 256; a field one byte past it is rejected as too large.
         let oversizedSignature = Transaction(
-            signatures: [String(repeating: "a", count: 257): "x"],
+            signatures: [String(repeating: "a", count: Int(UInt16.max) + 1): "x"],
             body: detached
         )
         await XCTAssertThrowsErrorAsync(

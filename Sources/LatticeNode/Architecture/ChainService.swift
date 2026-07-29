@@ -377,11 +377,16 @@ public actor ChainService {
         case canonicalCommit
     }
 
-    private static let maximumWorkIDBytes = 256
-    private static let maximumDirectoryBytes = 64
-    private static let maximumRewardSignatures = 64
-    private static let maximumSignatureFieldBytes = 256
-    private static let maximumRewardPlanEntries = 256
+    // Wire-field caps bound parse work by the structural wire capacity, not an
+    // invented sub-capacity constant. The authoritative check decides validity —
+    // a directory atom's consensus grammar (Lattice accepts up to the same wire
+    // capacity, so a 64-byte cap here would reject candidates consensus considers
+    // valid), a signature's crypto verification, a workID's template lookup — and
+    // the reward-plan BYTE cap already bounds how many entries fit, so no invented
+    // reward/signature COUNT cap is imposed on top of it.
+    private static let maximumWorkIDBytes = _wireAtomCapacity
+    private static let maximumDirectoryBytes = _wireAtomCapacity
+    private static let maximumSignatureFieldBytes = _wireAtomCapacity
     private static let maximumRewardPlanBytes =
         ChainServiceLimits.maximumPayloadBytes
     private static let maximumChildIntents = 64
@@ -1808,7 +1813,6 @@ public actor ChainService {
         )
         let (height, overflow) = previous.height.addingReportingOverflow(1)
         guard !overflow,
-              transaction.signatures.count <= Self.maximumRewardSignatures,
               transaction.signatures.allSatisfy({ key, signature in
                   key.utf8.count <= Self.maximumSignatureFieldBytes
                       && signature.utf8.count <= Self.maximumSignatureFieldBytes
@@ -1856,8 +1860,7 @@ public actor ChainService {
     private func validatedRewardPlan(
         _ rewards: [MiningReward]
     ) async throws -> ValidatedRewardPlan {
-        guard rewards.count <= Self.maximumRewardPlanEntries,
-              let encoded = try? JSONEncoder().encode(
+        guard let encoded = try? JSONEncoder().encode(
                   MiningTemplateRequest(rewards: rewards)
               ),
               encoded.count <= Self.maximumRewardPlanBytes else {
@@ -1874,8 +1877,6 @@ public actor ChainService {
                   Array(address.components.prefix(currentPath.count))
                     == currentPath,
                   seen.insert(address.key).inserted,
-                  reward.transaction.signatures.count
-                    <= Self.maximumRewardSignatures,
                   reward.transaction.signatures.allSatisfy({ key, signature in
                       key.utf8.count <= Self.maximumSignatureFieldBytes
                           && signature.utf8.count
