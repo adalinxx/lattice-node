@@ -960,7 +960,6 @@ public actor NodeNetworkRuntime: IvyDelegate {
     ) async -> [DirectChildCandidate] {
         guard isRunning,
             let process,
-              context.rewards.count <= ChildCandidateRequestMessage.maximumRewards,
               let parentData = context.parentCarrier.toData(),
               let parentCID = try? BlockHeader(node: context.parentCarrier).rawCID,
             let deadline = childCandidateRequestDeadline()

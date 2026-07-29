@@ -40,7 +40,9 @@ public struct TransactionPoolMutation: Sendable {
 }
 
 public actor TransactionPool {
-    private static let maximumSignatureFieldBytes = 256
+    // Bound parse work by wire capacity, not an invented cap — the signature's
+    // crypto verification is the authoritative check.
+    private static let maximumSignatureFieldBytes = _wireAtomCapacity
 
     private struct Entry: Sendable {
         let cid: String

@@ -1985,24 +1985,9 @@ final class NetworkTrustTests: XCTestCase {
             ChildCandidateRequestMessage.maximumEncodedBytes
         )
 
-        let reward = MiningReward(
-            chainPath: maximumDepthPath,
-            transaction: try unsignedTransaction(path: maximumDepthPath)
-        )
-        XCTAssertThrowsError(try ChildCandidateRequestMessage(
-            requestID: 16,
-            budgetMilliseconds: 750,
-            childPath: maximumDepthPath,
-            parentCID: parentCID,
-            parentData: parentData,
-            rewards: Array(
-                repeating: reward,
-                count: ChildCandidateRequestMessage.maximumRewards + 1
-            )
-        ).encoded()) { error in
-            XCTAssertEqual(error as? NodeNetworkWireError, .malformed)
-        }
-
+        // The reward list has no invented count cap; it is bounded structurally by
+        // the wire capacity (UInt16 count prefix) and the reward-byte cap. The
+        // total message is still bounded by the frame size below.
         XCTAssertThrowsError(try ChildCandidateRequestMessage.decoded(Data(
             repeating: 0,
             count: ChildCandidateRequestMessage.maximumEncodedBytes + 1

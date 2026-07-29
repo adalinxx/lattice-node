@@ -451,7 +451,6 @@ struct ChildCandidateReservationResponseMessage:
 /// One provisional parent carrier context sent only to its immediate child.
 struct ChildCandidateRequestMessage: Sendable {
     static let maximumBudgetMilliseconds: UInt32 = 60_000
-    static let maximumRewards = 256
     static let maximumRewardBytes = ChainServiceLimits.maximumPayloadBytes
     static let maximumEncodedBytes = _maximumNodeMessageSize
 
@@ -488,8 +487,7 @@ struct ChildCandidateRequestMessage: Sendable {
               childPath.count <= Int(UInt16.max),
               _isBoundedWireAtom(parentCID),
               parentData.count <= Int(UInt32.max),
-              _contentBoundBlock(cid: parentCID, data: parentData) != nil,
-              rewards.count <= Self.maximumRewards else {
+              _contentBoundBlock(cid: parentCID, data: parentData) != nil else {
             throw NodeNetworkWireError.malformed
         }
         let pathBytes = childPath.map { Data($0.utf8) }
@@ -837,8 +835,7 @@ private func _encodeMiningRewards(
     _ rewards: [MiningReward],
     under childPath: [String]
 ) throws -> Data {
-    guard rewards.count <= ChildCandidateRequestMessage.maximumRewards,
-          rewards.count <= Int(UInt16.max) else {
+    guard rewards.count <= Int(UInt16.max) else {
         throw NodeNetworkWireError.oversized
     }
     var seen: Set<String> = []
@@ -874,7 +871,6 @@ private func _decodeMiningRewards(
             [MiningReward].self,
             from: data
           ),
-          rewards.count <= ChildCandidateRequestMessage.maximumRewards,
           try _encodeMiningRewards(rewards, under: childPath) == data else {
         throw NodeNetworkWireError.malformed
     }
