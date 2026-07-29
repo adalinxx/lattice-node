@@ -29,7 +29,6 @@ final class NodeConfigurationTests: XCTestCase {
     func testNexusIdentityIsFixed() throws {
         let configuration = try NodeConfiguration(
             chainPath: ["Nexus"],
-            minimumRootWork: UInt256(1),
             storagePath: URL(fileURLWithPath: "/tmp/lattice-node-test"),
             privateKeyHex: String(repeating: "01", count: 32)
         )
@@ -40,7 +39,6 @@ final class NodeConfigurationTests: XCTestCase {
 
         XCTAssertThrowsError(try NodeConfiguration(
             chainPath: ["Nexus"],
-            minimumRootWork: UInt256(1),
             storagePath: URL(fileURLWithPath: "/tmp/lattice-node-test"),
             privateKeyHex: String(repeating: "01", count: 32),
             listenPort: 4001,
@@ -54,7 +52,6 @@ final class NodeConfigurationTests: XCTestCase {
         let key = Curve25519.Signing.PrivateKey()
         XCTAssertNoThrow(try NodeConfiguration(
             chainPath: ["Nexus"],
-            minimumRootWork: .zero,
             storagePath: FileManager.default.temporaryDirectory,
             privateKeyHex: key.rawRepresentation.map {
                 String(format: "%02x", $0)
@@ -65,7 +62,6 @@ final class NodeConfigurationTests: XCTestCase {
     func testSigningKeyRecreatesConfiguredIdentity() throws {
         let configuration = try NodeConfiguration(
             chainPath: ["Nexus"],
-            minimumRootWork: UInt256(1),
             storagePath: URL(fileURLWithPath: "/tmp/lattice-node-test"),
             privateKeyHex: String(repeating: "01", count: 32)
         )
@@ -96,7 +92,6 @@ final class NodeConfigurationTests: XCTestCase {
 
         let configuration = try NodeConfiguration(
             chainPath: ["Nexus", "Payments"],
-            minimumRootWork: UInt256(1),
             storagePath: URL(fileURLWithPath: "/tmp/lattice-node-test"),
             privateKeyHex: String(repeating: "01", count: 32),
             parentEndpoint: ParentEndpoint(
@@ -110,7 +105,6 @@ final class NodeConfigurationTests: XCTestCase {
 
         XCTAssertThrowsError(try NodeConfiguration(
             chainPath: ["Nexus", "Payments"],
-            minimumRootWork: UInt256(1),
             storagePath: URL(fileURLWithPath: "/tmp/lattice-node-test"),
             privateKeyHex: String(repeating: "01", count: 32),
             parentEndpoint: ParentEndpoint(publicKey: "bad", host: "", port: 0)

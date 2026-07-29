@@ -669,7 +669,6 @@ final class ChainServiceTests: XCTestCase {
         addTeardownBlock { try? FileManager.default.removeItem(at: storage) }
         let configuration = try NodeConfiguration(
             chainPath: ["Nexus"],
-            minimumRootWork: UInt256(1),
             storagePath: storage,
             privateKeyHex: String(repeating: "5c", count: 32)
         )
@@ -755,7 +754,6 @@ final class ChainServiceTests: XCTestCase {
         addTeardownBlock { try? FileManager.default.removeItem(at: storage) }
         let configuration = try NodeConfiguration(
             chainPath: ["Nexus"],
-            minimumRootWork: UInt256(1),
             storagePath: storage,
             privateKeyHex: String(repeating: "5e", count: 32)
         )
@@ -1043,7 +1041,6 @@ final class ChainServiceTests: XCTestCase {
         addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
         let process = try await ChainProcess.open(configuration: NodeConfiguration(
             chainPath: ["Nexus"],
-            minimumRootWork: UInt256(1),
             storagePath: directory,
             privateKeyHex: String(repeating: "01", count: 32)
         ))
@@ -1704,7 +1701,6 @@ final class ChainServiceTests: XCTestCase {
         addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
         let configuration = try NodeConfiguration(
             chainPath: ["Nexus"],
-            minimumRootWork: UInt256(1),
             storagePath: directory,
             privateKeyHex: String(repeating: "01", count: 32)
         )
@@ -2153,7 +2149,6 @@ final class ChainServiceTests: XCTestCase {
         addTeardownBlock { try? FileManager.default.removeItem(at: childDirectory) }
         let childProcess = try await ChainProcess.open(configuration: NodeConfiguration(
             chainPath: ["Nexus", "Payments"],
-            minimumRootWork: UInt256(1),
             storagePath: childDirectory,
             privateKeyHex: String(repeating: "02", count: 32),
             parentEndpoint: ParentEndpoint(
@@ -2612,7 +2607,6 @@ final class ChainServiceTests: XCTestCase {
         return try await ChainProcess.open(
             configuration: NodeConfiguration(
                 chainPath: ["Nexus"],
-                minimumRootWork: UInt256(1),
                 storagePath: directory,
                 privateKeyHex: String(repeating: "01", count: 32)
             )
@@ -2740,7 +2734,6 @@ final class ChainServiceTests: XCTestCase {
         addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
         let process = try await ChainProcess.open(configuration: NodeConfiguration(
             chainPath: ["Nexus", "Payments"],
-            minimumRootWork: UInt256(1),
             storagePath: directory,
             privateKeyHex: String(repeating: "02", count: 32),
             parentEndpoint: ParentEndpoint(

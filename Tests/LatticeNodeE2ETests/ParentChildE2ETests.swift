@@ -4946,7 +4946,6 @@ private final class E2ENode {
             "--chain-path", configuration.chainPath,
             "--data-directory", configuration.storage.path,
             "--identity-key", configuration.identity.file.path,
-            "--minimum-root-work", "1",
             "--listen-port", String(configuration.overlayPort),
             "--fact-listen-port", String(configuration.factPort),
             "--rpc-port", String(configuration.rpcPort),

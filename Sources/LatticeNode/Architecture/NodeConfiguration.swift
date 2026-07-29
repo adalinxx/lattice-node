@@ -70,7 +70,6 @@ public enum NodeConfigurationError: Error, Equatable, CustomStringConvertible {
 /// Immutable setup and process identity for exactly one absolute chain path.
 public struct NodeConfiguration: Sendable {
     public let address: ChainAddress
-    public let minimumRootWork: UInt256
     public let storagePath: URL
     private let signingKeyBytes: [UInt8]
     public let processPublicKey: String
@@ -84,7 +83,6 @@ public struct NodeConfiguration: Sendable {
 
     public init(
         chainPath: [String],
-        minimumRootWork: UInt256,
         storagePath: URL,
         privateKeyHex: String,
         listenPort: UInt16 = 4001,
@@ -138,7 +136,6 @@ public struct NodeConfiguration: Sendable {
         }
 
         self.address = address
-        self.minimumRootWork = minimumRootWork
         self.storagePath = storagePath
         self.signingKeyBytes = Array(bytes)
         self.processPublicKey = try! PeerKey(

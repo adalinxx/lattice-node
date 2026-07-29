@@ -51,7 +51,6 @@ final class DaemonHTTPTests: XCTestCase {
         addTeardownBlock { try? FileManager.default.removeItem(at: storage) }
         let process = try await ChainProcess.open(configuration: NodeConfiguration(
             chainPath: ["Nexus"],
-            minimumRootWork: UInt256(1),
             storagePath: storage,
             privateKeyHex: String(repeating: "01", count: 32)
         ))
@@ -100,7 +99,6 @@ final class DaemonHTTPTests: XCTestCase {
         addTeardownBlock { try? FileManager.default.removeItem(at: storage) }
         let configuration = try NodeConfiguration(
             chainPath: ["Nexus"],
-            minimumRootWork: UInt256(1),
             storagePath: storage,
             privateKeyHex: String(repeating: "01", count: 32)
         )
@@ -177,7 +175,6 @@ final class DaemonHTTPTests: XCTestCase {
         addTeardownBlock { try? FileManager.default.removeItem(at: storage) }
         let configuration = try NodeConfiguration(
             chainPath: ["Nexus"],
-            minimumRootWork: UInt256(1),
             storagePath: storage,
             privateKeyHex: String(repeating: "01", count: 32)
         )

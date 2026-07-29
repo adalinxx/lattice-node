@@ -120,14 +120,12 @@ public enum MiningTemplateError: Error, Equatable {
     case duplicateChildDirectory
     case unknownWork
     case expired
-    case belowSetupFloor
     case missesSearchTarget
 }
 
 /// Bounded work cache for external miners. It never searches a nonce.
 public actor MiningTemplateBook {
     private let chainPath: [String]
-    private let minimumRootWork: UInt256
     private let lifetime: Duration
     private let capacity: Int
     private var templates: [String: MiningTemplate] = [:]
@@ -135,13 +133,11 @@ public actor MiningTemplateBook {
 
     public init(
         chainPath: [String],
-        minimumRootWork: UInt256,
         lifetime: Duration = .seconds(30),
         capacity: Int = 16
     ) {
         precondition(capacity > 0 && lifetime > .zero)
         self.chainPath = chainPath
-        self.minimumRootWork = minimumRootWork
         self.lifetime = lifetime
         self.capacity = capacity
     }
@@ -313,13 +309,9 @@ public actor MiningTemplateBook {
             targets: childTargets,
             fetcher: fetcher
         )
-        let localFloorTarget = minimumRootWork == .zero
-            ? UInt256.max
-            : UInt256.max / minimumRootWork
         let searchTarget = min(
             scheduling.searchTarget,
-            scheduling.deploymentTarget ?? .max,
-            localFloorTarget
+            scheduling.deploymentTarget ?? .max
         )
         let template = MiningTemplate(
             workID: workID,
@@ -449,9 +441,6 @@ public actor MiningTemplateBook {
         }
         let candidate = template.block.replacingNonce(nonce)
         let rootHash = candidate.proofOfWorkHash()
-        guard workForHash(rootHash) >= minimumRootWork else {
-            throw MiningTemplateError.belowSetupFloor
-        }
         guard rootHash <= template.searchTarget else {
             throw MiningTemplateError.missesSearchTarget
         }

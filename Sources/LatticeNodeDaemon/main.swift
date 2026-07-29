@@ -49,9 +49,6 @@ struct LatticeNodeCommand: AsyncParsableCommand {
     @Option(help: "Process identity key file; created with mode 0600 when absent")
     var identityKey: String?
 
-    @Option(help: "Minimum accepted Nexus-root work, as hexadecimal")
-    var minimumRootWork = "1"
-
     @Option(help: "Same-chain overlay listen port")
     var listenPort: UInt16 = 4001
 
@@ -77,9 +74,6 @@ struct LatticeNodeCommand: AsyncParsableCommand {
         guard let address = ChainAddress(string: chainPath) else {
             throw ValidationError("--chain-path must be absolute and begin with Nexus")
         }
-        guard let rootWork = UInt256.fromHexString(minimumRootWork) else {
-            throw ValidationError("--minimum-root-work must be hexadecimal")
-        }
         guard ["127.0.0.1", "::1", "localhost"].contains(rpcBind.lowercased()) else {
             throw ValidationError("the unauthenticated HTTP API may bind only to loopback")
         }
@@ -93,7 +87,6 @@ struct LatticeNodeCommand: AsyncParsableCommand {
 
         let configuration = try NodeConfiguration(
             chainPath: address.components,
-            minimumRootWork: rootWork,
             storagePath: storage,
             privateKeyHex: privateKeyHex,
             listenPort: listenPort,

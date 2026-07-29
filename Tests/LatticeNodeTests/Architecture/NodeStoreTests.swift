@@ -941,8 +941,7 @@ final class NodeStoreTests: XCTestCase {
                 carrierLink: link,
                 carrierEvidence: AdmissionCarrierEvidence(
                     proof: fixture.first,
-                    childCID: fixture.childCID,
-                    isChildGenesis: true
+                    childCID: fixture.childCID
                 ),
                 parentGenesisLinks: []
             )
@@ -976,8 +975,7 @@ final class NodeStoreTests: XCTestCase {
                         """),
                     carrierEvidence: AdmissionCarrierEvidence(
                         proof: proof,
-                        childCID: fixture.childCID,
-                        isChildGenesis: true
+                        childCID: fixture.childCID
                     ),
                     parentGenesisLinks: []
                 )
@@ -1084,8 +1082,7 @@ final class NodeStoreTests: XCTestCase {
                         """),
                     carrierEvidence: AdmissionCarrierEvidence(
                         proof: proof,
-                        childCID: leafCID,
-                        isChildGenesis: true
+                        childCID: leafCID
                     ),
                     parentGenesisLinks: []
                 )
@@ -1288,8 +1285,7 @@ final class NodeStoreTests: XCTestCase {
                     """),
                 carrierEvidence: AdmissionCarrierEvidence(
                     proof: incoming,
-                    childCID: carrierHeader.rawCID,
-                    isChildGenesis: true
+                    childCID: carrierHeader.rawCID
                 ),
                 parentGenesisLinks: [try decode(
                     ParentGenesisLink.self,
@@ -2222,8 +2218,7 @@ final class NodeStoreTests: XCTestCase {
             volumeRoots: [],
             incomingCarrierEvidence: AdmissionCarrierEvidence(
                 proof: package.package.proof,
-                childCID: fixture.childCID,
-                isChildGenesis: true
+                childCID: fixture.childCID
             )
         )
         let admittedInbox = try await child!.parentEvidenceInbox()
@@ -2287,8 +2282,7 @@ final class NodeStoreTests: XCTestCase {
                 carrierLink: childCarrierLink,
                 carrierEvidence: AdmissionCarrierEvidence(
                     proof: secondPackage.package.proof,
-                    childCID: fixture.childCID,
-                    isChildGenesis: true
+                    childCID: fixture.childCID
                 ),
                 parentGenesisLinks: []
             )

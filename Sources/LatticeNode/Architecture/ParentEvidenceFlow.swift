@@ -11,6 +11,10 @@ struct ParentEvidenceFlow {
 
     enum Result: Equatable, Sendable {
         case handled
+        /// Advertised content was absent or incomplete. Absence carries no
+        /// blame: the sequence stops here and the next scan retries, without
+        /// recycling the session or flagging backpressure.
+        case unavailable
         case backpressured
         case failed
     }
@@ -78,6 +82,8 @@ struct ParentEvidenceFlow {
         switch result {
         case .handled:
             backpressured.remove(session)
+        case .unavailable:
+            break
         case .backpressured:
             backpressured.insert(session)
         case .failed:

@@ -122,7 +122,6 @@ struct ParentStateQueryGuard {
 }
 
 private enum NodePolicyDecline: Error {
-    case belowMinimumRootWork
     case chainSpecTooLarge
     case tooManyWasmPolicies
 }
@@ -398,7 +397,6 @@ public actor NodeNetworkRuntime: IvyDelegate {
     private static let maximumDirectChildren = 64
     private static let maximumConcurrentChildBuilds = 8
     private static let maximumConcurrentParentStateQueries = 64
-    private static let maximumParentStateContinuityBlockVisits = 4_096
     private static let maximumPeersPerChildPath = 4
     private static let maximumReconnectEvidenceAnnouncements = 64
     private static let maximumReconnectCarrierRoots = 64
@@ -2343,8 +2341,12 @@ public actor NodeNetworkRuntime: IvyDelegate {
                 return
             }
         }
+        // A page that yields nothing new is not progress: a peer echoing
+        // roots we already know could otherwise walk strictly-increasing
+        // pages forever without ever consuming the session budget.
         let remainingRoots = pending.remainingRoots - selected.count
         if response.hasMore,
+           !selected.isEmpty,
            remainingRoots > 0,
            let cursor = response.volumeRootCIDs.last {
             await requestTransactionInventory(
@@ -2879,6 +2881,10 @@ public actor NodeNetworkRuntime: IvyDelegate {
         Task { [weak self] in
             guard let self else { return }
             guard (await tail?.value ?? .handled) == .handled else { return }
+            // The scan cursor advances only through evidence this child has
+            // durably retained (the per-item advanceScan path). The parent's
+            // asserted `through` is never persisted directly: a lying parent
+            // must not move the high-water mark past ordinals it never served.
             if response.next < response.through {
                 await self.requestEvidenceIndex(
                     sourceID: response.sourceID,
@@ -2886,11 +2892,6 @@ public actor NodeNetworkRuntime: IvyDelegate {
                     through: response.through,
                     generation: generation,
                     process: process
-                )
-            } else {
-                try? await process.advanceParentEvidenceScan(
-                    sourceID: response.sourceID,
-                    throughOrdinal: response.through
                 )
             }
         }
@@ -2978,7 +2979,13 @@ public actor NodeNetworkRuntime: IvyDelegate {
             }
         }
         guard let attachment = resolved.value else {
-            return .failed
+            // Mirror the overlay gate: only a complete response that still
+            // failed to resolve is malformed and worth recycling. A parent
+            // momentarily unable to serve an advertised attachment is
+            // retried on the next scan, without blame.
+            return resolved.attribution.allResponsesComplete
+                ? .failed
+                : .unavailable
         }
         guard let envelope = try? ChildValidationPackageEnvelope.decode(
             attachment.envelopeBytes,
@@ -3061,9 +3068,7 @@ public actor NodeNetworkRuntime: IvyDelegate {
             case .continuity(let fromStateCID, let toStateCID):
                 found = await process.hasParentStateContinuity(
                     from: fromStateCID,
-                    to: toStateCID,
-                    maximumBlockVisits:
-                        Self.maximumParentStateContinuityBlockVisits
+                    to: toStateCID
                 )
             }
             guard found else { return }
@@ -3835,7 +3840,6 @@ public actor NodeNetworkRuntime: IvyDelegate {
                 ) { session in
                     try await Self.enforceLocalAdmissionPolicy(
                         candidateCID: candidate.blockCID,
-                        childPackage: authenticatedPackage,
                         source: session,
                         configuration: configuration
                     )
@@ -4061,7 +4065,6 @@ public actor NodeNetworkRuntime: IvyDelegate {
 
     private nonisolated static func enforceLocalAdmissionPolicy(
         candidateCID: String,
-        childPackage: AuthenticatedChildPackage?,
         source: any ContentSource,
         configuration: NodeConfiguration
     ) async throws {
@@ -4083,18 +4086,6 @@ public actor NodeNetworkRuntime: IvyDelegate {
                     throw NodePolicyDecline.tooManyWasmPolicies
                 }
             }
-            if configuration.address.isNexus,
-               workForHash(block.proofOfWorkHash())
-                    < configuration.minimumRootWork {
-                throw NodePolicyDecline.belowMinimumRootWork
-            }
-        }
-        if !configuration.address.isNexus,
-           let childPackage,
-           case .success(let work) =
-                childPackage.package.proof.verifiedRootWork(),
-           work < configuration.minimumRootWork {
-            throw NodePolicyDecline.belowMinimumRootWork
         }
     }
 

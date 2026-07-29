@@ -45,7 +45,7 @@ authenticated immediate parent's fact-plane public key and endpoint.
 
 ```text
 LatticeNodeDaemon
-  ├─ NodeConfiguration     immutable path, keys, ports, work floor
+  ├─ NodeConfiguration     immutable path, keys, ports
   ├─ ChainProcess          consensus admission and durable recovery
   ├─ ChainService          transactions, intents, templates, work results
   ├─ NodeStore             state.db: semantic facts, indexes, root references

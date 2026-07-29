@@ -1028,7 +1028,6 @@ final class NetworkTrustTests: XCTestCase {
         let hierarchyPort = NetworkTransportTestPorts.allocate()
         let configuration = try NodeConfiguration(
             chainPath: ["Nexus"],
-            minimumRootWork: UInt256(1),
             storagePath: storage,
             privateKeyHex: String(
                 repeating: String(format: "%02x", keyByte),
@@ -1180,7 +1179,6 @@ final class NetworkTrustTests: XCTestCase {
         let bootstrap = signingKey(46)
         let configuration = try NodeConfiguration(
             chainPath: ["Nexus", "Payments"],
-            minimumRootWork: UInt256(1),
             storagePath: URL(fileURLWithPath: "/tmp/lattice-network-plane-test"),
             privateKeyHex: String(repeating: "2a", count: 32),
             listenPort: 4101,
@@ -1238,7 +1236,6 @@ final class NetworkTrustTests: XCTestCase {
         let extra = signingKey(48)
         let configuration = try NodeConfiguration(
             chainPath: ["Nexus", "Payments"],
-            minimumRootWork: UInt256(1),
             storagePath: URL(fileURLWithPath: "/tmp/lattice-network-bootstrap-parent"),
             privateKeyHex: String(repeating: "2b", count: 32),
             parentEndpoint: ParentEndpoint(
@@ -1292,7 +1289,6 @@ final class NetworkTrustTests: XCTestCase {
         let extra = signingKey(49)
         let configuration = try NodeConfiguration(
             chainPath: ["Nexus"],
-            minimumRootWork: UInt256(1),
             storagePath: URL(fileURLWithPath: "/tmp/lattice-network-bootstrap-nexus"),
             privateKeyHex: String(repeating: "2c", count: 32)
         )
@@ -1338,7 +1334,6 @@ final class NetworkTrustTests: XCTestCase {
         let other = signingKey(44)
         let configuration = try NodeConfiguration(
             chainPath: ["Nexus", "Payments"],
-            minimumRootWork: UInt256(1),
             storagePath: URL(fileURLWithPath: "/tmp/lattice-hierarchy-hello-test"),
             privateKeyHex: String(repeating: "2d", count: 32),
             parentEndpoint: ParentEndpoint(
@@ -2175,7 +2170,6 @@ final class NetworkTrustTests: XCTestCase {
         let rootPeerKey = peerKey(rootKey).hex
         let middleConfiguration = try NodeConfiguration(
             chainPath: ["Nexus", "Middle"],
-            minimumRootWork: UInt256(1),
             storagePath: storage.appendingPathComponent("middle"),
             privateKeyHex: String(repeating: "74", count: 32),
             listenPort: NetworkTransportTestPorts.allocate(),
@@ -2193,7 +2187,6 @@ final class NetworkTrustTests: XCTestCase {
         let parentPort = NetworkTransportTestPorts.allocate()
         let targetConfiguration = try NodeConfiguration(
             chainPath: ["Nexus", "Middle", "Leaf"],
-            minimumRootWork: UInt256(1),
             storagePath: storage.appendingPathComponent("target"),
             privateKeyHex: String(repeating: "75", count: 32),
             listenPort: overlayPort,
@@ -3184,7 +3177,6 @@ final class NetworkTrustTests: XCTestCase {
         let rpcPort = NetworkTransportTestPorts.allocate()
         let configuration = try NodeConfiguration(
             chainPath: ["Nexus"],
-            minimumRootWork: UInt256(1),
             storagePath: storage,
             privateKeyHex: String(repeating: "5d", count: 32),
             listenPort: overlayPort,
@@ -3927,7 +3919,6 @@ final class NetworkTrustTests: XCTestCase {
         let hierarchyPort = NetworkTransportTestPorts.allocate()
         let configuration = try NodeConfiguration(
             chainPath: ["Nexus", "Payments"],
-            minimumRootWork: UInt256(1),
             storagePath: storage,
             privateKeyHex: String(repeating: "72", count: 32),
             listenPort: overlayPort,
@@ -4041,7 +4032,6 @@ final class NetworkTrustTests: XCTestCase {
         let rpcPort = NetworkTransportTestPorts.allocate()
         let configuration = try NodeConfiguration(
             chainPath: ["Nexus"],
-            minimumRootWork: UInt256(1),
             storagePath: storage,
             privateKeyHex: String(repeating: "6d", count: 32),
             listenPort: overlayPort,
@@ -4259,7 +4249,6 @@ final class NetworkTrustTests: XCTestCase {
         let overlayPort = NetworkTransportTestPorts.allocate()
         let configuration = try NodeConfiguration(
             chainPath: ["Nexus", "Payments"],
-            minimumRootWork: UInt256(1),
             storagePath: storage,
             privateKeyHex: String(repeating: "98", count: 32),
             listenPort: overlayPort,
@@ -5610,7 +5599,6 @@ final class NetworkTrustTests: XCTestCase {
         addTeardownBlock { try? FileManager.default.removeItem(at: storage) }
         let configuration = try NodeConfiguration(
             chainPath: ["Nexus"],
-            minimumRootWork: UInt256(1),
             storagePath: storage,
             privateKeyHex: String(repeating: "5b", count: 32)
         )
@@ -5725,7 +5713,6 @@ final class NetworkTrustTests: XCTestCase {
         }
         let parentConfiguration = try NodeConfiguration(
             chainPath: ["Nexus"],
-            minimumRootWork: UInt256(1),
             storagePath: parentStorage,
             privateKeyHex: String(
                 repeating: String(format: "%02x", keyByte),
@@ -5737,7 +5724,6 @@ final class NetworkTrustTests: XCTestCase {
         )
         let childConfiguration = try NodeConfiguration(
             chainPath: ["Nexus", "Payments"],
-            minimumRootWork: UInt256(1),
             storagePath: childStorage,
             privateKeyHex: String(
                 repeating: String(format: "%02x", keyByte &+ 1),
@@ -5950,7 +5936,6 @@ final class NetworkTrustTests: XCTestCase {
         )
         return try await ChainProcess.open(configuration: try NodeConfiguration(
             chainPath: ["Nexus"],
-            minimumRootWork: UInt256(1),
             storagePath: storage,
             privateKeyHex: String(repeating: "5a", count: 32)
         ))
@@ -6211,7 +6196,6 @@ final class NetworkTrustTests: XCTestCase {
         let hierarchyPort = NetworkTransportTestPorts.allocate()
         let configuration = try NodeConfiguration(
             chainPath: ["Nexus"],
-            minimumRootWork: UInt256(1),
             storagePath: storage,
             privateKeyHex: String(
                 repeating: String(format: "%02x", keyByte),
@@ -6469,7 +6453,6 @@ final class NetworkTrustTests: XCTestCase {
         let hierarchyPort = NetworkTransportTestPorts.allocate()
         let configuration = try NodeConfiguration(
             chainPath: ["Nexus", "Retry"],
-            minimumRootWork: UInt256(1),
             storagePath: storage,
             privateKeyHex: String(
                 repeating: String(format: "%02x", keyByte &+ 1),
