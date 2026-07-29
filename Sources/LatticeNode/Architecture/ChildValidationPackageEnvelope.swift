@@ -24,7 +24,7 @@ public struct AuthenticatedChildPackage: Sendable {
 /// Consensus meaning remains entirely in Lattice.
 public struct ChildValidationPackageEnvelope: Sendable {
     // Leave room for Ivy framing.
-    public static let maximumEncodedSize = Int(IvyConfig.protocolMaxFrameSize)
+    public static let maximumEncodedSize = Int(IvyConfig.defaultProtocolMaxFrameSize)
         - 1024
 
     private static let magic = Data("LNCPKG06".utf8)
@@ -97,7 +97,7 @@ public struct ChildValidationPackageEnvelope: Sendable {
               let proof = ChildBlockProof.deserialize(proofBytes),
               (try? proof.serialize()) == proofBytes,
               _isBoundedWireAtom(proof.rootCID),
-              proof.directoryPath.allSatisfy(StateAtomLimits.isDirectory)
+              proof.directoryPath.allSatisfy({ _isBoundedDirectoryAtom($0) })
         else {
             throw ChildValidationPackageEnvelopeError.malformed
         }

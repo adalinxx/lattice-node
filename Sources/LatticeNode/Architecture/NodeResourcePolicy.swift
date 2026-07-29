@@ -14,7 +14,7 @@ public struct NodeResourcePolicy: Sendable, Equatable {
     public init(
         maximumChainSpecBytes: Int = 1 * 1_024 * 1_024,
         maximumParentWitnessBytes: Int =
-            Int(IvyConfig.protocolMaxFrameSize) - 1_024,
+            Int(IvyConfig.defaultProtocolMaxFrameSize) - 1_024,
         maximumPendingParentEvidence: Int = 64,
         maximumWasmPolicies: Int = 64,
         maximumAcquisitionVolumes: Int = 20_548,

@@ -1,5 +1,5 @@
 {
-  "originHash" : "831cbb6ae3a66c41e706ab1db8fe971801eee6830f4332beb87b3b1e5efd2f99",
+  "originHash" : "149058bc57afaed854b4b2d6560390000ee3d9bea8d43395c6826f82e01ad961",
   "pins" : [
     {
       "identity" : "arraytrie",
@@ -60,8 +60,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/adalinxx/Ivy.git",
       "state" : {
-        "revision" : "7f4362c611c51cd733dd3511938c7760c8621c4f",
-        "version" : "12.1.1"
+        "revision" : "b9b90578249fe3f9391ef20085de12a21ad1d97f",
+        "version" : "13.0.0"
       }
     },
     {
@@ -69,8 +69,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/adalinxx/Lattice.git",
       "state" : {
-        "revision" : "437ab1ce7b52a26625370a8702b4946a6be5a610",
-        "version" : "26.0.10"
+        "revision" : "241fae4c6433e4faecbad569ab86b4f5e6ba1e6a",
+        "version" : "27.0.0"
       }
     },
     {

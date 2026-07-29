@@ -22,7 +22,7 @@ let package = Package(
     dependencies: [
         .package(
             url: "https://github.com/adalinxx/Lattice.git",
-            exact: "26.0.10"
+            exact: "27.0.0"
         ),
         .package(
             url: "https://github.com/adalinxx/cashew.git",
@@ -30,7 +30,7 @@ let package = Package(
         ),
         .package(
             url: "https://github.com/adalinxx/Ivy.git",
-            exact: "12.1.1"
+            exact: "13.0.0"
         ),
         .package(
             url: "https://github.com/adalinxx/Tally.git",

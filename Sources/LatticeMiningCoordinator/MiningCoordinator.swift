@@ -110,7 +110,7 @@ public struct MiningCoordinatorWorker: Sendable, Equatable {
             let midstate = ProofOfWork.midstate(for: block)
             guard let nonce = ProofOfWork.searchBatch(
                 midstate: midstate,
-                target: max(target, ChainSpec.minimumTarget),
+                target: target,
                 startNonce: range.startNonce,
                 count: range.count
             ) else {

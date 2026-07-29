@@ -80,10 +80,26 @@ func _isAbsoluteChainPath(_ path: [String]) -> Bool {
     ChainAddress(path) != nil
 }
 
-func _isBoundedWireAtom(_ value: String, maximumBytes: Int = 128) -> Bool {
+/// Default wire-atom byte bound: the structural wire capacity (a UInt16 length
+/// prefix), not an invented sub-capacity constant. Matches Lattice's
+/// `CIDIdentity.maximumTextBytes`/`ChildProofWireLimits.maximumDirectoryBytes`,
+/// which the simplified architecture raised from an arbitrary cap to `UInt16.max`:
+/// real CIDs/directories are ~59 bytes, the canonical round-trip is the true
+/// identity check, and this only bounds parse work to what the wire can represent.
+let _wireAtomCapacity = Int(UInt16.max)
+
+func _isBoundedWireAtom(_ value: String, maximumBytes: Int = _wireAtomCapacity) -> Bool {
     let bytes = value.utf8
     return !bytes.isEmpty && bytes.count <= maximumBytes
         && bytes.allSatisfy { (0x21...0x7e).contains($0) }
+}
+
+/// A well-formed directory atom: the same printable-ASCII grammar as any wire
+/// atom, plus no path separator (Lattice's `isValidDirectoryAtom`). Lattice 27.0.0
+/// keeps this grammar internal after removing the central state-atom limits, so
+/// the node validates locally, bounded by the same wire capacity.
+func _isBoundedDirectoryAtom(_ value: String, maximumBytes: Int = _wireAtomCapacity) -> Bool {
+    _isBoundedWireAtom(value, maximumBytes: maximumBytes) && !value.contains("/")
 }
 
 func _canonicalJSONEncode<T: Encodable>(_ value: T) throws -> Data {
