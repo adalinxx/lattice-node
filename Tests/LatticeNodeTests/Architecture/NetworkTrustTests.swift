@@ -155,11 +155,11 @@ private final class TransactionTopicRecordingPeer: IvyDelegate, Sendable {
 }
 
 private actor EchoInventoryPeer: IvyDelegate {
-    private let root: String
+    private let roots: [String]
     private var requests: [TransactionInventoryRequestMessage] = []
 
-    init(root: String) {
-        self.root = root
+    init(roots: [String]) {
+        self.roots = roots.sorted()
     }
 
     func ivy(
@@ -172,11 +172,12 @@ private actor EchoInventoryPeer: IvyDelegate {
                 message.payload
               ) else { return }
         requests.append(request)
+        let page = request.afterRootCID == nil ? roots : []
         guard let payload = try? TransactionInventoryResponseMessage(
             requestID: request.requestID,
             afterRootCID: request.afterRootCID,
-            volumeRootCIDs: [root],
-            hasMore: true
+            volumeRootCIDs: page,
+            hasMore: !page.isEmpty
         ).encoded() else { return }
         _ = await ivy.sendMessage(
             to: peer,
@@ -184,8 +185,6 @@ private actor EchoInventoryPeer: IvyDelegate {
             payload: payload
         )
     }
-
-    func requestCount() -> Int { requests.count }
 
     func continuationCount() -> Int {
         requests.filter { $0.afterRootCID != nil }.count
@@ -3084,9 +3083,7 @@ final class NetworkTrustTests: XCTestCase {
         await first.runtime.stop()
     }
 
-    func testKnownRootInventoryEchoDoesNotDriveContinuationRequests()
-        async throws
-    {
+    func testAllKnownInventoryPageStillContinuesTheScan() async throws {
         let node = try await overlayRuntime(
             keyByte: 0xa8,
             requestTimeout: .seconds(15)
@@ -3107,13 +3104,20 @@ final class NetworkTrustTests: XCTestCase {
                 process: node.process,
                 handlers: handlers
             )
-            let transaction = try signedNetworkTransaction(
-                chainPath: ["Nexus"]
-            )
-            let submitted = try await service.submitTransaction(
-                SubmitTransactionRequest(transaction: transaction)
-            )
-            let echo = EchoInventoryPeer(root: submitted.transactionCID)
+            // Fill the mempool with one full wire page of known roots, so a
+            // peer can serve a valid 64-root page containing nothing new.
+            var known: [String] = []
+            while known.count < TransactionInventoryResponseMessage
+                .maximumRoots {
+                let transaction = try signedNetworkTransaction(
+                    chainPath: ["Nexus"]
+                )
+                let submitted = try await service.submitTransaction(
+                    SubmitTransactionRequest(transaction: transaction)
+                )
+                known.append(submitted.transactionCID)
+            }
+            let echo = EchoInventoryPeer(roots: known)
             await peer.installTestDelegate(echo)
             try await connectAndHello(
                 peer,
@@ -3121,22 +3125,15 @@ final class NetworkTrustTests: XCTestCase {
                 endpoint: node.endpoint,
                 hello: node.hello
             )
-            for _ in 0..<200 {
-                if await echo.requestCount() >= 1 { break }
-                try await Task.sleep(for: .milliseconds(10))
-            }
-            let initialRequests = await echo.requestCount()
-            XCTAssertGreaterThanOrEqual(initialRequests, 1)
-            // A page consisting entirely of already-known roots is not
-            // progress. Watch a bounded window after the echoed page; any
-            // cursor-bearing continuation request is a regression toward the
-            // unbounded known-root re-scan loop.
-            for _ in 0..<200 {
-                if await echo.continuationCount() > 0 { break }
+            // Honest mempools overlap: a full page of already-known roots
+            // must consume budget yet continue the scan, because later pages
+            // may hold roots we lack. Truncating here is the regression.
+            for _ in 0..<400 {
+                if await echo.continuationCount() >= 1 { break }
                 try await Task.sleep(for: .milliseconds(10))
             }
             let continuations = await echo.continuationCount()
-            XCTAssertEqual(continuations, 0)
+            XCTAssertGreaterThanOrEqual(continuations, 1)
         } catch {
             await peer.stop()
             await node.runtime.stop()
