@@ -34,6 +34,44 @@ final class ParentEvidenceFlowTests: XCTestCase {
         flow.finishReservation(for: session)
     }
 
+    func testUnavailabilityStopsSequenceWithoutFailureOrBackpressure() throws {
+        let session = session(byte: 0x61)
+        var flow = ParentEvidenceFlow()
+        let append = try XCTUnwrap(flow.beginAppend(
+            for: session,
+            competingOperationCount: 0,
+            capacity: 1
+        ))
+        XCTAssertFalse(flow.finish(
+            token: append.token,
+            result: .unavailable,
+            for: session
+        ))
+        XCTAssertFalse(flow.isFailed(session))
+        XCTAssertFalse(flow.allowsReservation(
+            for: session,
+            after: .unavailable
+        ))
+
+        // Absence carries no blame: the next scan retries the same session,
+        // and a handled tail restores reservations without any capacity
+        // event.
+        let retry = try XCTUnwrap(flow.beginAppend(
+            for: session,
+            competingOperationCount: 0,
+            capacity: 1
+        ))
+        XCTAssertFalse(flow.finish(
+            token: retry.token,
+            result: .handled,
+            for: session
+        ))
+        XCTAssertTrue(flow.allowsReservation(
+            for: session,
+            after: .handled
+        ))
+    }
+
     func testFailureIsSessionScopedAndResetClearsIt() throws {
         let failedSession = session(byte: 0x51)
         let healthySession = session(byte: 0x52)

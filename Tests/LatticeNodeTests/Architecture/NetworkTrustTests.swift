@@ -154,6 +154,44 @@ private final class TransactionTopicRecordingPeer: IvyDelegate, Sendable {
     }
 }
 
+private actor EchoInventoryPeer: IvyDelegate {
+    private let root: String
+    private var requests: [TransactionInventoryRequestMessage] = []
+
+    init(root: String) {
+        self.root = root
+    }
+
+    func ivy(
+        _ ivy: Ivy,
+        didReceiveMessage message: PeerMessage,
+        from peer: AuthenticatedPeer
+    ) async {
+        guard message.topic == NodeNetworkTopic.transactionInventoryRequest,
+              let request = try? TransactionInventoryRequestMessage.decoded(
+                message.payload
+              ) else { return }
+        requests.append(request)
+        guard let payload = try? TransactionInventoryResponseMessage(
+            requestID: request.requestID,
+            afterRootCID: request.afterRootCID,
+            volumeRootCIDs: [root],
+            hasMore: true
+        ).encoded() else { return }
+        _ = await ivy.sendMessage(
+            to: peer,
+            topic: NodeNetworkTopic.transactionInventoryResponse,
+            payload: payload
+        )
+    }
+
+    func requestCount() -> Int { requests.count }
+
+    func continuationCount() -> Int {
+        requests.filter { $0.afterRootCID != nil }.count
+    }
+}
+
 private actor OverlayInventoryPeer: IvyDelegate {
     private let leaves: [String]?
     private var requestSessions: [Data] = []
@@ -3044,6 +3082,68 @@ final class NetworkTrustTests: XCTestCase {
         await publicationObserver.stop()
         await second.runtime.stop()
         await first.runtime.stop()
+    }
+
+    func testKnownRootInventoryEchoDoesNotDriveContinuationRequests()
+        async throws
+    {
+        let node = try await overlayRuntime(
+            keyByte: 0xa8,
+            requestTimeout: .seconds(15)
+        )
+        let service = networkService(
+            process: node.process,
+            runtime: node.runtime
+        )
+        let handlers = transactionServiceHandlers(service)
+        let peer = Ivy(config: IvyConfig(
+            signingKey: signingKey(0xa9),
+            listenPort: 0,
+            stunServers: [],
+            mode: .overlay
+        ))
+        do {
+            try await node.runtime.start(
+                process: node.process,
+                handlers: handlers
+            )
+            let transaction = try signedNetworkTransaction(
+                chainPath: ["Nexus"]
+            )
+            let submitted = try await service.submitTransaction(
+                SubmitTransactionRequest(transaction: transaction)
+            )
+            let echo = EchoInventoryPeer(root: submitted.transactionCID)
+            await peer.installTestDelegate(echo)
+            try await connectAndHello(
+                peer,
+                peerID: node.peerID,
+                endpoint: node.endpoint,
+                hello: node.hello
+            )
+            for _ in 0..<200 {
+                if await echo.requestCount() >= 1 { break }
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            let initialRequests = await echo.requestCount()
+            XCTAssertGreaterThanOrEqual(initialRequests, 1)
+            // A page consisting entirely of already-known roots is not
+            // progress. Watch a bounded window after the echoed page; any
+            // cursor-bearing continuation request is a regression toward the
+            // unbounded known-root re-scan loop.
+            for _ in 0..<200 {
+                if await echo.continuationCount() > 0 { break }
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            let continuations = await echo.continuationCount()
+            XCTAssertEqual(continuations, 0)
+        } catch {
+            await peer.stop()
+            await node.runtime.stop()
+            throw error
+        }
+        await peer.stop()
+        await node.runtime.stop()
     }
 
     func testTransactionFetchDoesNotBlockSameSessionIngress() async throws {

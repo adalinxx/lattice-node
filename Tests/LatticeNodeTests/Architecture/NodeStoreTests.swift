@@ -2045,6 +2045,60 @@ final class NodeStoreTests: XCTestCase {
         XCTAssertNil(releasedShared)
     }
 
+    func testHandoffClearsIssuedAndSnapshotCannotDemoteHandoff()
+        async throws
+    {
+        let directory = temporaryDirectory()
+        let broker = try DiskBroker(
+            path: directory.appendingPathComponent("volumes.db").path
+        )
+        let store = try makeStore(
+            path: directory.appendingPathComponent("state.db"),
+            broker: broker
+        )
+        let candidate = try VolumeImpl<PublicKey>(
+            node: PublicKey(key: "exclusive-candidate")
+        )
+        try await candidate.store(storer: broker)
+        try await store.persistContextualCandidateRoots(
+            candidateCID: candidate.rawCID,
+            roots: [candidate.rawCID],
+            capacity: 16
+        )
+        let issuedReplacement = try await store
+            .replaceIssuedContextualCandidates(
+            [candidate.rawCID],
+            capacity: 16
+        )
+        XCTAssertTrue(issuedReplacement)
+        let issuedBeforeHandoff = try await store
+            .issuedContextualCandidateCIDs()
+        XCTAssertEqual(issuedBeforeHandoff, [candidate.rawCID])
+
+        // Handoff ownership replaces the reservation rather than stacking on
+        // top of it: issued and handoff are mutually exclusive.
+        let beganHandoff = try await store.beginContextualCandidateHandoff(
+            candidateCID: candidate.rawCID
+        )
+        XCTAssertTrue(beganHandoff)
+        let issuedAfterHandoff = try await store
+            .issuedContextualCandidateCIDs()
+        XCTAssertTrue(issuedAfterHandoff.isEmpty)
+
+        // A later parent snapshot cannot demote durable handoff ownership
+        // back to a plain reservation.
+        let reissueAttempt = try await store
+            .replaceIssuedContextualCandidates(
+            [candidate.rawCID],
+            capacity: 16
+        )
+        XCTAssertTrue(reissueAttempt)
+        let issuedAfterReissue = try await store
+            .issuedContextualCandidateCIDs()
+        XCTAssertTrue(issuedAfterReissue.isEmpty)
+        try await store.auditNormalizedIndexes()
+    }
+
     func testParentEvidenceScanAndInboxSurviveCrashUntilAdmissionOwnsVolume()
         async throws
     {
