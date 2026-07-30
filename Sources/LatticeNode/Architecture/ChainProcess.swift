@@ -213,7 +213,9 @@ public actor ChainProcess: ContentSource, Fetcher, VolumeStorer {
                 parentEvidenceInboxRetentionScope,
             parentEvidenceInboxCapacity:
                 configuration.resourcePolicy.maximumPendingParentEvidence,
-            contextualCandidateOwner: contextualCandidateOwner
+            contextualCandidateOwner: contextualCandidateOwner,
+            handoffCandidateCapacity:
+                configuration.resourcePolicy.maximumRetainedHandoffCandidates
         )
 
         // Protocol constants are ordinary Volumes and therefore ordinary GC
@@ -227,6 +229,7 @@ public actor ChainProcess: ContentSource, Fetcher, VolumeStorer {
         let staged = try await store.stagedAdmissions()
         try await store.auditNormalizedIndexes()
         try await store.pruneAdmittedContextualCandidates()
+        try await store.enforceHandoffCandidateBudget()
         let retainedRoots = durableRetainedRoots(
             staged: staged,
             additionalRoots: constantRoots
@@ -1436,6 +1439,9 @@ public actor ChainProcess: ContentSource, Fetcher, VolumeStorer {
             package: package,
             advanceScan: advanceScan
         )
+        // Budget enforcement is a storage policy, not part of retention:
+        // its failure must not mark durably retained evidence as failed.
+        try? await store.enforceHandoffCandidateBudget()
     }
 
     public func status() async -> ChainProcessStatus {
