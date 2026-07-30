@@ -1439,9 +1439,10 @@ public actor ChainProcess: ContentSource, Fetcher, VolumeStorer {
             package: package,
             advanceScan: advanceScan
         )
-        // Budget enforcement is a storage policy, not part of retention:
-        // its failure must not mark durably retained evidence as failed.
-        try? await store.enforceHandoffCandidateBudget()
+        // The handoff budget is deliberately NOT enforced here: evidence
+        // retention is the critical path for child admission, and evidence
+        // only arrives while the parent is mining — the same cadence on
+        // which reservation snapshots already enforce the budget.
     }
 
     public func status() async -> ChainProcessStatus {
