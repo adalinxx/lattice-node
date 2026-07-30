@@ -10,6 +10,11 @@ public struct NodeResourcePolicy: Sendable, Equatable {
     public let maximumAcquisitionVolumes: Int
     public let maximumAcquisitionMembers: Int
     public let maximumAcquisitionStorageBytes: Int
+    /// Per-query visit budget for serving a child's parent-state continuity
+    /// question. The walk runs on the consensus actor, so this bounds how
+    /// long one fact-plane query can hold it. Exhaustion is served as
+    /// silence, which a child already treats as retryable unavailability.
+    public let maximumContinuityBlockVisits: Int
 
     public init(
         maximumChainSpecBytes: Int = 1 * 1_024 * 1_024,
@@ -19,7 +24,8 @@ public struct NodeResourcePolicy: Sendable, Equatable {
         maximumWasmPolicies: Int = 64,
         maximumAcquisitionVolumes: Int = 20_548,
         maximumAcquisitionMembers: Int = Int(UInt16.max),
-        maximumAcquisitionStorageBytes: Int = 64 * 1_024 * 1_024
+        maximumAcquisitionStorageBytes: Int = 64 * 1_024 * 1_024,
+        maximumContinuityBlockVisits: Int = 4_096
     ) {
         precondition(
             maximumChainSpecBytes > 0
@@ -29,6 +35,7 @@ public struct NodeResourcePolicy: Sendable, Equatable {
                 && maximumAcquisitionVolumes > 0
                 && maximumAcquisitionMembers > 0
                 && maximumAcquisitionStorageBytes > 0
+                && maximumContinuityBlockVisits > 0
         )
         self.maximumChainSpecBytes = maximumChainSpecBytes
         self.maximumParentWitnessBytes = maximumParentWitnessBytes
@@ -37,6 +44,7 @@ public struct NodeResourcePolicy: Sendable, Equatable {
         self.maximumAcquisitionVolumes = maximumAcquisitionVolumes
         self.maximumAcquisitionMembers = maximumAcquisitionMembers
         self.maximumAcquisitionStorageBytes = maximumAcquisitionStorageBytes
+        self.maximumContinuityBlockVisits = maximumContinuityBlockVisits
     }
 }
 import Ivy
