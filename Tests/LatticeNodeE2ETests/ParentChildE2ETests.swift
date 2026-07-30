@@ -5134,16 +5134,30 @@ private enum E2EPorts {
     private static var reservations: [UInt16: Int32] = [:]
 
     static func allocate(count: Int) throws -> [UInt16] {
+        // Probe below the kernel's ephemeral range (32768+ on Linux,
+        // 49152+ on macOS). Binding port 0 draws from that range, and in
+        // the window between releasing a reservation and its daemon
+        // binding it, any concurrent outbound connection on a shared
+        // runner can be handed the same port as its source port — the
+        // daemon then dies at launch with EADDRINUSE.
         var ports: [UInt16] = []
-        do {
-            while ports.count < count {
-                let reservation = try reservePort(0)
-                reservations[reservation.port] = reservation.descriptor
-                ports.append(reservation.port)
+        var attempts = 0
+        while ports.count < count {
+            attempts += 1
+            guard attempts <= 10_000 else {
+                release(ports)
+                throw E2EHTTPError(
+                    status: 0,
+                    body: "could not allocate test ports"
+                )
             }
-        } catch {
-            release(ports)
-            throw error
+            let candidate = UInt16.random(in: 20_000...29_999)
+            guard reservations[candidate] == nil,
+                  let reservation = try? reservePort(candidate) else {
+                continue
+            }
+            reservations[reservation.port] = reservation.descriptor
+            ports.append(reservation.port)
         }
         return ports.sorted()
     }
