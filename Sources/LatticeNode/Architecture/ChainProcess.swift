@@ -1103,9 +1103,10 @@ public actor ChainProcess: ContentSource, Fetcher, VolumeStorer {
     }
 
     /// Query this process's recovered graph of connected, validated blocks.
-    /// The walk is bounded by this process's own accepted graph and the
-    /// per-peer query guard; an artificial visit ceiling would turn a
-    /// genuinely continuous but distant reference into permanent silence.
+    /// The walk holds the consensus actor, so each query carries the local
+    /// resource-policy visit budget. Exhaustion answers with silence — the
+    /// same retryable unavailability as any other non-answer — and the
+    /// budget is operator-raisable; it never marks chain data invalid.
     func hasParentStateContinuity(
         from fromStateCID: String,
         to toStateCID: String
@@ -1113,7 +1114,9 @@ public actor ChainProcess: ContentSource, Fetcher, VolumeStorer {
         guard case .active(let level) = runtimePhase else { return false }
         return await level.chain.hasStateContinuity(
             from: fromStateCID,
-            to: toStateCID
+            to: toStateCID,
+            maximumBlockVisits:
+                configuration.resourcePolicy.maximumContinuityBlockVisits
         )
     }
 
