@@ -91,6 +91,22 @@ jobs:
           swift run lattice-mining-coordinator --help
           swift run lattice-miner --help
 
+      - name: Collect retained E2E artifacts
+        if: failure()
+        run: |
+          mkdir -p e2e-failure-artifacts
+          for d in /tmp/lattice-node-e2e-* "${TMPDIR:-/tmp}"/lattice-node-e2e-*; do
+            [ -d "$d" ] && cp -R "$d" e2e-failure-artifacts/ || true
+          done
+
+      - name: Upload retained E2E artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-failure-artifacts-${{ github.job }}
+          path: e2e-failure-artifacts
+          if-no-files-found: ignore
+
   test-linux:
     runs-on: ubuntu-latest
     container: swift:6.1-jammy
@@ -128,6 +144,22 @@ jobs:
           swift run lattice-node --help
           swift run lattice-mining-coordinator --help
           swift run lattice-miner --help
+
+      - name: Collect retained E2E artifacts
+        if: failure()
+        run: |
+          mkdir -p e2e-failure-artifacts
+          for d in /tmp/lattice-node-e2e-* "${TMPDIR:-/tmp}"/lattice-node-e2e-*; do
+            [ -d "$d" ] && cp -R "$d" e2e-failure-artifacts/ || true
+          done
+
+      - name: Upload retained E2E artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-failure-artifacts-${{ github.job }}
+          path: e2e-failure-artifacts
+          if-no-files-found: ignore
 
   thread-sanitizer:
     runs-on: macos-15
