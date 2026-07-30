@@ -2341,12 +2341,14 @@ public actor NodeNetworkRuntime: IvyDelegate {
                 return
             }
         }
-        // A page that yields nothing new is not progress: a peer echoing
-        // roots we already know could otherwise walk strictly-increasing
-        // pages forever without ever consuming the session budget.
-        let remainingRoots = pending.remainingRoots - selected.count
+        // Every page costs at least one unit of the session budget, so a
+        // peer serving roots we already know cannot page for free — while an
+        // all-known page still continues the scan, because honest mempools
+        // overlap and later pages may hold roots we lack. The wire contract
+        // (strictly ascending, unique, full page when hasMore) already
+        // prevents replaying the same roots within a session.
+        let remainingRoots = pending.remainingRoots - max(selected.count, 1)
         if response.hasMore,
-           !selected.isEmpty,
            remainingRoots > 0,
            let cursor = response.volumeRootCIDs.last {
             await requestTransactionInventory(
