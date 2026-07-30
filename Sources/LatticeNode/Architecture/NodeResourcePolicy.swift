@@ -15,6 +15,11 @@ public struct NodeResourcePolicy: Sendable, Equatable {
     /// long one fact-plane query can hold it. Exhaustion is served as
     /// silence, which a child already treats as retryable unavailability.
     public let maximumContinuityBlockVisits: Int
+    /// Storage budget for handed-off contextual candidates awaiting
+    /// admission. A handoff is a local cache of durable ownership, not a
+    /// consensus commitment: an evicted candidate whose branch returns is
+    /// re-acquired through ordinary verified acquisition. Oldest first.
+    public let maximumRetainedHandoffCandidates: Int
 
     public init(
         maximumChainSpecBytes: Int = 1 * 1_024 * 1_024,
@@ -25,7 +30,8 @@ public struct NodeResourcePolicy: Sendable, Equatable {
         maximumAcquisitionVolumes: Int = 20_548,
         maximumAcquisitionMembers: Int = Int(UInt16.max),
         maximumAcquisitionStorageBytes: Int = 64 * 1_024 * 1_024,
-        maximumContinuityBlockVisits: Int = 4_096
+        maximumContinuityBlockVisits: Int = 4_096,
+        maximumRetainedHandoffCandidates: Int = 1_024
     ) {
         precondition(
             maximumChainSpecBytes > 0
@@ -36,6 +42,7 @@ public struct NodeResourcePolicy: Sendable, Equatable {
                 && maximumAcquisitionMembers > 0
                 && maximumAcquisitionStorageBytes > 0
                 && maximumContinuityBlockVisits > 0
+                && maximumRetainedHandoffCandidates > 0
         )
         self.maximumChainSpecBytes = maximumChainSpecBytes
         self.maximumParentWitnessBytes = maximumParentWitnessBytes
@@ -45,6 +52,7 @@ public struct NodeResourcePolicy: Sendable, Equatable {
         self.maximumAcquisitionMembers = maximumAcquisitionMembers
         self.maximumAcquisitionStorageBytes = maximumAcquisitionStorageBytes
         self.maximumContinuityBlockVisits = maximumContinuityBlockVisits
+        self.maximumRetainedHandoffCandidates = maximumRetainedHandoffCandidates
     }
 }
 import Ivy

@@ -205,10 +205,11 @@ enum IssuedChildProofScope: String, Sendable {
 
 /// Node-owned immutable facts and availability indexes for one absolute path.
 actor NodeStore {
-    /// Epoch 37 makes issued and handed-off contextual candidates mutually
-    /// exclusive at the schema level. Older stores must be
+    /// Epoch 38 makes issued and handed-off contextual candidates mutually
+    /// exclusive and gives each handoff an age for budgeted eviction.
+    /// Older stores must be
     /// wiped; Nexus deterministically recreates the configured exact genesis.
-    static let currentSchemaEpoch: Int64 = 37
+    static let currentSchemaEpoch: Int64 = 38
 
     private static func parentGenesisFactKey(
         _ link: ParentGenesisLink
@@ -234,6 +235,7 @@ actor NodeStore {
     private let preparedRecoveryRetentionScope: String
     private let parentEvidenceInboxRetentionScope: String
     private let parentEvidenceInboxCapacity: Int
+    private let handoffCandidateCapacity: Int
     private let contextualCandidateOwner: String
     private var preparedMutationInFlight = false
     private var preparedMutationWaiters: [CheckedContinuation<Void, Never>] = []
@@ -247,7 +249,8 @@ actor NodeStore {
         preparedRecoveryRetentionScope: String,
         parentEvidenceInboxRetentionScope: String = "parent-evidence-inbox",
         parentEvidenceInboxCapacity: Int = 64,
-        contextualCandidateOwner: String
+        contextualCandidateOwner: String,
+        handoffCandidateCapacity: Int = 1_024
     ) throws {
         guard !nexusGenesisCID.isEmpty else {
             throw NodeStoreError.invalidConfiguration("Nexus genesis CID is empty")
@@ -259,6 +262,7 @@ actor NodeStore {
               !preparedRecoveryRetentionScope.isEmpty,
               !parentEvidenceInboxRetentionScope.isEmpty,
               parentEvidenceInboxCapacity > 0,
+              handoffCandidateCapacity > 0,
               issuedRecoveryRetentionScope != preparedRecoveryRetentionScope,
               issuedRecoveryRetentionScope != parentEvidenceInboxRetentionScope,
               preparedRecoveryRetentionScope != parentEvidenceInboxRetentionScope,
@@ -305,6 +309,7 @@ actor NodeStore {
             parentEvidenceInboxRetentionScope
         self.parentEvidenceInboxCapacity = parentEvidenceInboxCapacity
         self.contextualCandidateOwner = contextualCandidateOwner
+        self.handoffCandidateCapacity = handoffCandidateCapacity
     }
 
     private func acquirePreparedMutation() async {
@@ -848,11 +853,11 @@ actor NodeStore {
             )
         }
         let conflictedContextualCandidates = try database.query(
-            "SELECT 1 FROM contextual_candidates WHERE issued = 1 AND handoff = 1 LIMIT 1"
+            "SELECT 1 FROM contextual_candidates WHERE (issued = 1 AND handoff = 1) OR ((handoff = 1) != (handoff_seq IS NOT NULL)) LIMIT 1"
         )
         guard conflictedContextualCandidates.isEmpty else {
             throw NodeStoreError.corrupt(
-                "contextual candidate is both issued and handed off"
+                "contextual candidate handoff state is inconsistent"
             )
         }
         for row in try database.query(
@@ -2533,7 +2538,39 @@ actor NodeStore {
         }
         await acquirePreparedMutation()
         defer { releasePreparedMutation() }
-        return try markContextualCandidateHandoff(candidateCID: candidateCID)
+        let began = try markContextualCandidateHandoff(
+            candidateCID: candidateCID
+        )
+        if began {
+            try await evictExcessHandoffCandidates()
+        }
+        return began
+    }
+
+    /// Removes one candidate's row, descendants, and root references in the
+    /// caller's transaction and returns the roots to unpin afterwards. The
+    /// row, its index entries, and its pins always leave together: an index
+    /// that promises evicted content is a liveness wedge, not a saving.
+    private func deleteContextualCandidateRows(
+        candidateCID: String
+    ) throws -> [String] {
+        let roots = try database.query(
+            "SELECT root_cid FROM contextual_candidate_roots WHERE candidate_cid = ?1",
+            params: [.text(candidateCID)]
+        ).compactMap { $0["root_cid"]?.textValue }
+        try database.execute(
+            "DELETE FROM contextual_candidate_roots WHERE candidate_cid = ?1",
+            params: [.text(candidateCID)]
+        )
+        try database.execute(
+            "DELETE FROM contextual_candidate_children WHERE candidate_cid = ?1",
+            params: [.text(candidateCID)]
+        )
+        try database.execute(
+            "DELETE FROM contextual_candidates WHERE candidate_cid = ?1",
+            params: [.text(candidateCID)]
+        )
+        return roots
     }
 
     private func markContextualCandidateHandoff(
@@ -2544,7 +2581,7 @@ actor NodeStore {
             params: [.text(candidateCID)]
         ).isEmpty else { return false }
         try database.execute(
-            "UPDATE contextual_candidates SET handoff = 1, issued = 0, offer_seq = NULL WHERE candidate_cid = ?1",
+            "UPDATE contextual_candidates SET handoff = 1, issued = 0, offer_seq = NULL, handoff_seq = COALESCE(handoff_seq, (SELECT COALESCE(MAX(handoff_seq), 0) + 1 FROM contextual_candidates)) WHERE candidate_cid = ?1",
             params: [.text(candidateCID)]
         )
         return true
@@ -2602,21 +2639,8 @@ actor NodeStore {
                     )
                     continue
                 }
-                releasedRoots += try database.query(
-                    "SELECT root_cid FROM contextual_candidate_roots WHERE candidate_cid = ?1",
-                    params: [.text(candidateCID)]
-                ).compactMap { $0["root_cid"]?.textValue }
-                try database.execute(
-                    "DELETE FROM contextual_candidate_roots WHERE candidate_cid = ?1",
-                    params: [.text(candidateCID)]
-                )
-                try database.execute(
-                    "DELETE FROM contextual_candidate_children WHERE candidate_cid = ?1",
-                    params: [.text(candidateCID)]
-                )
-                try database.execute(
-                    "DELETE FROM contextual_candidates WHERE candidate_cid = ?1",
-                    params: [.text(candidateCID)]
+                releasedRoots += try deleteContextualCandidateRows(
+                    candidateCID: candidateCID
                 )
             }
             // Durable handoff ownership outlives any later snapshot: a
@@ -2634,6 +2658,7 @@ actor NodeStore {
                 (root: $0, owner: contextualCandidateOwner, count: 1)
             }
         )
+        try await evictExcessHandoffCandidates()
         return true
     }
 
@@ -2709,6 +2734,40 @@ actor NodeStore {
                 candidateCID: candidate
             )
         }
+    }
+
+    /// Enforces the local storage budget on handed-off candidates. Losing a
+    /// fork is a cache-eviction event, not a consensus event: a handoff is
+    /// re-derivable ownership, so the oldest handoffs beyond the budget are
+    /// dropped whole — row, descendants, and pins together — and a branch
+    /// that returns re-enters through ordinary verified acquisition. Newest
+    /// handoffs survive, so a live reservation-to-admission window keeps its
+    /// pinned roots.
+    func enforceHandoffCandidateBudget() async throws {
+        await acquirePreparedMutation()
+        defer { releasePreparedMutation() }
+        try await evictExcessHandoffCandidates()
+    }
+
+    private func evictExcessHandoffCandidates() async throws {
+        let stranded = try database.query(
+            "SELECT candidate_cid FROM contextual_candidates WHERE handoff = 1 ORDER BY handoff_seq"
+        ).compactMap { $0["candidate_cid"]?.textValue }
+        let excess = stranded.count - handoffCandidateCapacity
+        guard excess > 0 else { return }
+        var releasedRoots: [String] = []
+        try database.transaction {
+            for candidateCID in stranded.prefix(excess) {
+                releasedRoots += try deleteContextualCandidateRows(
+                    candidateCID: candidateCID
+                )
+            }
+        }
+        try? await recoveryVolumeBroker.unpinBatch(
+            items: releasedRoots.map {
+                (root: $0, owner: contextualCandidateOwner, count: 1)
+            }
+        )
     }
 
     private func canonicalRecoveryRoots(sql: String) throws -> [String] {
@@ -3548,9 +3607,11 @@ actor NodeStore {
                 offer_seq INTEGER UNIQUE,
                 issued INTEGER NOT NULL CHECK (issued IN (0, 1)),
                 handoff INTEGER NOT NULL CHECK (handoff IN (0, 1)),
+                handoff_seq INTEGER UNIQUE,
                 CHECK (offer_seq IS NULL OR offer_seq > 0),
                 CHECK (issued = 1 OR handoff = 1 OR offer_seq IS NOT NULL),
-                CHECK (NOT (issued = 1 AND handoff = 1))
+                CHECK (NOT (issued = 1 AND handoff = 1)),
+                CHECK ((handoff = 1) = (handoff_seq IS NOT NULL))
             ) WITHOUT ROWID
             """)
         try database.execute("""

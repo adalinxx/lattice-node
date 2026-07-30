@@ -2099,6 +2099,74 @@ final class NodeStoreTests: XCTestCase {
         try await store.auditNormalizedIndexes()
     }
 
+    func testHandoffBudgetEvictsOldestAndEvictedCandidateCanReturn()
+        async throws
+    {
+        let directory = temporaryDirectory()
+        let broker = try DiskBroker(
+            path: directory.appendingPathComponent("volumes.db").path
+        )
+        let store = try makeStore(
+            path: directory.appendingPathComponent("state.db"),
+            broker: broker,
+            handoffCandidateCapacity: 2
+        )
+        var candidates: [VolumeImpl<PublicKey>] = []
+        for index in 0..<3 {
+            let candidate = try VolumeImpl<PublicKey>(
+                node: PublicKey(key: "budget-candidate-\(index)")
+            )
+            try await candidate.store(storer: broker)
+            try await store.persistContextualCandidateRoots(
+                candidateCID: candidate.rawCID,
+                roots: [candidate.rawCID],
+                capacity: 16
+            )
+            candidates.append(candidate)
+        }
+        for candidate in candidates {
+            let began = try await store.beginContextualCandidateHandoff(
+                candidateCID: candidate.rawCID
+            )
+            XCTAssertTrue(began)
+        }
+
+        // The budget keeps the two newest handoffs and drops the oldest
+        // whole: row and pinned roots together.
+        let retained = try await store.contextualCandidateVolumeRoots()
+        XCTAssertEqual(
+            Set(retained),
+            Set([candidates[1].rawCID, candidates[2].rawCID])
+        )
+        _ = try await broker.evictUnpinned(graceSeconds: 0)
+        let evictedVolume = await broker.fetchVolumeLocal(
+            root: candidates[0].rawCID
+        )
+        XCTAssertNil(evictedVolume)
+        try await store.auditNormalizedIndexes()
+
+        // Eviction is willingness, not validity: the same candidate returns
+        // through the ordinary offer path and hands off again as the newest
+        // entry, and the budget then sheds the next-oldest.
+        let returning = candidates[0]
+        try await returning.store(storer: broker)
+        try await store.persistContextualCandidateRoots(
+            candidateCID: returning.rawCID,
+            roots: [returning.rawCID],
+            capacity: 16
+        )
+        let readmitted = try await store.beginContextualCandidateHandoff(
+            candidateCID: returning.rawCID
+        )
+        XCTAssertTrue(readmitted)
+        let afterReturn = try await store.contextualCandidateVolumeRoots()
+        XCTAssertEqual(
+            Set(afterReturn),
+            Set([candidates[2].rawCID, returning.rawCID])
+        )
+        try await store.auditNormalizedIndexes()
+    }
+
     func testParentEvidenceScanAndInboxSurviveCrashUntilAdmissionOwnsVolume()
         async throws
     {
@@ -2507,7 +2575,8 @@ final class NodeStoreTests: XCTestCase {
         genesisCID: String? = nil,
         chainPath: [String] = ["Nexus"],
         broker suppliedBroker: (any RetainedRootMergeBroker)? = nil,
-        parentEvidenceInboxCapacity: Int = 64
+        parentEvidenceInboxCapacity: Int = 64,
+        handoffCandidateCapacity: Int = 1_024
     ) throws -> NodeStore {
         let path = path ?? temporaryDirectory().appendingPathComponent("state.db")
         let broker: any RetainedRootMergeBroker
@@ -2527,7 +2596,8 @@ final class NodeStoreTests: XCTestCase {
             issuedRecoveryRetentionScope: "test:issued-hierarchy",
             preparedRecoveryRetentionScope: "test:prepared-hierarchy",
             parentEvidenceInboxCapacity: parentEvidenceInboxCapacity,
-            contextualCandidateOwner: "test:contextual-candidates"
+            contextualCandidateOwner: "test:contextual-candidates",
+            handoffCandidateCapacity: handoffCandidateCapacity
         )
     }
 
