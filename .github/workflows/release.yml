@@ -30,6 +30,8 @@ jobs:
     runs-on: ubuntu-latest
     container: swift@sha256:f5697100d3e66326314fb63a393b1dea2eb694fdcab689b03abc5b50b514ef6e
     timeout-minutes: 90
+    env:
+      E2E_TIME_SCALE: 3
     permissions:
       contents: read
       id-token: write
@@ -106,9 +108,27 @@ jobs:
           subject-path: ${{ steps.build.outputs.archive_path }}
           sbom-path: ${{ steps.build.outputs.sbom_path }}
 
+      - name: Collect retained E2E artifacts
+        if: failure()
+        run: |
+          mkdir -p e2e-failure-artifacts
+          for d in /tmp/lattice-node-e2e-* "${TMPDIR:-/tmp}"/lattice-node-e2e-*; do
+            [ -d "$d" ] && cp -R "$d" e2e-failure-artifacts/ || true
+          done
+
+      - name: Upload retained E2E artifacts
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: e2e-failure-artifacts-${{ github.job }}
+          path: e2e-failure-artifacts
+          if-no-files-found: ignore
+
   build-macos-release-artifacts:
     runs-on: macos-15
     timeout-minutes: 90
+    env:
+      E2E_TIME_SCALE: 3
     permissions:
       contents: read
       id-token: write
@@ -174,6 +194,22 @@ jobs:
         with:
           subject-path: ${{ steps.build.outputs.archive_path }}
           sbom-path: ${{ steps.build.outputs.sbom_path }}
+
+      - name: Collect retained E2E artifacts
+        if: failure()
+        run: |
+          mkdir -p e2e-failure-artifacts
+          for d in /tmp/lattice-node-e2e-* "${TMPDIR:-/tmp}"/lattice-node-e2e-*; do
+            [ -d "$d" ] && cp -R "$d" e2e-failure-artifacts/ || true
+          done
+
+      - name: Upload retained E2E artifacts
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: e2e-failure-artifacts-${{ github.job }}
+          path: e2e-failure-artifacts
+          if-no-files-found: ignore
 
   smoke-linux-release-without-swift:
     needs: build-linux-release-artifacts
