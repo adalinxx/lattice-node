@@ -52,6 +52,8 @@ jobs:
   test-macos:
     runs-on: macos-15
     timeout-minutes: 90
+    env:
+      E2E_TIME_SCALE: 3
     steps:
       - uses: actions/checkout@v4
 
@@ -93,6 +95,8 @@ jobs:
     runs-on: ubuntu-latest
     container: swift:6.1-jammy
     timeout-minutes: 90
+    env:
+      E2E_TIME_SCALE: 3
     steps:
       - uses: actions/checkout@v4
 

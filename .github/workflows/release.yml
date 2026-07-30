@@ -76,6 +76,7 @@ jobs:
           E2E_NODE_BIN="$extract_root/$bundle_name/bin/lattice-node" \
             E2E_COORDINATOR_BIN="$extract_root/$bundle_name/bin/lattice-mining-coordinator" \
             E2E_MINER_BIN="$extract_root/$bundle_name/bin/lattice-miner" \
+            E2E_TIME_SCALE=3 \
             swift test --filter LatticeNodeE2ETests
 
       - name: Verify release artifact bindings
@@ -144,6 +145,7 @@ jobs:
           E2E_NODE_BIN="$extract_root/$bundle_name/bin/lattice-node" \
             E2E_COORDINATOR_BIN="$extract_root/$bundle_name/bin/lattice-mining-coordinator" \
             E2E_MINER_BIN="$extract_root/$bundle_name/bin/lattice-miner" \
+            E2E_TIME_SCALE=3 \
             swift test --filter LatticeNodeE2ETests
 
       - name: Verify release artifact bindings

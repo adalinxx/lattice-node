@@ -16,6 +16,16 @@ import UInt256
 import XCTest
 import cashew
 
+/// Slow shared CI runners set E2E_TIME_SCALE above 1. Every wait in this
+/// harness polls and returns as soon as its condition holds, so scaling
+/// lengthens only genuinely failing runs, never passing ones.
+let e2eTimeScale: Int = ProcessInfo.processInfo
+    .environment["E2E_TIME_SCALE"].flatMap(Int.init).map { max(1, $0) } ?? 1
+
+func e2eScaled(_ timeout: Duration) -> Duration {
+    timeout * e2eTimeScale
+}
+
 @MainActor
 final class ParentChildE2ETests: XCTestCase {
     func testChildBootstrapsFromRestartedParentAndAdvancesInLiveRound() async throws {
@@ -3786,7 +3796,7 @@ final class ParentChildE2ETests: XCTestCase {
         minimumHeight: UInt64 = 0
     ) async throws -> ChainServiceStatusResponse {
         let clock = ContinuousClock()
-        let deadline = clock.now + .seconds(30)
+        let deadline = clock.now + e2eScaled(.seconds(30))
         while clock.now < deadline {
             let firstStatus = try? await first.waitForStatus(
                 timeout: .seconds(1),
@@ -3833,13 +3843,13 @@ final class ParentChildE2ETests: XCTestCase {
         try process.run()
 
         let clock = ContinuousClock()
-        let deadline = clock.now + .seconds(20)
+        let deadline = clock.now + e2eScaled(.seconds(20))
         while process.isRunning && clock.now < deadline {
             try? await Task.sleep(for: .milliseconds(50))
         }
         guard !process.isRunning else {
             process.terminate()
-            let terminationDeadline = clock.now + .seconds(5)
+            let terminationDeadline = clock.now + e2eScaled(.seconds(5))
             while process.isRunning && clock.now < terminationDeadline {
                 try? await Task.sleep(for: .milliseconds(50))
             }
@@ -3896,7 +3906,7 @@ final class ParentChildE2ETests: XCTestCase {
         try process.run()
 
         let clock = ContinuousClock()
-        let deadline = clock.now + .seconds(20)
+        let deadline = clock.now + e2eScaled(.seconds(20))
         while process.isRunning && clock.now < deadline {
             try? await Task.sleep(for: .milliseconds(50))
         }
@@ -4225,7 +4235,7 @@ private actor E2EOverlayObserver: IvyDelegate {
         timeout: Duration = .seconds(10)
     ) async throws {
         let clock = ContinuousClock()
-        let deadline = clock.now + timeout
+        let deadline = clock.now + e2eScaled(timeout)
         while clock.now < deadline {
             if connectionCount(to: publicKey) > count { return }
             try? await Task.sleep(for: .milliseconds(50))
@@ -4242,7 +4252,7 @@ private actor E2EOverlayObserver: IvyDelegate {
         timeout: Duration = .seconds(10)
     ) async throws {
         let clock = ContinuousClock()
-        let deadline = clock.now + timeout
+        let deadline = clock.now + e2eScaled(timeout)
         while clock.now < deadline {
             if announcementCount(of: blockCID) > count { return }
             try? await Task.sleep(for: .milliseconds(50))
@@ -4481,7 +4491,7 @@ private final class LoopbackTCPFaultProxy: @unchecked Sendable {
         timeout: Duration = .seconds(20)
     ) async throws {
         let clock = ContinuousClock()
-        let deadline = clock.now + timeout
+        let deadline = clock.now + e2eScaled(timeout)
         while clock.now < deadline {
             let connected = lock.withLock {
                 connectionCount >= expected && !sessions.isEmpty
@@ -4502,7 +4512,7 @@ private final class LoopbackTCPFaultProxy: @unchecked Sendable {
         timeout: Duration = .seconds(5)
     ) async throws {
         let clock = ContinuousClock()
-        let deadline = clock.now + timeout
+        let deadline = clock.now + e2eScaled(timeout)
         while clock.now < deadline {
             if lock.withLock({ sessions.isEmpty }) { return }
             try await Task.sleep(for: .milliseconds(25))
@@ -4755,7 +4765,7 @@ private final class E2ENode {
         if process.isRunning {
             process.terminate()
             let clock = ContinuousClock()
-            let deadline = clock.now + .seconds(5)
+            let deadline = clock.now + e2eScaled(.seconds(5))
             while process.isRunning && clock.now < deadline {
                 try? await Task.sleep(for: .milliseconds(50))
             }
@@ -4834,7 +4844,7 @@ private final class E2ENode {
         where predicate: @escaping (ChainServiceStatusResponse) -> Bool
     ) async throws -> ChainServiceStatusResponse {
         let clock = ContinuousClock()
-        let deadline = clock.now + timeout
+        let deadline = clock.now + e2eScaled(timeout)
         var lastError: Error?
         var lastStatus: ChainServiceStatusResponse?
         while clock.now < deadline {
@@ -4873,13 +4883,19 @@ private final class E2ENode {
     func post<Request: Encodable, Response: Decodable>(
         _ path: String,
         body: Request,
-        timeout: TimeInterval? = nil
+        timeout: TimeInterval? = nil,
+        caller: String = #fileID,
+        line: UInt = #line
     ) async throws -> Response {
         var request = URLRequest(url: baseURL.appending(path: path))
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONEncoder().encode(body)
-        return try await send(request, timeout: timeout)
+        return try await send(
+            request,
+            timeout: timeout,
+            caller: "\(caller):\(line)"
+        )
     }
 
     var rpcURL: URL {
@@ -4906,7 +4922,8 @@ private final class E2ENode {
 
     private func send<Response: Decodable>(
         _ request: URLRequest,
-        timeout: TimeInterval? = nil
+        timeout: TimeInterval? = nil,
+        caller: String? = nil
     ) async throws -> Response {
         var request = request
         request.timeoutInterval = timeout ?? Self.requestTimeout
@@ -4916,7 +4933,10 @@ private final class E2ENode {
                 body: "node is not running: \(configuration.name)"
             )
         }
-        let endpoint = request.url?.path ?? "<unknown endpoint>"
+        var endpoint = request.url?.path ?? "<unknown endpoint>"
+        if let caller {
+            endpoint += " (from \(caller), node \(configuration.name))"
+        }
         let data: Data
         let response: URLResponse
         do {
