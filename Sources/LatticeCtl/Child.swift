@@ -142,7 +142,10 @@ struct Child: AsyncParsableCommand {
             print("anchor \(submitted.transactionCID)")
 
             // Deployment templates are the only ones that include genesis
-            // actions. Success is "the anchor left the parent mempool and a
+            // actions. NOTE: the drain+height gate assumes no concurrent
+            // parent miner (deploy-before-mine on one host); with outside
+            // traffic, gate on the anchor CID landing in a block instead.
+            // Success is "the anchor left the parent mempool and a
             // block landed", never "a mining round exited cleanly" — only
             // then is the child recorded and spawned.
             let worker = try nodeBinary().deletingLastPathComponent()

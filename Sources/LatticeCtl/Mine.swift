@@ -24,6 +24,12 @@ struct Mine: AsyncParsableCommand {
         func run() async throws {
             let layout = rootOption.layout
             _ = try minerSettings(layout)
+            try await withSpawnLock(layout) {
+                try self.startLocked(layout)
+            }
+        }
+
+        private func startLocked(_ layout: HostLayout) throws {
             if let pid = runningPid(layout, "mine") {
                 throw CtlError("mining already running (pid \(pid))")
             }
