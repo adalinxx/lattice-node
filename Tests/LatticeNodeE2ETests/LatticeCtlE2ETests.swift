@@ -96,10 +96,32 @@ final class LatticeCtlE2ETests: XCTestCase {
         return String(decoding: data, as: UTF8.self)
     }
 
+    /// Probe-bind below the kernel ephemeral range so a chosen port is
+    /// actually free at selection time (mirrors the main harness's
+    /// allocator discipline).
     private func randomPorts(_ count: Int) -> [UInt16] {
         var chosen: Set<UInt16> = []
         while chosen.count < count {
-            chosen.insert(UInt16.random(in: 21_000...29_900))
+            let candidate = UInt16.random(in: 21_000...28_999)
+            guard !chosen.contains(candidate) else { continue }
+            #if canImport(Darwin)
+            let descriptor = socket(AF_INET, SOCK_STREAM, 0)
+            #else
+            let descriptor = socket(AF_INET, Int32(SOCK_STREAM.rawValue), 0)
+            #endif
+            guard descriptor >= 0 else { continue }
+            var address = sockaddr_in()
+            address.sin_family = sa_family_t(AF_INET)
+            address.sin_port = candidate.bigEndian
+            address.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
+            let bound = withUnsafePointer(to: &address) { pointer in
+                pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    Foundation.bind(descriptor, $0,
+                         socklen_t(MemoryLayout<sockaddr_in>.size))
+                }
+            }
+            _ = close(descriptor)
+            if bound == 0 { chosen.insert(candidate) }
         }
         return Array(chosen)
     }
