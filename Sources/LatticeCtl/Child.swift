@@ -142,9 +142,15 @@ struct Child: AsyncParsableCommand {
             print("anchor \(submitted.transactionCID)")
 
             // Deployment templates are the only ones that include genesis
-            // actions; run bounded deployment-mode rounds until it lands.
+            // actions. Success is "the anchor left the parent mempool and a
+            // block landed", never "a mining round exited cleanly" — only
+            // then is the child recorded and spawned.
             let worker = try nodeBinary().deletingLastPathComponent()
                 .appendingPathComponent("lattice-miner")
+            let heightBefore = await health(
+                rpc: parentChain.rpc
+            )?["height"] as? Int ?? 0
+            var anchored = false
             for _ in 0..<20 {
                 let coordinator = Process()
                 coordinator.executableURL = try nodeBinary()
@@ -155,14 +161,21 @@ struct Child: AsyncParsableCommand {
                     "--worker-executable", worker.path,
                     "--workers", "2", "--once", "--deployment",
                 ]
-                coordinator.standardOutput = Pipe()
-                coordinator.standardError = Pipe()
+                coordinator.standardOutput = FileHandle.nullDevice
+                coordinator.standardError = FileHandle.nullDevice
                 try coordinator.run()
                 coordinator.waitUntilExit()
-                if coordinator.terminationStatus == 0 { break }
+                if let health = await health(rpc: parentChain.rpc),
+                   health["mempoolCount"] as? Int == 0,
+                   (health["height"] as? Int ?? 0) > heightBefore {
+                    anchored = true
+                    break
+                }
                 try await Task.sleep(for: .seconds(2))
             }
-
+            guard anchored else {
+                throw CtlError("the genesis anchor was not mined; the child was NOT added — check the parent's mining and the funding key nonce, then retry")
+            }
             let ports = nextFreePorts(topology)
             topology.chains[childPath] = TopologyChain(
                 listen: ports.0, fact: ports.1, rpc: ports.2, peers: nil

@@ -35,6 +35,11 @@ struct RootOption: ParsableArguments {
 func loadOrCreateIdentity(at url: URL) throws -> String {
     let manager = FileManager.default
     if manager.fileExists(atPath: url.path) {
+        let attributes = try manager.attributesOfItem(atPath: url.path)
+        if let permissions = attributes[.posixPermissions] as? NSNumber,
+           permissions.intValue & 0o077 != 0 {
+            throw CtlError("identity key \(url.path) is group/other-readable; chmod 600 it")
+        }
         let value = try String(contentsOf: url, encoding: .utf8)
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard value.count == 64, Data(hex: value) != nil else {

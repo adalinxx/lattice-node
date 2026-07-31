@@ -39,8 +39,9 @@ struct Mine: AsyncParsableCommand {
             process.standardOutput = handle
             process.standardError = handle
             try process.run()
-            try Data(String(process.processIdentifier).utf8).write(
-                to: layout.pidFile(for: "mine"), options: .atomic
+            try writePidFile(
+                layout, "mine",
+                pid: process.processIdentifier, name: "lattice"
             )
             print("mining started (pid \(process.processIdentifier)), log \(log.path)")
         }
@@ -279,10 +280,11 @@ func runCoordinatorOnce(
     process.arguments = arguments
     let stdout = Pipe()
     process.standardOutput = stdout
-    process.standardError = Pipe()
+    process.standardError = FileHandle.nullDevice
     try process.run()
-    try? Data(String(process.processIdentifier).utf8).write(
-        to: layout.pidFile(for: "mine-coordinator"), options: .atomic
+    try? writePidFile(
+        layout, "mine-coordinator",
+        pid: process.processIdentifier, name: "lattice-mining-coordinator"
     )
     let data = stdout.fileHandleForReading.readDataToEndOfFile()
     process.waitUntilExit()
@@ -300,8 +302,12 @@ func runCoordinatorOnce(
         switch kind {
         case "submitted" where object["accepted"] as? Bool == true:
             return .accepted(tip: object["tipCID"] as? String ?? "")
-        case "noSolution", "stale", "submitted":
+        case "noSolution", "stale":
             return .harmless
+        case "submitted":
+            // Accepted was handled above: a rejected submission behaves like
+            // a refusal so the paired probe can heal an accept-then-crash.
+            return .refusal
         case "workerFailed", "nodeFailed":
             return .workerTrouble(kind)
         default:

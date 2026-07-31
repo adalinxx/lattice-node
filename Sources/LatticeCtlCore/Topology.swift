@@ -91,7 +91,10 @@ public struct Topology: Codable {
         var ports: Set<UInt16> = []
         for (path, chain) in chains {
             guard let address = ChainAddress(string: path),
-                  address.key == path else {
+                  address.key == path,
+                  address.components.allSatisfy({
+                      $0 != "." && $0 != ".." && !$0.contains("/")
+                  }) else {
                 throw CtlError("chain path is not absolute and Nexus-rooted: \(path)")
             }
             if address.components.count > 1 {

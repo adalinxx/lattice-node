@@ -383,9 +383,13 @@ final class LatticeCtlE2ETests: XCTestCase {
         _ = try await runCtl(["down"], root: rootB)
         _ = try await runCtl(["up"], root: rootB)
 
-        let targetChildHeight = await health(
-            hostA.childRPC!
-        )?["height"] as? Int ?? 0
+        var targetChildHeight = 0
+        try await waitFor("host A child height observable", seconds: 60) {
+            targetChildHeight = await self.health(
+                hostA.childRPC!
+            )?["height"] as? Int ?? 0
+            return targetChildHeight >= 1
+        }
         try await waitFor("host B syncs the child chain", seconds: 180) {
             guard let health = await self.health(childRPCB),
                   health["phase"] as? String == "active" else { return false }
@@ -512,10 +516,30 @@ final class LatticeCtlE2ETests: XCTestCase {
         )
         let heightBeforeSpend = await childHeight()
         try await submit(spend, rpc: childRPC, label: "spend")
-        try await waitFor("dependent spend proves both effects", seconds: 240) {
+        try await waitFor("dependent spend mined", seconds: 240) {
             let height = await childHeight()
             let drained = await mempoolDrained(childRPC)
             return height > heightBeforeSpend && drained
+        }
+
+        // 5. The credit is real, not merely drained-from-the-mempool: the
+        // sink can only spend if step 4 actually credited it. A spend chain
+        // is the strongest state proof available over public RPC.
+        let sinkSpend = try signedTransaction(
+            key: sink,
+            chainPath: ["Nexus", "Market"],
+            accountActions: [
+                AccountAction(owner: sink.address, delta: -35),
+                AccountAction(owner: seller.address, delta: 35),
+            ],
+            nonce: 0
+        )
+        let heightBeforeSinkSpend = await childHeight()
+        try await submit(sinkSpend, rpc: childRPC, label: "sink-spend")
+        try await waitFor("sink spend proves the credited state", seconds: 240) {
+            let height = await childHeight()
+            let drained = await mempoolDrained(childRPC)
+            return height > heightBeforeSinkSpend && drained
         }
     }
 }

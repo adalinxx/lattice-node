@@ -21,14 +21,66 @@ func nodeBinary() throws -> URL {
     throw CtlError("lattice-node not found beside lattice or in /usr/local/bin")
 }
 
+/// A live pid is only "ours" if the command name still matches what the
+/// pidfile recorded: pids recycle, and killing a stranger is worse than a
+/// stale file.
 func runningPid(_ layout: HostLayout, _ path: String) -> Int32? {
     guard let text = try? String(
         contentsOf: layout.pidFile(for: path), encoding: .utf8
-    ), let pid = Int32(text.trimmingCharacters(in: .whitespacesAndNewlines)),
+    ) else { return nil }
+    let parts = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        .split(separator: " ", maxSplits: 1)
+    guard let pid = parts.first.flatMap({ Int32($0) }),
           kill(pid, 0) == 0 else {
         return nil
     }
+    if parts.count == 2 {
+        let expected = String(parts[1])
+        let probe = Process()
+        probe.executableURL = URL(fileURLWithPath: "/bin/ps")
+        probe.arguments = ["-o", "comm=", "-p", String(pid)]
+        let out = Pipe()
+        probe.standardOutput = out
+        probe.standardError = FileHandle.nullDevice
+        guard (try? probe.run()) != nil else { return pid }
+        let name = String(
+            decoding: out.fileHandleForReading.readDataToEndOfFile(),
+            as: UTF8.self
+        ).trimmingCharacters(in: .whitespacesAndNewlines)
+        probe.waitUntilExit()
+        guard name.hasSuffix(expected) else { return nil }
+    }
     return pid
+}
+
+func writePidFile(
+    _ layout: HostLayout, _ path: String, pid: Int32, name: String
+) throws {
+    try Data("\(pid) \(name)".utf8).write(
+        to: layout.pidFile(for: path), options: .atomic
+    )
+}
+
+/// Exclusive per-root lock so concurrent invocations cannot double-spawn.
+func withSpawnLock<T>(
+    _ layout: HostLayout, _ body: () async throws -> T
+) async throws -> T {
+    let lockURL = layout.pidFile(for: "spawn-lock")
+    try FileManager.default.createDirectory(
+        at: lockURL.deletingLastPathComponent(),
+        withIntermediateDirectories: true
+    )
+    _ = FileManager.default.createFile(atPath: lockURL.path, contents: nil)
+    let descriptor = open(lockURL.path, O_RDWR)
+    guard descriptor >= 0, flock(descriptor, LOCK_EX) == 0 else {
+        if descriptor >= 0 { close(descriptor) }
+        throw CtlError("could not take the spawn lock at \(lockURL.path)")
+    }
+    defer {
+        flock(descriptor, LOCK_UN)
+        close(descriptor)
+    }
+    return try await body()
 }
 
 func health(rpc: UInt16) async -> [String: Any]? {
@@ -89,8 +141,8 @@ func spawnChain(
     process.standardOutput = handle
     process.standardError = handle
     try process.run()
-    try Data(String(process.processIdentifier).utf8).write(
-        to: layout.pidFile(for: path), options: .atomic
+    try writePidFile(
+        layout, path, pid: process.processIdentifier, name: "lattice-node"
     )
 }
 
@@ -107,13 +159,15 @@ struct Up: AsyncParsableCommand {
     func run() async throws {
         let layout = rootOption.layout
         let topology = try Topology.load(root: layout.root).validated()
-        for path in topology.orderedPaths() {
-            if let pid = runningPid(layout, path) {
-                print("\(path): already running (pid \(pid))")
-                continue
+        try await withSpawnLock(layout) {
+            for path in topology.orderedPaths() {
+                if let pid = runningPid(layout, path) {
+                    print("\(path): already running (pid \(pid))")
+                    continue
+                }
+                try spawnChain(path, topology: topology, layout: layout)
+                print("\(path): started (pid \(runningPid(layout, path) ?? -1))")
             }
-            try spawnChain(path, topology: topology, layout: layout)
-            print("\(path): started (pid \(runningPid(layout, path) ?? -1))")
         }
         guard foreground else { return }
         while true {
@@ -199,7 +253,10 @@ struct Wipe: AsyncParsableCommand {
             throw CtlError("\(chain) is running; `lattice down` first")
         }
         let directory = layout.chainDirectory(for: chain)
-        guard directory.path.contains("/chains/") else {
+            .standardizedFileURL
+        let container = layout.root.appendingPathComponent("chains")
+            .standardizedFileURL
+        guard directory.path.hasPrefix(container.path + "/") else {
             throw CtlError("refusing to remove unexpected path \(directory.path)")
         }
         try? FileManager.default.removeItem(at: directory)
