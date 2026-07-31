@@ -7,6 +7,9 @@
 // through the authenticated parent link, never from "a node that tracks it".
 
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 import ArgumentParser
 import Lattice
 import LatticeCtlCore

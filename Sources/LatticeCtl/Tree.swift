@@ -4,6 +4,9 @@
 // it never claims fleet truth. `wipe` removes chain state, never identity.
 
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 import ArgumentParser
 import Lattice
 import LatticeCtlCore
@@ -37,8 +40,8 @@ func runningPid(_ layout: HostLayout, _ path: String) -> Int32? {
     if parts.count == 2 {
         let expected = String(parts[1])
         let probe = Process()
-        probe.executableURL = URL(fileURLWithPath: "/bin/ps")
-        probe.arguments = ["-o", "comm=", "-p", String(pid)]
+        probe.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        probe.arguments = ["ps", "-o", "comm=", "-p", String(pid)]
         let out = Pipe()
         probe.standardOutput = out
         probe.standardError = FileHandle.nullDevice

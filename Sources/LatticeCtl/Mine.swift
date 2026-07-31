@@ -5,6 +5,9 @@
 // refused stalls loudly. Same discipline as deploy/mine-supervisor.py.
 
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 import ArgumentParser
 import LatticeCtlCore
 
