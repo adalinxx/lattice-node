@@ -98,7 +98,10 @@ is behind, never a reason to skip ahead on other failures: a skipped nonce
 permanently invalidates every later line. The reference
 [deploy/mine-supervisor.py](../deploy/mine-supervisor.py) implements this
 loop. Re-emit the batch before it is exhausted, and before a halving boundary
-makes its amount exceed the allowed reward.
+makes its amount exceed the allowed reward. Cursor advancement reflects the
+current tip: a deep reorg that reverts a paid reward strands the tail of the
+batch on a nonce gap — recover by re-emitting from the key's next expected
+nonce.
 
 ## Child chains
 
