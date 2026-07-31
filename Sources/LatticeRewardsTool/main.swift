@@ -50,11 +50,15 @@ struct GenerateKey: ParsableCommand {
         )
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .prettyPrinted]
-        try encoder.encode(file).write(to: url)
-        try FileManager.default.setAttributes(
-            [.posixPermissions: 0o600],
-            ofItemAtPath: url.path
-        )
+        // Created with its final mode so the private key is never readable
+        // through a permissive umask, even briefly.
+        guard FileManager.default.createFile(
+            atPath: url.path,
+            contents: try encoder.encode(file),
+            attributes: [.posixPermissions: 0o600]
+        ) else {
+            throw ValidationError("could not create key file: \(out)")
+        }
         print("address:   \(file.address)")
         print("publicKey: \(file.publicKey)")
     }

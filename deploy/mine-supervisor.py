@@ -3,10 +3,14 @@
 pre-signed reward per block, in nonce order.
 
 Consumes a `lattice-rewards emit-batch` file line by line. The cursor
-advances only when a block paying the current line is accepted, or when a
-healthy node repeatedly refuses the template — the node's signal that this
-nonce is already spent (HTTP 400 at template build). It never advances on
-generic failure: a skipped nonce permanently invalidates every later line.
+advances only when a block paying the current line is accepted, or on the
+one signature that proves the current nonce is already spent: the node
+refuses a template for line `i` (HTTP 400 at template build) while
+accepting one for line `i + 1`. Worker failures, node failures, and
+transient refusals never advance it — a skipped valid nonce permanently
+invalidates every later line — and `i` and `i + 1` both refused means a
+gap already exists, so the supervisor stalls loudly instead of cascading
+through the rest of the batch.
 
 Children are spawned with a clean signal mask because a shell that forks
 with SIGCHLD blocked (nohup + backgrounding) wedges Foundation's child
@@ -27,6 +31,7 @@ import os
 import signal
 import subprocess
 import time
+import urllib.error
 import urllib.request
 
 NODE_URL = os.environ.get("NODE_URL", "http://127.0.0.1:8080")
@@ -72,6 +77,43 @@ def node_healthy():
         return False
 
 
+def template_probe(reward_line):
+    """Ask the node to build a template paying `reward_line`.
+
+    Returns "accepted" (it built one), "refused" (HTTP 400 — the reward is
+    unusable at the current tip: spent, gapped, or over the allowed amount),
+    or "unavailable" for anything that proves nothing about the reward.
+    Probe templates are capacity-bounded and expire on their own.
+    """
+    request = urllib.request.Request(
+        NODE_URL + "/v1/mining/templates",
+        data=reward_line.encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=15):
+            return "accepted"
+    except urllib.error.HTTPError as error:
+        return "refused" if error.code == 400 else "unavailable"
+    except Exception:
+        return "unavailable"
+
+
+def current_nonce_is_spent(batch, index):
+    """The only signature that justifies advancing without an accepted
+    block: line `index` is refused while line `index + 1` builds — the
+    chain already contains the current nonce (e.g. a crash between block
+    acceptance and the cursor write)."""
+    if not node_healthy():
+        return False
+    if template_probe(batch[index]) != "refused":
+        return False
+    if index + 1 >= len(batch):
+        return False
+    return template_probe(batch[index + 1]) == "accepted"
+
+
 def main():
     batch = [line for line in open(REWARD_BATCH) if line.strip()]
     index = read_cursor()
@@ -115,20 +157,33 @@ def main():
         if kind in ("noSolution", "stale"):
             refused_streak = 0
             continue
-        # backoff / nodeFailed / unparsed output: only a HEALTHY node
-        # refusing the template implicates the reward (nonce already spent —
-        # e.g. a crash after acceptance but before the cursor write).
-        if node_healthy():
-            refused_streak += 1
-            if refused_streak >= 5:
-                log("reward %d refused by healthy node 5x; advancing "
-                    "(stderr: %s)" % (index, (run.stderr or "")[-200:]))
+        if kind in ("workerFailed", "nodeFailed") or kind.startswith("exit="):
+            # Worker or coordinator trouble proves nothing about the reward.
+            # Retry in place forever; advancing here strands the batch.
+            log("reward %d retrying after %s (stderr: %s)"
+                % (index, kind, (run.stderr or "")[-200:]))
+            time.sleep(5)
+            continue
+        # backoff: could be a transient node error OR the node refusing the
+        # reward. Only the paired probe below is allowed to advance.
+        refused_streak += 1
+        if refused_streak >= 3 and index < len(batch):
+            if current_nonce_is_spent(batch, index):
+                log("reward %d already spent on-chain; advancing" % index)
                 index += 1
                 write_cursor(index)
                 refused_streak = 0
                 continue
-        else:
-            refused_streak = 0
+            if (node_healthy()
+                    and template_probe(batch[index]) == "refused"):
+                # Refused but the next line does not build either: a nonce
+                # gap or an over-amount batch. Skipping would only compound
+                # the loss — stall loudly until the operator intervenes.
+                log("REWARD BATCH STALLED at %d: node refuses this line and "
+                    "the next; re-emit the batch (nonce gap or amount over "
+                    "the current reward)" % index)
+                time.sleep(60)
+                continue
         time.sleep(5)
 
 
