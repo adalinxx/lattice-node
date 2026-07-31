@@ -9,6 +9,7 @@
 import Foundation
 import ArgumentParser
 import Lattice
+import LatticeCtlCore
 import LatticeNode
 import UInt256
 import cashew
@@ -44,6 +45,9 @@ struct Child: AsyncParsableCommand {
         @Option(name: .long, help: "Anchor transaction fee.")
         var fee: UInt64 = 0
 
+        @Option(name: .long, help: "Credit the child spec's premine to this address in the child genesis.")
+        var premineTo: String?
+
         func run() async throws {
             let layout = rootOption.layout
             var topology = try Topology.load(root: layout.root).validated()
@@ -59,12 +63,35 @@ struct Child: AsyncParsableCommand {
                 from: Data(contentsOf: URL(fileURLWithPath: spec))
             )
 
+            var genesisTransactions: [Transaction] = []
+            if let premineTo {
+                let premineBody = TransactionBody(
+                    accountActions: [AccountAction(
+                        owner: premineTo,
+                        delta: Int64(chainSpec.premineAmount())
+                    )],
+                    actions: [],
+                    depositActions: [],
+                    genesisActions: [],
+                    receiptActions: [],
+                    withdrawalActions: [],
+                    signers: [],
+                    fee: 0,
+                    nonce: 0,
+                    chainPath: [parent, directory].joined(separator: "/")
+                        .components(separatedBy: "/")
+                )
+                genesisTransactions.append(Transaction(
+                    signatures: [:],
+                    body: try HeaderImpl(node: premineBody)
+                ))
+            }
             let intent: ChildDeployIntentResponse = try await post(
                 rpc: parentChain.rpc, path: "v1/children/intents",
                 body: ChildDeployIntentRequest(
                     directory: directory,
                     spec: chainSpec,
-                    genesisTransactions: [],
+                    genesisTransactions: genesisTransactions,
                     target: .max,
                     timestamp: Int64(Date().timeIntervalSince1970 * 1000)
                 )

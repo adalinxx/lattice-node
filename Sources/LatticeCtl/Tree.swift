@@ -6,6 +6,7 @@
 import Foundation
 import ArgumentParser
 import Lattice
+import LatticeCtlCore
 import LatticeNode
 
 func nodeBinary() throws -> URL {

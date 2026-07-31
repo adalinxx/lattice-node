@@ -6,6 +6,7 @@
 
 import Foundation
 import ArgumentParser
+import LatticeCtlCore
 
 struct Mine: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
@@ -58,11 +59,17 @@ struct Mine: AsyncParsableCommand {
                 print("mining not running")
                 return
             }
+            // Graceful: the loop finishes its batch and persists the cursor.
             kill(pid, SIGTERM)
-            for _ in 0..<30 where runningPid(layout, "mine") != nil {
+            for _ in 0..<600 where runningPid(layout, "mine") != nil {
                 try await Task.sleep(for: .milliseconds(100))
             }
-            if runningPid(layout, "mine") != nil { kill(pid, SIGKILL) }
+            if runningPid(layout, "mine") != nil {
+                kill(pid, SIGKILL)
+                if let coordinator = runningPid(layout, "mine-coordinator") {
+                    kill(coordinator, SIGKILL)
+                }
+            }
             try? FileManager.default.removeItem(
                 at: layout.pidFile(for: "mine")
             )
@@ -107,13 +114,21 @@ struct Mine: AsyncParsableCommand {
             let settings = try minerSettings(layout)
             var cursor = readCursor(layout)
             var refusedStreak = 0
+            // Finish the in-flight batch and persist the cursor on SIGTERM:
+            // killing mid-iteration can orphan a coordinator whose accepted
+            // block would leave the cursor behind the chain.
+            let stopRequested = InterruptFlag()
+            signal(SIGTERM, SIG_IGN)
+            let source = DispatchSource.makeSignalSource(signal: SIGTERM)
+            source.setEventHandler { stopRequested.raise() }
+            source.resume()
             log("mining loop start at reward cursor \(cursor)")
-            while true {
+            while !stopRequested.isRaised {
                 let rewardsFile = try prepareRewardsFile(
                     settings, cursor: cursor, layout: layout
                 )
                 let outcome = try runCoordinatorOnce(
-                    settings, rewardsFile: rewardsFile
+                    settings, rewardsFile: rewardsFile, layout: layout
                 )
                 switch outcome {
                 case .accepted(let tip):
@@ -228,8 +243,25 @@ enum CoordinatorOutcome {
     case workerTrouble(String)
 }
 
+final class InterruptFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var raised = false
+
+    func raise() {
+        lock.lock()
+        raised = true
+        lock.unlock()
+    }
+
+    var isRaised: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return raised
+    }
+}
+
 func runCoordinatorOnce(
-    _ settings: MinerSettings, rewardsFile: URL?
+    _ settings: MinerSettings, rewardsFile: URL?, layout: HostLayout
 ) throws -> CoordinatorOutcome {
     let process = Process()
     process.executableURL = try nodeBinary().deletingLastPathComponent()
@@ -249,8 +281,14 @@ func runCoordinatorOnce(
     process.standardOutput = stdout
     process.standardError = Pipe()
     try process.run()
+    try? Data(String(process.processIdentifier).utf8).write(
+        to: layout.pidFile(for: "mine-coordinator"), options: .atomic
+    )
     let data = stdout.fileHandleForReading.readDataToEndOfFile()
     process.waitUntilExit()
+    try? FileManager.default.removeItem(
+        at: layout.pidFile(for: "mine-coordinator")
+    )
     let lines = String(decoding: data, as: UTF8.self)
         .split(separator: "\n").reversed()
     for line in lines {

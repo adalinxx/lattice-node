@@ -9,34 +9,61 @@ import Foundation
 import Lattice
 import LatticeNode
 
-struct TopologyChain: Codable {
-    var listen: UInt16
-    var fact: UInt16
-    var rpc: UInt16
+public struct TopologyChain: Codable {
+    public var listen: UInt16
+    public var fact: UInt16
+    public var rpc: UInt16
     /// Overlay bootstrap peers as `publicKey@host:port`. Only meaningful
     /// entries for this chain's own path; children of a local parent are
     /// wired to it automatically.
-    var peers: [String]?
+    public var peers: [String]?
+
+    public init(
+        listen: UInt16, fact: UInt16, rpc: UInt16, peers: [String]? = nil
+    ) {
+        self.listen = listen
+        self.fact = fact
+        self.rpc = rpc
+        self.peers = peers
+    }
 }
 
-struct TopologyMine: Codable {
-    var chain: String
+public struct TopologyMine: Codable {
+    public var chain: String
     /// "cpu" or a path to any contract-conforming worker executable.
-    var worker: String?
-    var workers: Int?
-    var batchSize: UInt64?
+    public var worker: String?
+    public var workers: Int?
+    public var batchSize: UInt64?
     /// A `lattice-rewards emit-batch` file; the cursor lives beside it.
-    var rewards: String?
+    public var rewards: String?
+
+    public init(
+        chain: String, worker: String? = nil, workers: Int? = nil,
+        batchSize: UInt64? = nil, rewards: String? = nil
+    ) {
+        self.chain = chain
+        self.worker = worker
+        self.workers = workers
+        self.batchSize = batchSize
+        self.rewards = rewards
+    }
 }
 
-struct Topology: Codable {
+public struct Topology: Codable {
     /// Chain path key (e.g. "Nexus", "Nexus/Payments") to process settings.
-    var chains: [String: TopologyChain]
-    var mine: TopologyMine?
+    public var chains: [String: TopologyChain]
+    public var mine: TopologyMine?
 
-    static let fileName = "lattice.json"
+    public init(
+        chains: [String: TopologyChain], mine: TopologyMine? = nil
+    ) {
+        self.chains = chains
+        self.mine = mine
+    }
 
-    static func load(root: URL) throws -> Topology {
+    public static let fileName = "lattice.json"
+
+    public static func load(root: URL) throws -> Topology {
         let url = root.appendingPathComponent(fileName)
         guard let data = try? Data(contentsOf: url) else {
             throw CtlError("no \(fileName) in \(root.path); run `lattice init` first")
@@ -44,7 +71,7 @@ struct Topology: Codable {
         return try JSONDecoder().decode(Topology.self, from: data)
     }
 
-    func save(root: URL) throws {
+    public func save(root: URL) throws {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .prettyPrinted]
         try encoder.encode(self).write(
@@ -55,12 +82,12 @@ struct Topology: Codable {
 
     /// Parent-before-child order, so `up` can wire children to a parent
     /// that is already running.
-    func orderedPaths() -> [String] {
+    public func orderedPaths() -> [String] {
         chains.keys.sorted { $0.components(separatedBy: "/").count
             < $1.components(separatedBy: "/").count || $0 < $1 }
     }
 
-    func validated() throws -> Topology {
+    public func validated() throws -> Topology {
         var ports: Set<UInt16> = []
         for (path, chain) in chains {
             guard let address = ChainAddress(string: path),
@@ -86,39 +113,39 @@ struct Topology: Codable {
     }
 }
 
-struct CtlError: Error, CustomStringConvertible {
-    let description: String
-    init(_ description: String) { self.description = description }
+public struct CtlError: Error, CustomStringConvertible {
+    public let description: String
+    public init(_ description: String) { self.description = description }
 }
 
 /// Filesystem layout under the data root. Identity keys live OUTSIDE the
 /// wipeable chain directories so a flag-day wipe never destroys identity.
-struct HostLayout {
-    let root: URL
+public struct HostLayout {
+    public let root: URL
 
-    init(root: String?) {
+    public init(root: String?) {
         self.root = URL(fileURLWithPath: root
             ?? FileManager.default.currentDirectoryPath)
     }
 
-    func identityKey(for path: String) -> URL {
+    public func identityKey(for path: String) -> URL {
         root.appendingPathComponent("identity")
             .appendingPathComponent(
                 path.replacingOccurrences(of: "/", with: "-") + ".key"
             )
     }
 
-    func chainDirectory(for path: String) -> URL {
+    public func chainDirectory(for path: String) -> URL {
         root.appendingPathComponent("chains").appendingPathComponent(path)
     }
 
-    func pidFile(for path: String) -> URL {
+    public func pidFile(for path: String) -> URL {
         root.appendingPathComponent("run").appendingPathComponent(
             path.replacingOccurrences(of: "/", with: "-") + ".pid"
         )
     }
 
-    func logFile(for path: String) -> URL {
+    public func logFile(for path: String) -> URL {
         root.appendingPathComponent("log").appendingPathComponent(
             path.replacingOccurrences(of: "/", with: "-") + ".log"
         )
