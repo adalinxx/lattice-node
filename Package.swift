@@ -22,6 +22,10 @@ let package = Package(
             name: "lattice-rewards",
             targets: ["LatticeRewardsTool"]
         ),
+        .executable(
+            name: "lattice",
+            targets: ["LatticeCtl"]
+        ),
     ],
     dependencies: [
         .package(
@@ -104,6 +108,15 @@ let package = Package(
             name: "LatticeMiningCoordinatorTool",
             dependencies: [
                 "LatticeMiningCoordinator",
+                .product(name: "ArgumentParser", package: "swift-argument-parser"),
+            ]),
+        .executableTarget(
+            name: "LatticeCtl",
+            dependencies: [
+                "LatticeNode",
+                .product(name: "Lattice", package: "lattice"),
+                .product(name: "Ivy", package: "Ivy"),
+                .product(name: "Crypto", package: "swift-crypto"),
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ]),
         .executableTarget(
