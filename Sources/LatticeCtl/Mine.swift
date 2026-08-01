@@ -180,8 +180,11 @@ struct Mine: AsyncParsableCommand {
 
         private func log(_ message: String) {
             let stamp = ISO8601DateFormatter().string(from: Date())
-            print("\(stamp) \(message)")
-            fflush(stdout)
+            // A direct write is a syscall per line: nothing buffers, so a
+            // SIGKILL cannot erase the trail.
+            FileHandle.standardOutput.write(
+                Data("\(stamp) \(message)\n".utf8)
+            )
         }
     }
 }
