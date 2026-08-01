@@ -137,7 +137,7 @@ struct Mine: AsyncParsableCommand {
                 let rewardsFile = try prepareRewardsFile(
                     settings, cursor: cursor, layout: layout
                 )
-                let outcome = try runCoordinatorOnce(
+                let outcome = try await runCoordinatorOnce(
                     settings, rewardsFile: rewardsFile, layout: layout
                 )
                 switch outcome {
@@ -181,6 +181,7 @@ struct Mine: AsyncParsableCommand {
         private func log(_ message: String) {
             let stamp = ISO8601DateFormatter().string(from: Date())
             print("\(stamp) \(message)")
+            fflush(stdout)
         }
     }
 }
@@ -270,9 +271,26 @@ final class InterruptFlag: @unchecked Sendable {
     }
 }
 
+final class OutputCollector: @unchecked Sendable {
+    private let lock = NSLock()
+    private var data = Data()
+
+    func append(_ chunk: Data) {
+        lock.lock()
+        data.append(chunk)
+        lock.unlock()
+    }
+
+    func snapshot() -> Data {
+        lock.lock()
+        defer { lock.unlock() }
+        return data
+    }
+}
+
 func runCoordinatorOnce(
     _ settings: MinerSettings, rewardsFile: URL?, layout: HostLayout
-) throws -> CoordinatorOutcome {
+) async throws -> CoordinatorOutcome {
     let process = Process()
     process.executableURL = try nodeBinary().deletingLastPathComponent()
         .appendingPathComponent("lattice-mining-coordinator")
@@ -290,13 +308,34 @@ func runCoordinatorOnce(
     let stdout = Pipe()
     process.standardOutput = stdout
     process.standardError = FileHandle.nullDevice
-    try process.run()
-    try? writePidFile(
-        layout, "mine-coordinator",
-        pid: process.processIdentifier, name: "lattice-mining-coordinator"
+    // terminationHandler-based reaping: on Linux, parking a thread in
+    // waitUntilExit can hang forever on a missed SIGCHLD (the same
+    // corelibs wedge documented for daemonized coordinators).
+    let collector = OutputCollector()
+    stdout.fileHandleForReading.readabilityHandler = { handle in
+        collector.append(handle.availableData)
+    }
+    try await withCheckedThrowingContinuation { (
+        continuation: CheckedContinuation<Void, Error>
+    ) in
+        process.terminationHandler = { _ in continuation.resume() }
+        do {
+            try process.run()
+            try? writePidFile(
+                layout, "mine-coordinator",
+                pid: process.processIdentifier,
+                name: "lattice-mining-coordinator"
+            )
+        } catch {
+            process.terminationHandler = nil
+            continuation.resume(throwing: error)
+        }
+    }
+    stdout.fileHandleForReading.readabilityHandler = nil
+    collector.append(
+        stdout.fileHandleForReading.readDataToEndOfFile()
     )
-    let data = stdout.fileHandleForReading.readDataToEndOfFile()
-    process.waitUntilExit()
+    let data = collector.snapshot()
     try? FileManager.default.removeItem(
         at: layout.pidFile(for: "mine-coordinator")
     )
