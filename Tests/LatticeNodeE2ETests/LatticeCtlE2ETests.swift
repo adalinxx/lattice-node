@@ -219,7 +219,7 @@ final class LatticeCtlE2ETests: XCTestCase {
         miner: KeyFile
     ) async throws -> CtlHost {
         let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent("ctl-e2e-\(UUID().uuidString)")
+            .appendingPathComponent("lattice-node-e2e-ctl-\(UUID().uuidString)")
         try FileManager.default.createDirectory(
             at: root, withIntermediateDirectories: true
         )
@@ -244,8 +244,8 @@ final class LatticeCtlE2ETests: XCTestCase {
         chains["Nexus"] = nexus
         topology["chains"] = chains
         topology["mine"] = [
-            "chain": "Nexus", "worker": "cpu", "workers": 2,
-            "batchSize": 200_000, "rewards": "rewards.jsonl",
+            "chain": "Nexus", "worker": "cpu", "workers": 1,
+            "batchSize": 100_000, "rewards": "rewards.jsonl",
         ] as [String: Any]
         try JSONSerialization.data(withJSONObject: topology)
             .write(to: topologyURL)
@@ -314,7 +314,7 @@ final class LatticeCtlE2ETests: XCTestCase {
 
     func testMultichainHostsSyncAcrossTheCLI() async throws {
         let scratch = FileManager.default.temporaryDirectory
-            .appendingPathComponent("ctl-keys-\(UUID().uuidString)")
+            .appendingPathComponent("lattice-node-e2e-ctlkeys-\(UUID().uuidString)")
         try FileManager.default.createDirectory(
             at: scratch, withIntermediateDirectories: true
         )
@@ -347,7 +347,7 @@ final class LatticeCtlE2ETests: XCTestCase {
         )
 
         let rootB = FileManager.default.temporaryDirectory
-            .appendingPathComponent("ctl-e2e-\(UUID().uuidString)")
+            .appendingPathComponent("lattice-node-e2e-ctl-\(UUID().uuidString)")
         try FileManager.default.createDirectory(
             at: rootB, withIntermediateDirectories: true
         )
@@ -410,7 +410,7 @@ final class LatticeCtlE2ETests: XCTestCase {
 
     func testFullChildTokenSwapThroughTheCLI() async throws {
         let scratch = FileManager.default.temporaryDirectory
-            .appendingPathComponent("ctl-keys-\(UUID().uuidString)")
+            .appendingPathComponent("lattice-node-e2e-ctlkeys-\(UUID().uuidString)")
         try FileManager.default.createDirectory(
             at: scratch, withIntermediateDirectories: true
         )
@@ -564,7 +564,7 @@ final class LatticeCtlE2ETests: XCTestCase {
     /// and a dependent spend proving the credited state.
     func testGrandchildSwapThroughTheCLI() async throws {
         let scratch = FileManager.default.temporaryDirectory
-            .appendingPathComponent("ctl-keys-\(UUID().uuidString)")
+            .appendingPathComponent("lattice-node-e2e-ctlkeys-\(UUID().uuidString)")
         try FileManager.default.createDirectory(
             at: scratch, withIntermediateDirectories: true
         )

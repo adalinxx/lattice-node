@@ -171,7 +171,7 @@ struct Child: AsyncParsableCommand {
                 coordinator.arguments = [
                     "--node", "http://127.0.0.1:\(rootChain.rpc)",
                     "--worker-executable", worker.path,
-                    "--workers", "2", "--once", "--deployment",
+                    "--workers", "1", "--once", "--deployment",
                 ]
                 coordinator.standardOutput = FileHandle.nullDevice
                 coordinator.standardError = FileHandle.nullDevice
