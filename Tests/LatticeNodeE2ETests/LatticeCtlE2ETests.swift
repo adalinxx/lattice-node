@@ -23,10 +23,15 @@ final class LatticeCtlE2ETests: XCTestCase {
     private var hosts: [CtlHost] = []
 
     override func tearDown() async throws {
+        let failed = (testRun?.totalFailureCount ?? 0) > 0
         for host in hosts {
             _ = try? await runCtl(["mine", "stop"], root: host.root)
             _ = try? await runCtl(["down"], root: host.root)
-            try? FileManager.default.removeItem(at: host.root)
+            if failed {
+                print("lattice-ctl E2E artifacts retained at \(host.root.path)")
+            } else {
+                try? FileManager.default.removeItem(at: host.root)
+            }
         }
         hosts = []
     }
