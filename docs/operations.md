@@ -9,9 +9,9 @@ processes (children wired to their local parent automatically; `--foreground`
 for containers, `emit-systemd` for hosts); `status` reads local loopback RPC
 only; `mine` runs the rewarded mining loop with the nonce-cursor discipline
 below; `child deploy`/`child adopt` are the two ways a child chain comes to
-exist; `wipe` removes one chain's state and never identity. Everything the
-CLI does maps to the manual runbooks in this document — the sections below
-remain the ground truth for what each verb performs.
+exist; `wipe` removes one chain's state and never identity. The full usage
+guide is [operator-cli.md](operator-cli.md); the sections below remain the
+ground truth for what each verb performs.
 
 ## Process model
 
