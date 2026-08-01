@@ -229,14 +229,41 @@ struct Child: AsyncParsableCommand {
     }
 }
 
+/// Free means free on this HOST, not merely absent from the file: another
+/// root's tree (or a lingering process) may hold a port the topology has
+/// never heard of, and a child that cannot bind dies at launch while health
+/// probes silently hit the squatter.
 func nextFreePorts(_ topology: Topology) -> (UInt16, UInt16, UInt16) {
     let used = topology.chains.values.flatMap { [$0.listen, $0.fact, $0.rpc] }
     var base: UInt16 = 4101
     while used.contains(base) || used.contains(base + 1)
-        || used.contains(base + 2) {
+        || used.contains(base + 2)
+        || !portIsBindable(base) || !portIsBindable(base + 1)
+        || !portIsBindable(base + 2) {
         base += 100
     }
     return (base, base + 1, base + 2)
+}
+
+func portIsBindable(_ port: UInt16) -> Bool {
+    #if canImport(Darwin)
+    let descriptor = socket(AF_INET, SOCK_STREAM, 0)
+    #else
+    let descriptor = socket(AF_INET, Int32(SOCK_STREAM.rawValue), 0)
+    #endif
+    guard descriptor >= 0 else { return false }
+    defer { close(descriptor) }
+    var address = sockaddr_in()
+    address.sin_family = sa_family_t(AF_INET)
+    address.sin_port = port.bigEndian
+    address.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
+    return withUnsafePointer(to: &address) { pointer in
+        pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+            Foundation.bind(
+                descriptor, $0, socklen_t(MemoryLayout<sockaddr_in>.size)
+            )
+        }
+    } == 0
 }
 
 func waitActive(
