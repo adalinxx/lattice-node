@@ -153,6 +153,12 @@ struct Child: AsyncParsableCommand {
             // then is the child recorded and spawned.
             let worker = try nodeBinary().deletingLastPathComponent()
                 .appendingPathComponent("lattice-miner")
+            // Templates come only from the tree root: a deployment round
+            // there cascades carriers down to the immediate parent, which is
+            // where the anchor and the mempool/height gate live.
+            guard let rootChain = topology.chains["Nexus"] else {
+                throw CtlError("the tree has no Nexus root to mine from")
+            }
             let heightBefore = await health(
                 rpc: parentChain.rpc
             )?["height"] as? Int ?? 0
@@ -163,7 +169,7 @@ struct Child: AsyncParsableCommand {
                     .deletingLastPathComponent()
                     .appendingPathComponent("lattice-mining-coordinator")
                 coordinator.arguments = [
-                    "--node", "http://127.0.0.1:\(parentChain.rpc)",
+                    "--node", "http://127.0.0.1:\(rootChain.rpc)",
                     "--worker-executable", worker.path,
                     "--workers", "2", "--once", "--deployment",
                 ]

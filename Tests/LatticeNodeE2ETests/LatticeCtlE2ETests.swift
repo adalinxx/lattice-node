@@ -270,11 +270,17 @@ final class LatticeCtlE2ETests: XCTestCase {
         ]).write(to: root.appendingPathComponent("\(name).json"))
     }
 
+    /// Deploys a child of `parent` through the CLI, premining it to
+    /// `premineTo`, and returns the new chain's RPC port. Each deploy uses
+    /// its own funding key nonce (fresh key per call keeps nonces at 0).
+    @discardableResult
     private func deployChild(
-        _ host: inout CtlHost,
-        seller: KeyFile,
+        _ host: CtlHost,
+        directory: String,
+        parent: String = "Nexus",
+        premineTo: String,
         fund: KeyFile
-    ) async throws {
+    ) async throws -> UInt16 {
         let spec: [String: Any] = [
             "maxNumberOfTransactionsPerBlock": 100,
             "maxStateGrowth": 100_000,
@@ -285,21 +291,23 @@ final class LatticeCtlE2ETests: XCTestCase {
             "halvingInterval": 100_000,
             "retargetWindow": 120,
         ]
-        let specURL = host.root.appendingPathComponent("spec.json")
+        let specURL = host.root.appendingPathComponent("spec-\(directory).json")
         try JSONSerialization.data(withJSONObject: spec).write(to: specURL)
-        try writeMinerKey(fund, into: host.root, name: "fund")
+        try writeMinerKey(fund, into: host.root, name: "fund-\(directory)")
         _ = try await runCtl([
-            "child", "deploy", "Market",
+            "child", "deploy", directory,
+            "--parent", parent,
             "--spec", specURL.path,
-            "--fund", host.root.appendingPathComponent("fund.json").path,
-            "--premine-to", seller.address,
+            "--fund", host.root
+                .appendingPathComponent("fund-\(directory).json").path,
+            "--premine-to", premineTo,
         ], root: host.root)
         let topology = try JSONSerialization.jsonObject(with: Data(
             contentsOf: host.root.appendingPathComponent("lattice.json")
         )) as! [String: Any]
         let chains = topology["chains"] as! [String: Any]
-        let market = chains["Nexus/Market"] as! [String: Any]
-        host.childRPC = UInt16(market["rpc"] as! Int)
+        let deployed = chains["\(parent)/\(directory)"] as! [String: Any]
+        return UInt16(deployed["rpc"] as! Int)
     }
 
     // MARK: scenarios
@@ -316,7 +324,10 @@ final class LatticeCtlE2ETests: XCTestCase {
 
         let minerA = try await makeKey(scratch, "minerA")
         var hostA = try await bringUpMiningHost(miner: minerA)
-        try await deployChild(&hostA, seller: seller, fund: fund)
+        hostA.childRPC = try await deployChild(
+            hostA, directory: "Market",
+            premineTo: seller.address, fund: fund
+        )
         _ = try await runCtl(["mine", "start"], root: hostA.root)
         try await waitFor("host A mines blocks", seconds: 120) {
             (await self.health(hostA.nexusRPC)?["height"] as? Int ?? 0) >= 3
@@ -409,7 +420,10 @@ final class LatticeCtlE2ETests: XCTestCase {
         let buyer = try await makeKey(scratch, "minerSwap")
 
         var host = try await bringUpMiningHost(miner: buyer)
-        try await deployChild(&host, seller: seller, fund: fund)
+        host.childRPC = try await deployChild(
+            host, directory: "Market",
+            premineTo: seller.address, fund: fund
+        )
         _ = try await runCtl(["mine", "start"], root: host.root)
 
         // Fund the buyer parent-side through mining rewards, then switch to
@@ -540,6 +554,116 @@ final class LatticeCtlE2ETests: XCTestCase {
             let height = await childHeight()
             let drained = await mempoolDrained(childRPC)
             return height > heightBeforeSinkSpend && drained
+        }
+    }
+
+    /// A swap one level deeper: the seller lives on a GRANDCHILD, the buyer
+    /// pays on the middle child chain, and the whole flow rides three-level
+    /// merged mining driven from Nexus. Four transactions total: deposit on
+    /// the grandchild, receipt on its parent, withdrawal on the grandchild,
+    /// and a dependent spend proving the credited state.
+    func testGrandchildSwapThroughTheCLI() async throws {
+        let scratch = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ctl-keys-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(
+            at: scratch, withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: scratch) }
+        let miner = try await makeKey(scratch, "minerG")
+        let seller = try await makeKey(scratch, "sellerG")
+        let buyer = try await makeKey(scratch, "buyerG")
+        let sink = try await makeKey(scratch, "sinkG")
+
+        let host = try await bringUpMiningHost(miner: miner)
+        // Middle chain premined to the BUYER (their receipt funding);
+        // grandchild premined to the SELLER (the locked goods).
+        let marketRPC = try await deployChild(
+            host, directory: "Market",
+            premineTo: buyer.address,
+            fund: try await makeKey(scratch, "fundMarket")
+        )
+        let stallsRPC = try await deployChild(
+            host, directory: "Stalls", parent: "Nexus/Market",
+            premineTo: seller.address,
+            fund: try await makeKey(scratch, "fundStalls")
+        )
+        _ = try await runCtl(["mine", "start"], root: host.root)
+
+        func height(_ rpc: UInt16) async -> Int {
+            await health(rpc)?["height"] as? Int ?? -1
+        }
+        func drained(_ rpc: UInt16) async -> Bool {
+            await health(rpc)?["mempoolCount"] as? Int == 0
+        }
+
+        // 1. Seller locks 100 on the grandchild, demanding 60 on Market.
+        let deposit = try signedTransaction(
+            key: seller,
+            chainPath: ["Nexus", "Market", "Stalls"],
+            accountActions: [AccountAction(owner: seller.address, delta: -100)],
+            depositActions: [DepositAction(
+                nonce: 9, demander: seller.address,
+                amountDemanded: 60, amountDeposited: 100
+            )],
+            nonce: 0
+        )
+        let beforeDeposit = await height(stallsRPC)
+        try await submit(deposit, rpc: stallsRPC, label: "grandchild-deposit")
+        try await waitFor("deposit mined on the grandchild", seconds: 240) {
+            let now = await height(stallsRPC)
+            let empty = await drained(stallsRPC)
+            return now > beforeDeposit && empty
+        }
+
+        // 2. Buyer pays the demanded 60 on the middle chain.
+        let receipt = try signedTransaction(
+            key: buyer,
+            chainPath: ["Nexus", "Market"],
+            receiptActions: [ReceiptAction(
+                withdrawer: buyer.address, nonce: 9,
+                demander: seller.address, amountDemanded: 60,
+                directory: "Stalls"
+            )],
+            nonce: 0
+        )
+        try await submit(receipt, rpc: marketRPC, label: "child-receipt")
+        try await waitFor("receipt mined on the middle chain", seconds: 240) {
+            await drained(marketRPC)
+        }
+
+        // 3. Buyer withdraws the locked 100 on the grandchild.
+        let withdrawal = try signedTransaction(
+            key: buyer,
+            chainPath: ["Nexus", "Market", "Stalls"],
+            accountActions: [AccountAction(owner: buyer.address, delta: 100)],
+            withdrawalActions: [WithdrawalAction(
+                withdrawer: buyer.address, nonce: 9,
+                demander: seller.address, amountDemanded: 60,
+                amountWithdrawn: 100
+            )],
+            nonce: 0
+        )
+        try await submit(withdrawal, rpc: stallsRPC, label: "grandchild-withdrawal")
+        try await waitFor("withdrawal mined on the grandchild", seconds: 300) {
+            await drained(stallsRPC)
+        }
+
+        // 4. The credit is real: the buyer spends it onward to the sink.
+        let spend = try signedTransaction(
+            key: buyer,
+            chainPath: ["Nexus", "Market", "Stalls"],
+            accountActions: [
+                AccountAction(owner: buyer.address, delta: -40),
+                AccountAction(owner: sink.address, delta: 40),
+            ],
+            nonce: 1
+        )
+        let beforeSpend = await height(stallsRPC)
+        try await submit(spend, rpc: stallsRPC, label: "grandchild-spend")
+        try await waitFor("dependent spend mined on the grandchild", seconds: 240) {
+            let now = await height(stallsRPC)
+            let empty = await drained(stallsRPC)
+            return now > beforeSpend && empty
         }
     }
 }
