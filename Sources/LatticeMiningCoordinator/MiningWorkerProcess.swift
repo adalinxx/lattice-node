@@ -70,9 +70,18 @@ public struct MiningWorkerProcessClient: Sendable {
 
         try await handle.run()
 
-        // On cancellation (e.g. stale work) the worker result is irrelevant. Bail
-        // before reading: a worker that forked a child inheriting the stdout pipe
-        // would otherwise make readDataToEndOfFile() block until that child exits.
+        // Close the parent's copy of the pipe write-ends now that the child
+        // owns its own: otherwise readDataToEndOfFile() below waits for an EOF
+        // that can never arrive (this parent still holds the write end open),
+        // which wedged the coordinator under fast, instant-block workers.
+        try? stdout.fileHandleForWriting.close()
+        try? stderr.fileHandleForWriting.close()
+        defer {
+            try? stdout.fileHandleForReading.close()
+            try? stderr.fileHandleForReading.close()
+        }
+
+        // On cancellation (e.g. stale work) the worker result is irrelevant.
         if Task.isCancelled { return nil }
 
         let output = stdout.fileHandleForReading.readDataToEndOfFile()
