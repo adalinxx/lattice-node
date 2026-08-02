@@ -2,6 +2,9 @@ import Foundation
 #if canImport(FoundationNetworking)
 import FoundationNetworking
 #endif
+#if canImport(Glibc)
+import Glibc
+#endif
 import XCTest
 @testable import LatticeMiningCoordinator
 import LatticeMinerCore
@@ -315,6 +318,49 @@ final class MiningCoordinatorTests: XCTestCase {
         XCTAssertEqual(submissionCount, 0)
         let metrics = await coordinator.metrics()
         XCTAssertEqual(metrics.workerFailureCount, 1)
+    }
+
+    /// A worker that exits instantly (as it does at genesis-max difficulty)
+    /// must be reaped without wedging the coordinator: previously the parent
+    /// held the pipe write-end open, so readDataToEndOfFile blocked on an EOF
+    /// that never came — the "coordinator did not finish within 20 seconds"
+    /// flake, hit under sustained instant-block mining on Linux. Hammering it
+    /// under a low fd cap also guards against a per-spawn fd leak.
+    func testFastExitingWorkersAreReapedWithoutWedgingOrLeaking() async throws {
+        let stub = FileManager.default.temporaryDirectory
+            .appendingPathComponent("worker-stub-\(UUID().uuidString).sh")
+        try #"""
+        #!/bin/sh
+        echo '{"workId":"w","status":"exhausted","nonce":null,"rangeStart":0,"rangeCount":1}'
+        exit 0
+        """#.write(to: stub, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755], ofItemAtPath: stub.path
+        )
+        defer { try? FileManager.default.removeItem(at: stub) }
+
+        #if canImport(Glibc)
+        let nofile = __rlimit_resource_t(RLIMIT_NOFILE.rawValue)
+        #else
+        let nofile = RLIMIT_NOFILE
+        #endif
+        var original = rlimit()
+        XCTAssertEqual(getrlimit(nofile, &original), 0)
+        var capped = original
+        capped.rlim_cur = min(original.rlim_max, 128)
+        XCTAssertEqual(setrlimit(nofile, &capped), 0)
+        defer { setrlimit(nofile, &original) }
+
+        let client = MiningWorkerProcessClient(executableURL: stub)
+        for iteration in 0..<200 {
+            // A wedge would hang here (the test times out); a leak throws EMFILE.
+            let result = try await client.search(
+                workerId: "fast-\(iteration)",
+                work: work,
+                range: NonceSearchRange(startNonce: 0, count: 1)
+            )
+            XCTAssertNil(result, "exhausted worker should yield no solution")
+        }
     }
 
     func testProcessWorkerNonzeroExitThrowsInsteadOfNoSolution() async throws {
