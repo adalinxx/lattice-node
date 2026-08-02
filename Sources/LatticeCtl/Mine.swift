@@ -134,12 +134,21 @@ struct Mine: AsyncParsableCommand {
             source.resume()
             log("mining loop start at reward cursor \(cursor)")
             while !stopRequested.isRaised {
-                let rewardsFile = try prepareRewardsFile(
-                    settings, cursor: cursor, layout: layout
-                )
-                let outcome = try await runCoordinatorOnce(
-                    settings, rewardsFile: rewardsFile, layout: layout
-                )
+                let outcome: CoordinatorOutcome
+                do {
+                    let rewardsFile = try prepareRewardsFile(
+                        settings, cursor: cursor, layout: layout
+                    )
+                    outcome = try await runCoordinatorOnce(
+                        settings, rewardsFile: rewardsFile, layout: layout
+                    )
+                } catch {
+                    // A spawn/IO failure proves nothing about the reward and
+                    // must never advance the cursor or kill the loop: retry.
+                    log("reward \(cursor) retrying after spawn error: \(error)")
+                    try? await Task.sleep(for: .seconds(5))
+                    continue
+                }
                 switch outcome {
                 case .accepted(let tip):
                     log("reward \(cursor) accepted tip=\(tip.prefix(24))")
@@ -310,7 +319,13 @@ func runCoordinatorOnce(
     process.arguments = arguments
     let stdout = Pipe()
     process.standardOutput = stdout
-    process.standardError = FileHandle.nullDevice
+    // A fresh /dev/null per spawn, not the shared FileHandle.nullDevice
+    // singleton: corelibs-Foundation closes a child's standard-handle fd
+    // after the process exits, so reusing the singleton makes a later
+    // spawn throw EBADF and (previously) killed the whole miner.
+    let devNull = FileHandle(forWritingAtPath: "/dev/null")
+    defer { try? devNull?.close() }
+    process.standardError = devNull ?? FileHandle.nullDevice
     // terminationHandler-based reaping: on Linux, parking a thread in
     // waitUntilExit can hang forever on a missed SIGCHLD (the same
     // corelibs wedge documented for daemonized coordinators).
