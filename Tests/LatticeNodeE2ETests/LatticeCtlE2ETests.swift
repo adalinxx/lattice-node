@@ -22,6 +22,16 @@ final class LatticeCtlE2ETests: XCTestCase {
 
     private var hosts: [CtlHost] = []
 
+    /// These drive real multi-chain CPU mining and starve when co-run with
+    /// the rest of the E2E suite on a small shared runner, so they gate on
+    /// an explicit opt-in and run in their own CI lane.
+    override func setUp() async throws {
+        try XCTSkipUnless(
+            ProcessInfo.processInfo.environment["E2E_CTL"] == "1",
+            "set E2E_CTL=1 to run the operator-CLI E2Es"
+        )
+    }
+
     override func tearDown() async throws {
         let failed = (testRun?.totalFailureCount ?? 0) > 0
         for host in hosts {
