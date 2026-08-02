@@ -56,5 +56,10 @@ public func spawnCollectingOutput(
     }
     stdout.fileHandleForReading.readabilityHandler = nil
     collector.append(stdout.fileHandleForReading.readDataToEndOfFile())
+    // Close both pipe ends explicitly: corelibs-Foundation does not reliably
+    // reclaim a Pipe's fds on dealloc, so a spawn-per-block loop leaks two
+    // descriptors each iteration until it hits RLIMIT_NOFILE (EMFILE).
+    try? stdout.fileHandleForReading.close()
+    try? stdout.fileHandleForWriting.close()
     return collector.snapshot()
 }
