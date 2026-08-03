@@ -64,49 +64,43 @@ public struct MiningWorkerProcessClient: Sendable {
         ])
 
         let stdout = Pipe()
-        let stderr = Pipe()
         process.standardOutput = stdout
-        process.standardError = stderr
 
-        // Drain BOTH pipes concurrently (on their own threads), starting before
-        // the child exits. A single post-exit read would fill and wedge on
-        // whichever pipe exceeds the 64 KB kernel buffer before the child exits
-        // — the exact hazard the stdout-only fix left open for stderr (a large
-        // worker crash backtrace never drained, the worker blocks in write(),
-        // terminationHandler never fires). The drains capture the Pipe so it
-        // outlives the read even when we abandon them on the cancel path.
-        let stdoutDrain = Task.detached { Self.readToEnd(stdout, cap: 16_384) }
-        let stderrDrain = Task.detached { Self.readToEnd(stderr, cap: 4_096) }
-
-        // Close the parent's write-ends so the concurrent reads see EOF; the
-        // child owns its own dup'd copies. This must happen AFTER run() so the
-        // child inherits its dup, and on BOTH outcomes: because the drains
-        // capture (retain) the Pipe, a run() failure that left the write-end
-        // open would leave the reads unable to reach EOF, parking the detached
-        // tasks and leaking all four fds forever — a leak whose canonical
-        // trigger (EMFILE on fork/exec) is the very exhaustion this guards.
-        do {
-            try await handle.run()
-        } catch {
-            try? stdout.fileHandleForWriting.close()
-            try? stderr.fileHandleForWriting.close()
-            throw error
+        // stderr goes to a TEMP FILE, never a Pipe. The worker prints one small
+        // JSON line to stdout, but on failure can flood stderr (a crash
+        // backtrace) past the 64 KB pipe buffer — and a pipe blocks the worker
+        // in write() until drained, so it would never exit. Draining it
+        // concurrently means a second raw-fd reader racing corelibs' Process fd
+        // management, which wedges and throws EBADF under fd pressure on Linux.
+        // A regular file never blocks the writer and needs no concurrent reader:
+        // the worker runs to completion, and we read the file (capped) after it
+        // exits. stdout stays a pipe read once post-exit, like the CLI's
+        // spawnCollectingOutput.
+        let stderrURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("miner-stderr-\(UUID().uuidString)")
+        FileManager.default.createFile(atPath: stderrURL.path, contents: nil)
+        let stderrWrite = FileHandle(forWritingAtPath: stderrURL.path)
+        process.standardError = stderrWrite ?? FileHandle.nullDevice
+        defer {
+            try? stderrWrite?.close()
+            try? FileManager.default.removeItem(at: stderrURL)
         }
+
+        try await handle.run()
+
+        // stdout: a single post-exit read. The worker's stdout is one small
+        // JSON line, so it cannot fill the pipe buffer before the child exits.
         try? stdout.fileHandleForWriting.close()
-        try? stderr.fileHandleForWriting.close()
+        let output = stdout.fileHandleForReading.readDataToEndOfFile()
+        try? stdout.fileHandleForReading.close()
 
         // On cancellation (e.g. stale work) the worker result is irrelevant.
-        // Return WITHOUT awaiting the drains: a forked grandchild could hold a
-        // write-end open past the worker's SIGKILL, so the reads may never hit
-        // EOF. The detached tasks own their Pipe and terminate whenever the
-        // write-end finally closes.
         if Task.isCancelled { return nil }
 
-        let output = await stdoutDrain.value
-        let errorData = await stderrDrain.value
-
         if process.terminationStatus != 0 {
-            let errorText = String(data: errorData, encoding: .utf8) ?? ""
+            let errorData = (try? Data(contentsOf: stderrURL)) ?? Data()
+            let capped = errorData.count > 4096 ? Data(errorData.suffix(4096)) : errorData
+            let errorText = String(data: capped, encoding: .utf8) ?? ""
             throw MiningWorkerProcessError.nonzeroExit(status: process.terminationStatus, stderr: errorText)
         }
         guard let result = try? JSONDecoder().decode(MiningWorkerProcessResult.self, from: output) else {
@@ -126,34 +120,6 @@ public struct MiningWorkerProcessClient: Sendable {
         )
     }
 
-    /// Blocking drain of a pipe's read-end to EOF, retaining at most `cap`
-    /// bytes (it keeps reading and discarding past the cap so the child never
-    /// blocks on a full pipe). The `pipe` argument is captured so the drain
-    /// keeps it alive across the read — including when the caller abandons this
-    /// task on the cancel path. Reading the raw descriptor keeps the detached
-    /// task Sendable.
-    private static func readToEnd(_ pipe: Pipe, cap: Int) -> Data {
-        let fd = pipe.fileHandleForReading.fileDescriptor
-        var data = Data()
-        var buffer = [UInt8](repeating: 0, count: 65536)
-        while true {
-            let n = buffer.withUnsafeMutableBytes {
-                read(fd, $0.baseAddress, $0.count)
-            }
-            if n > 0 {
-                if data.count < cap {
-                    data.append(contentsOf: buffer[0..<min(n, cap - data.count)])
-                }
-            } else if n == 0 {
-                break
-            } else if errno == EINTR {
-                continue
-            } else {
-                break
-            }
-        }
-        return data
-    }
 }
 
 private final class MiningWorkerSubprocess: @unchecked Sendable {
