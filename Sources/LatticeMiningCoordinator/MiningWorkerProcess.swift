@@ -78,10 +78,20 @@ public struct MiningWorkerProcessClient: Sendable {
         let stdoutDrain = Task.detached { Self.readToEnd(stdout, cap: 16_384) }
         let stderrDrain = Task.detached { Self.readToEnd(stderr, cap: 4_096) }
 
-        try await handle.run()
-
         // Close the parent's write-ends so the concurrent reads see EOF; the
-        // child owns its own dup'd copies.
+        // child owns its own dup'd copies. This must happen AFTER run() so the
+        // child inherits its dup, and on BOTH outcomes: because the drains
+        // capture (retain) the Pipe, a run() failure that left the write-end
+        // open would leave the reads unable to reach EOF, parking the detached
+        // tasks and leaking all four fds forever — a leak whose canonical
+        // trigger (EMFILE on fork/exec) is the very exhaustion this guards.
+        do {
+            try await handle.run()
+        } catch {
+            try? stdout.fileHandleForWriting.close()
+            try? stderr.fileHandleForWriting.close()
+            throw error
+        }
         try? stdout.fileHandleForWriting.close()
         try? stderr.fileHandleForWriting.close()
 
