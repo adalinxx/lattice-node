@@ -287,12 +287,55 @@ func makeApplication(
     port: Int
 ) -> Application<RouterResponder<BasicRequestContext>> {
     let router = Router()
+    router.add(middleware: CORSMiddleware(
+        allowOrigin: .all,
+        allowHeaders: [.contentType],
+        allowMethods: [.get, .post, .options]
+    ))
 
     router.get("health") { request, context in
-        try json(await service.status(), request: request, context: context)
+        try jsonCached(
+            await service.readSnapshot(),
+            cacheControl: statusCacheControl,
+            request: request,
+            context: context
+        )
     }
     router.get("v1/status") { request, context in
-        try json(await service.status(), request: request, context: context)
+        try jsonCached(
+            await service.readSnapshot(),
+            cacheControl: statusCacheControl,
+            request: request,
+            context: context
+        )
+    }
+    router.get("v1/blocks/:cid") { request, context in
+        guard let cid = context.parameters.get("cid"), isPlausibleCID(cid) else {
+            throw HTTPError(.badRequest)
+        }
+        guard let block = await service.block(cid: cid) else {
+            throw HTTPError(.notFound)
+        }
+        return try jsonCached(
+            BlockResponse(cid: cid, block: block),
+            cacheControl: immutableCacheControl,
+            request: request,
+            context: context
+        )
+    }
+    router.get("v1/transactions/:cid") { request, context in
+        guard let cid = context.parameters.get("cid"), isPlausibleCID(cid) else {
+            throw HTTPError(.badRequest)
+        }
+        guard let transaction = await service.transaction(cid: cid) else {
+            throw HTTPError(.notFound)
+        }
+        return try jsonCached(
+            TransactionResponse(cid: cid, transaction: transaction),
+            cacheControl: immutableCacheControl,
+            request: request,
+            context: context
+        )
     }
     router.post("v1/transactions") { request, context in
         let input: SubmitTransactionRequest = try await decode(request, context: context)
@@ -391,6 +434,36 @@ private func json<Value: Encodable, Context: RequestContext>(
     context: Context
 ) throws -> Response {
     try context.responseEncoder.encode(value, from: request, context: context)
+}
+
+/// A block or transaction served by CID never changes once accepted.
+let immutableCacheControl = "public, max-age=31536000, immutable"
+/// Chain status/health is a live snapshot; cache it only briefly.
+let statusCacheControl = "public, max-age=3"
+
+private func jsonCached<Value: Encodable, Context: RequestContext>(
+    _ value: Value,
+    cacheControl: String,
+    request: Request,
+    context: Context
+) throws -> Response {
+    var response = try json(value, request: request, context: context)
+    response.headers[.cacheControl] = cacheControl
+    return response
+}
+
+/// GET /v1/blocks/:cid response: the decoded, content-verified block, echoing
+/// the requested CID (Codable, never raw CBOR).
+struct BlockResponse: Codable {
+    let cid: String
+    let block: Block
+}
+
+/// GET /v1/transactions/:cid response: the decoded, content-verified
+/// transaction, echoing the requested CID.
+struct TransactionResponse: Codable {
+    let cid: String
+    let transaction: Transaction
 }
 
 private extension Data {
