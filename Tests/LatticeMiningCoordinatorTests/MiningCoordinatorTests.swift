@@ -363,6 +363,48 @@ final class MiningCoordinatorTests: XCTestCase {
         }
     }
 
+    /// A worker that writes far more than the 64 KB pipe buffer to stderr
+    /// before exiting must not wedge the coordinator: stderr is drained
+    /// concurrently, and the surfaced text is capped. Without the concurrent
+    /// drain the worker blocks in write(), never exits, and search() hangs.
+    func testLargeWorkerStderrIsDrainedAndCappedWithoutWedging() async throws {
+        let stub = FileManager.default.temporaryDirectory
+            .appendingPathComponent("worker-loud-\(UUID().uuidString).sh")
+        // ~256 KB to stderr (4x the pipe buffer), then a nonzero exit.
+        try #"""
+        #!/bin/sh
+        i=0
+        while [ $i -lt 4096 ]; do
+          printf 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n' >&2
+          i=$((i+1))
+        done
+        exit 3
+        """#.write(to: stub, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755], ofItemAtPath: stub.path
+        )
+        defer { try? FileManager.default.removeItem(at: stub) }
+
+        let client = MiningWorkerProcessClient(executableURL: stub)
+        // A wedge hangs here (the test times out); success is a bounded throw.
+        do {
+            _ = try await client.search(
+                workerId: "loud",
+                work: work,
+                range: NonceSearchRange(startNonce: 0, count: 1)
+            )
+            XCTFail("expected nonzero worker to throw")
+        } catch let error as MiningWorkerProcessError {
+            guard case .nonzeroExit(let status, let stderr) = error else {
+                return XCTFail("expected nonzeroExit, got \(error)")
+            }
+            XCTAssertEqual(status, 3)
+            XCTAssertLessThanOrEqual(
+                stderr.utf8.count, 4096, "stderr must be capped"
+            )
+        }
+    }
+
     func testProcessWorkerNonzeroExitThrowsInsteadOfNoSolution() async throws {
         let client = MiningWorkerProcessClient(
             executableURL: URL(fileURLWithPath: "/bin/sh"),
