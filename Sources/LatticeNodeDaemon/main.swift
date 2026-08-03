@@ -287,10 +287,16 @@ func makeApplication(
     port: Int
 ) -> Application<RouterResponder<BasicRequestContext>> {
     let router = Router()
+    // CORS is scoped to READ methods only. The POST write routes stay off the
+    // allow-list on purpose: they consume application/json, so a cross-origin
+    // browser POST needs a preflight — denying .post here keeps those routes
+    // reachable only by same-host (non-browser) clients, preserving the
+    // daemon's loopback-only write posture. Cross-origin GETs to the public
+    // read routes are "simple" requests and still succeed.
     router.add(middleware: CORSMiddleware(
         allowOrigin: .all,
         allowHeaders: [.contentType],
-        allowMethods: [.get, .post, .options]
+        allowMethods: [.get, .options]
     ))
 
     router.get("health") { request, context in
