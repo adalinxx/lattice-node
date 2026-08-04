@@ -299,6 +299,9 @@ func makeApplication(
         allowMethods: [.get, .options]
     ))
 
+    // /health is the public, non-mutating status: readSnapshot() takes no
+    // operation gate and reconciles nothing, so a health-check/explorer poll
+    // can never head-of-line-block or mutate consensus/mempool state.
     router.get("health") { request, context in
         try jsonCached(
             await service.readSnapshot(),
@@ -307,13 +310,12 @@ func makeApplication(
             context: context
         )
     }
+    // /v1/status stays on the reconciling status() (expires the mempool, prunes
+    // stale child-intents) — existing operational clients poll it to observe
+    // mempool drain, and depend on that reconciliation. It is an internal
+    // endpoint; the public status surface is /health above.
     router.get("v1/status") { request, context in
-        try jsonCached(
-            await service.readSnapshot(),
-            cacheControl: statusCacheControl,
-            request: request,
-            context: context
-        )
+        try json(await service.status(), request: request, context: context)
     }
     router.get("v1/blocks/:cid") { request, context in
         guard let cid = context.parameters.get("cid"), isPlausibleCID(cid) else {

@@ -414,9 +414,11 @@ final class DaemonHTTPTests: XCTestCase {
         XCTAssertFalse(finishedEarly, "status() must still be queued behind the held operation gate")
 
         // The UNGATED read must return promptly regardless — over HTTP, the
-        // very surface under test — while the gate is still fully held.
+        // very surface under test — while the gate is still fully held. /health
+        // is the public non-mutating status endpoint (readSnapshot); /v1/status
+        // stays on the gated, reconciling status().
         try await app.test(.router) { client in
-            try await client.execute(uri: "/v1/status", method: .get) { response in
+            try await client.execute(uri: "/health", method: .get) { response in
                 XCTAssertEqual(response.status, .ok)
                 XCTAssertEqual(response.headers[.cacheControl], statusCacheControl)
                 let snapshot = try JSONDecoder().decode(
