@@ -408,7 +408,7 @@ public actor ChainService {
     private static let templateLifetimeMilliseconds: UInt64 = 30_000
     private static let templateCapacity = 16
     private static let maximumReadResponseBytes = Int(IvyConfig.defaultProtocolMaxFrameSize)
-    private static let maximumRecentBlocksLimit = 50
+    public static let maximumRecentBlocksLimit = 50
 
     private let process: ChainProcess
     private let pool: TransactionPool

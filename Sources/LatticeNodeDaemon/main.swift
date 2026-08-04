@@ -388,9 +388,16 @@ func makeApplication(
         guard let blocks = await service.recentBlocks(before: before, limit: limit) else {
             throw HTTPError(.notFound)
         }
+        // A `before` walk is immutable ONLY when it is complete — it returned
+        // the full (capped) limit or reached genesis. If it truncated early
+        // because a parent body was pruned/temporarily unavailable, the list
+        // can grow later, so it must not be cached as immutable for a year.
+        let cappedLimit = min(limit, ChainService.maximumRecentBlocksLimit)
+        let complete = blocks.count >= cappedLimit || blocks.last?.parentCID == nil
         return try jsonCached(
             blocks,
-            cacheControl: before == nil ? statusCacheControl : immutableCacheControl,
+            cacheControl: (before != nil && complete)
+                ? immutableCacheControl : statusCacheControl,
             request: request,
             context: context
         )
@@ -526,6 +533,12 @@ struct TransactionResponse: Codable {
 
 /// GET /v1/accounts/:owner?block=:cid response: the balance and next-expected
 /// nonce as of `block`'s post-state, echoing the requested owner/block CIDs.
+///
+/// NODE-ATTESTED, not proof-backed: unlike by-CID block/tx bytes (which a
+/// client can re-hash), these values are read from the node's content-verified
+/// post-state and returned as plain fields — a client cannot independently
+/// verify them without a sparse-Merkle proof (LatticeLightClient is kept out of
+/// the daemon). Trust rests on the replica being a full verifier.
 struct AccountResponse: Codable {
     let owner: String
     let block: String
