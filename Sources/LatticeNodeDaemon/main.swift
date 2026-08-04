@@ -345,6 +345,56 @@ func makeApplication(
             context: context
         )
     }
+    router.get("v1/accounts/:owner") { request, context in
+        guard let owner = context.parameters.get("owner"), isPlausibleCID(owner) else {
+            throw HTTPError(.badRequest)
+        }
+        guard let block = request.uri.queryParameters["block"].map(String.init),
+              isPlausibleCID(block) else {
+            throw HTTPError(.badRequest)
+        }
+        guard let account = await service.account(owner: owner, blockCID: block) else {
+            throw HTTPError(.notFound)
+        }
+        return try jsonCached(
+            AccountResponse(
+                owner: owner,
+                block: block,
+                balance: account.balance,
+                nonce: account.nonce
+            ),
+            cacheControl: immutableCacheControl,
+            request: request,
+            context: context
+        )
+    }
+    router.get("v1/blocks") { request, context in
+        let query = request.uri.queryParameters
+        var before: String?
+        if let cid = query["before"] {
+            let value = String(cid)
+            guard isPlausibleCID(value) else { throw HTTPError(.badRequest) }
+            before = value
+        }
+        let limit: Int
+        if let requested = query["limit"] {
+            guard let parsed = Int(requested), parsed > 0 else {
+                throw HTTPError(.badRequest)
+            }
+            limit = parsed
+        } else {
+            limit = 20
+        }
+        guard let blocks = await service.recentBlocks(before: before, limit: limit) else {
+            throw HTTPError(.notFound)
+        }
+        return try jsonCached(
+            blocks,
+            cacheControl: before == nil ? statusCacheControl : immutableCacheControl,
+            request: request,
+            context: context
+        )
+    }
     router.post("v1/transactions") { request, context in
         let input: SubmitTransactionRequest = try await decode(request, context: context)
         return try await serviceCall(request: request, context: context) {
@@ -472,6 +522,15 @@ struct BlockResponse: Codable {
 struct TransactionResponse: Codable {
     let cid: String
     let transaction: Transaction
+}
+
+/// GET /v1/accounts/:owner?block=:cid response: the balance and next-expected
+/// nonce as of `block`'s post-state, echoing the requested owner/block CIDs.
+struct AccountResponse: Codable {
+    let owner: String
+    let block: String
+    let balance: UInt64
+    let nonce: UInt64
 }
 
 private extension Data {
