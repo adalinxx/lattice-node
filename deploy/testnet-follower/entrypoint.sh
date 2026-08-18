@@ -17,7 +17,11 @@ ROOT=/data
 CHILD_PATH="${CHILD_PATH:?absolute child path, e.g. Nexus/testnet}"
 CHILD_DIR="$ROOT/chains/$CHILD_PATH"
 NEXUS_PEERS="${NEXUS_PEERS:?space-separated publicKey@host:port peers}"
-EXTERNAL_HOST="${EXTERNAL_HOST:?publicly reachable host, e.g. lattice-mainnet-testnet.fly.dev}"
+# Optional overlay self-description. Ivy accepts IP LITERALS only (the
+# browser-facing hostname stays a lattice-home concern; the protocol is
+# name-free): set this to the app's dedicated public IPv4 so overlay
+# announcements are dialable, or leave unset to announce nothing.
+EXTERNAL_HOST="${EXTERNAL_HOST:-}"
 
 mkdir -p "$CHILD_DIR"
 
@@ -27,6 +31,15 @@ for peer in $NEXUS_PEERS; do
 done
 peers_json="${peers_json%,}"
 
+external_nexus=""
+external_child=""
+if [ -n "$EXTERNAL_HOST" ]; then
+    external_nexus=",
+      \"externalAddress\": \"$EXTERNAL_HOST\""
+    external_child=",
+      \"externalAddress\": \"$EXTERNAL_HOST\""
+fi
+
 cat > "$ROOT/lattice.json" <<EOF
 {
   "chains": {
@@ -34,15 +47,13 @@ cat > "$ROOT/lattice.json" <<EOF
       "listen": 4001,
       "fact": 4002,
       "rpc": 8080,
-      "peers": [$peers_json],
-      "externalAddress": "$EXTERNAL_HOST"
+      "peers": [$peers_json]$external_nexus
     },
     "$CHILD_PATH": {
       "listen": 4101,
       "fact": 4102,
       "rpc": 8180,
-      "publicRead": 8081,
-      "externalAddress": "$EXTERNAL_HOST"
+      "publicRead": 8081$external_child
     }
   }
 }
