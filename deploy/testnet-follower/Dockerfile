@@ -1,6 +1,6 @@
 # Public child-chain follower: the node image + the declarative follower
 # entrypoint. Pin the node image by immutable sha tag (bump on release).
-FROM ghcr.io/adalinxx/lattice-node:sha-9a22720
+FROM ghcr.io/adalinxx/lattice-node:sha-8637025
 
 COPY entrypoint.sh /usr/local/bin/testnet-follower-entrypoint
 USER root
