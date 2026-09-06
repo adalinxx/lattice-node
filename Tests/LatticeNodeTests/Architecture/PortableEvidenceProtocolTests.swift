@@ -120,6 +120,24 @@ final class PortableEvidenceProtocolTests: XCTestCase {
         ))
     }
 
+    func testEvidenceMemberBudgetAdmitsTheMultiEntryDAG() async throws {
+        // The DAG is always header + >=1 proof node, so the network fetch's
+        // per-volume member budget MUST exceed 1 — a stale `maximumMembers: 1`
+        // silently drops the whole volume on cross-node fetch (the local-broker
+        // tests can't see it). Guard the invariant the recover sites depend on.
+        let (envelope, childCID) = try await evidenceFixture()
+        let attachment = try ChildEvidenceVolume(
+            envelopeBytes: envelope,
+            childCID: childCID
+        )
+        XCTAssertGreaterThan(attachment.serialized.entries.count, 1)
+        XCTAssertLessThanOrEqual(
+            attachment.serialized.entries.count,
+            ChildEvidenceVolume.maximumMembers
+        )
+        XCTAssertGreaterThanOrEqual(ChildEvidenceVolume.maximumMembers, 2)
+    }
+
     func testLargeMultiHopProofIsNotWedgedByTheFrameSize() async throws {
         // A proof whose entries SUM past one Ivy frame — the old single-blob
         // format threw `.oversized` at ~4 MiB and wedged the child chain here.
