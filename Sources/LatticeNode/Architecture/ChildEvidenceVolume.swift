@@ -48,7 +48,15 @@ struct ChildEvidenceVolume: Sendable {
 
     let serialized: SerializedVolume
     let proof: ChildBlockProof
-    let envelopeBytes: Data
+
+    /// The flat transport envelope, derived on demand from the (already
+    /// validated) proof. Lazy on purpose: most volumes are built only to be
+    /// stored/served — they never read this — so eagerly re-serializing on
+    /// every construction was pure churn. The proof was canonicalized and
+    /// validated at construction, so the encode cannot fail here.
+    var envelopeBytes: Data {
+        (try? ChildValidationPackageEnvelope(proof: proof).encode()) ?? Data()
+    }
 
     var rawCID: String { serialized.root }
 
@@ -147,10 +155,8 @@ struct ChildEvidenceVolume: Sendable {
         }
         // The flat envelope is derived in memory for the local validation path
         // (it never travels as one frame — the DAG above is the transport).
-        let envelope = try ChildValidationPackageEnvelope(proof: proof)
         self.serialized = serialized
         self.proof = proof
-        self.envelopeBytes = try envelope.encode()
     }
 
     func store(storer: any VolumeStorer) async throws {
