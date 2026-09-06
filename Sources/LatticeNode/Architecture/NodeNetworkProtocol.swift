@@ -18,14 +18,6 @@ enum NodeNetworkTopic {
     static let acceptedLeavesResponse = "lattice.overlay.accepted-leaves.response.v1"
     static let forwardRangeRequest = "lattice.overlay.forward-range.request.v1"
     static let forwardRangeResponse = "lattice.overlay.forward-range.response.v1"
-    static let portableAttachmentAvailable =
-        "lattice.overlay.portable-attachment.available.v1"
-    static let portableAttachmentIndexRequest =
-        "lattice.overlay.portable-attachment.index.request.v1"
-    static let portableAttachmentIndexResponse =
-        "lattice.overlay.portable-attachment.index.response.v1"
-    static let portableAttachmentLocateRequest =
-        "lattice.overlay.portable-attachment.locate.request.v1"
     static let readEndpointRequest = "lattice.overlay.read-endpoint.request.v1"
     static let readEndpointResponse = "lattice.overlay.read-endpoint.response.v1"
     static let hierarchyHello = "lattice.hierarchy.hello.v1"
@@ -53,10 +45,6 @@ enum NodeNetworkTopic {
              transactionInventoryRequest, transactionInventoryResponse,
              acceptedLeavesRequest, acceptedLeavesResponse,
              forwardRangeRequest, forwardRangeResponse,
-             portableAttachmentAvailable,
-             portableAttachmentIndexRequest,
-             portableAttachmentIndexResponse,
-             portableAttachmentLocateRequest,
              readEndpointRequest, readEndpointResponse: .overlay
         case hierarchyHello, childEvidenceAvailable,
              childEvidenceIndexRequest, childEvidenceIndexResponse,
@@ -379,100 +367,6 @@ struct ForwardRangeResponseMessage: NodeJSONMessage, Equatable, Sendable {
               blockCIDs.count <= Self.maximumBlocks,
               blockCIDs.allSatisfy({ _isBoundedWireAtom($0) }),
               !hasMore || blockCIDs.count == Self.maximumBlocks else {
-            throw NodeNetworkWireError.malformed
-        }
-    }
-}
-
-/// One physical outer-root attachment for a root-independent direct child
-/// edge. The edge CID addresses the canonical direct-edge object; `rootCID`
-/// identifies the upstream proof context; `attachmentCID` is its CAS manifest.
-struct PortableAttachmentSummary: Codable, Equatable, Hashable, Sendable {
-    let edgeCID: String
-    let rootCID: String
-    let attachmentCID: String
-
-    fileprivate var isValid: Bool {
-        _isCanonicalWireCID(edgeCID)
-            && _isCanonicalWireCID(rootCID)
-            && _isCanonicalWireCID(attachmentCID)
-    }
-}
-
-struct PortableAttachmentAvailableMessage: NodeJSONMessage, Equatable, Sendable {
-    let edgeCID: String
-    let rootCID: String
-    let attachmentCID: String
-
-    func validate() throws {
-        guard PortableAttachmentSummary(
-            edgeCID: edgeCID,
-            rootCID: rootCID,
-            attachmentCID: attachmentCID
-        ).isValid else {
-            throw NodeNetworkWireError.malformed
-        }
-    }
-}
-
-struct PortableAttachmentIndexRequestMessage: NodeJSONMessage, Equatable, Sendable {
-    let requestID: UInt64
-    let after: PortableAttachmentSummary?
-
-    func validate() throws {
-        guard requestID != 0, after?.isValid ?? true else {
-            throw NodeNetworkWireError.malformed
-        }
-    }
-}
-
-struct PortableAttachmentIndexResponseMessage: NodeJSONMessage, Equatable, Sendable {
-    // Page size matches the sibling index/range messages (accepted-leaves,
-    // child-evidence index, forward-range all page at 64). A page of 1 made
-    // the incoming-carrier attachment walk advance one entry per round trip —
-    // an arbitrary throttle, not a size bound, that crawled deep child-evidence
-    // sync. `hasMore` pagination is unchanged.
-    static let maximumEntries = 64
-
-    let requestID: UInt64
-    let after: PortableAttachmentSummary?
-    let entries: [PortableAttachmentSummary]
-    let hasMore: Bool
-
-    func validate() throws {
-        let sorted = entries.sorted {
-            ($0.edgeCID, $0.rootCID) < ($1.edgeCID, $1.rootCID)
-        }
-        guard requestID != 0,
-              after?.isValid ?? true,
-              entries.count <= Self.maximumEntries,
-              entries == sorted,
-              Set(entries).count == entries.count,
-              entries.allSatisfy({ entry in
-                  entry.isValid && (after.map({ cursor in
-                      (entry.edgeCID, entry.rootCID)
-                          > (cursor.edgeCID, cursor.rootCID)
-                  }) ?? true)
-              }),
-              !hasMore || !entries.isEmpty else {
-            throw NodeNetworkWireError.malformed
-        }
-    }
-}
-
-/// Solicits the portable child-evidence a peer holds for ONE specific child
-/// block CID. A peer that mined (or relayed with a package) the carrier can
-/// recover the block's `ChildValidationPackage`; it answers by sending the
-/// requester a `PortableAttachmentAvailableMessage` for that block, which the
-/// requester recovers through the ordinary portable-evidence path. This lets a
-/// cold-syncing adopter obtain per-block evidence directly from the block's
-/// supplier, instead of relying on its own parent having mined the carriers.
-struct PortableAttachmentLocateRequestMessage: NodeJSONMessage, Equatable, Sendable {
-    let requestID: UInt64
-    let childCID: String
-
-    func validate() throws {
-        guard requestID != 0, _isCanonicalWireCID(childCID) else {
             throw NodeNetworkWireError.malformed
         }
     }
