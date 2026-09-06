@@ -2334,7 +2334,8 @@ final class NetworkTrustTests: XCTestCase {
         )
         let decoded = try ChildEvidenceAvailableMessage.decoded(response.encoded())
         XCTAssertEqual(decoded.attachmentCID, attachment.rawCID)
-        XCTAssertEqual(attachment.serialized.entries.count, 1)
+        // The evidence DAG carries the proof, never the child's own content.
+        XCTAssertNotNil(attachment.serialized.entries[attachment.rawCID])
         XCTAssertNil(attachment.serialized.entries[childCID])
     }
 
@@ -2349,7 +2350,7 @@ final class NetworkTrustTests: XCTestCase {
             childCID: childCID
         )
 
-        XCTAssertEqual(attachment.serialized.entries.count, 1)
+        XCTAssertNotNil(attachment.serialized.entries[attachment.rawCID])
         XCTAssertNil(attachment.serialized.entries[childCID])
     }
 

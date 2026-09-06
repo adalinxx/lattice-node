@@ -3517,7 +3517,7 @@ public actor NodeNetworkRuntime: IvyDelegate {
             ivy: overlay,
             peer: peer,
             maximumMembers: 1,
-            maximumStorageBytes: ChildEvidenceVolume.maximumFramedBytes,
+            maximumStorageBytes: ChildEvidenceVolume.maximumStorageBytes,
             maximumArchiveBytes: ChildEvidenceVolume.maximumArchiveBytes
         )
         let resolved: (
@@ -3704,7 +3704,7 @@ public actor NodeNetworkRuntime: IvyDelegate {
             ivy: hierarchy,
             peer: peer,
             maximumMembers: 1,
-            maximumStorageBytes: ChildEvidenceVolume.maximumFramedBytes,
+            maximumStorageBytes: ChildEvidenceVolume.maximumStorageBytes,
             maximumArchiveBytes: ChildEvidenceVolume.maximumArchiveBytes
         )
         let resolved: (

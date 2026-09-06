@@ -10,7 +10,7 @@ private func protocolCID(_ seed: String) -> String {
 }
 
 final class PortableEvidenceProtocolTests: XCTestCase {
-    func testChildEvidenceIsOneCompleteContentAddressedVolume() async throws {
+    func testChildEvidenceIsACompleteContentAddressedDAG() async throws {
         let (envelope, childCID) = try await evidenceFixture()
         let attachment = try ChildEvidenceVolume(
             envelopeBytes: envelope,
@@ -22,18 +22,10 @@ final class PortableEvidenceProtocolTests: XCTestCase {
         let volume = try XCTUnwrap(fetched)
         try volume.validate()
         XCTAssertEqual(volume.root, attachment.rawCID)
-        XCTAssertEqual(volume.entries.count, 1)
-        XCTAssertNotNil(volume.entries[attachment.rawCID])
-        let rootData = try XCTUnwrap(volume.entries[attachment.rawCID])
-        let framedBytes = 6 + attachment.rawCID.utf8.count + rootData.count
-        XCTAssertLessThanOrEqual(
-            framedBytes,
-            ChildEvidenceVolume.maximumFramedBytes
-        )
-        XCTAssertEqual(
-            ChildEvidenceVolume.maximumArchiveBytes,
-            ChildEvidenceVolume.maximumFramedBytes + 2
-        )
+        // A real DAG: the header node plus one entry per proof CAS node — not a
+        // single flattened blob.
+        XCTAssertGreaterThan(volume.entries.count, 1)
+        XCTAssertNotNil(volume.entries[attachment.rawCID], "header present")
 
         let resolved = try ChildEvidenceVolume(
             serialized: volume,
@@ -63,13 +55,18 @@ final class PortableEvidenceProtocolTests: XCTestCase {
         )
         XCTAssertEqual(left.rawCID, right.rawCID)
         XCTAssertEqual(left.serialized.entries, right.serialized.entries)
+        // A different proof (different entry set) commits to a different root.
+        let differentEnvelope = try ChildValidationPackageEnvelope(
+            proof: evidenceProof(entryCount: 4)
+        ).encode()
         XCTAssertNotEqual(
             left.rawCID,
             try ChildEvidenceVolume(
-                envelopeBytes: envelope + Data([0]),
+                envelopeBytes: differentEnvelope,
                 childCID: childCID
             ).rawCID
         )
+        // A different child commits to a different root.
         XCTAssertNotEqual(
             left.rawCID,
             try ChildEvidenceVolume(
@@ -77,6 +74,11 @@ final class PortableEvidenceProtocolTests: XCTestCase {
                 childCID: protocolCID("another-child")
             ).rawCID
         )
+        // A corrupted envelope is rejected outright (not silently re-rooted).
+        XCTAssertThrowsError(try ChildEvidenceVolume(
+            envelopeBytes: envelope + Data([0]),
+            childCID: childCID
+        ))
     }
 
     func testChildEvidenceRejectsMembershipDrift() async throws {
@@ -116,6 +118,40 @@ final class PortableEvidenceProtocolTests: XCTestCase {
             ),
             childCID: childCID
         ))
+    }
+
+    func testLargeMultiHopProofIsNotWedgedByTheFrameSize() async throws {
+        // A proof whose entries SUM past one Ivy frame — the old single-blob
+        // format threw `.oversized` at ~4 MiB and wedged the child chain here.
+        // As a cashew DAG each node stays small and the total rides the
+        // operator budget, so it builds, stores, round-trips, and re-resolves.
+        let frame = Int(IvyConfig.defaultProtocolMaxFrameSize)
+        // Six entries at ~frame/4 each: total > one frame (the old wedge), each
+        // node well under a frame.
+        let proof = try evidenceProof(entryCount: 6, perEntryBytes: frame / 4)
+        let envelope = try ChildValidationPackageEnvelope(proof: proof).encode()
+        XCTAssertGreaterThan(envelope.count, frame,
+            "fixture must exceed one frame to exercise the old wedge")
+        let childCID = protocolCID("child")
+        let attachment = try ChildEvidenceVolume(
+            envelopeBytes: envelope,
+            childCID: childCID
+        )
+        // Each stored node stays under a frame; the whole DAG rides the budget.
+        for (_, data) in attachment.serialized.entries {
+            XCTAssertLessThan(data.count, frame)
+        }
+        let total = attachment.serialized.entries.values.reduce(0) { $0 + $1.count }
+        XCTAssertGreaterThan(total, frame)
+        XCTAssertLessThanOrEqual(total, ChildEvidenceVolume.maximumArchiveBytes)
+        let broker = MemoryBroker()
+        try await attachment.store(storer: broker)
+        let maybeFetched = await broker.fetchVolumeLocal(root: attachment.rawCID)
+        let fetched = try XCTUnwrap(maybeFetched)
+        let resolved = try ChildEvidenceVolume(serialized: fetched, childCID: childCID)
+        XCTAssertEqual(resolved.envelopeBytes, envelope)
+        XCTAssertEqual(resolved.proof.entries.count, 6)
+        XCTAssertEqual(resolved.rawCID, attachment.rawCID)
     }
 
     func testPortableAttachmentTopicsStayOnOverlay() {
@@ -403,19 +439,37 @@ final class PortableEvidenceProtocolTests: XCTestCase {
         }
     }
 
+    private struct EvidenceBlob: Scalar { let bytes: Data }
+
+    /// A real content-addressed CAS entry: (rawCID, canonical bytes). Passes
+    /// SerializedVolume's per-entry content-address check.
+    private func contentEntry(bytes: Data) throws -> (cid: String, data: Data) {
+        let header = try HeaderImpl<EvidenceBlob>(node: EvidenceBlob(bytes: bytes))
+        return (header.rawCID, try header.mapToData())
+    }
+
+    private func evidenceProof(
+        entryCount: Int = 3,
+        perEntryBytes: Int = 8
+    ) throws -> ChildBlockProof {
+        let entries = try (0..<entryCount).map { i in
+            try contentEntry(
+                bytes: Data("entry-\(i)-".utf8)
+                    + Data(repeating: UInt8(i & 0xff), count: perEntryBytes)
+            )
+        }
+        return ChildBlockProof(
+            rootCID: protocolCID("proof-root"),
+            directoryPath: ["dir"],
+            entries: entries
+        )
+    }
+
     private func evidenceFixture() async throws
         -> (envelope: Data, childCID: String) {
-        let source = MemoryBroker()
-        try await LatticeState.emptyHeader.storeRecursively(
-            storer: source
-        )
-        let block = try await NexusGenesis.create(
-            fetcher: source
-        ).block
-        let childCID = try BlockHeader(node: block).rawCID
-        return (
-            Data("envelope".utf8),
-            childCID
-        )
+        let envelope = try ChildValidationPackageEnvelope(
+            proof: evidenceProof()
+        ).encode()
+        return (envelope, protocolCID("child"))
     }
 }
