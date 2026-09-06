@@ -39,6 +39,12 @@ struct ChildEvidenceVolume: Sendable {
     static let maximumArchiveBytes = Int(IvyConfig.defaultProtocolMaxFrameSize) * 16
     /// Per-volume storage budget the fetch path will hold for one evidence root.
     static let maximumStorageBytes = maximumArchiveBytes
+    /// Entry-count budget for the fetch path: the DAG is header + one node per
+    /// proof entry, so it is always multi-entry. Bounded by the proof's own
+    /// wire limit (ChildBlockProof serializes at most UInt16.max entries, which
+    /// Ivy's per-volume entry cap also matches); total bytes are bounded
+    /// separately by maximumArchiveBytes.
+    static let maximumMembers = Int(UInt16.max)
 
     let serialized: SerializedVolume
     let proof: ChildBlockProof
@@ -61,7 +67,9 @@ struct ChildEvidenceVolume: Sendable {
         guard !childCID.isEmpty else {
             throw ChildEvidenceVolumeError.malformed
         }
-        // `ChildBlockProof.init` canonicalizes: entries sorted by CID, deduped.
+        // `ChildBlockProof.init` canonicalizes entries by sorting on CID; the
+        // envelope decode path (the only production caller) already rejects
+        // duplicate/unsorted entries, so the entry CIDs are unique and ascending.
         var entries: [String: Data] = [:]
         for entry in proof.entries {
             entries[entry.cid] = entry.data

@@ -3516,7 +3516,7 @@ public actor NodeNetworkRuntime: IvyDelegate {
         let source = IvyRootContentSource(
             ivy: overlay,
             peer: peer,
-            maximumMembers: 1,
+            maximumMembers: ChildEvidenceVolume.maximumMembers,
             maximumStorageBytes: ChildEvidenceVolume.maximumStorageBytes,
             maximumArchiveBytes: ChildEvidenceVolume.maximumArchiveBytes
         )
@@ -3703,7 +3703,7 @@ public actor NodeNetworkRuntime: IvyDelegate {
         let source = IvyRootContentSource(
             ivy: hierarchy,
             peer: peer,
-            maximumMembers: 1,
+            maximumMembers: ChildEvidenceVolume.maximumMembers,
             maximumStorageBytes: ChildEvidenceVolume.maximumStorageBytes,
             maximumArchiveBytes: ChildEvidenceVolume.maximumArchiveBytes
         )
