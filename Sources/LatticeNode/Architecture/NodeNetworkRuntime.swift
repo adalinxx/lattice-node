@@ -334,11 +334,6 @@ public actor NodeNetworkRuntime: IvyDelegate {
         let package: AuthenticatedChildPackage
     }
 
-    private struct PendingPortableAttachmentIndex: Sendable {
-        let peer: AuthenticatedPeer
-        let request: PortableAttachmentIndexRequestMessage
-    }
-
     private struct PendingGenesisVerification: Sendable {
         let peer: AuthenticatedPeer
         let request: ParentChainFactMessage
@@ -436,13 +431,6 @@ public actor NodeNetworkRuntime: IvyDelegate {
     private struct CandidateReservationRemovalFlush {
         let token: UInt64
         let task: Task<Void, Never>
-    }
-
-    private struct PortableEvidenceWork: Sendable {
-        let summary: PortableAttachmentSummary
-        let peer: AuthenticatedPeer
-        let generation: UInt64
-        let process: ChainProcess
     }
 
     private enum CandidateSourcePlane: Hashable {
@@ -556,17 +544,10 @@ public actor NodeNetworkRuntime: IvyDelegate {
     private var parentStateQueryGuard = ParentStateQueryGuard(
         capacity: NodeNetworkRuntime.maximumConcurrentParentStateQueries
     )
-    private var portableIndexCursors: [PeerKey: PortableAttachmentSummary] = [:]
     private var deferredSessionSweeps: [PeerKey: AuthenticatedPeer] = [:]
     private var announcedTips: [PeerKey: (height: UInt64, peer: AuthenticatedPeer)] = [:]
     private var rangeSyncReentryTask: Task<Void, Never>?
-    private var pendingPortableAttachmentIndexes:
-        [UInt64: PendingPortableAttachmentIndex] = [:]
     private var activeEvidenceVolumes = Set<EvidenceVolumeLease>()
-    private var portableEvidenceOrder: [EvidenceVolumeLease] = []
-    private var portableEvidenceWork:
-        [EvidenceVolumeLease: PortableEvidenceWork] = [:]
-    private var portableEvidenceWorker: Task<Void, Never>?
     /// Orders parent evidence and reservation transfer within one authenticated
     /// session. Transport effects remain in this actor.
     private var parentEvidence = ParentEvidenceFlow()
@@ -951,17 +932,11 @@ public actor NodeNetworkRuntime: IvyDelegate {
         }
         pendingGenesisResolves.removeAll()
         parentStateQueryGuard.removeAll()
-        pendingPortableAttachmentIndexes.removeAll()
-        portableIndexCursors.removeAll()
         deferredSessionSweeps.removeAll()
         announcedTips.removeAll()
         rangeSyncReentryTask?.cancel()
         rangeSyncReentryTask = nil
         activeEvidenceVolumes.removeAll()
-        portableEvidenceWorker?.cancel()
-        portableEvidenceWorker = nil
-        portableEvidenceOrder.removeAll()
-        portableEvidenceWork.removeAll()
         parentEvidence.reset()
         let pendingChildCandidates = Array(self.pendingChildCandidates.values)
         self.pendingChildCandidates.removeAll()
@@ -1688,13 +1663,9 @@ public actor NodeNetworkRuntime: IvyDelegate {
               let session = parentEvidenceSession(for: peer) else {
             return .rejected
         }
-        let activePortable = activeEvidenceVolumes.lazy.filter {
-            $0.plane == .overlay
-        }.count
         guard let append = parentEvidence.beginAppend(
             for: session,
-            competingOperationCount: portableEvidenceWork.count
-                + activePortable,
+            competingOperationCount: 0,
             capacity: Self.maximumEvidenceCandidates
         ) else { return .backpressured }
         let task = Task { [weak self] in
@@ -2193,10 +2164,6 @@ public actor NodeNetworkRuntime: IvyDelegate {
             }
             overlayPeers.removeValue(forKey: peer.key)
             discardAcceptedLeavesSessions(for: peer.key)
-            pendingPortableAttachmentIndexes =
-                pendingPortableAttachmentIndexes.filter {
-                    $0.value.peer.key != peer.key
-                }
             overlaySessions[peer.key] = peer
             scheduleOverlayHelloDeadline(for: peer, generation: generation)
             topic = NodeNetworkTopic.overlayHello
@@ -2262,10 +2229,6 @@ public actor NodeNetworkRuntime: IvyDelegate {
             overlaySessions.removeValue(forKey: key)
             overlayPeers.removeValue(forKey: key)
             announcedTips.removeValue(forKey: key)
-            pendingPortableAttachmentIndexes =
-                pendingPortableAttachmentIndexes.filter {
-                    $0.value.peer.key != key
-                }
             let disconnectedInventories = pendingTransactionInventories.filter {
                 $0.value.peer.key == key
             }
@@ -2429,16 +2392,6 @@ public actor NodeNetworkRuntime: IvyDelegate {
                 generation: generation,
                 process: process
             )
-            if rangeSync == nil {
-                await requestPortableAttachmentIndex(
-                    from: peer,
-                    after: portableIndexCursors[peer.key],
-                    generation: generation,
-                    process: process
-                )
-            } else {
-                deferredSessionSweeps[peer.key] = peer
-            }
             await requestTransactionInventory(
                 from: peer,
                 after: nil,
@@ -2477,47 +2430,6 @@ public actor NodeNetworkRuntime: IvyDelegate {
             scheduleTransactionInventory(
                 response,
                 from: peer,
-                generation: generation,
-                process: process
-            )
-        case NodeNetworkTopic.portableAttachmentAvailable:
-            guard let available = try? PortableAttachmentAvailableMessage
-                .decoded(message.payload) else { return }
-            let handled = enqueuePortableEvidence(
-                PortableAttachmentSummary(
-                    edgeCID: available.edgeCID,
-                    rootCID: available.rootCID,
-                    attachmentCID: available.attachmentCID
-                ),
-                from: peer,
-                generation: generation,
-                process: process
-            )
-            if !handled { await overlay.recycleSession(ifCurrent: peer) }
-        case NodeNetworkTopic.portableAttachmentIndexRequest:
-            guard let request = try? PortableAttachmentIndexRequestMessage
-                .decoded(message.payload) else { return }
-            await servePortableAttachmentIndex(
-                request,
-                to: peer,
-                generation: generation,
-                process: process
-            )
-        case NodeNetworkTopic.portableAttachmentIndexResponse:
-            guard let response = try? PortableAttachmentIndexResponseMessage
-                .decoded(message.payload) else { return }
-            schedulePortableAttachmentIndex(
-                response,
-                from: peer,
-                generation: generation,
-                process: process
-            )
-        case NodeNetworkTopic.portableAttachmentLocateRequest:
-            guard let request = try? PortableAttachmentLocateRequestMessage
-                .decoded(message.payload) else { return }
-            await servePortableAttachmentLocate(
-                request,
-                to: peer,
                 generation: generation,
                 process: process
             )
@@ -3102,484 +3014,6 @@ public actor NodeNetworkRuntime: IvyDelegate {
                 payload: payload
             )
         }
-    }
-
-    private func requestPortableAttachmentIndex(
-        from peer: AuthenticatedPeer,
-        after: PortableAttachmentSummary?,
-        generation: UInt64,
-        process: ChainProcess
-    ) async {
-        guard !configuration.address.isNexus,
-              isCurrentRuntime(generation: generation, process: process),
-              overlayPeers[peer.key]?.sessionID == peer.sessionID,
-              !pendingPortableAttachmentIndexes.values.contains(where: {
-                  $0.peer.sessionID == peer.sessionID
-              }) else { return }
-        let request = PortableAttachmentIndexRequestMessage(
-            requestID: makeRequestID(),
-            after: after
-        )
-        guard let payload = try? request.encoded() else { return }
-        pendingPortableAttachmentIndexes[request.requestID] = .init(
-            peer: peer,
-            request: request
-        )
-        let result = await overlay.sendMessage(
-            to: peer,
-            topic: NodeNetworkTopic.portableAttachmentIndexRequest,
-            payload: payload
-        )
-        if result == .notConnected {
-            pendingPortableAttachmentIndexes.removeValue(forKey: request.requestID)
-        } else {
-            scheduleRecoveryTimeout(
-                request.requestID,
-                generation: generation
-            )
-        }
-    }
-
-    private func announcePortableAttachmentAvailability(
-        edgeCID: String,
-        rootCID: String,
-        attachmentCID: String,
-        generation: UInt64,
-        process: ChainProcess
-    ) async {
-        guard let payload = try? PortableAttachmentAvailableMessage(
-            edgeCID: edgeCID,
-            rootCID: rootCID,
-            attachmentCID: attachmentCID
-        ).encoded() else { return }
-        for peer in overlayPeers.values {
-            guard isCurrentRuntime(generation: generation, process: process) else {
-                return
-            }
-            _ = await overlay.sendMessage(
-                to: peer,
-                topic: NodeNetworkTopic.portableAttachmentAvailable,
-                payload: payload
-            )
-        }
-    }
-
-    private func servePortableAttachmentIndex(
-        _ request: PortableAttachmentIndexRequestMessage,
-        to peer: AuthenticatedPeer,
-        generation: UInt64,
-        process: ChainProcess
-    ) async {
-        guard !configuration.address.isNexus else { return }
-        let after = request.after.map {
-            ChildRootAttachmentSummary(
-                edgeCID: $0.edgeCID,
-                rootCID: $0.rootCID,
-                attachmentCID: $0.attachmentCID
-            )
-        }
-        guard let entries = try? await process.childRootAttachmentSummaries(
-            scope: .incomingCarrier,
-            directory: configuration.address.directory,
-            after: after,
-            limit: PortableAttachmentIndexResponseMessage.maximumEntries + 1
-        ), isCurrentRuntime(generation: generation, process: process) else {
-            return
-        }
-        let page = entries.prefix(
-            PortableAttachmentIndexResponseMessage.maximumEntries
-        ).map {
-            PortableAttachmentSummary(
-                edgeCID: $0.edgeCID,
-                rootCID: $0.rootCID,
-                attachmentCID: $0.attachmentCID
-            )
-        }
-        guard let payload = try? PortableAttachmentIndexResponseMessage(
-            requestID: request.requestID,
-            after: request.after,
-            entries: Array(page),
-            hasMore: entries.count > page.count
-        ).encoded() else { return }
-        _ = await overlay.sendMessage(
-            to: peer,
-            topic: NodeNetworkTopic.portableAttachmentIndexResponse,
-            payload: payload
-        )
-    }
-
-    /// Answer a per-block evidence request: if this process holds the recovered
-    /// incoming-carrier package for the asked child block, tell the requester the
-    /// attachment is available (the same message the live announce path emits), so
-    /// it recovers the package through the ordinary portable-evidence path. A peer
-    /// that cannot recover the block stays silent.
-    private func servePortableAttachmentLocate(
-        _ request: PortableAttachmentLocateRequestMessage,
-        to peer: AuthenticatedPeer,
-        generation: UInt64,
-        process: ChainProcess
-    ) async {
-        guard !configuration.address.isNexus else { return }
-        guard let package = try? await process
-                .recoveredAuthenticatedChildPackage(for: request.childCID),
-              let edge = await DirectChildEdge.derive(from: package.package.proof),
-              let edgeCID = edge.edgeCID,
-              let attachmentCID = try? await process.portableEvidenceVolumeCID(
-                scope: .incomingCarrier,
-                edgeCID: edgeCID,
-                rootCID: package.package.proof.rootCID
-              )
-        else {
-            // A silent miss here on a block only this node can prove is a
-            // chain-liveness event: no follower can ever cross that block.
-            SyncTrace.log("locate-serve \(request.childCID) miss")
-            return
-        }
-        SyncTrace.log("locate-serve \(request.childCID) hit")
-        guard isCurrentRuntime(generation: generation, process: process),
-              overlayPeers[peer.key]?.sessionID == peer.sessionID,
-              let payload = try? PortableAttachmentAvailableMessage(
-                edgeCID: edgeCID,
-                rootCID: package.package.proof.rootCID,
-                attachmentCID: attachmentCID
-              ).encoded()
-        else { return }
-        _ = await overlay.sendMessage(
-            to: peer,
-            topic: NodeNetworkTopic.portableAttachmentAvailable,
-            payload: payload
-        )
-    }
-
-    /// Solicit per-block evidence from the peers that can serve the block: the
-    /// candidate's advertisers and the peer that supplied its content. Used when a
-    /// cold-synced block needs a child proof this node cannot recover locally
-    /// (its own parent never mined the carriers), so the block's supplier conveys
-    /// the portable package the live path would have carried.
-    private func requestPortableAttachmentLocate(
-        for childCID: String,
-        candidate: Candidate,
-        supplierPublicKey: String?,
-        generation: UInt64,
-        process: ChainProcess
-    ) async {
-        guard !configuration.address.isNexus else { return }
-        var peers: [AuthenticatedPeer] = candidate.providers
-            .compactMap(overlayPeer(for:))
-        if let supplierPublicKey, let key = try? PeerKey(supplierPublicKey),
-           let peer = overlayPeers[key],
-           !peers.contains(where: { $0.key == key }) {
-            peers.append(peer)
-        }
-        // Blocks reached through the predecessor walk carry no advertiser, and
-        // pin-resolved content need not attribute a sole supplier. Fall back to
-        // the current overlay peers so the block's holder is still asked; each
-        // peer either has the package or stays silent (same reach as the live
-        // announce broadcast), bounded by the exact-source cap.
-        if peers.isEmpty {
-            peers = Array(overlayPeers.values)
-        }
-        guard !peers.isEmpty,
-              let payload = try? PortableAttachmentLocateRequestMessage(
-                requestID: makeRequestID(),
-                childCID: childCID
-              ).encoded() else { return }
-        for peer in peers.prefix(Self.maximumExactContentSources) {
-            guard isCurrentRuntime(generation: generation, process: process) else {
-                return
-            }
-            let sent = await overlay.sendMessage(
-                to: peer,
-                topic: NodeNetworkTopic.portableAttachmentLocateRequest,
-                payload: payload
-            )
-            SyncTrace.log(
-                "locate-request \(childCID) "
-                    + "peer=\(peer.key.hex.prefix(8)) sent=\(sent)"
-            )
-        }
-    }
-
-    private func schedulePortableAttachmentIndex(
-        _ response: PortableAttachmentIndexResponseMessage,
-        from peer: AuthenticatedPeer,
-        generation: UInt64,
-        process: ChainProcess
-    ) {
-        guard let pending = pendingPortableAttachmentIndexes[response.requestID],
-              pending.peer.sessionID == peer.sessionID,
-              pending.request.after == response.after else { return }
-        pendingPortableAttachmentIndexes.removeValue(forKey: response.requestID)
-        Task { [weak self] in
-            await self?.finishPortableAttachmentIndex(
-                response,
-                from: peer,
-                generation: generation,
-                process: process
-            )
-        }
-    }
-
-    private func finishPortableAttachmentIndex(
-        _ response: PortableAttachmentIndexResponseMessage,
-        from peer: AuthenticatedPeer,
-        generation: UInt64,
-        process: ChainProcess
-    ) async {
-        guard let entry = response.entries.first else {
-            portableIndexCursors.removeValue(forKey: peer.key)
-            return
-        }
-        // Persist the walk cursor per PEER (not per session): a churned
-        // session must resume where it left off, or the walk restarts from
-        // the lexicographic beginning forever and never completes. A
-        // finished walk clears the cursor so a later session re-checks the
-        // full index (new entries sort anywhere).
-        portableIndexCursors[peer.key] = entry
-        let handled = await recoverPortableAttachment(
-            entry,
-            from: peer,
-            generation: generation,
-            process: process
-        )
-        guard isCurrentRuntime(generation: generation, process: process) else {
-            return
-        }
-        if !handled {
-            await overlay.recycleSession(ifCurrent: peer)
-        } else if rangeSync != nil {
-            // A deep catch-up began while this page was in flight (the
-            // start-time purge cannot see a walk between its page-response
-            // and its continuation): defer here, at the one choke point
-            // every walk passes through. The cursor above already persisted.
-            deferredSessionSweeps[peer.key] = peer
-        } else if response.hasMore {
-            await requestPortableAttachmentIndex(
-                from: peer,
-                after: entry,
-                generation: generation,
-                process: process
-            )
-        } else {
-            portableIndexCursors.removeValue(forKey: peer.key)
-        }
-    }
-
-    private func enqueuePortableEvidence(
-        _ summary: PortableAttachmentSummary,
-        from peer: AuthenticatedPeer,
-        generation: UInt64,
-        process: ChainProcess
-    ) -> Bool {
-        guard !configuration.address.isNexus,
-              isCurrentRuntime(generation: generation, process: process),
-              overlayPeers[peer.key]?.sessionID == peer.sessionID else {
-            return false
-        }
-        let lease = EvidenceVolumeLease(
-            plane: .overlay,
-            sessionID: peer.sessionID,
-            attachmentCID: summary.attachmentCID
-        )
-        guard !activeEvidenceVolumes.contains(lease),
-              portableEvidenceWork[lease] == nil else { return true }
-        let work = PortableEvidenceWork(
-            summary: summary,
-            peer: peer,
-            generation: generation,
-            process: process
-        )
-        let activePortable = activeEvidenceVolumes.lazy.filter {
-            $0.plane == .overlay
-        }.count
-        guard portableEvidenceWork.count + parentEvidence.activeOperationCount
-                + activePortable
-                < Self.maximumEvidenceCandidates - 1 else {
-            // Overflow drops the item, never the session: for a NATed
-            // follower the announcing peer may be the ONLY session, and a
-            // catch-up burst would tear down its own evidence source. The
-            // dropped item is re-solicited when the waiting candidate's
-            // window expires and re-enters admission.
-            SyncTrace.log(
-                "evidence-overflow drop \(summary.attachmentCID)"
-            )
-            return true
-        }
-        portableEvidenceWork[lease] = work
-        portableEvidenceOrder.append(lease)
-        startPortableEvidenceWorker()
-        return true
-    }
-
-    private func startPortableEvidenceWorker() {
-        guard portableEvidenceWorker == nil else { return }
-        portableEvidenceWorker = Task { [weak self] in
-            await self?.drainPortableEvidence()
-        }
-    }
-
-    private func drainPortableEvidence() async {
-        defer {
-            portableEvidenceWorker = nil
-            if !portableEvidenceOrder.isEmpty {
-                startPortableEvidenceWorker()
-            }
-        }
-        while !portableEvidenceOrder.isEmpty {
-            let lease = portableEvidenceOrder.removeFirst()
-            guard let work = portableEvidenceWork.removeValue(forKey: lease)
-            else { continue }
-            let handled = await recoverPortableAttachment(
-                work.summary,
-                from: work.peer,
-                generation: work.generation,
-                process: work.process
-            )
-            SyncTrace.log(
-                "evidence-recover \(work.summary.attachmentCID) "
-                    + "handled=\(handled)"
-            )
-            if !handled {
-                await overlay.recycleSession(ifCurrent: work.peer)
-            }
-        }
-    }
-
-    private func recoverPortableAttachment(
-        _ summary: PortableAttachmentSummary,
-        from peer: AuthenticatedPeer,
-        generation: UInt64,
-        process: ChainProcess
-    ) async -> Bool {
-        guard !configuration.address.isNexus,
-              isCurrentRuntime(generation: generation, process: process),
-              overlayPeers[peer.key]?.sessionID == peer.sessionID else {
-            return false
-        }
-        let lease = EvidenceVolumeLease(
-            plane: .overlay,
-            sessionID: peer.sessionID,
-            attachmentCID: summary.attachmentCID
-        )
-        if activeEvidenceVolumes.contains(lease) { return true }
-        // Reserve one slot for the structurally-required parent endpoint (a
-        // connectivity reservation, NOT validation trust — parent facts are still
-        // verified and never vouch for the child transition) so overlay churn
-        // cannot starve consensus-critical hierarchy evidence.
-        while activeEvidenceVolumes.count >= Self.maximumEvidenceCandidates - 1 {
-            do {
-                try await Task.sleep(
-                    nanoseconds: Self.nanoseconds(
-                        planeConfigurations.overlay.requestTimeout
-                    )
-                )
-            } catch {
-                return false
-            }
-            guard isCurrentRuntime(
-                generation: generation,
-                process: process
-            ), overlayPeers[peer.key]?.sessionID == peer.sessionID else {
-                return true
-            }
-            if activeEvidenceVolumes.contains(lease) { return true }
-        }
-        activeEvidenceVolumes.insert(lease)
-        defer { activeEvidenceVolumes.remove(lease) }
-        if let evidence = try? await process.childRootAttachment(
-            scope: .incomingCarrier,
-            edgeCID: summary.edgeCID,
-            rootCID: summary.rootCID
-        ) {
-            guard isCurrentRuntime(
-                generation: generation,
-                process: process
-            ), overlayPeers[peer.key]?.sessionID == peer.sessionID else {
-                return true
-            }
-            // A rejected enqueue is LOCAL congestion (ready pool full), not
-            // peer misbehavior: the recovery succeeded, so never let callers
-            // recycle the session over it. The rejection already requested
-            // inventory recovery, which re-derives the item later.
-            _ = enqueueCandidate(CandidateSeed(
-                blockCID: evidence.edge.childCID,
-                package: AuthenticatedChildPackage(
-                    package: ChildValidationPackage(proof: evidence.proof)
-                )
-            ))
-            return true
-        }
-        // The peer advertising an attachment is responsible for serving its
-        // immutable CAS graph. Binding resolution to that exact authenticated
-        // session prevents a false summary from being blamed on an honest
-        // third-party content provider.
-        let source = IvyRootContentSource(
-            ivy: overlay,
-            peer: peer,
-            maximumMembers: 1,
-            maximumStorageBytes: ChildEvidenceVolume.maximumFramedBytes,
-            maximumArchiveBytes: ChildEvidenceVolume.maximumArchiveBytes
-        )
-        let resolved: (
-            value: ChildEvidenceVolume?,
-            attribution: IvyRootContentSource.Attribution
-        )
-        while true {
-            let fetched = await source.withRootTracing(
-                summary.attachmentCID
-            ) { session in
-                await Self.resolveEvidenceVolume(
-                    summary.attachmentCID,
-                    source: session
-                )
-            }
-            guard fetched.attribution.localCapacityUnavailable else {
-                resolved = fetched
-                break
-            }
-            do {
-                try await Task.sleep(
-                    nanoseconds: Self.nanoseconds(
-                        planeConfigurations.overlay.requestTimeout
-                    )
-                )
-            } catch {
-                return true
-            }
-            guard isCurrentRuntime(generation: generation, process: process),
-                  overlayPeers[peer.key]?.sessionID == peer.sessionID else {
-                return true
-            }
-        }
-        guard let attachment = resolved.value,
-              let envelope = try? ChildValidationPackageEnvelope.decode(
-                attachment.envelopeBytes,
-                maximumEncodedSize:
-                    configuration.resourcePolicy.maximumParentWitnessBytes
-              ),
-              let package = try? envelope.makeValidationPackage(),
-              package.proof.rootCID == summary.rootCID,
-              let edge = await DirectChildEdge.derive(from: package.proof),
-              edge.edgeCID == summary.edgeCID,
-              isCurrentRuntime(generation: generation, process: process),
-              overlayPeers[peer.key]?.sessionID == peer.sessionID else {
-            if resolved.attribution.allResponsesComplete,
-               let supplier = resolved.attribution.soleRemoteSupplierPublicKey {
-                await overlay.reportDeficientContent(
-                    rootCID: summary.attachmentCID,
-                    servedBy: PeerID(publicKey: supplier)
-                )
-            }
-            return false
-        }
-        let gated = AuthenticatedChildPackage(package: package)
-        // See above: a rejected enqueue after a VERIFIED recovery is local
-        // congestion; only verification failures return false (and recycle).
-        _ = enqueueCandidate(CandidateSeed(
-            blockCID: edge.childCID,
-            package: gated
-        ))
-        return true
     }
 
     private nonisolated static func resolveEvidenceVolume(
@@ -4837,25 +4271,6 @@ public actor NodeNetworkRuntime: IvyDelegate {
             guard isCurrentRuntime(generation: generation, process: process) else {
                 return
             }
-            if let authenticated = authenticatedPackage,
-               let edge = await DirectChildEdge.derive(
-                    from: authenticated.package.proof
-               ), let edgeCID = edge.edgeCID {
-                if let portableAttachmentCID = try? await process
-                        .portableEvidenceVolumeCID(
-                            scope: .incomingCarrier,
-                            edgeCID: edgeCID,
-                            rootCID: authenticated.package.proof.rootCID
-                        ) {
-                    await announcePortableAttachmentAvailability(
-                        edgeCID: edgeCID,
-                        rootCID: authenticated.package.proof.rootCID,
-                        attachmentCID: portableAttachmentCID,
-                        generation: generation,
-                        process: process
-                    )
-                }
-            }
         }
 
         // Only the peer that supplied a COMPLETE invalid candidate can be blamed
@@ -4914,20 +4329,10 @@ public actor NodeNetworkRuntime: IvyDelegate {
                 break
             }
         }
-        // A cold-synced block arrives without the portable package the live path
-        // carries. When it needs a child proof this node cannot recover locally
-        // (its own parent never mined the carriers), solicit the package from the
-        // block's supplier so the retry admits it exactly like the live path.
-        if authenticatedPackage == nil,
-           case .unavailable(.childProof(_, let childCID)?) = outcome.decision {
-            await requestPortableAttachmentLocate(
-                for: childCID,
-                candidate: candidate,
-                supplierPublicKey: attempt.attribution.soleRemoteSupplierPublicKey,
-                generation: generation,
-                process: process
-            )
-        }
+        // PR2: peer-relayed portable child-proof solicitation removed. A block
+        // needing a child proof this node cannot recover locally now relies on
+        // the trusted hierarchy parent-evidence path to supply the securing
+        // fact; there is no untrusted-peer fallback.
         let resolution: CandidateAcquirer.Resolution
         if let predecessor = outcome.sameChainPredecessor,
            await process.hasAcceptedBlock(predecessor.predecessorCID) == false {
@@ -5178,8 +4583,8 @@ public actor NodeNetworkRuntime: IvyDelegate {
     /// on a peer that has genuinely stopped advancing our tip.
     private static let rangeSyncMaxRedrives: Int = 8
 
-    /// Run the session sweeps (accepted-leaves descent, portable-index walk)
-    /// that were deferred while a deep range sync was draining the pipeline.
+    /// Run the session sweeps (accepted-leaves descent) that were deferred
+    /// while a deep range sync was draining the pipeline.
     private func resumeDeferredSessionSweeps(
         generation: UInt64,
         process: ChainProcess
@@ -5206,12 +4611,6 @@ public actor NodeNetworkRuntime: IvyDelegate {
                 generation: generation,
                 process: process
             )
-            await requestPortableAttachmentIndex(
-                from: peer,
-                after: portableIndexCursors[key],
-                generation: generation,
-                process: process
-            )
         }
     }
 
@@ -5232,13 +4631,9 @@ public actor NodeNetworkRuntime: IvyDelegate {
             "range-sync start target=\(targetHeight) "
                 + "peer=\(peer.key.hex.prefix(8))"
         )
-        // Deep catch-up begins: stop this peer's height-blind index walk
-        // (cursor persists; it resumes after catch-up) so the range pages
-        // are not buried under lexicographic-order parks.
-        for (requestID, pending) in pendingPortableAttachmentIndexes
-            where pending.peer.key == peer.key {
-            pendingPortableAttachmentIndexes.removeValue(forKey: requestID)
-        }
+        // Deep catch-up begins: defer this peer's session sweeps (they resume
+        // after catch-up) so the range pages are not buried under
+        // lexicographic-order parks.
         deferredSessionSweeps[peer.key] = peer
         rangeSync = RangeSyncState(
             peer: peer,
@@ -6804,38 +6199,6 @@ public actor NodeNetworkRuntime: IvyDelegate {
         for requestID in buildIDs {
             childCandidateBuilds.removeValue(forKey: requestID)?.task.cancel()
         }
-    }
-
-    private func scheduleRecoveryTimeout(
-        _ requestID: UInt64,
-        generation: UInt64
-    ) {
-        let timeoutNanoseconds = Self.nanoseconds(
-            planeConfigurations.overlay.requestTimeout
-        )
-        Task { [weak self] in
-            do {
-                try await Task.sleep(nanoseconds: timeoutNanoseconds)
-            } catch {
-                return
-            }
-            await self?.recoveryRequestTimedOut(
-                requestID,
-                generation: generation
-            )
-        }
-    }
-
-    private func recoveryRequestTimedOut(
-        _ requestID: UInt64,
-        generation: UInt64
-    ) async {
-        guard isCurrentGeneration(generation) else { return }
-        let peer = pendingPortableAttachmentIndexes.removeValue(
-            forKey: requestID
-        )?.peer
-        guard let peer else { return }
-        await overlay.recycleSession(ifCurrent: peer)
     }
 
     private func childCandidateRequestDeadline() -> ContinuousClock.Instant? {
