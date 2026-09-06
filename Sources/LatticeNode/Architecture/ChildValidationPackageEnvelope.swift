@@ -22,9 +22,11 @@ public struct AuthenticatedChildPackage: Sendable {
 /// Deterministic, bounded transport for one structural child-work proof.
 /// Consensus meaning remains entirely in Lattice.
 public struct ChildValidationPackageEnvelope: Sendable {
-    // Leave room for Ivy framing.
-    public static let maximumEncodedSize = Int(IvyConfig.defaultProtocolMaxFrameSize)
-        - 1024
+    // The envelope is an in-memory reassembly of the proof, transported as a
+    // cashew DAG (ChildEvidenceVolume) — never as one Ivy frame — so this bound
+    // is the total-bytes operator budget, not the frame size. The per-frame
+    // allocation bound is preserved by the DAG's per-node chunking at transport.
+    public static let maximumEncodedSize = Int(IvyConfig.defaultProtocolMaxFrameSize) * 16
 
     private static let magic = Data("LNCPKG06".utf8)
 

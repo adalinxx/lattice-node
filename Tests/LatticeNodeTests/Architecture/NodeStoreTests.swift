@@ -787,13 +787,13 @@ final class NodeStoreTests: XCTestCase {
             root: evidence.attachmentCID
         )
         let evidenceVolume = try XCTUnwrap(storedEvidenceVolume)
-        XCTAssertEqual(evidenceVolume.entries.count, 1)
-        let evidenceFramedBytes = evidenceVolume.entries.reduce(0) {
-            $0 + 6 + $1.key.utf8.count + $1.value.count
-        }
+        // A cashew DAG: header node + one entry per proof CAS node.
+        XCTAssertGreaterThanOrEqual(evidenceVolume.entries.count, 1)
+        XCTAssertNotNil(evidenceVolume.entries[evidence.attachmentCID])
+        let totalBytes = evidenceVolume.entries.values.reduce(0) { $0 + $1.count }
         XCTAssertLessThanOrEqual(
-            evidenceFramedBytes,
-            ChildValidationPackageEnvelope.maximumEncodedSize + 1_024
+            totalBytes,
+            ChildEvidenceVolume.maximumArchiveBytes
         )
 
         _ = try await broker.evictUnpinned()
