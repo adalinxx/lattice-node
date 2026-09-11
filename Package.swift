@@ -38,7 +38,7 @@ let package = Package(
         ),
         .package(
             url: "https://github.com/adalinxx/Ivy.git",
-            exact: "13.0.0"
+            revision: "c0c92a7a556a458c82ac529b4de7ff694fb1c647"
         ),
         .package(
             url: "https://github.com/adalinxx/Tally.git",

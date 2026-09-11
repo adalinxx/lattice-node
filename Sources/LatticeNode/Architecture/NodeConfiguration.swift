@@ -82,20 +82,24 @@ public struct NodeConfiguration: Sendable {
     public let bootstrapPeers: [PeerEndpoint]
     public let parentEndpoint: ParentEndpoint?
     public let minPeerKeyBits: Int
-    /// Per-netgroup inbound/outbound overlay connection cap. Ivy buckets peers by
-    /// the connection's observed remote host (/16), an anti-eclipse defense that
-    /// assumes distinct source IPs. Nodes fronted by an L4 proxy (e.g. fly-proxy)
-    /// see every connection as the proxy's single address, collapsing the whole
-    /// mesh onto one netgroup and strangling it. This cap governs per-netgroup
-    /// connections in BOTH directions. A low value buys little here: bad data is
-    /// rejected on CID/PoW verification, not on connection policy (no
-    /// assumevalid); the reserved outbound slots that carry a node's own sync
-    /// are protected by a separate inbound ceiling regardless of this value; so
-    /// slot-flooding an unauthenticated peer can only withhold or delay, never
-    /// feed a false chain. The default is therefore permissive. A public
-    /// direct-IP node that wants a real per-source admission COST should set
-    /// `minPeerKeyBits > 0` (a grinding price) rather than rely on this bucket.
-    public let overlayMaxConnectionsPerNetgroup: Int
+    /// Per-netgroup INBOUND overlay connection cap. Ivy buckets peers by the
+    /// connection's observed remote host (/16). Nodes fronted by an L4 proxy
+    /// (e.g. fly-proxy) see every inbound connection as the proxy's single
+    /// address, collapsing all inbound peers onto one netgroup, so a low value
+    /// strangles them. The default is therefore permissive. This cap does not
+    /// govern outbound dials; see `overlayMaxOutboundConnectionsPerNetgroup`.
+    public let overlayMaxInboundConnectionsPerNetgroup: Int
+    /// Per-netgroup OUTBOUND overlay connection cap. Outbound peers are the
+    /// ones this node chooses to learn the chain from. Verification proves a
+    /// chain valid and measures its work, but cannot show a heavier chain
+    /// exists elsewhere: a node whose peers all belong to one attacker sees only
+    /// the attacker's branch and treats it as best, even when it has less work
+    /// than the honest chain, and builds templates on it. Peer identities are
+    /// free, so one host can offer unlimited identities; only this cap stops
+    /// that host holding every outbound slot. Outbound dials target real
+    /// addresses, so proxies do not collapse them. Operator-configured peers
+    /// (`bootstrapPeers`) are exempt.
+    public let overlayMaxOutboundConnectionsPerNetgroup: Int
     /// Operator-declared address at which this node is publicly reachable
     /// (host only; the overlay listen port applies). Behind NAT or an L4
     /// proxy the OBSERVED address differs from the reachable one, so
@@ -130,7 +134,8 @@ public struct NodeConfiguration: Sendable {
         bootstrapPeers: [PeerEndpoint] = [],
         parentEndpoint: ParentEndpoint? = nil,
         minPeerKeyBits: Int = 0,
-        overlayMaxConnectionsPerNetgroup: Int = IvyConfig.defaultMaxConnections,
+        overlayMaxInboundConnectionsPerNetgroup: Int = IvyConfig.defaultMaxConnections,
+        overlayMaxOutboundConnectionsPerNetgroup: Int = IvyConfig.defaultMaxOutboundConnectionsPerNetgroup,
         externalAddress: String? = nil,
         publicReadURL: String? = nil,
         resourcePolicy: NodeResourcePolicy = .default
@@ -200,7 +205,8 @@ public struct NodeConfiguration: Sendable {
         self.bootstrapPeers = bootstrapPeers
         self.parentEndpoint = normalizedParentEndpoint
         self.minPeerKeyBits = minPeerKeyBits
-        self.overlayMaxConnectionsPerNetgroup = max(1, overlayMaxConnectionsPerNetgroup)
+        self.overlayMaxInboundConnectionsPerNetgroup = max(1, overlayMaxInboundConnectionsPerNetgroup)
+        self.overlayMaxOutboundConnectionsPerNetgroup = max(1, overlayMaxOutboundConnectionsPerNetgroup)
         self.externalAddress = externalAddress
         self.publicReadURL = declaredReadURL
         self.resourcePolicy = resourcePolicy

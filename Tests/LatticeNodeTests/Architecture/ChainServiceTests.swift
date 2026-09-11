@@ -632,7 +632,7 @@ final class ChainServiceTests: XCTestCase {
                 listenPort: 0,
                 stunServers: [],
                 maxConnections: IvyConfig.defaultMaxConnections,
-                maxConnectionsPerNetgroup: IvyConfig.defaultMaxConnections,
+                maxInboundConnectionsPerNetgroup: IvyConfig.defaultMaxConnections,
                 relayEnabled: false,
                 carriers: [],
                 mode: .privateNetwork

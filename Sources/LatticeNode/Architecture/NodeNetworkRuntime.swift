@@ -176,17 +176,15 @@ struct NodeNetworkPlaneConfigurations {
                     NodeConfiguration.overlayReservedOutboundSlots,
                     IvyConfig.defaultMaxConnections - 1
                 ),
-                // Default: permissive (= the total connection cap). This is a
-                // PUBLIC plane (unlike the identity-pinned hierarchy plane), so
-                // the justification is not "the other plane does it" — it is
-                // that a per-netgroup connection cap is weak defense here: bad
-                // data is rejected on CID/PoW verification, the reserved
-                // outbound sync slots are protected by a separate inbound
-                // ceiling, and behind an L4 proxy every peer shares one address
-                // so a low cap just strangles the mesh. Operator-tunable; the
-                // real per-source cost for a public direct-IP node is
-                // minPeerKeyBits, not this bucket.
-                maxConnectionsPerNetgroup: configuration.overlayMaxConnectionsPerNetgroup,
+                // Inbound default: permissive (= the total connection cap),
+                // because behind an L4 proxy every inbound peer shares one
+                // address and a low cap strangles the mesh.
+                maxInboundConnectionsPerNetgroup: configuration.overlayMaxInboundConnectionsPerNetgroup,
+                // Outbound default: small. Verification cannot reveal a heavier
+                // chain the node's peers withhold, so an attacker holding every
+                // outbound slot can feed a valid lower-work branch as best.
+                // Dials target real addresses, so proxies do not affect this.
+                maxOutboundConnectionsPerNetgroup: configuration.overlayMaxOutboundConnectionsPerNetgroup,
                 minPeerKeyBits: configuration.minPeerKeyBits,
                 // Self-described reachable address: provider announcements and
                 // rendezvous records advertise this instead of the observed
@@ -203,7 +201,8 @@ struct NodeNetworkPlaneConfigurations {
                 inboundAdmissionBypassPeerKeys: parentAdmissionBypass,
                 maxConnections: IvyConfig.defaultMaxConnections,
                 reservedOutboundConnectionSlots: configuration.parentEndpoint == nil ? 0 : 1,
-                maxConnectionsPerNetgroup: IvyConfig.defaultMaxConnections,
+                maxInboundConnectionsPerNetgroup: IvyConfig.defaultMaxConnections,
+                maxOutboundConnectionsPerNetgroup: IvyConfig.defaultMaxConnections,
                 minPeerKeyBits: 0,
                 relayEnabled: false,
                 privateContentExchangeEnabled: true,

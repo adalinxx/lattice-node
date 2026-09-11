@@ -1331,6 +1331,64 @@ private enum NetworkTransportTestPorts {
 }
 
 final class NetworkTrustTests: XCTestCase {
+    /// Eclipse reproduction under the daemon's default overlay configuration:
+    /// identities are free, so one host can offer many of them, and every one
+    /// shares a single netgroup. That netgroup must not take more outbound
+    /// connections than the outbound per-netgroup cap.
+    func testDefaultOverlayCapsOutboundDialsIntoOneNetgroup() async throws {
+        var attackers: [Ivy] = []
+        var attackerEndpoints: [PeerEndpoint] = []
+        for index in 0..<6 {
+            let key = signingKey(UInt8(200 + index))
+            let port = NetworkTransportTestPorts.allocate()
+            let attacker = Ivy(config: IvyConfig(
+                signingKey: key,
+                listenPort: port,
+                stunServers: [],
+                healthConfig: PeerHealthConfig(enabled: false),
+                externalAddress: ("127.0.0.1", port),
+                mode: .overlay
+            ))
+            try await attacker.start()
+            attackers.append(attacker)
+            attackerEndpoints.append(PeerEndpoint(
+                publicKey: peerKey(key).hex,
+                host: "127.0.0.1",
+                port: port
+            ))
+        }
+        let configuration = try NodeConfiguration(
+            chainPath: ["Nexus"],
+            storagePath: URL(fileURLWithPath: "/tmp/lattice-outbound-netgroup-cap"),
+            privateKeyHex: String(repeating: "3d", count: 32),
+            listenPort: NetworkTransportTestPorts.allocate(),
+            factListenPort: NetworkTransportTestPorts.allocate(),
+            rpcPort: NetworkTransportTestPorts.allocate(),
+            externalAddress: "127.0.0.1"
+        )
+        let node = Ivy(config: try NodeNetworkPlaneConfigurations(configuration).overlay)
+        try await node.start()
+
+        for endpoint in attackerEndpoints {
+            try? await node.connect(to: endpoint)
+        }
+        let connected = await node.connectedPeers.count
+
+        await node.stop()
+        for attacker in attackers {
+            await attacker.stop()
+        }
+        XCTAssertLessThan(
+            configuration.overlayMaxOutboundConnectionsPerNetgroup,
+            attackerEndpoints.count
+        )
+        XCTAssertEqual(
+            connected,
+            configuration.overlayMaxOutboundConnectionsPerNetgroup,
+            "outbound sessions held by one netgroup"
+        )
+    }
+
     func testDuplicateParentQueryCannotReleaseActivePeerSlot() throws {
         let first = try PeerKey(
             rawRepresentation: Data(repeating: 1, count: PeerKey.byteCount)
@@ -1399,7 +1457,7 @@ final class NetworkTrustTests: XCTestCase {
                     listenPort: hierarchyPort,
                     stunServers: [],
                     maxConnections: IvyConfig.defaultMaxConnections,
-                    maxConnectionsPerNetgroup: IvyConfig.defaultMaxConnections,
+                    maxInboundConnectionsPerNetgroup: IvyConfig.defaultMaxConnections,
                     relayEnabled: false,
                     carriers: [],
                     mode: .privateNetwork
@@ -1823,8 +1881,24 @@ final class NetworkTrustTests: XCTestCase {
         XCTAssertTrue(planes.hierarchy.privateContentExchangeEnabled)
         XCTAssertEqual(planes.hierarchy.reservedOutboundConnectionSlots, 1)
         XCTAssertEqual(
-            planes.hierarchy.maxConnectionsPerNetgroup,
+            planes.hierarchy.maxInboundConnectionsPerNetgroup,
             IvyConfig.defaultMaxConnections
+        )
+        XCTAssertEqual(
+            planes.hierarchy.maxOutboundConnectionsPerNetgroup,
+            IvyConfig.defaultMaxConnections
+        )
+        XCTAssertEqual(
+            planes.overlay.maxInboundConnectionsPerNetgroup,
+            IvyConfig.defaultMaxConnections
+        )
+        XCTAssertEqual(
+            planes.overlay.maxOutboundConnectionsPerNetgroup,
+            IvyConfig.defaultMaxOutboundConnectionsPerNetgroup
+        )
+        XCTAssertLessThan(
+            planes.overlay.maxOutboundConnectionsPerNetgroup,
+            planes.overlay.maxConnections
         )
         XCTAssertEqual(planes.overlay.publicKey, planes.hierarchy.publicKey)
         XCTAssertEqual(
@@ -1870,7 +1944,7 @@ final class NetworkTrustTests: XCTestCase {
                 inboundAdmissionBypassPeerKeys: [peerKey(parent)],
                 stunServers: [],
                 maxConnections: IvyConfig.defaultMaxConnections,
-                maxConnectionsPerNetgroup: IvyConfig.defaultMaxConnections,
+                maxInboundConnectionsPerNetgroup: IvyConfig.defaultMaxConnections,
                 relayEnabled: false,
                 carriers: [],
                 mode: .privateNetwork
@@ -1914,7 +1988,7 @@ final class NetworkTrustTests: XCTestCase {
                 )],
                 stunServers: [],
                 maxConnections: IvyConfig.defaultMaxConnections,
-                maxConnectionsPerNetgroup: IvyConfig.defaultMaxConnections,
+                maxInboundConnectionsPerNetgroup: IvyConfig.defaultMaxConnections,
                 relayEnabled: false,
                 carriers: [],
                 mode: .privateNetwork
@@ -2815,7 +2889,7 @@ final class NetworkTrustTests: XCTestCase {
                     healthConfig: PeerHealthConfig(enabled: false),
                     maxConnections: IvyConfig.defaultMaxConnections,
                     reservedOutboundConnectionSlots: 1,
-                    maxConnectionsPerNetgroup: IvyConfig.defaultMaxConnections,
+                    maxInboundConnectionsPerNetgroup: IvyConfig.defaultMaxConnections,
                     relayEnabled: false,
                     privateContentExchangeEnabled: true,
                     carriers: [],
@@ -3738,7 +3812,7 @@ final class NetworkTrustTests: XCTestCase {
                 listenPort: hierarchyPort,
                 stunServers: [],
                 maxConnections: IvyConfig.defaultMaxConnections,
-                maxConnectionsPerNetgroup: IvyConfig.defaultMaxConnections,
+                maxInboundConnectionsPerNetgroup: IvyConfig.defaultMaxConnections,
                 relayEnabled: false,
                 carriers: [],
                 mode: .privateNetwork
@@ -4592,7 +4666,7 @@ final class NetworkTrustTests: XCTestCase {
                 listenPort: hierarchyPort,
                 stunServers: [],
                 maxConnections: IvyConfig.defaultMaxConnections,
-                maxConnectionsPerNetgroup: IvyConfig.defaultMaxConnections,
+                maxInboundConnectionsPerNetgroup: IvyConfig.defaultMaxConnections,
                 relayEnabled: false,
                 carriers: [],
                 mode: .privateNetwork
@@ -6153,7 +6227,7 @@ final class NetworkTrustTests: XCTestCase {
                 listenPort: 0,
                 stunServers: [],
                 maxConnections: IvyConfig.defaultMaxConnections,
-                maxConnectionsPerNetgroup: IvyConfig.defaultMaxConnections,
+                maxInboundConnectionsPerNetgroup: IvyConfig.defaultMaxConnections,
                 relayEnabled: false,
                 carriers: [],
                 mode: .privateNetwork
@@ -8077,7 +8151,7 @@ final class NetworkTrustTests: XCTestCase {
                     requestTimeout: .milliseconds(200),
                     stunServers: [],
                     maxConnections: IvyConfig.defaultMaxConnections,
-                    maxConnectionsPerNetgroup: IvyConfig.defaultMaxConnections,
+                    maxInboundConnectionsPerNetgroup: IvyConfig.defaultMaxConnections,
                     privateContentExchangeEnabled: true,
                     mode: .privateNetwork
                 )
@@ -8348,7 +8422,7 @@ final class NetworkTrustTests: XCTestCase {
                     requestTimeout: .milliseconds(100),
                     stunServers: [],
                     maxConnections: IvyConfig.defaultMaxConnections,
-                    maxConnectionsPerNetgroup: IvyConfig.defaultMaxConnections,
+                    maxInboundConnectionsPerNetgroup: IvyConfig.defaultMaxConnections,
                     relayEnabled: false,
                     carriers: [],
                     mode: .privateNetwork

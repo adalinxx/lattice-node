@@ -70,8 +70,11 @@ struct LatticeNodeCommand: AsyncParsableCommand {
     @Option(help: "Minimum overlay peer-key work bits")
     var minimumPeerKeyBits = 0
 
-    @Option(help: "Per-netgroup overlay connection cap (both directions). Defaults to the total connection cap (no effective throttle): a low value breaks proxy-fronted nodes where every connection shares one address, and buys little since bad data is rejected on verification and outbound sync slots are separately reserved. For a real per-source admission cost on a public direct-IP node, set --minimum-peer-key-bits (a grinding price) instead of lowering this.")
+    @Option(help: "Per-netgroup INBOUND overlay connection cap. Defaults to the total connection cap (no effective throttle): a low value breaks proxy-fronted nodes, where every inbound connection shares the proxy's address. Does not limit outbound dials; see --overlay-max-outbound-connections-per-netgroup.")
     var overlayMaxConnectionsPerNetgroup = IvyConfig.defaultMaxConnections
+
+    @Option(help: "Per-netgroup OUTBOUND overlay connection cap. Keeps one address block from holding every peer this node syncs from: an eclipsed node cannot see a heavier chain and treats the attacker's lower-work branch as best. Configured --peer endpoints are exempt. Unaffected by proxies, since dials target real addresses.")
+    var overlayMaxOutboundConnectionsPerNetgroup = IvyConfig.defaultMaxOutboundConnectionsPerNetgroup
 
     @Option(help: "Public read-only HTTP port; binds all interfaces and serves ONLY the bounded GET read routes (the read-replica allowlist, enforced in code). Chain data is public; this exposes no operator or write surface.")
     var publicReadPort: UInt16?
@@ -112,7 +115,8 @@ struct LatticeNodeCommand: AsyncParsableCommand {
             bootstrapPeers: overlayPeers,
             parentEndpoint: parentEndpoint,
             minPeerKeyBits: minimumPeerKeyBits,
-            overlayMaxConnectionsPerNetgroup: overlayMaxConnectionsPerNetgroup,
+            overlayMaxInboundConnectionsPerNetgroup: overlayMaxConnectionsPerNetgroup,
+            overlayMaxOutboundConnectionsPerNetgroup: overlayMaxOutboundConnectionsPerNetgroup,
             externalAddress: externalAddress,
             publicReadURL: publicReadUrl
         )
