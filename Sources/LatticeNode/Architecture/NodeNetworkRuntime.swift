@@ -3993,6 +3993,22 @@ public actor NodeNetworkRuntime: IvyDelegate {
             pendingChildCandidates.removeValue(forKey: response.requestID)
             pending.continuation.resume(returning: candidate)
 
+        case (NodeNetworkTopic.childCandidateUnavailable, .child(let childPath)):
+            // The same authentication the response path applies: only the peer
+            // holding this pending request, on the path it was asked about, for
+            // the parent block it was asked about, can retire it. Otherwise any
+            // child could cancel another's candidate.
+            guard
+                let message = try? ChildCandidateUnavailableMessage.decoded(
+                    message.payload
+                  ), let pending = pendingChildCandidates[message.requestID],
+                  pending.peerKey == peer.key,
+                  pending.childPath == childPath,
+                  message.childPath == childPath,
+                  pending.parentCID == message.parentCID
+            else { return }
+            finishChildCandidateRequest(message.requestID, with: nil)
+
         case (NodeNetworkTopic.childCandidateReservationRequest, .parent):
             guard let request = try?
                     ChildCandidateReservationRequestMessage.decoded(
@@ -6995,7 +7011,16 @@ public actor NodeNetworkRuntime: IvyDelegate {
                     )
                 }
             }
-        ) else { return }
+        ) else {
+            // The build failed, and staying silent would cost the PARENT the
+            // whole request deadline on every template it assembles -- a chain
+            // still awaiting its genesis can never build, so that stall repeats
+            // forever. Say so instead.
+            await sendChildCandidateUnavailable(
+                request, peer: peer, generation: generation, process: process
+            )
+            return
+        }
         guard isCurrentRuntime(generation: generation, process: process),
             childCandidateBuilds[request.requestID]?.token == token,
               !Task.isCancelled,
@@ -7004,7 +7029,12 @@ public actor NodeNetworkRuntime: IvyDelegate {
               candidate.directory == configuration.address.directory,
               let blockData = candidate.block.toData(),
               let childCID = try? BlockHeader(node: candidate.block).rawCID
-        else { return }
+        else {
+            await sendChildCandidateUnavailable(
+                request, peer: peer, generation: generation, process: process
+            )
+            return
+        }
         guard let payload = try? ChildCandidateResponseMessage(
                 requestID: request.requestID,
                 childPath: configuration.chainPath,
@@ -7023,6 +7053,34 @@ public actor NodeNetworkRuntime: IvyDelegate {
         else {
             return
         }
+    }
+
+    /// Tell the parent this request will not be answered.
+    ///
+    /// Best effort on purpose: if the session is already gone there is nobody
+    /// to tell, and the parent's deadline remains the backstop. A parent that
+    /// predates this topic ignores it and falls back to that same deadline, so
+    /// sending it is never worse than silence.
+    private func sendChildCandidateUnavailable(
+        _ request: ChildCandidateRequestMessage,
+        peer: AuthenticatedPeer,
+        generation: UInt64,
+        process: ChainProcess
+    ) async {
+        guard isCurrentRuntime(generation: generation, process: process),
+              hierarchySessions[peer.key]?.sessionID == peer.sessionID,
+              hierarchyPeers[peer.key] == .parent,
+              let payload = try? ChildCandidateUnavailableMessage(
+                requestID: request.requestID,
+                childPath: configuration.chainPath,
+                parentCID: request.parentCID
+              ).encoded()
+        else { return }
+        _ = await hierarchy.sendMessage(
+            to: peer,
+            topic: NodeNetworkTopic.childCandidateUnavailable,
+            payload: payload
+        )
     }
 
     private func scheduleChildCandidateTimeout(

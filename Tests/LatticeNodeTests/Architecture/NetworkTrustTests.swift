@@ -2771,6 +2771,69 @@ final class NetworkTrustTests: XCTestCase {
         ).encoded())
     }
 
+    /// A child's explicit "I cannot answer this" must survive the wire exactly,
+    /// and must be as strictly bounded as every other hierarchy message. It
+    /// carries no block by design -- the whole point is to be the cheapest
+    /// possible answer -- so the usual content binding cannot stand in for
+    /// canonical encoding here.
+    func testChildCandidateUnavailableWireRoundTripsAndRejectsJunk() throws {
+        let parentCID = "bafyreiayw4z5qz4lt2sljf2enzn7uol3qa6bebadav7qwnqz7agxkiuwhq"
+        let message = ChildCandidateUnavailableMessage(
+            requestID: 42,
+            childPath: ["Nexus", "Payments"],
+            parentCID: parentCID
+        )
+        let decoded = try ChildCandidateUnavailableMessage.decoded(
+            message.encoded()
+        )
+        XCTAssertEqual(decoded.requestID, 42)
+        XCTAssertEqual(decoded.childPath, ["Nexus", "Payments"])
+        XCTAssertEqual(decoded.parentCID, parentCID)
+
+        // Trailing bytes are not ignored: the decoder pins `position ==
+        // endIndex` and re-encodes to confirm the bytes were canonical.
+        var trailing = try message.encoded()
+        trailing.append(contentsOf: [0x00])
+        XCTAssertThrowsError(
+            try ChildCandidateUnavailableMessage.decoded(trailing),
+            "trailing bytes must not decode"
+        )
+
+        var truncated = try message.encoded()
+        truncated.removeLast()
+        XCTAssertThrowsError(
+            try ChildCandidateUnavailableMessage.decoded(truncated),
+            "a truncated message must not decode"
+        )
+
+        // requestID 0 is the reserved "no request" value everywhere else on
+        // this plane, so it must not be expressible here either.
+        XCTAssertThrowsError(try ChildCandidateUnavailableMessage(
+            requestID: 0,
+            childPath: ["Nexus", "Payments"],
+            parentCID: parentCID
+        ).encoded())
+
+        // A child path must be absolute and deeper than the root: a bare
+        // ["Nexus"] is the parent, not a child, and could retire a request
+        // that was never about it.
+        XCTAssertThrowsError(try ChildCandidateUnavailableMessage(
+            requestID: 43,
+            childPath: ["Nexus"],
+            parentCID: parentCID
+        ).encoded())
+    }
+
+    /// The topic must route on the hierarchy plane. A hierarchy message that
+    /// fell through to the overlay would be reachable by peers that are not
+    /// this chain's children.
+    func testChildCandidateUnavailableRoutesOnTheHierarchyPlane() {
+        XCTAssertEqual(
+            NodeNetworkTopic.plane(for: NodeNetworkTopic.childCandidateUnavailable),
+            .hierarchy
+        )
+    }
+
     func testCandidateWireRejectsMismatchedAndOversizedContent() async throws {
         let block = try await canonicalNetworkBlock()
         let childCID = try BlockHeader(node: block).rawCID
@@ -5982,6 +6045,76 @@ final class NetworkTrustTests: XCTestCase {
             XCTAssertEqual(committing.count, 1)
             let forwardedOptIn = await received.lastCommit()
             XCTAssertEqual(forwardedOptIn, true)
+        } catch {
+            await fixture.childRuntime.stop()
+            await fixture.parentRuntime.stop()
+            throw error
+        }
+        await fixture.childRuntime.stop()
+        await fixture.parentRuntime.stop()
+    }
+
+    /// A child that CANNOT build must say so, not go quiet.
+    ///
+    /// Silence is indistinguishable from slowness, so the parent has no choice
+    /// but to hold the request open until its deadline expires -- and it pays
+    /// that on EVERY template it assembles. A child that can never build (one
+    /// still awaiting its genesis, say) therefore taxes the parent forever.
+    /// Live, this was 15 seconds per template against 23 milliseconds once the
+    /// child answered.
+    ///
+    /// The bound here is deliberately far below the request deadline rather
+    /// than tight: this asserts "did not wait for the timeout", which is the
+    /// property, and a tight bound would just be a flake on a loaded machine.
+    func testChildThatCannotBuildIsRetiredWithoutWaitingForTheDeadline()
+        async throws
+    {
+        let fixture = try await provisionalRootFixture(keyByte: 0x97)
+        // The session has to be established before the child can refuse
+        // anything, so the builder answers normally until it is armed.
+        let refusing = RefusalSwitch()
+        let childHandlers = NodeNetworkHandlers(
+            childCandidateBuilder: { _, _ in
+                if await refusing.isArmed() {
+                    // Exactly what a chain with no genesis does: it cannot
+                    // produce a candidate for any parent block.
+                    throw CancellationError()
+                }
+                return fixture.candidate
+            },
+            candidateReservations: { _ in true },
+            admission: { _ in throw CancellationError() }
+        )
+        do {
+            try await fixture.parentRuntime.start(
+                process: fixture.parentProcess,
+                handlers: inertNetworkHandlers()
+            )
+            try await fixture.childRuntime.start(
+                process: fixture.childProcess,
+                handlers: childHandlers
+            )
+            try await waitForChildCandidate(fixture)
+            await refusing.arm()
+
+            let started = ContinuousClock.now
+            let candidates = await fixture.parentRuntime.directChildCandidates(
+                ChildCandidateRequestContext(
+                    parentCarrier: fixture.context.parentCarrier,
+                    rewards: [],
+                    minimumWork: []
+                )
+            )
+            let elapsed = started.duration(to: ContinuousClock.now)
+
+            XCTAssertTrue(
+                candidates.isEmpty,
+                "a child that cannot build contributes no candidate"
+            )
+            XCTAssertLessThan(
+                elapsed, .seconds(5),
+                "the parent must act on the child's refusal, not wait out its deadline"
+            )
         } catch {
             await fixture.childRuntime.stop()
             await fixture.parentRuntime.stop()
@@ -9405,4 +9538,12 @@ private final class AnchorRequestingChildPeer: IvyDelegate, Sendable {
             payload: anchor
         )
     }
+}
+
+/// Flips a fixture child from "answers normally" to "cannot build", so a test
+/// can establish the session first and refuse afterwards.
+private actor RefusalSwitch {
+    private var armed = false
+    func arm() { armed = true }
+    func isArmed() -> Bool { armed }
 }
