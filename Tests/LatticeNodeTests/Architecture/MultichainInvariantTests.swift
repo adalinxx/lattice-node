@@ -153,13 +153,27 @@ final class MultichainInvariantTests: XCTestCase {
         XCTAssertEqual(evidence.proof.rootCID, carrierHeader.rawCID)
         XCTAssertEqual(evidence.proof.directoryPath, ["Payments"])
 
-        // A co-mined height-1 block is authenticated by its carrier proof alone;
-        // the genesis link is only for genesis admission (the child already
-        // self-admitted its genesis). validateParentFacts requires a nil link here.
+        // A height-1 block proves its `parentState` like every other height
+        // (spec §5.3 step 6, which carries no height-1 exemption). The carrier
+        // proof cannot establish it: that compares the child's declared
+        // `parentState` against a CARRIER's `prevState`, and a carrier need not
+        // be admitted, connected, valid or canonical (§9.5) — so both sides may
+        // be chosen by one party.
+        //
+        // The predecessor is the child's genesis, whose `parentState` is
+        // `emptyHeader`, so the link runs from there to the block's declared
+        // parent state. In production the node derives this itself: admission
+        // answers `crossChainEvidenceRequired(.parentStateContinuity(...))`, the
+        // node asks its parent, and builds the link from the reply.
         let package = AuthenticatedChildPackage(
             package: ChildValidationPackage(
                 proof: evidence.proof,
-                parentGenesisLink: nil
+                parentGenesisLink: nil,
+                parentStateContinuityLink: ParentStateContinuityLink(
+                    parentPath: [DEFAULT_ROOT_DIRECTORY],
+                    fromStateCID: LatticeState.emptyHeader.rawCID,
+                    toStateCID: childBlock.parentState.rawCID
+                )
             )
         )
         let childBlockHeader = BlockHeader(

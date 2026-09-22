@@ -391,10 +391,28 @@ public actor ChainProcess: ContentSource, Fetcher, VolumeStorer {
                     throw ChainProcessError.invalidNexusGenesis
                 }
             }
-            let batches = staged.map(\.batch)
             // Admission batches are the only recovery authority. The
             // projection is a derived cache and must not be able to add facts
             // or prevent a valid history from reopening.
+            //
+            // The one exception is the tier column, and only for history that
+            // predates durable validation facts: those rows record executions
+            // this store really performed, and replaying without them would
+            // come back having forgotten every one — leaving the chain unable
+            // to attest any state it produced, so no child could anchor and no
+            // child could advance. Synthesizing is safe because the fact is
+            // idempotent by id and the in-memory set is monotone, so a block
+            // that also carries a durable fact is unaffected.
+            let executed = try await store.executedBlockCIDs()
+            let carriedFacts = Set(staged.flatMap { admission in
+                admission.batch.facts.compactMap { fact -> String? in
+                    guard case .validation(let value) = fact else { return nil }
+                    return value.blockHash
+                }
+            })
+            let batches = staged.map(\.batch) + executed.subtracting(carriedFacts)
+                .sorted()
+                .map { ChainAdmissionBatch.validation(blockHash: $0) }
             let chain = try await ChainState.restore(
                 replaying: batches,
                 revisionFloor: try await store.consensusRevisionFloor()
@@ -909,10 +927,15 @@ public actor ChainProcess: ContentSource, Fetcher, VolumeStorer {
             try Task.checkCancellation()
             // Validated tier (deferred execution): the block was already weighed,
             // and its weighed block fact (empty stateDiff) is immutable and keyed
-            // by blockHash only. Re-staging the validated fact's real stateDiff
-            // would collide, so a validate SUCCESS never rewrites `admission_facts`
-            // — it retains the freshly materialized post-state and flips the durable
-            // marker. A validate EXCLUSION is a brand-new fact and stages normally.
+            // by blockHash only, so the validated fact's real stateDiff cannot
+            // rewrite it. What a validate SUCCESS does stage is the standalone
+            // `.validation` fact, which is keyed separately and so never collides:
+            // it retains the freshly materialized post-state, appends that fact,
+            // and flips the durable marker. The fact is not decoration —
+            // `admission_batches` is the only recovery authority, so without it
+            // execution would be forgotten on every restart and the chain would
+            // attest nothing. A validate EXCLUSION is a brand-new fact and stages
+            // normally.
             if case .validate = mode {
                 let isExclusion = context.batch.facts.contains {
                     if case .exclusion = $0 { return true }
@@ -970,6 +993,22 @@ public actor ChainProcess: ContentSource, Fetcher, VolumeStorer {
                             pendingChildProofCapacity: Self.preparedChildProofCapacity
                         )
                     }
+                    // Append BEFORE the marker flips, for the same reason the
+                    // pin goes first: a crash between leaves a block the walk
+                    // simply re-validates (the fact is idempotent by id), never
+                    // a marker whose fact was lost. The batch carries no volume
+                    // roots — execution owns no new content, only the judgment.
+                    // No revision floor: a validation carries no block and no
+                    // work, so Lattice returns no commit for it and the chain's
+                    // revision does not move. Advancing the durable floor here
+                    // would push it past a revision the replayed chain never
+                    // reaches.
+                    try await self.store.stage(
+                        ChainAdmissionBatch.validation(
+                            blockHash: blockHeader.rawCID
+                        ),
+                        volumeRoots: []
+                    )
                     try await self.store.promoteValidated(
                         blockCID: blockHeader.rawCID
                     )
@@ -1740,11 +1779,14 @@ public actor ChainProcess: ContentSource, Fetcher, VolumeStorer {
         )
     }
 
-    /// Query this process's recovered graph of connected, validated blocks.
-    /// The walk holds the consensus actor, so each query carries the local
-    /// resource-policy visit budget. Exhaustion answers with silence — the
-    /// same retryable unavailability as any other non-answer — and the
-    /// budget is operator-raisable; it never marks chain data invalid.
+    /// Query this process's recovered graph of connected, executed blocks.
+    ///
+    /// Carries no visit budget. Whether a state was produced by this chain is a
+    /// property of the graph, not of how hard this node is willing to look, and
+    /// truncating the search would make the same question answerable here and
+    /// unanswerable on an identically-stocked peer — splitting honest nodes by
+    /// local policy. Serving RATE stays a node's choice (`ParentStateQueryGuard`
+    /// bounds concurrency per peer); the ANSWER does not.
     func hasParentStateContinuity(
         from fromStateCID: String,
         to toStateCID: String
@@ -1752,9 +1794,7 @@ public actor ChainProcess: ContentSource, Fetcher, VolumeStorer {
         guard case .active(let level) = runtimePhase else { return false }
         return await level.chain.hasStateContinuity(
             from: fromStateCID,
-            to: toStateCID,
-            maximumBlockVisits:
-                configuration.resourcePolicy.maximumContinuityBlockVisits
+            to: toStateCID
         )
     }
 
