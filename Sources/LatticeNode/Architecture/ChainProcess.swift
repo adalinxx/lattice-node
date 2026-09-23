@@ -13,6 +13,9 @@ public enum ChainProcessError: Error, Equatable, Sendable {
     case unresolvedCanonicalTip(String)
     case malformedAuthenticatedChildProof
     case consensusRevisionExhausted
+    /// The validated tier produced a batch that does not record execution.
+    /// Recording one anyway would attest a state this node never produced.
+    case validatedTierRecordedNoExecution
 }
 
 public enum ChainProcessPhase: String, Sendable {
@@ -293,6 +296,11 @@ public actor ChainProcess: ContentSource, Fetcher, VolumeStorer {
         // volumes.db (unlike the batch-rebuilt scope above). A marker whose
         // pin is gone is demoted to weighed so the walk re-validates it; a pin
         // whose marker never flipped (crash between pin and flip) is released.
+        // Read BEFORE the demotion below rewrites this column. Demotion is
+        // retention bookkeeping — it says a cached post-state may be evicted,
+        // not that the transition never ran — so an execution demoted on this
+        // boot must still be carried across.
+        let executedBeforeDemotion = try await store.executedBlockCIDs()
         let walkValidated = try await store.walkValidatedBlockCIDs()
         let validatedOwnerPrefix = Self.validatedOwnerPrefix(retentionScope)
         let pinnedOwners = Set(
@@ -395,24 +403,43 @@ public actor ChainProcess: ContentSource, Fetcher, VolumeStorer {
             // projection is a derived cache and must not be able to add facts
             // or prevent a valid history from reopening.
             //
-            // The one exception is the tier column, and only for history that
-            // predates durable validation facts: those rows record executions
-            // this store really performed, and replaying without them would
-            // come back having forgotten every one — leaving the chain unable
-            // to attest any state it produced, so no child could anchor and no
-            // child could advance. Synthesizing is safe because the fact is
-            // idempotent by id and the in-memory set is monotone, so a block
-            // that also carries a durable fact is unaffected.
-            let executed = try await store.executedBlockCIDs()
+            // The one exception is history written before durable validation
+            // facts existed: those rows record executions this store really
+            // performed, and replaying without them would come back having
+            // forgotten every one — leaving the chain unable to attest any
+            // state it produced, so no child could anchor and no child could
+            // advance.
+            //
+            // They are STAGED, not merely replayed. Replaying alone would leave
+            // the mutable tier column as the only record of those executions
+            // forever, and demotion sets it to zero — so a demote would erase
+            // an execution that actually happened, permanently. Staging makes
+            // this a one-time migration after which the immutable fact is the
+            // authority, matching every execution recorded from here on.
             let carriedFacts = Set(staged.flatMap { admission in
                 admission.batch.facts.compactMap { fact -> String? in
                     guard case .validation(let value) = fact else { return nil }
                     return value.blockHash
                 }
             })
-            let batches = staged.map(\.batch) + executed.subtracting(carriedFacts)
+            // Only blocks this log actually admitted: a validation naming a
+            // block absent from the replayed facts would defer forever and turn
+            // a boot into `corruptConsensusGraph`.
+            let admittedBlocks = Set(staged.flatMap { admission in
+                admission.batch.facts.compactMap { fact -> String? in
+                    guard case .block(let value) = fact else { return nil }
+                    return value.blockHash
+                }
+            })
+            let migrated = executedBeforeDemotion
+                .intersection(admittedBlocks)
+                .subtracting(carriedFacts)
                 .sorted()
                 .map { ChainAdmissionBatch.validation(blockHash: $0) }
+            for batch in migrated {
+                try await store.stage(batch, volumeRoots: [])
+            }
+            let batches = staged.map(\.batch) + migrated
             let chain = try await ChainState.restore(
                 replaying: batches,
                 revisionFloor: try await store.consensusRevisionFloor()
@@ -993,11 +1020,27 @@ public actor ChainProcess: ContentSource, Fetcher, VolumeStorer {
                             pendingChildProofCapacity: Self.preparedChildProofCapacity
                         )
                     }
-                    // Append BEFORE the marker flips, for the same reason the
+                    // Take Lattice's own judgment rather than re-deriving it
+                    // from the mode: Lattice appends the validation fact when it
+                    // executed the transition, and inferring "this mode means
+                    // executed" would silently become a forged-attestation
+                    // primitive the day any non-executing outcome is added under
+                    // `.validate`.
+                    //
+                    // Appended BEFORE the marker flips, for the same reason the
                     // pin goes first: a crash between leaves a block the walk
                     // simply re-validates (the fact is idempotent by id), never
                     // a marker whose fact was lost. The batch carries no volume
                     // roots — execution owns no new content, only the judgment.
+                    let executed = context.batch.facts.contains { fact in
+                        guard case .validation(let value) = fact else {
+                            return false
+                        }
+                        return value.blockHash == blockHeader.rawCID
+                    }
+                    guard executed else {
+                        throw ChainProcessError.validatedTierRecordedNoExecution
+                    }
                     // No revision floor: a validation carries no block and no
                     // work, so Lattice returns no commit for it and the chain's
                     // revision does not move. Advancing the durable floor here

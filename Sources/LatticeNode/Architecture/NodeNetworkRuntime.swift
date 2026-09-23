@@ -141,6 +141,54 @@ struct ParentStateQueryGuard {
     }
 }
 
+/// Bounds how OFTEN one peer may ask a parent-state CONTINUITY question, never
+/// WHAT the answer is.
+///
+/// Concurrency alone does not bound that question: the walk runs on the
+/// consensus actor and its cost grows with executed chain height, so one peer
+/// asking back-to-back holds a growing share of the actor — and the hierarchy
+/// plane admits any host declaring a one-deeper path, so being that peer costs
+/// nothing. Truncating the search instead would make the same question
+/// answerable here and unanswerable on an identically-stocked peer, splitting
+/// honest nodes by local policy: a refused question is retried, a truncated one
+/// is silently wrong.
+///
+/// Deliberately NOT folded into `ParentStateQueryGuard`, which also gates
+/// read-endpoint serving and genesis-anchor lookups — cheap, frequent topics
+/// whose legitimate rate is far higher. A rate meant for one topic must not
+/// throttle another.
+struct ParentStateQueryRateLimiter {
+    let refillPerSecond: Double
+    let burst: Double
+    private var tokens: [PeerKey: Double] = [:]
+    private var lastRefill: [PeerKey: Date] = [:]
+
+    init(refillPerSecond: Double = 8, burst: Double = 64) {
+        self.refillPerSecond = refillPerSecond
+        self.burst = burst
+    }
+
+    mutating func admit(_ peer: PeerKey, now: Date = Date()) -> Bool {
+        let last = lastRefill[peer] ?? now
+        let available = min(
+            burst,
+            (tokens[peer] ?? burst) + now.timeIntervalSince(last) * refillPerSecond
+        )
+        lastRefill[peer] = now
+        guard available >= 1 else {
+            tokens[peer] = available
+            return false
+        }
+        tokens[peer] = available - 1
+        return true
+    }
+
+    mutating func removeAll() {
+        tokens.removeAll()
+        lastRefill.removeAll()
+    }
+}
+
 private enum NodePolicyDecline: Error {
     case chainSpecTooLarge
     case tooManyWasmPolicies
@@ -557,6 +605,7 @@ public actor NodeNetworkRuntime: IvyDelegate {
     private var parentStateQueryGuard = ParentStateQueryGuard(
         capacity: NodeNetworkRuntime.maximumConcurrentParentStateQueries
     )
+    private var parentStateQueryRateLimiter = ParentStateQueryRateLimiter()
     private var announcedTips: [PeerKey: (height: UInt64, peer: AuthenticatedPeer)] = [:]
     private var rangeSyncReentryTask: Task<Void, Never>?
     private var activeEvidenceVolumes = Set<EvidenceVolumeLease>()
@@ -956,6 +1005,7 @@ public actor NodeNetworkRuntime: IvyDelegate {
         }
         pendingGenesisResolves.removeAll()
         parentStateQueryGuard.removeAll()
+        parentStateQueryRateLimiter.removeAll()
         announcedTips.removeAll()
         rangeSyncReentryTask?.cancel()
         rangeSyncReentryTask = nil
@@ -3735,6 +3785,7 @@ public actor NodeNetworkRuntime: IvyDelegate {
               .child(let childPath)):
             guard let request = try?
                     ParentChainFactMessage.decoded(message.payload),
+                  parentStateQueryRateLimiter.admit(peer.key),
                   parentStateQueryGuard.acquire(peer.key)
             else { return }
             defer {

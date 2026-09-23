@@ -83,8 +83,12 @@ Parent canonicity never affects work. An authenticated parent process may issue
 genesis and parent-state continuity facts; it cannot declare the child valid,
 assign work, or choose the child's tip. Continuity is transitive: for consecutive
 child blocks, the new parent-state CID must equal or be reachable through the
-parent's connected accepted same-chain graph from the predecessor's parent-state
-CID. A restarted child can recompute fork choice entirely from durable accepted
+parent's connected, EXECUTED same-chain graph from the predecessor's
+parent-state CID. Execution is required because a parent attests that it
+PRODUCED a state, and the weighed tier records a declared post-state without
+running it — attesting an unexecuted claim would let a forged `receiptState`
+settle a withdrawal that was never paid. The rule applies at every height: block
+1's predecessor is the genesis, whose parent-state is the empty state. A restarted child can recompute fork choice entirely from durable accepted
 blocks and proof-derived work. When admission needs a new genesis or continuity
 fact, the child asks its authenticated immediate-parent process. A positive
 answer is an unsigned acknowledgement bound to that live session and exact
