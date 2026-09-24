@@ -36,6 +36,13 @@ enum NodeNetworkTopic {
     static let childEvidenceIndexResponse = "lattice.hierarchy.evidence.index.response.v4"
     static let childCandidateRequest = "lattice.hierarchy.child-candidate.request.v1"
     static let childCandidateResponse = "lattice.hierarchy.child-candidate.response.v1"
+    /// A child saying it cannot answer THIS request. Without it a child that
+    /// can never build -- one still awaiting its genesis, say -- simply stays
+    /// silent, and the parent holds the request open until its deadline
+    /// expires. That turns an instant "no" into a multi-second stall on every
+    /// template the parent builds.
+    static let childCandidateUnavailable =
+        "lattice.hierarchy.child-candidate.unavailable.v1"
     static let childCandidateReservationRequest =
         "lattice.hierarchy.child-candidate.reservation.request.v1"
     static let childCandidateReservationResponse =
@@ -64,11 +71,78 @@ enum NodeNetworkTopic {
         case hierarchyHello, childEvidenceAvailable,
              childEvidenceIndexRequest, childEvidenceIndexResponse,
              childCandidateRequest, childCandidateResponse,
+             childCandidateUnavailable,
              childCandidateReservationRequest, childCandidateReservationResponse,
              parentChainFactRequest, parentChainFactResponse,
              childGenesisAnchorRequest, childGenesisAnchorResponse: .hierarchy
         default: nil
         }
+    }
+}
+
+/// A child's explicit refusal of one candidate request.
+///
+/// Carries no block by design: the point is to say "not from me, not for this
+/// parent" as cheaply and as early as possible. The parent matches it to a
+/// pending request and gives up on that child immediately instead of waiting
+/// out the request deadline.
+struct ChildCandidateUnavailableMessage: Sendable {
+    let requestID: UInt64
+    let childPath: [String]
+    let parentCID: String
+
+    init(requestID: UInt64, childPath: [String], parentCID: String) {
+        self.requestID = requestID
+        self.childPath = childPath
+        self.parentCID = parentCID
+    }
+
+    func encoded() throws -> Data {
+        guard requestID != 0,
+              _isAbsoluteChainPath(childPath), childPath.count > 1,
+              childPath.count <= Int(UInt16.max),
+              _isBoundedWireAtom(parentCID) else {
+            throw NodeNetworkWireError.malformed
+        }
+        let pathBytes = childPath.map { Data($0.utf8) }
+        let parentBytes = Data(parentCID.utf8)
+        var size = 8 + 2 + pathBytes.reduce(0) { $0 + 2 + $1.count }
+        size += 2 + parentBytes.count
+        guard size <= _maximumNodeMessageSize else {
+            throw NodeNetworkWireError.oversized
+        }
+        var data = Data(capacity: size)
+        data.appendUInt64(requestID)
+        data.appendUInt16(UInt16(pathBytes.count))
+        for component in pathBytes {
+            data.appendUInt16(UInt16(component.count))
+            data.append(component)
+        }
+        data.appendUInt16(UInt16(parentBytes.count))
+        data.append(parentBytes)
+        return data
+    }
+
+    static func decoded(_ data: Data) throws -> Self {
+        guard data.count <= _maximumNodeMessageSize else {
+            throw NodeNetworkWireError.oversized
+        }
+        var position = data.startIndex
+        guard let requestID = data.readUInt64(at: &position), requestID != 0,
+              let childPath = data.readChainPath(at: &position),
+              let parentCID = data.readString(at: &position),
+              position == data.endIndex else {
+            throw NodeNetworkWireError.malformed
+        }
+        let message = Self(
+            requestID: requestID,
+            childPath: childPath,
+            parentCID: parentCID
+        )
+        guard try message.encoded() == data else {
+            throw NodeNetworkWireError.nonCanonical
+        }
+        return message
     }
 }
 
