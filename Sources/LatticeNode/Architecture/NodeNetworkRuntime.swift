@@ -158,10 +158,19 @@ struct ParentStateQueryGuard {
 /// whose legitimate rate is far higher. A rate meant for one topic must not
 /// throttle another.
 struct ParentStateQueryRateLimiter {
+    private struct Bucket {
+        var tokens: Double
+        var updatedAt: Date
+    }
+
     let refillPerSecond: Double
     let burst: Double
-    private var tokens: [PeerKey: Double] = [:]
-    private var lastRefill: [PeerKey: Date] = [:]
+    private var buckets: [PeerKey: Bucket] = [:]
+    /// The earliest instant any tracked bucket could be full again, and so the
+    /// earliest a sweep could free anything. Kept as a lower bound: every write
+    /// lowers it, a sweep recomputes it exactly, so it can never miss an
+    /// eviction while keeping the sweep off the common path.
+    private var earliestPossibleEviction = Date.distantFuture
 
     init(refillPerSecond: Double = 8, burst: Double = 64) {
         self.refillPerSecond = refillPerSecond
@@ -169,24 +178,71 @@ struct ParentStateQueryRateLimiter {
     }
 
     mutating func admit(_ peer: PeerKey, now: Date = Date()) -> Bool {
-        let last = lastRefill[peer] ?? now
-        let available = min(
-            burst,
-            (tokens[peer] ?? burst) + now.timeIntervalSince(last) * refillPerSecond
-        )
-        lastRefill[peer] = now
+        if now >= earliestPossibleEviction { sweep(now: now) }
+        let available = refilled(buckets[peer], at: now)
         guard available >= 1 else {
-            tokens[peer] = available
+            store(peer, tokens: available, at: now)
             return false
         }
-        tokens[peer] = available - 1
+        store(peer, tokens: available - 1, at: now)
         return true
     }
 
-    mutating func removeAll() {
-        tokens.removeAll()
-        lastRefill.removeAll()
+    /// An absent bucket is a FULL bucket: that equivalence is what makes
+    /// eviction safe, and it is the whole reason this map cannot grow without
+    /// bound.
+    private func refilled(_ bucket: Bucket?, at now: Date) -> Double {
+        guard let bucket else { return burst }
+        return min(
+            burst,
+            bucket.tokens
+                + now.timeIntervalSince(bucket.updatedAt) * refillPerSecond
+        )
     }
+
+    private mutating func store(
+        _ peer: PeerKey,
+        tokens: Double,
+        at now: Date
+    ) {
+        buckets[peer] = Bucket(tokens: tokens, updatedAt: now)
+        earliestPossibleEviction = min(
+            earliestPossibleEviction,
+            now.addingTimeInterval((burst - tokens) / refillPerSecond)
+        )
+    }
+
+    /// Drop every bucket that has refilled to full.
+    ///
+    /// Evicting a FULL bucket grants an attacker nothing, because a peer with
+    /// no entry starts full anyway — so this bounds memory without opening the
+    /// bypass that evicting on disconnect would: a draining bucket is never
+    /// dropped, so reconnecting under a fresh session cannot reset a spent
+    /// budget. Steady-state size is therefore the rate at which distinct peers
+    /// can arrive times the time a bucket takes to refill, not the number of
+    /// peer identities ever seen — and identities are free to mint, so that
+    /// distinction is the difference between a bound and a leak.
+    private mutating func sweep(now: Date) {
+        var earliest = Date.distantFuture
+        buckets = buckets.filter { _, bucket in
+            let available = refilled(bucket, at: now)
+            guard available < burst else { return false }
+            earliest = min(
+                earliest,
+                now.addingTimeInterval((burst - available) / refillPerSecond)
+            )
+            return true
+        }
+        earliestPossibleEviction = earliest
+    }
+
+    mutating func removeAll() {
+        buckets.removeAll()
+        earliestPossibleEviction = .distantFuture
+    }
+
+    /// Test seam: how many peers currently hold a draining budget.
+    var trackedPeerCount: Int { buckets.count }
 }
 
 private enum NodePolicyDecline: Error {

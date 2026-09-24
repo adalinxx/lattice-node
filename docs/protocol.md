@@ -81,14 +81,26 @@ target is the only work gate.
 
 Parent canonicity never affects work. An authenticated parent process may issue
 genesis and parent-state continuity facts; it cannot declare the child valid,
-assign work, or choose the child's tip. Continuity is transitive: for consecutive
-child blocks, the new parent-state CID must equal or be reachable through the
-parent's connected, EXECUTED same-chain graph from the predecessor's
-parent-state CID. Execution is required because a parent attests that it
-PRODUCED a state, and the weighed tier records a declared post-state without
-running it — attesting an unexecuted claim would let a forged `receiptState`
-settle a withdrawal that was never paid. The rule applies at every height: block
-1's predecessor is the genesis, whose parent-state is the empty state. A restarted child can recompute fork choice entirely from durable accepted
+assign work, or choose the child's tip. Every child block anchors its
+`parentState` directly to the PARENT CHAIN'S GENESIS — not to its predecessor:
+the state must be reachable from the empty state through the parent's connected,
+EXECUTED same-chain graph, which is to say it is a state real parent history
+actually produced.
+
+Anchoring to the predecessor instead would make this an induction, and the
+induction has no base. The weighed tier never runs these checks, so a weighed
+predecessor proves nothing about its own `parentState`; a block could match its
+unchecked predecessor and be admitted on no evidence at all. Every block
+therefore proves its own anchor, at every height, block 1 included — there is no
+height-1 exemption, and none is needed, because the executed-from-genesis
+frontier answers the question in O(1).
+
+Execution is required because a parent attests that it PRODUCED a state, and the
+weighed tier records a DECLARED post-state without running it — attesting an
+unexecuted claim would let a forged `receiptState` settle a withdrawal that was
+never paid.
+
+A restarted child can recompute fork choice entirely from durable accepted
 blocks and proof-derived work. When admission needs a new genesis or continuity
 fact, the child asks its authenticated immediate-parent process. A positive
 answer is an unsigned acknowledgement bound to that live session and exact

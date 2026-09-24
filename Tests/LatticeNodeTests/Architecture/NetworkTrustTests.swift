@@ -1359,6 +1359,109 @@ final class NetworkTrustTests: XCTestCase {
         XCTAssertTrue(guardState.acquire(second))
     }
 
+    private func continuityPeer(_ byte: UInt8) throws -> PeerKey {
+        try PeerKey(
+            rawRepresentation: Data(repeating: byte, count: PeerKey.byteCount)
+        )
+    }
+
+    /// The bound has to bind: a peer that spends its burst is refused, and the
+    /// refusal lifts only as the bucket refills.
+    func testContinuityRateLimiterSpendsThenRefillsOneBudget() throws {
+        let peer = try continuityPeer(1)
+        let start = Date(timeIntervalSince1970: 1_000)
+        var limiter = ParentStateQueryRateLimiter(
+            refillPerSecond: 8, burst: 64
+        )
+
+        for index in 0..<64 {
+            XCTAssertTrue(
+                limiter.admit(peer, now: start),
+                "burst token \(index) should be admitted"
+            )
+        }
+        XCTAssertFalse(
+            limiter.admit(peer, now: start),
+            "the 65th question in the same instant exceeds the burst"
+        )
+
+        // 1s of refill at 8/s buys exactly 8 more, and no ninth.
+        for index in 0..<8 {
+            XCTAssertTrue(
+                limiter.admit(peer, now: start.addingTimeInterval(1)),
+                "refilled token \(index) should be admitted"
+            )
+        }
+        XCTAssertFalse(limiter.admit(peer, now: start.addingTimeInterval(1)))
+    }
+
+    /// Memory is bounded by how fast distinct peers can ARRIVE, not by how many
+    /// identities have ever been seen. Identities are free to mint, so without
+    /// eviction this map is a remote memory leak.
+    func testContinuityRateLimiterEvictsRefilledPeers() throws {
+        let start = Date(timeIntervalSince1970: 1_000)
+        var limiter = ParentStateQueryRateLimiter(
+            refillPerSecond: 8, burst: 64
+        )
+
+        // 200 distinct identities each ask once, all in the same instant.
+        for byte in 1...200 {
+            let peer = try continuityPeer(UInt8(byte))
+            XCTAssertTrue(limiter.admit(peer, now: start))
+        }
+        XCTAssertEqual(
+            limiter.trackedPeerCount, 200,
+            "each peer holds a draining budget while it is still draining"
+        )
+
+        // Each spent exactly one token, so each is full again after 1/8s.
+        // The next call sweeps them.
+        let probe = try continuityPeer(201)
+        XCTAssertTrue(limiter.admit(probe, now: start.addingTimeInterval(1)))
+        XCTAssertEqual(
+            limiter.trackedPeerCount, 1,
+            "refilled buckets are dropped; only the probe is still draining"
+        )
+    }
+
+    /// Eviction must not become a bypass: a peer that is still draining keeps
+    /// its spent budget, so presenting a fresh session cannot reset it.
+    func testContinuityRateLimiterDoesNotEvictADrainingPeer() throws {
+        let spender = try continuityPeer(1)
+        let filler = try continuityPeer(2)
+        let other = try continuityPeer(3)
+        let start = Date(timeIntervalSince1970: 1_000)
+        var limiter = ParentStateQueryRateLimiter(
+            refillPerSecond: 8, burst: 64
+        )
+
+        for _ in 0..<64 { XCTAssertTrue(limiter.admit(spender, now: start)) }
+        XCTAssertFalse(limiter.admit(spender, now: start))
+        // Spends one token, so it is full again after 1/8s — this is what
+        // ARMS the sweep. Without it the spender's own 8s refill would be the
+        // earliest eviction and no sweep would run at all, leaving this test
+        // asserting a survival that was never in question.
+        XCTAssertTrue(limiter.admit(filler, now: start))
+        XCTAssertEqual(limiter.trackedPeerCount, 2)
+
+        // A second later: the filler is full, the spender has refilled only 8
+        // of its 64 and is still draining.
+        let sweepAt = start.addingTimeInterval(1)
+        XCTAssertTrue(limiter.admit(other, now: sweepAt))
+        XCTAssertEqual(
+            limiter.trackedPeerCount, 2,
+            "the sweep dropped the full filler and kept the draining spender"
+        )
+
+        // It refilled 8 tokens in that second, and no more — surviving a
+        // sweep did not hand it a fresh burst.
+        for _ in 0..<8 { XCTAssertTrue(limiter.admit(spender, now: sweepAt)) }
+        XCTAssertFalse(
+            limiter.admit(spender, now: sweepAt),
+            "the spender did not get a fresh burst by surviving a sweep"
+        )
+    }
+
     private let nexusCID = "bafyreiaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     private let minimumRootWork = String(repeating: "0", count: 63) + "1"
     private func overlayRuntime(
