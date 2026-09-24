@@ -543,6 +543,11 @@ directions:
 - **Old child, new parent:** an old child asks the `v1` topic, which the new
   parent no longer serves, and also asks with a `from` the new rule rejects.
   Same outcome — silent retry, no durable damage.
+- **A new child cannot DEPLOY or ADOPT against an old parent.** Genesis
+  confirmation rides the same topic, and a child will not activate an adopted
+  genesis without it, so it sits in `awaitingGenesis` polling. This is the case
+  an operator is most likely to hit mid-roll: defer child deploys until the
+  parent has rolled.
 
 Neither direction corrupts state or requires a wipe; both simply make no
 progress until the other side rolls. **Roll parents first**, then children, to
