@@ -304,31 +304,37 @@ final class ContinuityDurabilityTests: XCTestCase {
             CAST(payload AS TEXT) LIKE '%validation%'
               AND CAST(payload AS TEXT) NOT LIKE '%blockHeight%'
             """
-        // The DELETEs below are matched against the JSON encoding of a batch.
-        // If that encoding ever shifts, they silently match nothing, the store
-        // is never actually "legacy", the migration is never exercised, and the
-        // assertions below pass for the wrong reason. Assert the setup fired.
-        let doomed = try queryScalar(
-            db, "SELECT count(*) FROM admission_batches WHERE \(batchPredicate);"
+        // These DELETEs are matched against the JSON encoding of a batch. If
+        // that encoding ever shifts they silently match nothing, the store is
+        // never actually "legacy", the migration is never exercised, and the
+        // assertions below pass for the wrong reason — so assert each one
+        // actually removed rows. Issued SEPARATELY on purpose: sqlite3_prepare
+        // compiles only the FIRST statement of a string and drops the rest, so
+        // a combined script would run one DELETE and silently skip the other.
+        let deletedBatches = try runSQL(
+            db, "DELETE FROM admission_batches WHERE \(batchPredicate)"
         )
         XCTAssertGreaterThan(
-            doomed, 0,
+            deletedBatches, 0,
             """
             Fixture no longer simulates a legacy store: no standalone \
-            validation batch matched. The encoding these DELETEs depend on \
+            validation batch matched. The encoding this predicate depends on \
             has changed — fix the predicate, do not delete this assertion.
             """
         )
-        try runSQL(db, """
-            DELETE FROM admission_batches WHERE \(batchPredicate);
+        let deletedFacts = try runSQL(db, """
             DELETE FROM admission_facts
               WHERE CAST(fact_id AS TEXT) LIKE '%validation%'
-                AND CAST(fact_id AS TEXT) NOT LIKE '%\(genesis)%';
+                AND CAST(fact_id AS TEXT) NOT LIKE '%\(genesis)%'
             """)
+        XCTAssertGreaterThan(
+            deletedFacts, 0,
+            "no normalized validation fact matched; the fact-id shape changed"
+        )
         XCTAssertEqual(
             try queryScalar(
                 db,
-                "SELECT count(*) FROM admission_batches WHERE \(batchPredicate);"
+                "SELECT count(*) FROM admission_batches WHERE \(batchPredicate)"
             ),
             0,
             "every standalone validation batch should now be gone"
@@ -366,29 +372,23 @@ final class ContinuityDurabilityTests: XCTestCase {
         )
     }
 
-    private func runSQL(_ path: String, _ sql: String) throws {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/sqlite3")
-        process.arguments = [path, sql]
-        try process.run()
-        process.waitUntilExit()
-        XCTAssertEqual(process.terminationStatus, 0)
+    /// In-process, via the same SQLite wrapper the node uses. Shelling out to
+    /// `/usr/bin/sqlite3` put a host binary in a unit test's path — the CI
+    /// image ships `libsqlite3-dev` (the library), not the CLI, so this test
+    /// could only ever run on macOS.
+    @discardableResult
+    private func runSQL(_ path: String, _ sql: String) throws -> Int {
+        let db = try NodeSQLite(path: path)
+        return try db.execute(sql)
     }
 
-    @discardableResult
     private func queryScalar(_ path: String, _ sql: String) throws -> Int {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/sqlite3")
-        process.arguments = [path, sql]
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        try process.run()
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
-        XCTAssertEqual(process.terminationStatus, 0)
-        let text = String(decoding: data, as: UTF8.self)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        return Int(text) ?? -1
+        let db = try NodeSQLite(path: path)
+        guard let value = try db.query(sql).first?.values.first?.intValue else {
+            XCTFail("scalar query returned no value: \(sql)")
+            return -1
+        }
+        return Int(value)
     }
 }
 

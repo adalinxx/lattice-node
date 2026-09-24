@@ -3752,8 +3752,9 @@ public actor NodeNetworkRuntime: IvyDelegate {
             case .continuity(_, let toStateCID):
                 // `decoded` already refused any `from` but the empty state, so
                 // this is only ever the anchor question — answered by the
-                // executed-from-genesis frontier in O(1) at any height. That is
-                // why this path needs neither a visit budget nor a rate limit.
+                // executed-from-genesis frontier, walking no chain and
+                // independently of height. That is why this path needs neither
+                // a visit budget nor a rate limit.
                 found = await process.hasProducedParentState(toStateCID)
             }
             guard found else { return }

@@ -93,7 +93,7 @@ predecessor proves nothing about its own `parentState`; a block could match its
 unchecked predecessor and be admitted on no evidence at all. Every block
 therefore proves its own anchor, at every height, block 1 included — there is no
 height-1 exemption, and none is needed, because the executed-from-genesis
-frontier answers the question in O(1).
+frontier answers the question without walking the chain.
 
 Execution is required because a parent attests that it PRODUCED a state, and the
 weighed tier records a DECLARED post-state without running it — attesting an
@@ -106,8 +106,9 @@ malformed, not merely unusual: no correct child can produce one, and serving it
 would mean running a general ancestry walk on the consensus actor on a peer's
 behalf. Refusing the shape is not a budget — the question the protocol actually
 asks is still answered in full, and identically on every node — which is why
-this path needs neither a visit ceiling nor a serving rate limit. A truncated
-answer would have been worse than a refusal: a refused question is retried,
+this path needs neither a visit ceiling nor a serving rate limit: answering it
+walks no chain and is independent of height. A truncated answer would have been
+worse than a refusal: a refused question is retried,
 while a truncated one is silently wrong and splits honest nodes by local policy.
 
 A restarted child can recompute fork choice entirely from durable accepted

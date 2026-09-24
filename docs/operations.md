@@ -520,6 +520,34 @@ Plan the roll accordingly:
 - Roll one node first and let it accept a block before proceeding, so the
   one-way step is taken deliberately rather than fleet-wide at once.
 
+### Roll parents before children
+
+The parent-chain fact topic moved to `...v2` because the ANSWER changed
+meaning, not merely the request's shape. A `v1` parent attests any *connected*
+state — including one it only weighed, a declared post-state it never executed.
+A `v2` parent attests only what it **executed**.
+
+A child cannot tell the two apart from the reply, which echoes the request
+either way. Left at `v1`, an upgraded child would bind a withdrawal to an
+unexecuted claim whenever its parent had not rolled yet — the exact exposure
+this change closes, reappearing inside the upgrade window.
+
+The topic bump makes that impossible rather than merely discouraged: a `v1`
+parent does not recognise the topic, drops it unread, and the child parks and
+retries. So the mixed-version window is **safe but stalled**, in both
+directions:
+
+- **New child, old parent:** the child's continuity questions go unanswered. It
+  parks on `.wait(.later)` and retries; admission of blocks needing a new
+  anchor waits. No wrong answer is ever accepted.
+- **Old child, new parent:** an old child asks the `v1` topic, which the new
+  parent no longer serves, and also asks with a `from` the new rule rejects.
+  Same outcome — silent retry, no durable damage.
+
+Neither direction corrupts state or requires a wipe; both simply make no
+progress until the other side rolls. **Roll parents first**, then children, to
+keep that window short.
+
 ## Common failures
 
 ### `invalidNexusGenesis`

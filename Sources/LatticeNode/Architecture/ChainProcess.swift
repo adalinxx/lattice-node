@@ -1846,7 +1846,13 @@ public actor ChainProcess: ContentSource, Fetcher, VolumeStorer {
     /// genesis, so Lattice builds exactly one shape of continuity requirement:
     /// `from` is always `emptyHeader` (`validateParentFacts`, the single
     /// construction site). That shape is answered outright by the
-    /// executed-from-genesis frontier — O(1), zero block visits, at any height.
+    /// executed-from-genesis frontier, without walking the chain and
+    /// independently of HEIGHT — which is what mattered, since the removed
+    /// visit budget existed precisely because cost grew with height. Not
+    /// literally O(1): the frontier check scans the blocks DECLARING that
+    /// post-state, and the weighed tier records a declared post-state without
+    /// executing it, so that bucket can be grown — at one proof-of-work solve
+    /// per entry, against a query already capped at one in flight per peer.
     ///
     /// Asking it as a general `from`→`to` reachability query is what made it
     /// expensive, and the expense was never something an honest peer imposed:
