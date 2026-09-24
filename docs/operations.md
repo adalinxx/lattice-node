@@ -548,6 +548,23 @@ Neither direction corrupts state or requires a wipe; both simply make no
 progress until the other side rolls. **Roll parents first**, then children, to
 keep that window short.
 
+### What the migration grandfathers
+
+The boot migration converts the old tier column into durable execution facts
+without re-validating. Those rows were written by an image whose parent-state
+rules were weaker, so an execution it recorded is re-affirmed rather than
+re-checked.
+
+This matters only for a chain that could have been fed a forged parent anchor
+*before* the upgrade — that is, a child chain. It does not apply to a root: a
+root anchors to no parent, so its recorded executions are its own, and
+migrating them re-affirms nothing it did not genuinely run.
+
+So a root upgrades in place safely. **A child chain carried across this upgrade
+should be redeployed rather than migrated**, unless you are satisfied its
+history predates any exposure. A child deployed fresh after the upgrade is
+unaffected.
+
 ## Common failures
 
 ### `invalidNexusGenesis`
