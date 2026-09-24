@@ -1274,7 +1274,12 @@ actor NodeStore {
     /// fact existed carry no fact, and without them a chain would come back
     /// having forgotten every execution and would attest nothing.
     ///
-    /// The column defaults to `1`, so legacy rows qualify.
+    /// `>= 1` and not `== 1` so the walk-validated tier (`2`) counts too. The
+    /// column's DEFAULT of `1` is not what makes legacy rows qualify — every
+    /// row is inserted with an explicit `validated ? 1 : 0`, and the schema
+    /// epoch wipes any store old enough to predate the column, so the default
+    /// never fires. What makes them qualify is that they were written `1` or
+    /// `2` by an image that really did execute them.
     func executedBlockCIDs() throws -> Set<String> {
         Set(try database.query(
             "SELECT block_cid FROM accepted_blocks WHERE validated >= 1"

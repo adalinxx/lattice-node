@@ -94,16 +94,12 @@ final class ContinuityDurabilityTests: XCTestCase {
         let chain = try await mine(on: process!, depth: 3, miner: CryptoUtils.generateKeyPair())
         let tipState = try XCTUnwrap(chain.last).postState.rawCID
 
-        let live = await process!.hasParentStateContinuity(
-            from: LatticeState.emptyHeader.rawCID, to: tipState
-        )
+        let live = await process!.hasProducedParentState(tipState)
         XCTAssertTrue(live, "live eager chain must attest its own tip state")
 
         process = nil
         let restarted = try await ChainProcess.open(configuration: config)
-        let recovered = await restarted.hasParentStateContinuity(
-            from: LatticeState.emptyHeader.rawCID, to: tipState
-        )
+        let recovered = await restarted.hasProducedParentState(tipState)
         XCTAssertTrue(recovered, "eager chain must still attest its tip state after restart")
     }
 
@@ -129,16 +125,12 @@ final class ContinuityDurabilityTests: XCTestCase {
                 XCTAssertTrue(outcome.decision.isAccepted, "\(mode) admission")
             }
         }
-        let live = await consumer!.hasParentStateContinuity(
-            from: LatticeState.emptyHeader.rawCID, to: tipState
-        )
+        let live = await consumer!.hasProducedParentState(tipState)
         XCTAssertTrue(live, "live walk-validated chain must attest its tip state")
 
         consumer = nil
         let restarted = try await ChainProcess.open(configuration: config)
-        let recovered = await restarted.hasParentStateContinuity(
-            from: LatticeState.emptyHeader.rawCID, to: tipState
-        )
+        let recovered = await restarted.hasProducedParentState(tipState)
         XCTAssertTrue(
             recovered,
             "walk-validated chain must still attest its tip state after restart"
@@ -165,22 +157,22 @@ final class ContinuityDurabilityTests: XCTestCase {
             )
             XCTAssertTrue(outcome.decision.isAccepted)
         }
+        // Fixture guard: nothing here may have executed, or the assertions
+        // below would hold for the wrong reason.
         for block in chain {
             let cid = try BlockHeader(node: block).rawCID
-            let v = await consumer!.blockValidated(cid)
-            print("AUDIT weighed-only h=\(block.height) validated=\(v)")
+            let executed = await consumer!.blockValidated(cid)
+            XCTAssertFalse(
+                executed,
+                "weighed admission must not mark a block executed"
+            )
         }
-        let live = await consumer!.hasParentStateContinuity(
-            from: LatticeState.emptyHeader.rawCID, to: tipState
-        )
-        print("AUDIT live continuity = \(live)")
+        let live = await consumer!.hasProducedParentState(tipState)
         XCTAssertFalse(live, "a weighed (unexecuted) tip must not be attestable")
 
         consumer = nil
         let restarted = try await ChainProcess.open(configuration: config)
-        let recovered = await restarted.hasParentStateContinuity(
-            from: LatticeState.emptyHeader.rawCID, to: tipState
-        )
+        let recovered = await restarted.hasProducedParentState(tipState)
         XCTAssertFalse(
             recovered, "a weighed tip must not become attestable by restarting"
         )
@@ -211,56 +203,76 @@ final class ContinuityDurabilityTests: XCTestCase {
             }
         }
         try await consumer!.demoteValidatedForTesting(tipCID)
-        let afterDemote = await consumer!.hasParentStateContinuity(
-            from: LatticeState.emptyHeader.rawCID, to: tipState
-        )
-        print("AUDIT live-after-demote attestable = \(afterDemote)")
+        let afterDemote = await consumer!.hasProducedParentState(tipState)
         consumer = nil
+
+        XCTAssertTrue(
+            afterDemote,
+            """
+            A demote is retention bookkeeping — the cached post-state may be \
+            evicted — not a retraction of the execution. A live chain must \
+            still attest a state it ran.
+            """
+        )
 
         let restarted = try await ChainProcess.open(configuration: config)
         let marker = await restarted.blockValidated(tipCID)
-        let attestable = await restarted.hasParentStateContinuity(
-            from: LatticeState.emptyHeader.rawCID, to: tipState
+        XCTAssertFalse(
+            marker,
+            """
+            Fixture guard: the demote must still be in force after restart. \
+            If boot re-promoted the block, the assertion below would pass on \
+            the mutable marker and never exercise the durable fact.
+            """
         )
-        print("AUDIT restarted marker=\(marker) attestable=\(attestable)")
+        let attestable = await restarted.hasProducedParentState(tipState)
         XCTAssertTrue(
             attestable,
             "a demoted marker must not unmake the durable execution fact"
         )
     }
 
-    /// Item 6: cost of one unbounded continuity walk as a function of height.
-    func testContinuityWalkCostGrowsWithHeight() async throws {
-        let depth = 60
-        let producer = try await ChainProcess.open(
-            configuration: try configuration(directory())
+    /// The serving surface answers ONE question, so there is no cost to
+    /// ration. A non-anchor `from` is not a question any correct child can ask,
+    /// and is refused as malformed before it can reach the consensus actor —
+    /// which is what replaced the old visit budget and the rate limiter alike.
+    func testNonAnchorContinuityQuestionIsRefusedAsMalformed() throws {
+        let anchor = LatticeState.emptyHeader.rawCID
+        let someState = NexusGenesis.expectedBlockHash
+        // Both must be well-formed and distinct, or this test would be decided
+        // by the canonical-CID or from==to checks and never reach the anchor
+        // rule it exists to pin.
+        XCTAssertTrue(CIDIdentity.isCanonical(anchor))
+        XCTAssertTrue(CIDIdentity.isCanonical(someState))
+        XCTAssertNotEqual(anchor, someState)
+
+        // The protocol's own shape survives.
+        XCTAssertNoThrow(
+            try ParentChainFactMessage(
+                requestID: 1,
+                fact: .continuity(fromStateCID: anchor, toStateCID: someState)
+            ).validate()
         )
-        let chain = try await mine(
-            on: producer, depth: depth, miner: CryptoUtils.generateKeyPair()
-        )
-        let tipState = try XCTUnwrap(chain.last).postState.rawCID
-        // Attacker shape: `to` is a real produced state, `from` is a CID that
-        // is nowhere in the graph, so the walk exhausts the whole ancestry.
-        let bogus = LatticeState.emptyHeader.rawCID.replacingOccurrences(
-            of: "a", with: "b"
-        )
-        let start = ContinuousClock.now
-        var answered = false
-        for _ in 0..<200 {
-            answered = await producer.hasParentStateContinuity(
-                from: bogus, to: tipState
-            )
+
+        // A general reachability question does not: it is the only way to
+        // reach an ancestry walk, and no correct child can ask for one.
+        XCTAssertThrowsError(
+            try ParentChainFactMessage(
+                requestID: 1,
+                fact: .continuity(fromStateCID: someState, toStateCID: anchor)
+            ).validate()
+        ) { error in
+            XCTAssertEqual(error as? NodeNetworkWireError, .malformed)
         }
-        let elapsed = ContinuousClock.now - start
-        print("AUDIT 200 exhaustive walks at height \(depth): \(elapsed) answered=\(answered)")
-        XCTAssertFalse(answered)
     }
 
-    /// Item 3/4: for LEGACY rows (written before the validation fact existed)
-    /// the COLUMN is the only execution record, it is re-read on every boot
-    /// (the synthesized batches are never persisted), and it is MUTABLE. A
-    /// demote of such a row therefore erases an execution permanently.
-    func testLegacyColumnIsTheSoleAndMutableExecutionRecord() async throws {
+    /// An UPGRADED store — rows written before validation facts existed, so the
+    /// mutable tier column is their only execution record — is migrated at boot
+    /// into durable facts, and a later demote no longer erases those
+    /// executions. Without the migration the chain comes back having forgotten
+    /// every execution; without STAGING it (replaying only), the column stays
+    /// the sole record and the demote below erases it permanently.
+    func testUpgradedStoreMigratesLegacyExecutionsIntoDurableFacts() async throws {
         let producer = try await ChainProcess.open(
             configuration: try configuration(directory())
         )
@@ -288,34 +300,69 @@ final class ContinuityDurabilityTests: XCTestCase {
         // set, but no validation fact/batch was ever written.
         let db = dir.appendingPathComponent("state.db").path
         let genesis = NexusGenesis.expectedBlockHash
+        let batchPredicate = """
+            CAST(payload AS TEXT) LIKE '%validation%'
+              AND CAST(payload AS TEXT) NOT LIKE '%blockHeight%'
+            """
+        // The DELETEs below are matched against the JSON encoding of a batch.
+        // If that encoding ever shifts, they silently match nothing, the store
+        // is never actually "legacy", the migration is never exercised, and the
+        // assertions below pass for the wrong reason. Assert the setup fired.
+        let doomed = try queryScalar(
+            db, "SELECT count(*) FROM admission_batches WHERE \(batchPredicate);"
+        )
+        XCTAssertGreaterThan(
+            doomed, 0,
+            """
+            Fixture no longer simulates a legacy store: no standalone \
+            validation batch matched. The encoding these DELETEs depend on \
+            has changed — fix the predicate, do not delete this assertion.
+            """
+        )
         try runSQL(db, """
-            DELETE FROM admission_batches
-              WHERE CAST(payload AS TEXT) LIKE '%validation%'
-                AND CAST(payload AS TEXT) NOT LIKE '%blockHeight%';
+            DELETE FROM admission_batches WHERE \(batchPredicate);
             DELETE FROM admission_facts
               WHERE CAST(fact_id AS TEXT) LIKE '%validation%'
                 AND CAST(fact_id AS TEXT) NOT LIKE '%\(genesis)%';
             """)
+        XCTAssertEqual(
+            try queryScalar(
+                db,
+                "SELECT count(*) FROM admission_batches WHERE \(batchPredicate);"
+            ),
+            0,
+            "every standalone validation batch should now be gone"
+        )
 
         var migrated: ChainProcess? = try await ChainProcess.open(configuration: config)
-        let afterMigration = await migrated!.hasParentStateContinuity(
-            from: LatticeState.emptyHeader.rawCID, to: tipState
-        )
-        print("AUDIT legacy-store attestable after migration = \(afterMigration)")
+        let afterMigration = await migrated!.hasProducedParentState(tipState)
         XCTAssertTrue(afterMigration, "the migration must carry legacy history")
+
+        // The migration must have STAGED, not merely replayed: a batch has to
+        // be back on disk, or the column is still the sole record and the
+        // demote below would erase the execution for good.
+        XCTAssertGreaterThan(
+            try queryScalar(
+                db,
+                "SELECT count(*) FROM admission_batches WHERE \(batchPredicate);"
+            ),
+            0,
+            """
+            The migration replayed without staging. The mutable column would \
+            remain the only record of these executions, and any later demote \
+            would erase them permanently.
+            """
+        )
 
         // Now demote that legacy row exactly as boot reconciliation or
         // retention eviction would.
         try await migrated!.demoteValidatedForTesting(tipCID)
         migrated = nil
         let reopened = try await ChainProcess.open(configuration: config)
-        let afterDemote = await reopened.hasParentStateContinuity(
-            from: LatticeState.emptyHeader.rawCID, to: tipState
-        )
-        print("AUDIT legacy-store attestable after demote+restart = \(afterDemote)")
+        let afterDemote = await reopened.hasProducedParentState(tipState)
         XCTAssertTrue(
             afterDemote,
-            "LEGACY REGRESSION: demoting a pre-fact row erased the execution"
+            "demoting a migrated pre-fact row must not erase the execution"
         )
     }
 
@@ -326,6 +373,22 @@ final class ContinuityDurabilityTests: XCTestCase {
         try process.run()
         process.waitUntilExit()
         XCTAssertEqual(process.terminationStatus, 0)
+    }
+
+    @discardableResult
+    private func queryScalar(_ path: String, _ sql: String) throws -> Int {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/sqlite3")
+        process.arguments = [path, sql]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        try process.run()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        XCTAssertEqual(process.terminationStatus, 0)
+        let text = String(decoding: data, as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return Int(text) ?? -1
     }
 }
 

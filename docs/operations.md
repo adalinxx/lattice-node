@@ -486,6 +486,40 @@ again, which requires its configured parent to confirm the recorded CID.
 Before running a recursive removal, resolve and verify the explicit path. Never
 target a home directory, workspace root, or an unresolved environment variable.
 
+## Upgrading to executed-state attestation is one-way
+
+The image that records execution as a durable admission fact writes a batch
+shape the previous image cannot decode. **Once a node has accepted a single
+block on the new image, the previous image can no longer open that data
+directory.**
+
+The schema epoch is deliberately NOT bumped. Bumping it would force every node
+to wipe on upgrade, which is exactly what the boot-time migration exists to
+avoid — it carries pre-existing executions across so an upgraded chain does not
+come back having forgotten every one. The cost of keeping the epoch is that a
+downgrade has no clean path.
+
+Because the epoch still matches, the old binary passes its schema check and
+then fails later, while replaying the durable log. It reports:
+
+```
+The node store is corrupt: <decoding error>
+```
+
+That message is misleading here — the store is intact. It is `corrupt`, not
+`wipeRequired`, so the old image offers no reset instruction even though a
+reset is what a rollback would need.
+
+Plan the roll accordingly:
+
+- **Snapshot `state.db` and `volumes.db` together, before first start on the
+  new image.** Restoring that matched pair is the only way back to the old
+  image without resyncing.
+- Otherwise a rollback is a whole-directory wipe plus a resync, per the section
+  above.
+- Roll one node first and let it accept a block before proceeding, so the
+  one-way step is taken deliberately rather than fleet-wide at once.
+
 ## Common failures
 
 ### `invalidNexusGenesis`

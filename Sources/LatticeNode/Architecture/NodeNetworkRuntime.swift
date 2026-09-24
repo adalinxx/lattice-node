@@ -141,110 +141,6 @@ struct ParentStateQueryGuard {
     }
 }
 
-/// Bounds how OFTEN one peer may ask a parent-state CONTINUITY question, never
-/// WHAT the answer is.
-///
-/// Concurrency alone does not bound that question: the walk runs on the
-/// consensus actor and its cost grows with executed chain height, so one peer
-/// asking back-to-back holds a growing share of the actor — and the hierarchy
-/// plane admits any host declaring a one-deeper path, so being that peer costs
-/// nothing. Truncating the search instead would make the same question
-/// answerable here and unanswerable on an identically-stocked peer, splitting
-/// honest nodes by local policy: a refused question is retried, a truncated one
-/// is silently wrong.
-///
-/// Deliberately NOT folded into `ParentStateQueryGuard`, which also gates
-/// read-endpoint serving and genesis-anchor lookups — cheap, frequent topics
-/// whose legitimate rate is far higher. A rate meant for one topic must not
-/// throttle another.
-struct ParentStateQueryRateLimiter {
-    private struct Bucket {
-        var tokens: Double
-        var updatedAt: Date
-    }
-
-    let refillPerSecond: Double
-    let burst: Double
-    private var buckets: [PeerKey: Bucket] = [:]
-    /// The earliest instant any tracked bucket could be full again, and so the
-    /// earliest a sweep could free anything. Kept as a lower bound: every write
-    /// lowers it, a sweep recomputes it exactly, so it can never miss an
-    /// eviction while keeping the sweep off the common path.
-    private var earliestPossibleEviction = Date.distantFuture
-
-    init(refillPerSecond: Double = 8, burst: Double = 64) {
-        self.refillPerSecond = refillPerSecond
-        self.burst = burst
-    }
-
-    mutating func admit(_ peer: PeerKey, now: Date = Date()) -> Bool {
-        if now >= earliestPossibleEviction { sweep(now: now) }
-        let available = refilled(buckets[peer], at: now)
-        guard available >= 1 else {
-            store(peer, tokens: available, at: now)
-            return false
-        }
-        store(peer, tokens: available - 1, at: now)
-        return true
-    }
-
-    /// An absent bucket is a FULL bucket: that equivalence is what makes
-    /// eviction safe, and it is the whole reason this map cannot grow without
-    /// bound.
-    private func refilled(_ bucket: Bucket?, at now: Date) -> Double {
-        guard let bucket else { return burst }
-        return min(
-            burst,
-            bucket.tokens
-                + now.timeIntervalSince(bucket.updatedAt) * refillPerSecond
-        )
-    }
-
-    private mutating func store(
-        _ peer: PeerKey,
-        tokens: Double,
-        at now: Date
-    ) {
-        buckets[peer] = Bucket(tokens: tokens, updatedAt: now)
-        earliestPossibleEviction = min(
-            earliestPossibleEviction,
-            now.addingTimeInterval((burst - tokens) / refillPerSecond)
-        )
-    }
-
-    /// Drop every bucket that has refilled to full.
-    ///
-    /// Evicting a FULL bucket grants an attacker nothing, because a peer with
-    /// no entry starts full anyway — so this bounds memory without opening the
-    /// bypass that evicting on disconnect would: a draining bucket is never
-    /// dropped, so reconnecting under a fresh session cannot reset a spent
-    /// budget. Steady-state size is therefore the rate at which distinct peers
-    /// can arrive times the time a bucket takes to refill, not the number of
-    /// peer identities ever seen — and identities are free to mint, so that
-    /// distinction is the difference between a bound and a leak.
-    private mutating func sweep(now: Date) {
-        var earliest = Date.distantFuture
-        buckets = buckets.filter { _, bucket in
-            let available = refilled(bucket, at: now)
-            guard available < burst else { return false }
-            earliest = min(
-                earliest,
-                now.addingTimeInterval((burst - available) / refillPerSecond)
-            )
-            return true
-        }
-        earliestPossibleEviction = earliest
-    }
-
-    mutating func removeAll() {
-        buckets.removeAll()
-        earliestPossibleEviction = .distantFuture
-    }
-
-    /// Test seam: how many peers currently hold a draining budget.
-    var trackedPeerCount: Int { buckets.count }
-}
-
 private enum NodePolicyDecline: Error {
     case chainSpecTooLarge
     case tooManyWasmPolicies
@@ -661,7 +557,6 @@ public actor NodeNetworkRuntime: IvyDelegate {
     private var parentStateQueryGuard = ParentStateQueryGuard(
         capacity: NodeNetworkRuntime.maximumConcurrentParentStateQueries
     )
-    private var parentStateQueryRateLimiter = ParentStateQueryRateLimiter()
     private var announcedTips: [PeerKey: (height: UInt64, peer: AuthenticatedPeer)] = [:]
     private var rangeSyncReentryTask: Task<Void, Never>?
     private var activeEvidenceVolumes = Set<EvidenceVolumeLease>()
@@ -1061,7 +956,6 @@ public actor NodeNetworkRuntime: IvyDelegate {
         }
         pendingGenesisResolves.removeAll()
         parentStateQueryGuard.removeAll()
-        parentStateQueryRateLimiter.removeAll()
         announcedTips.removeAll()
         rangeSyncReentryTask?.cancel()
         rangeSyncReentryTask = nil
@@ -3841,7 +3735,6 @@ public actor NodeNetworkRuntime: IvyDelegate {
               .child(let childPath)):
             guard let request = try?
                     ParentChainFactMessage.decoded(message.payload),
-                  parentStateQueryRateLimiter.admit(peer.key),
                   parentStateQueryGuard.acquire(peer.key)
             else { return }
             defer {
@@ -3856,11 +3749,12 @@ public actor NodeNetworkRuntime: IvyDelegate {
                     childGenesisCID: childGenesisCID,
                     parentStateCID: parentStateCID
                 )) != nil
-            case .continuity(let fromStateCID, let toStateCID):
-                found = await process.hasParentStateContinuity(
-                    from: fromStateCID,
-                    to: toStateCID
-                )
+            case .continuity(_, let toStateCID):
+                // `decoded` already refused any `from` but the empty state, so
+                // this is only ever the anchor question — answered by the
+                // executed-from-genesis frontier in O(1) at any height. That is
+                // why this path needs neither a visit budget nor a rate limit.
+                found = await process.hasProducedParentState(toStateCID)
             }
             guard found else { return }
             _ = await hierarchy.sendMessage(

@@ -118,8 +118,7 @@ final class MultichainInvariantTests: XCTestCase {
         )
 
         // 2. A live parent that executed its own chain answers the question.
-        let parentConfirms = await parent.hasParentStateContinuity(
-            from: LatticeState.emptyHeader.rawCID, to: anchorState
+        let parentConfirms = await parent.hasProducedParentState(anchorState
         )
         XCTAssertTrue(
             parentConfirms,

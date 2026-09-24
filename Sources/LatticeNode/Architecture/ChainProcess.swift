@@ -301,6 +301,52 @@ public actor ChainProcess: ContentSource, Fetcher, VolumeStorer {
         // not that the transition never ran — so an execution demoted on this
         // boot must still be carried across.
         let executedBeforeDemotion = try await store.executedBlockCIDs()
+        // Admission batches are the only recovery authority. The projection is
+        // a derived cache and must not be able to add facts or prevent a valid
+        // history from reopening.
+        //
+        // The one exception is history written before durable validation facts
+        // existed: those rows record executions this store really performed,
+        // and replaying without them would come back having forgotten every one
+        // — leaving the chain unable to attest any state it produced, so no
+        // child could anchor and no child could advance.
+        //
+        // They are STAGED, not merely replayed. Replaying alone would leave the
+        // mutable tier column as the only record of those executions forever,
+        // and demotion sets it to zero — so a demote would erase an execution
+        // that actually happened, permanently. Staging makes this a one-time
+        // migration after which the immutable fact is the authority, matching
+        // every execution recorded from here on.
+        //
+        // Staged BEFORE the demotion loop below, not merely read before it.
+        // Demotion commits per block while this writes its own transactions, so
+        // a crash in between would leave a legacy row demoted to `validated=0`
+        // with no durable fact — `executedBlockCIDs()` would never return it
+        // again and no later boot could carry it. Ordering the writes closes
+        // that window; the migration needs nothing the demotion produces.
+        let carriedFacts = Set(staged.flatMap { admission in
+            admission.batch.facts.compactMap { fact -> String? in
+                guard case .validation(let value) = fact else { return nil }
+                return value.blockHash
+            }
+        })
+        // Only blocks this log actually admitted: a validation naming a block
+        // absent from the replayed facts would defer forever and turn a boot
+        // into `corruptConsensusGraph`.
+        let admittedBlocks = Set(staged.flatMap { admission in
+            admission.batch.facts.compactMap { fact -> String? in
+                guard case .block(let value) = fact else { return nil }
+                return value.blockHash
+            }
+        })
+        let migrated = executedBeforeDemotion
+            .intersection(admittedBlocks)
+            .subtracting(carriedFacts)
+            .sorted()
+            .map { ChainAdmissionBatch.validation(blockHash: $0) }
+        for batch in migrated {
+            try await store.stage(batch, volumeRoots: [])
+        }
         let walkValidated = try await store.walkValidatedBlockCIDs()
         let validatedOwnerPrefix = Self.validatedOwnerPrefix(retentionScope)
         let pinnedOwners = Set(
@@ -399,46 +445,8 @@ public actor ChainProcess: ContentSource, Fetcher, VolumeStorer {
                     throw ChainProcessError.invalidNexusGenesis
                 }
             }
-            // Admission batches are the only recovery authority. The
-            // projection is a derived cache and must not be able to add facts
-            // or prevent a valid history from reopening.
-            //
-            // The one exception is history written before durable validation
-            // facts existed: those rows record executions this store really
-            // performed, and replaying without them would come back having
-            // forgotten every one — leaving the chain unable to attest any
-            // state it produced, so no child could anchor and no child could
-            // advance.
-            //
-            // They are STAGED, not merely replayed. Replaying alone would leave
-            // the mutable tier column as the only record of those executions
-            // forever, and demotion sets it to zero — so a demote would erase
-            // an execution that actually happened, permanently. Staging makes
-            // this a one-time migration after which the immutable fact is the
-            // authority, matching every execution recorded from here on.
-            let carriedFacts = Set(staged.flatMap { admission in
-                admission.batch.facts.compactMap { fact -> String? in
-                    guard case .validation(let value) = fact else { return nil }
-                    return value.blockHash
-                }
-            })
-            // Only blocks this log actually admitted: a validation naming a
-            // block absent from the replayed facts would defer forever and turn
-            // a boot into `corruptConsensusGraph`.
-            let admittedBlocks = Set(staged.flatMap { admission in
-                admission.batch.facts.compactMap { fact -> String? in
-                    guard case .block(let value) = fact else { return nil }
-                    return value.blockHash
-                }
-            })
-            let migrated = executedBeforeDemotion
-                .intersection(admittedBlocks)
-                .subtracting(carriedFacts)
-                .sorted()
-                .map { ChainAdmissionBatch.validation(blockHash: $0) }
-            for batch in migrated {
-                try await store.stage(batch, volumeRoots: [])
-            }
+            // The legacy-execution migration was staged before the boot
+            // demotion above; replay it alongside the durable log.
             let batches = staged.map(\.batch) + migrated
             let chain = try await ChainState.restore(
                 replaying: batches,
@@ -982,6 +990,30 @@ public actor ChainProcess: ContentSource, Fetcher, VolumeStorer {
                         )
                     )
                 } else {
+                    // Take Lattice's own judgment rather than re-deriving it
+                    // from the mode: Lattice appends the validation fact when it
+                    // executed the transition, and inferring "this mode means
+                    // executed" would silently become a forged-attestation
+                    // primitive the day any non-executing outcome is added under
+                    // `.validate`.
+                    //
+                    // Checked FIRST, before the pin and before any hierarchy
+                    // artifact is written. Those artifacts are exactly what this
+                    // node serves children as the binding it stands behind, and
+                    // `persistIssuedHierarchyArtifacts` does not roll back — so
+                    // a guard placed after them would let a non-executing
+                    // outcome publish a child-visible binding and only then
+                    // refuse. A refusal that lands after the evidence is durable
+                    // is not a refusal.
+                    let executed = context.batch.facts.contains { fact in
+                        guard case .validation(let value) = fact else {
+                            return false
+                        }
+                        return value.blockHash == blockHeader.rawCID
+                    }
+                    guard executed else {
+                        throw ChainProcessError.validatedTierRecordedNoExecution
+                    }
                     // Pin BEFORE flipping the marker: a crash between leaves an
                     // orphan pin that boot reclaims, never a marker without its
                     // state. The owner pin (not the batch-rebuilt retention
@@ -1020,27 +1052,12 @@ public actor ChainProcess: ContentSource, Fetcher, VolumeStorer {
                             pendingChildProofCapacity: Self.preparedChildProofCapacity
                         )
                     }
-                    // Take Lattice's own judgment rather than re-deriving it
-                    // from the mode: Lattice appends the validation fact when it
-                    // executed the transition, and inferring "this mode means
-                    // executed" would silently become a forged-attestation
-                    // primitive the day any non-executing outcome is added under
-                    // `.validate`.
-                    //
                     // Appended BEFORE the marker flips, for the same reason the
                     // pin goes first: a crash between leaves a block the walk
                     // simply re-validates (the fact is idempotent by id), never
                     // a marker whose fact was lost. The batch carries no volume
                     // roots — execution owns no new content, only the judgment.
-                    let executed = context.batch.facts.contains { fact in
-                        guard case .validation(let value) = fact else {
-                            return false
-                        }
-                        return value.blockHash == blockHeader.rawCID
-                    }
-                    guard executed else {
-                        throw ChainProcessError.validatedTierRecordedNoExecution
-                    }
+                    //
                     // No revision floor: a validation carries no block and no
                     // work, so Lattice returns no commit for it and the chain's
                     // revision does not move. Advancing the durable floor here
@@ -1822,22 +1839,30 @@ public actor ChainProcess: ContentSource, Fetcher, VolumeStorer {
         )
     }
 
-    /// Query this process's recovered graph of connected, executed blocks.
+    /// Did this chain PRODUCE this state? — the one continuity question the
+    /// protocol asks, and the only one this node answers for a peer.
     ///
-    /// Carries no visit budget. Whether a state was produced by this chain is a
-    /// property of the graph, not of how hard this node is willing to look, and
-    /// truncating the search would make the same question answerable here and
-    /// unanswerable on an identically-stocked peer — splitting honest nodes by
-    /// local policy. Serving RATE stays a node's choice (`ParentStateQueryGuard`
-    /// bounds concurrency per peer); the ANSWER does not.
-    func hasParentStateContinuity(
-        from fromStateCID: String,
-        to toStateCID: String
-    ) async -> Bool {
+    /// Every child block anchors its `parentState` at the parent chain's
+    /// genesis, so Lattice builds exactly one shape of continuity requirement:
+    /// `from` is always `emptyHeader` (`validateParentFacts`, the single
+    /// construction site). That shape is answered outright by the
+    /// executed-from-genesis frontier — O(1), zero block visits, at any height.
+    ///
+    /// Asking it as a general `from`→`to` reachability query is what made it
+    /// expensive, and the expense was never something an honest peer imposed:
+    /// no child can need a non-genesis `from`, so the only way to reach the
+    /// ancestry walk was to craft a request for it. A budget would have
+    /// truncated the ANSWER (making the same question answerable here and
+    /// unanswerable on an identically-stocked peer), and a rate limit would
+    /// have rationed a cost no correct caller creates — bounding arrivals while
+    /// leaving each one unbounded. Neither is needed once the node simply does
+    /// not serve a question the protocol never asks: the bound is structural,
+    /// not a policy, so every honest node answers identically.
+    func hasProducedParentState(_ stateCID: String) async -> Bool {
         guard case .active(let level) = runtimePhase else { return false }
         return await level.chain.hasStateContinuity(
-            from: fromStateCID,
-            to: toStateCID
+            from: LatticeState.emptyHeader.rawCID,
+            to: stateCID
         )
     }
 

@@ -95,9 +95,27 @@ struct ParentChainFactMessage: NodeJSONMessage, Equatable, Sendable {
                 throw NodeNetworkWireError.malformed
             }
         case .continuity(let fromStateCID, let toStateCID):
+            // `from` must be the empty state. Every child block anchors its
+            // `parentState` at the PARENT CHAIN'S GENESIS, so Lattice builds
+            // exactly one shape of continuity requirement and no correct child
+            // can ask for another — which makes any other `from` malformed, not
+            // merely unusual.
+            //
+            // This is the whole bound on serving cost. That shape is answered
+            // by the executed-from-genesis frontier in O(1) at any height,
+            // while a general `from` would run an ancestry walk on the
+            // consensus actor for a peer. Refusing it here is not a budget: the
+            // question the protocol actually asks is still answered in full,
+            // and identically on every node, so nothing is left to ration.
+            //
+            // Answering it anyway would also attest a continuity claim this
+            // node never checked — the response echoes the request verbatim —
+            // which is the same "unverified treated as verification" shape the
+            // executed-frontier rule exists to close.
             guard _isCanonicalWireCID(fromStateCID),
                   _isCanonicalWireCID(toStateCID),
-                  fromStateCID != toStateCID else {
+                  fromStateCID != toStateCID,
+                  fromStateCID == LatticeState.emptyHeader.rawCID else {
                 throw NodeNetworkWireError.malformed
             }
         }

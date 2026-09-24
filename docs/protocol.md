@@ -100,6 +100,16 @@ weighed tier records a DECLARED post-state without running it — attesting an
 unexecuted claim would let a forged `receiptState` settle a withdrawal that was
 never paid.
 
+Because that anchor is the only continuity question the protocol defines, it is
+also the only one a parent answers. A request naming any other `from` is
+malformed, not merely unusual: no correct child can produce one, and serving it
+would mean running a general ancestry walk on the consensus actor on a peer's
+behalf. Refusing the shape is not a budget — the question the protocol actually
+asks is still answered in full, and identically on every node — which is why
+this path needs neither a visit ceiling nor a serving rate limit. A truncated
+answer would have been worse than a refusal: a refused question is retried,
+while a truncated one is silently wrong and splits honest nodes by local policy.
+
 A restarted child can recompute fork choice entirely from durable accepted
 blocks and proof-derived work. When admission needs a new genesis or continuity
 fact, the child asks its authenticated immediate-parent process. A positive
