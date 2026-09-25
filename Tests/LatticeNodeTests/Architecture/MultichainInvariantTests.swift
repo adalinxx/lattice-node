@@ -71,11 +71,23 @@ final class MultichainInvariantTests: XCTestCase {
         _ = try await parent.prepareChildProofs(for: carrier, capacity: 16)
         let carrierHeader = try BlockHeader(node: carrier)
         // Not served yet: nothing hosts Payments until the parent prepares
-        // proofs for it — that is the operator's declaration.
+        // proofs for it — that is the operator's declaration, made through the
+        // service, which also pushes every changed run to a publisher.
         let servedBefore = await parent.servedRunDirectoryList()
         XCTAssertEqual(servedBefore, [])
-        let carrierOutcome = try await parent.admit(
-            carrierHeader, preparingChildDirectories: ["Payments"]
+        let pushed = ParentRunReportSink()
+        let parentService = ChainService(
+            process: parent,
+            childCandidateProvider: { _ in [] },
+            childProofPublisher: { _ in },
+            parentRunReportPublisher: { report in await pushed.record(report) },
+            acceptedBlockPublisher: { _ in }
+        )
+        let carrierOutcome = try await parentService.admitNetworkCandidate(
+            carrierHeader,
+            authenticatedChildPackage: nil,
+            preparingChildDirectories: ["Payments"],
+            contentSource: FetcherContentSource(parent)
         )
         XCTAssertTrue(carrierOutcome.decision.isAccepted)
         _ = try await parent.retryPendingChildProofs(carrierCID: carrierHeader.rawCID)
@@ -84,13 +96,13 @@ final class MultichainInvariantTests: XCTestCase {
         )
         let evidence = try XCTUnwrap(issued)
 
-        // ChainService serves on prepare; at the process level, say so here.
-        await parent.serveRuns(for: "Payments")
         let served = await parent.servedRunDirectoryList()
-        XCTAssertEqual(served, ["Payments"])
+        XCTAssertEqual(served, ["Payments"], "preparing proofs for a directory serves its runs")
         let carrierReports = await parent.runReports(changedBy: carrierHeader.rawCID)
         XCTAssertEqual(carrierReports.count, 1)
         let carrierReport = try XCTUnwrap(carrierReports.first)
+        let pushedAfterCarrier = await pushed.received()
+        XCTAssertEqual(pushedAfterCarrier, [carrierReport], "the carrier's own admission pushed its run")
         XCTAssertEqual(carrierReport.blockHash, carrierHeader.rawCID)
         XCTAssertEqual(carrierReport.directory, "Payments")
         XCTAssertEqual(carrierReport.childBlock, childBlockCID)
@@ -138,9 +150,19 @@ final class MultichainInvariantTests: XCTestCase {
             block: unminedSuccessor, target: carrier.nextTarget
         ))
         let successorHeader = try BlockHeader(node: successor)
-        let successorOutcome = try await parent.admit(successorHeader)
+        // Through the service, so the emission path is the one under test:
+        // every accepted admission pushes each served directory's changed run.
+        let successorOutcome = try await parentService.admitNetworkCandidate(
+            successorHeader,
+            authenticatedChildPackage: nil,
+            preparingChildDirectories: [],
+            contentSource: FetcherContentSource(parent)
+        )
         XCTAssertTrue(successorOutcome.decision.isAccepted)
+        let pushedReports = await pushed.received()
+        XCTAssertEqual(pushedReports.count, 2, "one push per changed run, per admission")
         let successorReports = await parent.runReports(changedBy: successorHeader.rawCID)
+        XCTAssertEqual(pushedReports.suffix(1).map { $0 }, successorReports, "the push carries exactly the changed run")
         XCTAssertEqual(successorReports.count, 1, "the successor's admission changed exactly the carrier's run")
         let grown = try XCTUnwrap(successorReports.first)
         XCTAssertEqual(grown.blockHash, carrierHeader.rawCID, "credited to the nearest committer")
@@ -601,6 +623,12 @@ final class MultichainInvariantTests: XCTestCase {
             signatures: [key.publicKey: signature],
             body: bodyHeader
         )
+    }
+
+    private actor ParentRunReportSink {
+        private var reports: [ParentRunReport] = []
+        func record(_ report: ParentRunReport) { reports.append(report) }
+        func received() -> [ParentRunReport] { reports }
     }
 
     private func temporaryDirectory() -> URL {
