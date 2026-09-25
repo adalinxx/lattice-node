@@ -5427,6 +5427,143 @@ final class NetworkTrustTests: XCTestCase {
         await runtime.stop()
     }
 
+    /// The restart the three-node smoke found, through the real acquirer: a
+    /// child deferred a parent-carried block, died before the retry, and on
+    /// restart must admit it from the durable obligation alone — the
+    /// package recovered from its own verified edge, the content served by
+    /// the parent's session — with no announcement, no evidence index entry
+    /// and no push telling it to. Removing the start-time seeding fails this.
+    func testRestartedChildAdmitsTheCarriedBlockItStillOwes() async throws {
+        let storage = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "lattice-carried-block-owed-\(UUID().uuidString)", isDirectory: true
+        )
+        addTeardownBlock { try? FileManager.default.removeItem(at: storage) }
+        let parentKey = signingKey(0x9b)
+        let parentPeerKey = peerKey(parentKey)
+        let parentPort = NetworkTransportTestPorts.allocate()
+        let overlayPort = NetworkTransportTestPorts.allocate()
+        let hierarchyPort = NetworkTransportTestPorts.allocate()
+        let configuration = try NodeConfiguration(
+            chainPath: ["Nexus", "Payments"],
+            storagePath: storage,
+            privateKeyHex: String(repeating: "9c", count: 32),
+            listenPort: overlayPort,
+            factListenPort: hierarchyPort,
+            rpcPort: NetworkTransportTestPorts.allocate(),
+            parentEndpoint: ParentEndpoint(publicKey: parentPeerKey.hex, host: "127.0.0.1", port: parentPort)
+        )
+        let source = NetworkTestContentStore()
+        try await LatticeState.emptyHeader.storeRecursively(storer: source)
+        let seed = ChildGenesisSeed(spec: NexusGenesis.spec, premineTo: nil, timestamp: 1)
+        let childGenesis = try await ChildGenesisBuilder.build(
+            seed: seed, chainPath: configuration.chainPath, fetcher: source
+        )
+        try await BlockHeader(node: childGenesis).storeBlock(fetcher: source, storer: source)
+        var process: ChainProcess? = try await ChainProcess.open(configuration: configuration)
+        let bootstrapped = try await process!.activateSeededChildGenesis(
+            seed: seed, confirmParentRecordedGenesis: { _ in true }
+        )
+        XCTAssertTrue(bootstrapped)
+        let genesis = try await process!.canonicalTipBlock()
+        // Deferred deterministically: a clock 3 s ahead.
+        let notYet = Int64(Date().timeIntervalSince1970 * 1_000) + 3_000
+        let carried = try await BlockBuilder.buildBlock(
+            previous: genesis, timestamp: notYet, nonce: 1, fetcher: process!
+        )
+        let carriedHeader = try BlockHeader(node: carried)
+        // The parent holds the block's content; this child does NOT (it must
+        // fetch it over the hierarchy session on restart).
+        try await carriedHeader.storeBlock(fetcher: process!, storer: source)
+        let carrierCandidate = try await BlockBuilder.buildGenesis(
+            spec: NexusGenesis.spec, children: ["Payments": carried],
+            timestamp: 10, target: UInt256.max, fetcher: source
+        )
+        let carrier = try XCTUnwrap(BlockBuilder.mine(
+            block: carrierCandidate, target: carried.target, maxAttempts: 1_024
+        ))
+        let carrierHeader = try BlockHeader(node: carrier)
+        await source.store(entries: [carrierHeader.rawCID: try XCTUnwrap(carrier.toData())])
+        let proof = try await ChildBlockProof.generate(
+            rootHeader: carrierHeader, childDirectory: "Payments", fetcher: source
+        )
+        let deferred = try await process!.admit(
+            carriedHeader,
+            authenticatedChildPackage: AuthenticatedChildPackage(package: ChildValidationPackage(proof: proof)),
+            remoteSource: FetcherContentSource(source)
+        )
+        guard case .temporarilyInvalid = deferred.decision else {
+            return XCTFail("a block from the future is deferred, got \(deferred.decision)")
+        }
+        let owed = try await process!.carriedBlockObligations(limit: 16).obligations
+        XCTAssertEqual(owed.map(\.childCID), [carriedHeader.rawCID])
+        // Died before the retry.
+        process = nil
+        try await Task.sleep(for: .milliseconds(3_200))
+
+        let runtime = try NodeNetworkRuntime(
+            configuration: configuration,
+            planeConfigurations: try NodeNetworkPlaneConfigurations(
+                overlay: IvyConfig(
+                    signingKey: configuration.signingKey, listenPort: overlayPort,
+                    stunServers: [], mode: .overlay
+                ),
+                hierarchy: IvyConfig(
+                    signingKey: configuration.signingKey, listenPort: hierarchyPort,
+                    bootstrapPeers: [configuration.parentEndpoint!.ivy],
+                    inboundAdmissionBypassPeerKeys: [parentPeerKey],
+                    requestTimeout: .milliseconds(500), stunServers: [],
+                    maxConnections: IvyConfig.defaultMaxConnections,
+                    maxConnectionsPerNetgroup: IvyConfig.defaultMaxConnections,
+                    relayEnabled: false, privateContentExchangeEnabled: true,
+                    carriers: [], mode: .privateNetwork
+                )
+            )
+        )
+        let recovered = try await ChainProcess.open(configuration: configuration)
+        let admissions = NetworkEventRecorder()
+        let handlers = NodeNetworkHandlers(admission: { [weak recovered] admission in
+            guard let recovered else { throw CancellationError() }
+            let outcome = try await recovered.admit(
+                admission.header,
+                authenticatedChildPackage: admission.authenticatedChildPackage,
+                remoteSource: admission.contentSource
+            )
+            await admissions.append("\(admission.header.rawCID):\(outcome.decision.isAccepted)")
+            return outcome
+        })
+        let parentRecorder = HierarchyRetryRecorder()
+        let parent = Ivy(config: IvyConfig(
+            signingKey: parentKey, listenPort: parentPort, stunServers: [],
+            privateContentExchangeEnabled: true, mode: .privateNetwork
+        ))
+        let parentDelegate = HierarchyRetryPeer(
+            recorder: parentRecorder,
+            parentHello: try ChainHello(
+                nexusGenesisCID: configuration.nexusGenesisCID, chainPath: ["Nexus"]
+            ).encode(),
+            summary: nil
+        )
+        await parent.installTestDelegate(parentDelegate)
+        await parent.setContentSource(source)
+        do {
+            try await parent.start()
+            try await runtime.start(process: recovered, handlers: handlers)
+            try await waitUntil("the owed block admitted after restart", attempts: 1_500) {
+                (await admissions.snapshot()).contains("\(carriedHeader.rawCID):true")
+            }
+            let status = await recovered.status()
+            XCTAssertEqual(status.tipCID, carriedHeader.rawCID, "the carried block is the tip")
+            let owedAfter = try await recovered.carriedBlockObligations(limit: 16).obligations
+            XCTAssertEqual(owedAfter, [], "accepted: nothing owed")
+        } catch {
+            await parent.stop()
+            await runtime.stop()
+            throw error
+        }
+        await parent.stop()
+        await runtime.stop()
+    }
+
     func testConfiguredParentReconnectsWhenFirstHierarchyHelloIsWithheld()
         async throws {
         let fixture = try await hierarchyRetryFixture(

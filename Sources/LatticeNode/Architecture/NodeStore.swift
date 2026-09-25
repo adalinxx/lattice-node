@@ -211,9 +211,13 @@ actor NodeStore {
     /// each accepted block so recovery reconstructs the validated set.
     /// Epoch 40 records leaf-ness on each accepted block so the frontier page
     /// is an index read, not a per-row scan of the accepted history.
+    /// Epoch 41 records the terminal refusals of carried blocks, so the
+    /// blocks this chain still owes an admission are a query over facts
+    /// (verified carrier edges minus accepted blocks minus refusals) and no
+    /// in-memory retry is ever the only memory of one.
     /// Older stores must be
     /// wiped; Nexus deterministically recreates the configured exact genesis.
-    static let currentSchemaEpoch: Int64 = 40
+    static let currentSchemaEpoch: Int64 = 41
 
     private static func parentGenesisFactKey(
         _ link: ParentGenesisLink
@@ -1477,6 +1481,99 @@ actor NodeStore {
                 payload: genesis.payload
             )
         }
+    }
+
+    /// Why a carried block will never be accepted here. A fact about the
+    /// bytes, not a retry state: nothing this chain later learns can change
+    /// it, so the block leaves the set it still owes an admission.
+    enum CarriedBlockRefusal: String, Sendable {
+        /// The grind that carried it missed THIS chain's target — a carrier
+        /// for deeper chains only, exactly as merged mining produces.
+        case carrier
+        /// The evidence or the block violates the protocol.
+        case invalid
+    }
+
+    /// A carried block this chain still owes an admission: a verified
+    /// incoming-carrier edge whose child is not accepted and not refused for
+    /// good. Derived, never queued — a restart or a reconnect recomputes it
+    /// from these rows, so no crash between a deferred admission and its
+    /// retry can lose the block. Paged in evidence order.
+    struct CarriedBlockObligation: Equatable, Sendable {
+        let childCID: String
+        let rootCID: String
+    }
+
+    func persistCarriedBlockRefusal(
+        childCID: String,
+        rootCID: String,
+        reason: CarriedBlockRefusal
+    ) throws {
+        guard CIDIdentity.isCanonical(childCID), CIDIdentity.isCanonical(rootCID) else {
+            throw NodeStoreError.corrupt("invalid carried-block refusal")
+        }
+        try database.execute(
+            "INSERT OR IGNORE INTO carried_block_refusals (child_cid, root_cid, reason) VALUES (?1, ?2, ?3)",
+            params: [.text(childCID), .text(rootCID), .text(reason.rawValue)]
+        )
+    }
+
+    func carriedBlockRefusal(
+        childCID: String,
+        rootCID: String
+    ) throws -> CarriedBlockRefusal? {
+        try database.query(
+            "SELECT reason FROM carried_block_refusals WHERE child_cid = ?1 AND root_cid = ?2 LIMIT 1",
+            params: [.text(childCID), .text(rootCID)]
+        ).first?["reason"]?.textValue.flatMap(CarriedBlockRefusal.init(rawValue:))
+    }
+
+    func carriedBlockObligations(
+        directory: String,
+        afterProofRowID: Int64?,
+        limit: Int
+    ) throws -> (obligations: [CarriedBlockObligation], lastProofRowID: Int64?) {
+        guard limit > 0, let sqlLimit = Int64(exactly: limit) else {
+            throw NodeStoreError.invalidConfiguration("obligation page must be positive")
+        }
+        let rows = try database.query(
+            """
+            SELECT p.rowid AS proof_rowid, e.child_cid, p.root_cid
+            FROM issued_child_proofs AS p
+            INNER JOIN issued_child_edges AS e ON e.edge_cid = p.edge_cid
+            WHERE p.scope = ?1
+                AND e.directory = ?2
+                AND p.rowid > ?3
+                AND NOT EXISTS (
+                    SELECT 1 FROM accepted_blocks AS a WHERE a.block_cid = e.child_cid
+                )
+                AND NOT EXISTS (
+                    SELECT 1 FROM carried_block_refusals AS r
+                    WHERE r.child_cid = e.child_cid AND r.root_cid = p.root_cid
+                )
+            ORDER BY p.rowid
+            LIMIT ?4
+            """,
+            params: [
+                .text(IssuedChildProofScope.incomingCarrier.rawValue),
+                .text(directory),
+                .int(afterProofRowID ?? 0),
+                .int(sqlLimit),
+            ]
+        )
+        var obligations: [CarriedBlockObligation] = []
+        var last: Int64?
+        for row in rows {
+            guard let childCID = row["child_cid"]?.textValue,
+                  let rootCID = row["root_cid"]?.textValue,
+                  let rowID = row["proof_rowid"]?.intValue,
+                  CIDIdentity.isCanonical(childCID), CIDIdentity.isCanonical(rootCID) else {
+                throw NodeStoreError.corrupt("malformed carried-block obligation")
+            }
+            obligations.append(CarriedBlockObligation(childCID: childCID, rootCID: rootCID))
+            last = rowID
+        }
+        return (obligations, last)
     }
 
     func persistIssuedHierarchyArtifacts(
@@ -3667,6 +3764,7 @@ actor NodeStore {
         "issued_parent_facts",
         "issued_child_edges",
         "issued_child_proofs",
+        "carried_block_refusals",
         "parent_evidence_scan",
         "parent_evidence_inbox",
         "local_mempool_transactions",
@@ -3789,6 +3887,20 @@ actor NodeStore {
                 ),
                 PRIMARY KEY (scope, edge_cid, root_cid)
             )
+            """)
+        // A carried block this chain refused for good: it does not meet this
+        // chain's target (a carrier for deeper chains only) or its evidence
+        // was malformed. A judgment about immutable bytes, so recording it is
+        // a fact, and the one thing that makes "carried but not accepted"
+        // finite: every merged-mining round whose grind missed this chain's
+        // target leaves such a carrier behind.
+        try database.execute("""
+            CREATE TABLE IF NOT EXISTS carried_block_refusals (
+                child_cid TEXT NOT NULL,
+                root_cid TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                PRIMARY KEY (child_cid, root_cid)
+            ) WITHOUT ROWID
             """)
         try database.execute("""
             CREATE TABLE IF NOT EXISTS parent_evidence_scan (

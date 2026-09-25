@@ -877,6 +877,35 @@ public actor ChainProcess: ContentSource, Fetcher, VolumeStorer {
         )
     }
 
+    /// Which non-accepted outcomes are final for this chain. Anything else
+    /// (evidence not yet held, a rule not yet satisfied, a local failure) is
+    /// retried from the durable obligation, never forgotten.
+    static func carriedBlockRefusal(
+        _ decision: NodeAdmissionDecision
+    ) -> NodeStore.CarriedBlockRefusal? {
+        switch decision {
+        case .carrier: .carrier
+        case .invalid: .invalid
+        case .canonicalized, .acceptedSide, .duplicate,
+             .unavailable, .temporarilyInvalid, .localFailure: nil
+        }
+    }
+
+    /// The carried blocks this chain still owes an admission, in evidence
+    /// order, one page; `afterProofRowID` continues a previous page. Derived
+    /// from durable facts on every call.
+    func carriedBlockObligations(
+        afterProofRowID: Int64? = nil,
+        limit: Int
+    ) async throws -> (obligations: [NodeStore.CarriedBlockObligation], lastProofRowID: Int64?) {
+        guard !configuration.address.isNexus else { return ([], nil) }
+        return try await store.carriedBlockObligations(
+            directory: configuration.address.directory,
+            afterProofRowID: afterProofRowID,
+            limit: limit
+        )
+    }
+
     func recoveredAuthenticatedChildPackage(
         for childCID: String,
         rootCID: String? = nil
@@ -1161,6 +1190,19 @@ public actor ChainProcess: ContentSource, Fetcher, VolumeStorer {
                 ),
                 pendingChildProofCapacity: Self.preparedChildProofCapacity
             )
+            // The relay evidence above is also this chain's record that a
+            // parent block carried this block. A deferred outcome leaves the
+            // block owed an admission — derivable from that record, so no
+            // restart can lose it. A refusal for good is recorded as such,
+            // so the owed set stays finite: every merged-mining round whose
+            // grind missed this chain's target leaves a carrier behind.
+            if let refusal = Self.carriedBlockRefusal(decision) {
+                try await store.persistCarriedBlockRefusal(
+                    childCID: blockHeader.rawCID,
+                    rootCID: link.rootCID,
+                    reason: refusal
+                )
+            }
         }
         var receipt: CanonicalCommitReceipt?
         if let canonicalCommitPublisher {

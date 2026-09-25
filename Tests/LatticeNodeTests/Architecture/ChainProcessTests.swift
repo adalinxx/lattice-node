@@ -780,6 +780,132 @@ final class ChainProcessTests: XCTestCase {
         XCTAssertEqual(retainedAfter, retainedBefore)
     }
 
+    /// The crash the three-node smoke found: a carried block whose first
+    /// admission is deferred (here: a timestamp still in the future, the
+    /// same `notYetAdmissible` class as a continuity fact not yet held) had
+    /// its evidence persisted and its retry kept only in memory, so a
+    /// restart in that window lost the block for good. The obligation is
+    /// now a fact derived from the durable edge: it survives the reopen, the
+    /// package is recoverable from the edge, and once the rule is satisfied
+    /// the same block is accepted and the obligation is gone.
+    func testDeferredCarriedBlockStaysOwedAcrossRestartUntilAccepted() async throws {
+        let fixture = try await childBootstrapFixture()
+        let parentSource = fixture.source
+        var process: ChainProcess? = try await ChainProcess.open(configuration: fixture.configuration)
+        let bootstrapped = try await process!.activateSeededChildGenesis(
+            seed: fixture.seed, confirmParentRecordedGenesis: { _ in true }
+        )
+        XCTAssertTrue(bootstrapped)
+        let genesis = try XCTUnwrap(fixture.childHeader.node)
+        // Deferred, deterministically: the block's clock is 2.5 s ahead.
+        let notYet = Int64(Date().timeIntervalSince1970 * 1_000) + 2_500
+        let carried = try await BlockBuilder.buildBlock(
+            previous: genesis, timestamp: notYet, nonce: 1, fetcher: parentSource
+        )
+        let carriedHeader = try BlockHeader(node: carried)
+        try await carriedHeader.storeBlock(fetcher: parentSource, storer: parentSource)
+        try await carriedHeader.storeBlock(fetcher: parentSource, storer: process!)
+        let parentCarrier = try await BlockBuilder.buildGenesis(
+            spec: NexusGenesis.spec, children: ["Payments": carried],
+            timestamp: 3, target: UInt256.max, fetcher: parentSource
+        )
+        let parentCarrierHeader = try BlockHeader(node: parentCarrier)
+        let proof = try await ChildBlockProof.generate(
+            rootHeader: parentCarrierHeader, childDirectory: "Payments", fetcher: parentSource
+        )
+        let package = AuthenticatedChildPackage(package: ChildValidationPackage(proof: proof))
+
+        let deferred = try await process!.admit(
+            carriedHeader, authenticatedChildPackage: package, remoteSource: parentSource
+        )
+        XCTAssertEqual(deferred.decision, .temporarilyInvalid)
+        let expected = NodeStore.CarriedBlockObligation(
+            childCID: carriedHeader.rawCID, rootCID: proof.rootCID
+        )
+        let owedLive = try await process!.carriedBlockObligations(limit: 16).obligations
+        XCTAssertEqual(owedLive, [expected], "a deferred block is owed an admission")
+        // A second deferral before the rule is met adds nothing and loses nothing.
+        let deferredAgain = try await process!.admit(
+            carriedHeader, authenticatedChildPackage: package, remoteSource: parentSource
+        )
+        XCTAssertEqual(deferredAgain.decision, .temporarilyInvalid)
+        let owedStill = try await process!.carriedBlockObligations(limit: 16).obligations
+        XCTAssertEqual(owedStill, [expected])
+
+        // The restart that used to lose it.
+        process = nil
+        process = try await ChainProcess.open(configuration: fixture.configuration)
+        let owedAfterRestart = try await process!.carriedBlockObligations(limit: 16).obligations
+        XCTAssertEqual(owedAfterRestart, [expected], "the obligation is a fact, not a memory")
+        let recovered = try await process!.recoveredAuthenticatedChildPackage(
+            for: carriedHeader.rawCID, rootCID: proof.rootCID
+        )
+        XCTAssertEqual(recovered?.package.proof.rootCID, proof.rootCID, "the package is recoverable from the edge")
+
+        // Once the rule is satisfiable, the same block is accepted.
+        try await Task.sleep(for: .milliseconds(2_700))
+        let accepted = try await process!.admit(
+            carriedHeader, authenticatedChildPackage: try XCTUnwrap(recovered), remoteSource: parentSource
+        )
+        XCTAssertTrue(accepted.decision.isAccepted, "\(accepted.decision)")
+        let owedAfterAcceptance = try await process!.carriedBlockObligations(limit: 16).obligations
+        XCTAssertEqual(owedAfterAcceptance, [], "accepted: nothing owed")
+        let tip = await process!.status().tipCID
+        XCTAssertEqual(tip, carriedHeader.rawCID)
+    }
+
+    /// The other half of what merged mining produces: a carrier whose grind
+    /// cleared a deeper chain's target but not this one's. It is refused as
+    /// a carrier — a judgment about immutable bytes — so it is recorded as
+    /// such and never owed, on this open or the next. Without that record
+    /// every restart would re-admit every such carrier in this chain's
+    /// history.
+    func testCarrierRefusedForGoodIsRecordedAndNeverOwed() async throws {
+        let fixture = try await childBootstrapFixture()
+        let parentSource = fixture.source
+        var process: ChainProcess? = try await ChainProcess.open(configuration: fixture.configuration)
+        let bootstrapped = try await process!.activateSeededChildGenesis(
+            seed: fixture.seed, confirmParentRecordedGenesis: { _ in true }
+        )
+        XCTAssertTrue(bootstrapped)
+        let genesis = try XCTUnwrap(fixture.childHeader.node)
+        // A child block priced far above what the carrier's grind will reach.
+        let carried = try await BlockBuilder.buildBlock(
+            previous: genesis, timestamp: 2, target: UInt256(1) << 8, nonce: 1,
+            fetcher: parentSource
+        )
+        let carriedHeader = try BlockHeader(node: carried)
+        try await carriedHeader.storeBlock(fetcher: parentSource, storer: parentSource)
+        try await carriedHeader.storeBlock(fetcher: parentSource, storer: process!)
+        let parentCarrier = try await BlockBuilder.buildGenesis(
+            spec: NexusGenesis.spec, children: ["Payments": carried],
+            timestamp: 3, target: UInt256.max, fetcher: parentSource
+        )
+        let proof = try await ChildBlockProof.generate(
+            rootHeader: try BlockHeader(node: parentCarrier), childDirectory: "Payments",
+            fetcher: parentSource
+        )
+        let refused = try await process!.admit(
+            carriedHeader,
+            authenticatedChildPackage: AuthenticatedChildPackage(package: ChildValidationPackage(proof: proof)),
+            remoteSource: parentSource
+        )
+        guard case .carrier = refused.decision else {
+            return XCTFail("a grind that misses this chain's target is a carrier, got \(refused.decision)")
+        }
+        let owed = try await process!.carriedBlockObligations(limit: 16).obligations
+        XCTAssertEqual(owed, [], "a carrier for deeper chains only is not owed")
+        process = nil
+        process = try await ChainProcess.open(configuration: fixture.configuration)
+        let owedAfterRestart = try await process!.carriedBlockObligations(limit: 16).obligations
+        XCTAssertEqual(owedAfterRestart, [], "the refusal is a fact: still not owed")
+        // Its evidence is still relay data for deeper chains.
+        let relay = try await process!.recoveredAuthenticatedChildPackage(
+            for: carriedHeader.rawCID, rootCID: proof.rootCID
+        )
+        XCTAssertNotNil(relay)
+    }
+
     func testSuccessorAttachmentWaitsForChildGenesis() async throws {
         let fixture = try await childBootstrapFixture()
         let parentSource = fixture.source

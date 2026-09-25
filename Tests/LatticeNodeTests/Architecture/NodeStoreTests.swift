@@ -1217,6 +1217,102 @@ final class NodeStoreTests: XCTestCase {
         XCTAssertEqual(betaSummaries.first?.rootCID, carrierHeader.rawCID)
     }
 
+    /// A carried block this chain still owes an admission is a query over
+    /// facts: verified incoming-carrier edges, minus accepted blocks, minus
+    /// refusals for good. Every clause, the page cursor, and the directory
+    /// scope are pinned here so no write path can quietly widen or narrow it.
+    func testCarriedBlockObligationsAreEdgesMinusAcceptedMinusRefused() async throws {
+        let store = try makeStore(chainPath: ["Nexus", "Child"])
+        let fixture = try await childProofFixture()
+        func persist(_ proof: ChildBlockProof) async throws {
+            let link = try decode(ParentCarrierLink.self, json: """
+                {"parentPath":["Nexus","Child"],"carrierCID":"\(fixture.childCID)","rootCID":"\(proof.rootCID)"}
+                """)
+            try await store.persistIssuedHierarchyArtifacts(AdmissionHierarchyArtifacts(
+                carrierLink: link,
+                carrierEvidence: AdmissionCarrierEvidence(proof: proof, childCID: fixture.childCID),
+                parentGenesisLinks: []
+            ))
+        }
+        func owed(
+            directory: String = "Child", after: Int64? = nil, limit: Int = 16
+        ) async throws -> [NodeStore.CarriedBlockObligation] {
+            try await store.carriedBlockObligations(
+                directory: directory, afterProofRowID: after, limit: limit
+            ).obligations
+        }
+        let first = NodeStore.CarriedBlockObligation(childCID: fixture.childCID, rootCID: fixture.first.rootCID)
+        let second = NodeStore.CarriedBlockObligation(childCID: fixture.childCID, rootCID: fixture.second.rootCID)
+
+        let none = try await owed()
+        XCTAssertEqual(none, [], "no edge, nothing owed")
+        try await persist(fixture.first)
+        let one = try await owed()
+        XCTAssertEqual(one, [first], "a verified edge whose child is not accepted is owed")
+        try await persist(fixture.second)
+        let both = try await owed()
+        XCTAssertEqual(both, [first, second], "one obligation per (child, root), in evidence order")
+        let elsewhere = try await owed(directory: "Other")
+        XCTAssertEqual(elsewhere, [], "scoped to this chain's directory")
+
+        // Paged by the proof row: the cursor continues exactly where the page ended.
+        let page = try await store.carriedBlockObligations(directory: "Child", afterProofRowID: nil, limit: 1)
+        XCTAssertEqual(page.obligations, [first])
+        let cursor = try XCTUnwrap(page.lastProofRowID)
+        let next = try await store.carriedBlockObligations(directory: "Child", afterProofRowID: cursor, limit: 1)
+        XCTAssertEqual(next.obligations, [second])
+        let end = try await store.carriedBlockObligations(
+            directory: "Child", afterProofRowID: try XCTUnwrap(next.lastProofRowID), limit: 1
+        )
+        XCTAssertEqual(end.obligations, [])
+        XCTAssertNil(end.lastProofRowID)
+
+        // A refusal for good removes exactly that (child, root); it is a fact,
+        // written once, readable back with its reason.
+        try await store.persistCarriedBlockRefusal(
+            childCID: fixture.childCID, rootCID: fixture.first.rootCID, reason: .carrier
+        )
+        try await store.persistCarriedBlockRefusal(
+            childCID: fixture.childCID, rootCID: fixture.first.rootCID, reason: .invalid
+        )
+        let firstRefusal = try await store.carriedBlockRefusal(
+            childCID: fixture.childCID, rootCID: fixture.first.rootCID
+        )
+        XCTAssertEqual(firstRefusal, .carrier, "the first verdict stands; a second write is ignored")
+        let afterRefusal = try await owed()
+        XCTAssertEqual(afterRefusal, [second], "refused under one root, still owed under the other")
+        let secondRefusal = try await store.carriedBlockRefusal(
+            childCID: fixture.childCID, rootCID: fixture.second.rootCID
+        )
+        XCTAssertNil(secondRefusal)
+
+        // Acceptance clears every root at once, refused or not.
+        try await store.stage(
+            blockBatch(postStateCID: "child-state", blockHash: fixture.childCID),
+            volumeRoots: []
+        )
+        let afterAcceptance = try await owed()
+        XCTAssertEqual(afterAcceptance, [], "an accepted block is owed nothing")
+
+        // Malformed input is refused, never recorded.
+        await XCTAssertThrowsErrorAsync(
+            try await store.persistCarriedBlockRefusal(
+                childCID: "not-a-cid", rootCID: fixture.first.rootCID, reason: .carrier
+            )
+        ) { error in
+            guard case NodeStoreError.corrupt = error else {
+                return XCTFail("expected corrupt, got \(error)")
+            }
+        }
+        await XCTAssertThrowsErrorAsync(
+            try await store.carriedBlockObligations(directory: "Child", afterProofRowID: nil, limit: 0)
+        ) { error in
+            guard case NodeStoreError.invalidConfiguration = error else {
+                return XCTFail("expected invalidConfiguration, got \(error)")
+            }
+        }
+    }
+
     func testIssuedCarrierEvidencePersistsProofAndLinkTogether() async throws {
         let path = temporaryDirectory().appendingPathComponent("state.db")
         let store = try makeStore(path: path, chainPath: ["Nexus", "Child"])
