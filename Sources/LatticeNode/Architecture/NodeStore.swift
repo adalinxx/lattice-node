@@ -1795,30 +1795,28 @@ actor NodeStore {
         )
     }
 
-    /// The committing parent block of each child block this chain admitted
-    /// with a carrier proof, newest first (Lattice §9.10). Durable, so it is
-    /// the answer to "whom does this chain ask its parent to re-serve" after a
-    /// restart — and the edge was derived from the sparse proof at admission,
-    /// never taken from the wire, so it is also the locally verified
-    /// "which of MY blocks does this committer commit".
-    func incomingCarrierCommitters(limit: Int) throws -> [(committer: String, childCID: String)] {
+    /// The committing parent blocks of the blocks this chain ACCEPTED with a
+    /// carrier proof, distinct, newest first (Lattice §9.10). Durable, so it
+    /// is the answer to "whom does this chain ask its parent to re-serve"
+    /// after a restart. Joined on `accepted_blocks` deliberately: the relay
+    /// evidence table also records carriers of blocks this chain refused —
+    /// every merged-mining round whose root missed this chain's target — and
+    /// those are not committers of anything here.
+    func incomingCarrierCommitters(limit: Int) throws -> [String] {
         let rows = try database.query(
-            "SELECT e.parent_carrier_cid, e.child_cid FROM issued_child_proofs AS p INNER JOIN issued_child_edges AS e ON e.edge_cid = p.edge_cid WHERE p.scope = ?1 ORDER BY p.rowid DESC LIMIT ?2",
+            "SELECT e.parent_carrier_cid FROM issued_child_proofs AS p INNER JOIN issued_child_edges AS e ON e.edge_cid = p.edge_cid INNER JOIN accepted_blocks AS a ON a.block_cid = e.child_cid WHERE p.scope = ?1 GROUP BY e.parent_carrier_cid ORDER BY MAX(p.rowid) DESC LIMIT ?2",
             params: [.text(IssuedChildProofScope.incomingCarrier.rawValue), .int(Int64(limit))]
         )
-        return rows.compactMap { row in
-            guard let committer = row["parent_carrier_cid"]?.textValue,
-                  let childCID = row["child_cid"]?.textValue else { return nil }
-            return (committer, childCID)
-        }
+        return rows.compactMap { $0["parent_carrier_cid"]?.textValue }
     }
 
-    /// The block of THIS chain that `committer` commits, from the carrier
-    /// proof verified at that block's admission; nil for a committer this
-    /// chain never admitted a block from.
+    /// The ACCEPTED block of this chain that `committer` commits, from the
+    /// carrier proof verified at that block's admission — the edge was derived
+    /// from the sparse proof, never taken from the wire — or nil for a
+    /// committer of nothing this chain accepted.
     func incomingCarrierChildBlock(committer: String) throws -> String? {
         let rows = try database.query(
-            "SELECT e.child_cid FROM issued_child_proofs AS p INNER JOIN issued_child_edges AS e ON e.edge_cid = p.edge_cid WHERE p.scope = ?1 AND e.parent_carrier_cid = ?2 LIMIT 1",
+            "SELECT e.child_cid FROM issued_child_proofs AS p INNER JOIN issued_child_edges AS e ON e.edge_cid = p.edge_cid INNER JOIN accepted_blocks AS a ON a.block_cid = e.child_cid WHERE p.scope = ?1 AND e.parent_carrier_cid = ?2 LIMIT 1",
             params: [.text(IssuedChildProofScope.incomingCarrier.rawValue), .text(committer)]
         )
         return rows.first?["child_cid"]?.textValue

@@ -2157,15 +2157,17 @@ public actor ChainService {
                 scheduleValidateWalkRetry()
                 return
             case .temporarilyInvalid:
-                // A parked verdict. Counted where the operator can see it
-                // either way. A not-yet-admissible TIMESTAMP resolves by
-                // itself, so poll for it like an availability gap; a root
-                // exclusion with no other executed root to stand on (§9.9,
-                // only ever at height 0) resolves only with a new root, which
-                // arrives as a commit that re-arms the walk anyway — polling
-                // it would re-execute the block every interval for nothing.
+                // A parked verdict: a not-yet-admissible timestamp, or a root
+                // exclusion with no other executed root to stand on (§9.9).
+                // The decision does not say which, and a height-0 park can be
+                // either (a root's future timestamp parks the same way), so
+                // poll for both like an availability gap: the timestamp case
+                // resolves by itself, and the root case is a chain with an
+                // invalid own genesis — dead until a new root lands — where
+                // one genesis-sized prepare per interval is the cost of not
+                // guessing. Counted where the operator can see it.
                 validateWalkParkedCount += 1
-                if nextHeight > 0 { scheduleValidateWalkRetry() }
+                scheduleValidateWalkRetry()
                 return
             case .invalid, .localFailure, .carrier:
                 // Ordering / non-availability park: keep acting on the last

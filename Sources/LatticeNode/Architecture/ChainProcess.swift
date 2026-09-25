@@ -2344,10 +2344,7 @@ public actor ChainProcess: ContentSource, Fetcher, VolumeStorer {
     /// reconnect. Durable: read from the carrier edges verified at admission,
     /// so a child restarted while its parent was down still asks.
     func recentCommitters() async throws -> [String] {
-        var seen = Set<String>()
-        return try await store.incomingCarrierCommitters(limit: Self.recentCommitterCapacity)
-            .map(\.committer)
-            .filter { seen.insert($0).inserted }
+        try await store.incomingCarrierCommitters(limit: Self.recentCommitterCapacity)
     }
 
     static let recentCommitterCapacity = maximumParentRunReportRequestCommitters
