@@ -3831,6 +3831,11 @@ public actor NodeNetworkRuntime: IvyDelegate {
             defer {
                 parentStateQueryGuard.release(peer.key)
             }
+            // A child re-asks right after its hello, which may race this
+            // node's serve-on-hello; serve first (idempotent, gated on the
+            // directory being anchored here) so the answer is never silence
+            // for want of a settled table.
+            await handlers?.runReportServing?(directory)
             for committer in request.committerCIDs {
                 guard isCurrentRuntime(generation: generation, process: process),
                       hierarchySessions[peer.key]?.sessionID == peer.sessionID,
