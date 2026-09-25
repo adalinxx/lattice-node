@@ -135,6 +135,11 @@ final class MultichainInvariantTests: XCTestCase {
         XCTAssertTrue(admitted.decision.isAccepted)
         let remembered = try await child().recentCommitters()
         XCTAssertEqual(remembered, [carrierHeader.rawCID], "the child remembers whom to re-ask")
+        // A directory this chain never anchored a child genesis for is not
+        // served, whoever names it.
+        await parent.serveRuns(for: "Markets")
+        let servedAfterStranger = await parent.servedRunDirectoryList()
+        XCTAssertEqual(servedAfterStranger, ["Payments"], "a stranger's directory is refused")
 
         // The carrier's own run attributes nothing: refused, visibly.
         let carrierOnly = try await child().applyParentRunReport(carrierReport)
@@ -198,6 +203,19 @@ final class MultichainInvariantTests: XCTestCase {
         }
         counters = try await child().parentReportCounters()
         XCTAssertEqual(counters.refusals["notCommitterOfChild"], 1)
+        // A committer this chain never admitted a block from names nothing:
+        // the location is local knowledge, never the report's.
+        let stranger = ParentRunReport(
+            blockHash: successorHeader.rawCID, directory: grown.directory,
+            childBlock: childBlockCID, grinds: grown.grinds,
+            runWork: grown.runWork, ownWork: grown.ownWork, revision: grown.revision
+        )
+        let strangerOutcome = try await child().applyParentRunReport(stranger)
+        guard case .refused(.notCommitterOfChild) = strangerOutcome else {
+            return XCTFail("an unknown committer must be refused, got \(strangerOutcome)")
+        }
+        counters = try await child().parentReportCounters()
+        XCTAssertEqual(counters.refusals["unknownCommitter"], 1)
 
         // The credit is durable: after a restart the same report is still
         // "not stronger", which only a replayed attributed fact explains.
@@ -207,6 +225,9 @@ final class MultichainInvariantTests: XCTestCase {
         guard case .refused(.notStronger) = afterRestart else {
             return XCTFail("the attributed credit must survive a restart, got \(afterRestart)")
         }
+        // ... and so does whom to re-ask: the fallback works after a restart.
+        let rememberedAfterRestart = try await reopened.recentCommitters()
+        XCTAssertEqual(rememberedAfterRestart, [carrierHeader.rawCID])
     }
 
     func testBlockOneAnchorResolvesAgainstALiveParent() async throws {

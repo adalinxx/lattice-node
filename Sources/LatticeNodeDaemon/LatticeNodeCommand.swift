@@ -246,7 +246,8 @@ struct LatticeNodeCommand: AsyncParsableCommand {
                 await service?.serveRuns(for: directory)
             },
             recentCommitters: { [weak service] in
-                await service?.recentCommitters() ?? []
+                guard let service else { return [] }
+                return (try? await service.recentCommitters()) ?? []
             }
         )
         try await network.start(process: process, handlers: handlers)

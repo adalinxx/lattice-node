@@ -214,6 +214,13 @@ struct ParentRunReportMessage: NodeJSONMessage, Equatable, Sendable {
     }
 }
 
+/// The most committers one re-serve request may name — what a correct child
+/// asks for (its newest carriers, `ChainProcess.recentCommitterCapacity`).
+/// Structural, not a budget: a larger request is one no correct child sends,
+/// so it is malformed rather than served slowly. Each named committer costs
+/// the parent one O(1) read and at most one push.
+let maximumParentRunReportRequestCommitters = 256
+
 /// A child asks its authenticated immediate parent to re-serve the runs of the
 /// committers it names — the fallback for a push it missed while its session
 /// was down. The parent answers with one `ParentRunReportMessage` per named
@@ -226,6 +233,7 @@ struct ParentRunReportRequestMessage: NodeJSONMessage, Equatable, Sendable {
     func validate() throws {
         guard requestID != 0,
               !committerCIDs.isEmpty,
+              committerCIDs.count <= maximumParentRunReportRequestCommitters,
               Set(committerCIDs).count == committerCIDs.count,
               committerCIDs.allSatisfy(_isCanonicalWireCID) else {
             throw NodeNetworkWireError.malformed

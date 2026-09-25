@@ -4184,14 +4184,16 @@ public actor NodeNetworkRuntime: IvyDelegate {
                 process: process
             )
         } else if case .child(let childPath) = role {
-            // A child wired in: serve its runs from now on (idempotent).
-            if let directory = childPath.last {
-                await handlers?.runReportServing?(directory)
-            }
             guard await waitForChildEvidenceReady(peer: peer) else {
                 _ = clearHierarchyAuthorization(for: peer.key)
                 await hierarchy.recycleSession(ifCurrent: peer)
                 return
+            }
+            // A child wired in: serve its runs from now on. The service
+            // refuses a directory this chain never anchored a child genesis
+            // for, so a hello alone names nothing (idempotent otherwise).
+            if let directory = childPath.last {
+                await handlers?.runReportServing?(directory)
             }
             await acquireCandidateReservationReconciliation()
             defer { releaseCandidateReservationReconciliation() }

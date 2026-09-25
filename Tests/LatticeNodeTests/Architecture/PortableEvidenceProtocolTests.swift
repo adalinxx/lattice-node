@@ -179,6 +179,12 @@ final class PortableEvidenceProtocolTests: XCTestCase {
         XCTAssertThrowsError(try ParentRunReportRequestMessage(
             requestID: 3, committerCIDs: [protocolCID("c"), protocolCID("c")]
         ).encoded())
+        // Bounded by what a correct child can ask: one more is malformed, not slow.
+        let atBound = (0..<maximumParentRunReportRequestCommitters).map { protocolCID("bound-\($0)") }
+        XCTAssertNoThrow(try ParentRunReportRequestMessage(requestID: 4, committerCIDs: atBound).encoded())
+        XCTAssertThrowsError(try ParentRunReportRequestMessage(
+            requestID: 5, committerCIDs: atBound + [protocolCID("one-too-many")]
+        ).encoded())
     }
 
     func testParentChainFactsAreExactSessionBoundQueries() throws {

@@ -1139,10 +1139,6 @@ public actor ChainProcess: ContentSource, Fetcher, VolumeStorer {
 
         let decision = NodeAdmissionDecision(result)
         let admissionStaged = result.commit != nil
-        if decision.isAccepted, let proof = authenticatedPackage?.package.proof,
-           let edge = await DirectChildEdge.derive(from: proof) {
-            rememberCommitter(edge.parentCarrierCID)
-        }
         // A disconnected accepted block is not yet a parent-fact issuer, but
         // its content-verified carrier remains valid relay data for deeper
         // chains. Persist that relay with no genesis facts; a later duplicate
@@ -1701,8 +1697,6 @@ public actor ChainProcess: ContentSource, Fetcher, VolumeStorer {
     private var servedRunDirectories: Set<String> = []
     private var parentReportsAppliedCount: UInt64 = 0
     private var parentReportRefusalCounts: [String: UInt64] = [:]
-    private var recentCommitterOrder: [String] = []
-    private var recentCommitterSet: Set<String> = []
     /// The prefix assumption has one hole: a demoted block (eviction of an
     /// off-main-chain block; boot reconciliation of a marker whose owner pin
     /// is gone) can sit on the main chain BENEATH still-validated blocks —
@@ -2291,15 +2285,22 @@ public actor ChainProcess: ContentSource, Fetcher, VolumeStorer {
     // MARK: - Parent-attributed run work (§9.10)
 
     /// Start serving run reports for `directory`: this process hosts a child
-    /// chain there. Operator choice, expressed by which children this node
-    /// wires or prepares proofs for. Idempotent; the served set is NOT
-    /// persisted (Lattice's lives in memory), so callers re-serve after every
-    /// restart. One whole-graph walk per directory, on the consensus actor.
+    /// chain there. The directory must be one THIS chain has anchored a child
+    /// genesis for — a peer's hello or a prepare request names it, but a name
+    /// this chain never committed into is refused, so a stranger cannot make
+    /// this node walk its graph for directories it does not host (Lattice
+    /// §9.10: which directories a node serves is its own choice). Idempotent;
+    /// the served set is NOT persisted (Lattice's lives in memory), so callers
+    /// re-serve after every restart. One whole-graph walk per directory, on
+    /// the consensus actor; the node-side set is updated only after the walk,
+    /// so a report asked for meanwhile is answered from a settled table.
     func serveRuns(for directory: String) async {
         guard case .active(let level) = runtimePhase,
-              !servedRunDirectories.contains(directory) else { return }
-        servedRunDirectories.insert(directory)
+              !servedRunDirectories.contains(directory),
+              await anchoredChildGenesisCIDs(directories: [directory])[directory] != nil
+        else { return }
         await level.chain.serveRuns(for: directory)
+        servedRunDirectories.insert(directory)
     }
 
     func servedRunDirectoryList() -> [String] {
@@ -2337,25 +2338,19 @@ public actor ChainProcess: ContentSource, Fetcher, VolumeStorer {
         return await level.chain.parentRunReport(at: committer, directory: directory)
     }
 
-    /// The committing parent blocks of the child blocks this process admitted
-    /// with a package, newest last — what it asks its parent to re-serve after
-    /// a reconnect. In memory only, bounded by `recentCommitterCapacity`; an
-    /// older committer's run changes only when parent work lands under it,
-    /// which the parent pushes on the live session.
-    func recentCommitters() -> [String] {
-        recentCommitterOrder
+    /// The committing parent blocks of the child blocks this chain admitted
+    /// with a carrier proof, newest first, bounded to what one re-serve
+    /// request may name — what it asks its parent to re-serve after a
+    /// reconnect. Durable: read from the carrier edges verified at admission,
+    /// so a child restarted while its parent was down still asks.
+    func recentCommitters() async throws -> [String] {
+        var seen = Set<String>()
+        return try await store.incomingCarrierCommitters(limit: Self.recentCommitterCapacity)
+            .map(\.committer)
+            .filter { seen.insert($0).inserted }
     }
 
-    static let recentCommitterCapacity = 256
-
-    private func rememberCommitter(_ committer: String) {
-        guard recentCommitterSet.insert(committer).inserted else { return }
-        recentCommitterOrder.append(committer)
-        if recentCommitterOrder.count > Self.recentCommitterCapacity {
-            let evicted = recentCommitterOrder.removeFirst()
-            recentCommitterSet.remove(evicted)
-        }
-    }
+    static let recentCommitterCapacity = maximumParentRunReportRequestCommitters
 
     public enum ParentReportApplication: Sendable {
         /// The attributed batch is durable and applied; the commit, if the
@@ -2381,15 +2376,26 @@ public actor ChainProcess: ContentSource, Fetcher, VolumeStorer {
         }
         try await acquireMutationOperation()
         defer { releaseOperation() }
+        // The LOCATION is this chain's own knowledge, never the report's: the
+        // block this committer commits comes from the carrier proof verified
+        // at that block's admission. A committer this chain never admitted a
+        // block from names nothing here.
+        guard let childBlock = try await store.incomingCarrierChildBlock(
+            committer: report.blockHash
+        ) else {
+            parentReportRefusalCounts["unknownCommitter", default: 0] += 1
+            return .refused(.notCommitterOfChild)
+        }
         let outcome = await level.chain.strengthenFromParentReport(
-            child: report.childBlock, directory: directory, report: report
+            child: childBlock, directory: directory, report: report
         )
         guard case .strengthened(let batch) = outcome else {
             parentReportRefusalCounts[Self.refusalName(outcome), default: 0] += 1
             return .refused(outcome)
         }
-        // A work-only batch carries no block, so — like a validation batch — it
-        // advances no consensus-revision floor.
+        // No consensus-revision floor: live apply and restore both reach this
+        // batch through `chain.replay`, so the generation it produces is the
+        // same on both paths, and a floor would only push replay past it.
         try await store.stage(batch, volumeRoots: [])
         let commit = try await level.chain.replay(batch)
         parentReportsAppliedCount += 1

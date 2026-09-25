@@ -2157,13 +2157,15 @@ public actor ChainService {
                 scheduleValidateWalkRetry()
                 return
             case .temporarilyInvalid:
-                // A parked verdict (§9.9: a root exclusion with no other
-                // executed root to stand on, or a not-yet-admissible
-                // timestamp). Nothing here is a fact, so nothing re-arms the
-                // walk on its own: count it where the operator can see it and
-                // keep polling, like an availability gap.
+                // A parked verdict. Counted where the operator can see it
+                // either way. A not-yet-admissible TIMESTAMP resolves by
+                // itself, so poll for it like an availability gap; a root
+                // exclusion with no other executed root to stand on (§9.9,
+                // only ever at height 0) resolves only with a new root, which
+                // arrives as a commit that re-arms the walk anyway — polling
+                // it would re-execute the block every interval for nothing.
                 validateWalkParkedCount += 1
-                scheduleValidateWalkRetry()
+                if nextHeight > 0 { scheduleValidateWalkRetry() }
                 return
             case .invalid, .localFailure, .carrier:
                 // Ordering / non-availability park: keep acting on the last
@@ -2189,8 +2191,8 @@ public actor ChainService {
     }
 
     /// The committers this chain asks its parent to re-serve on a reconnect.
-    public func recentCommitters() async -> [String] {
-        await process.recentCommitters()
+    public func recentCommitters() async throws -> [String] {
+        try await process.recentCommitters()
     }
 
     /// Credit a parent's run report at the child block it names. The commit,
@@ -2198,16 +2200,15 @@ public actor ChainService {
     public func applyParentRunReport(
         _ report: ParentRunReport
     ) async throws -> ChainProcess.ParentReportApplication {
-        let application = try await process.applyParentRunReport(
+        // A canonical change is reconciled exactly once, on the queued
+        // worker under the service gate — the same path every admission's
+        // commit takes.
+        return try await process.applyParentRunReport(
             report,
             canonicalCommitPublisher: { [self] commit in
                 await enqueueCanonicalCommit(commit)
             }
         )
-        if case .credited(let commit?) = application, commit.canonicalChanged {
-            await reconcileCanonicalCommitOrResetLocked(commit)
-        }
-        return application
     }
 
     private func reconcileCanonicalCommitOrResetLocked(

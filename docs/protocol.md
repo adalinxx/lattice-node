@@ -81,10 +81,12 @@ target is the only work gate.
 
 Parent canonicity never affects work. An authenticated parent process may issue
 genesis and parent-state continuity facts and serves the run reports of spec
-§9.10 for the directories it hosts; it cannot declare the child valid, choose
-the child's tip, or assign work. A run report names a quantity; the child binds
-it — its own directory, the named child block, one of the committer's grinds
-already credited there — and derives the credit itself, `runWork − ownWork`,
+§9.10 for the directories it hosts; it cannot declare the child valid or
+choose the child's tip. A run report names a quantity, and only a quantity:
+the child binds it — its own directory, the block THIS chain's verified
+carrier proof says that committer commits (never the block the report names),
+one of the committer's grinds already credited there — and derives the credit
+itself, `runWork − ownWork`,
 under an identity keyed by the committer and directory, applied only as a
 strict increase and never revoked. The quantity is the configured immediate
 parent's word: the same trust the child already extends to that process for
