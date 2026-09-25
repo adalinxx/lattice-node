@@ -138,16 +138,21 @@ accepted blocks, proof-derived work, and the attributed work-only batches it
 credited from parent run reports. The blocks it still owes an admission are
 likewise a query over facts, never a queue: every verified incoming-carrier
 edge whose child it has not accepted and not refused for good (a carrier
-whose grind missed this chain's target, or malformed evidence — judgments
-about immutable bytes, recorded as such). A deferred admission — evidence not
-yet held, a rule not yet satisfied, a local failure — leaves the block owed,
-and the node re-arms every owed block when it starts and when its parent's
-session comes up, recovering the package from its own edge. So no crash or
-stop between a deferral and its retry can lose a parent-carried block, and a
-child never stays on a branch its parent chain has left for want of one. It asks its parent for a committer's run
-when it admits a block that committer carried and after each evidence round,
-the fallback for a push it missed; a credit it already holds never depends on
-the parent being reachable again.
+whose grind missed this chain's target, or a block that violates the
+protocol — verdicts about immutable bytes, recorded as such; a provider's
+malformed or missing bytes are not). A deferred admission — evidence not yet
+held, a rule not yet satisfied, a local failure — leaves the block owed, and
+the node re-arms owed blocks, newest first and sweeping the whole set across
+seedings, when it starts, when its parent's session comes up, and when an
+evidence round completes — the moments a retry held only in memory could
+have been lost, and the moments the parent can serve the block — recovering
+the package from its own edge and admitting at the weighed tier. So no crash
+or stop between a deferral and its retry can lose a parent-carried block, and
+a child never stays on a branch its parent chain has left for want of one.
+It asks its parent for a committer's run when it admits a block that
+committer carried and after each evidence round, the fallback for a push it
+missed; a credit it already holds never depends on the parent being
+reachable again.
 When admission needs a new genesis or continuity
 fact, the child asks its authenticated immediate-parent process. A positive
 answer is an unsigned acknowledgement bound to that live session and exact

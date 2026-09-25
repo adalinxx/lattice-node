@@ -1498,7 +1498,10 @@ actor NodeStore {
     /// incoming-carrier edge whose child is not accepted and not refused for
     /// good. Derived, never queued — a restart or a reconnect recomputes it
     /// from these rows, so no crash between a deferred admission and its
-    /// retry can lose the block. Paged in evidence order.
+    /// retry can lose the block. Paged NEWEST first: the block whose loss
+    /// strands the chain is the one the parent just carried, and a row that
+    /// can never be satisfied (a carrier on a fork the parent abandoned) must
+    /// never shadow it. The caller sweeps with the cursor and wraps.
     struct CarriedBlockObligation: Equatable, Sendable {
         let childCID: String
         let rootCID: String
@@ -1530,7 +1533,7 @@ actor NodeStore {
 
     func carriedBlockObligations(
         directory: String,
-        afterProofRowID: Int64?,
+        beforeProofRowID: Int64?,
         limit: Int
     ) throws -> (obligations: [CarriedBlockObligation], lastProofRowID: Int64?) {
         guard limit > 0, let sqlLimit = Int64(exactly: limit) else {
@@ -1543,7 +1546,7 @@ actor NodeStore {
             INNER JOIN issued_child_edges AS e ON e.edge_cid = p.edge_cid
             WHERE p.scope = ?1
                 AND e.directory = ?2
-                AND p.rowid > ?3
+                AND p.rowid < ?3
                 AND NOT EXISTS (
                     SELECT 1 FROM accepted_blocks AS a WHERE a.block_cid = e.child_cid
                 )
@@ -1551,13 +1554,13 @@ actor NodeStore {
                     SELECT 1 FROM carried_block_refusals AS r
                     WHERE r.child_cid = e.child_cid AND r.root_cid = p.root_cid
                 )
-            ORDER BY p.rowid
+            ORDER BY p.rowid DESC
             LIMIT ?4
             """,
             params: [
                 .text(IssuedChildProofScope.incomingCarrier.rawValue),
                 .text(directory),
-                .int(afterProofRowID ?? 0),
+                .int(beforeProofRowID ?? Int64.max),
                 .int(sqlLimit),
             ]
         )

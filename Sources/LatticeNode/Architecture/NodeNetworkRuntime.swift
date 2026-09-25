@@ -802,7 +802,7 @@ public actor NodeNetworkRuntime: IvyDelegate {
             }
             // Evidence the last run verified but whose block it never
             // accepted: owed an admission, from the durable edges.
-            await seedCarriedBlockObligations(
+            scheduleCarriedBlockObligationSeeding(
                 generation: runtimeGeneration, process: process
             )
             // A peer may complete its hello while the listeners are starting.
@@ -850,20 +850,32 @@ public actor NodeNetworkRuntime: IvyDelegate {
     }
 
     /// One page of the carried blocks this chain still owes an admission,
-    /// as seeds the acquirer recovers the package for from the durable edge
-    /// (`recoveryRootCID`). Bounded by the acquirer's own retained capacity:
-    /// what one page leaves is picked up by the next seeding — every
-    /// admission that accepts a block shrinks the set.
+    /// newest first, as WEIGHED seeds the acquirer recovers the package for
+    /// from the durable edge (`recoveryRootCID`) — weighed like every other
+    /// durable seed: the edge's proof is what the weighed tier needs, the
+    /// eager tier would also demand a continuity fact and pin the block to
+    /// execution for the process lifetime. Bounded by the acquirer's
+    /// retained capacity; successive seedings continue from the cursor and
+    /// wrap when a page comes back short, so a row that can never be
+    /// satisfied shadows nothing — the whole owed set is swept, newest
+    /// first, across seedings.
     private static let carriedBlockObligationPage = CandidateAcquirer.retainedCapacity
+    private var carriedBlockObligationCursor: Int64?
 
     private func carriedBlockObligationSeeds(
         process: ChainProcess
     ) async throws -> [CandidateSeed] {
         let page = try await process.carriedBlockObligations(
+            beforeProofRowID: carriedBlockObligationCursor,
             limit: Self.carriedBlockObligationPage
         )
+        carriedBlockObligationCursor = page.obligations.count
+            < Self.carriedBlockObligationPage ? nil : page.lastProofRowID
         return page.obligations.map {
-            CandidateSeed(blockCID: $0.childCID, package: nil, recoveryRootCID: $0.rootCID)
+            CandidateSeed(
+                blockCID: $0.childCID, package: nil,
+                recoveryRootCID: $0.rootCID, weighed: true
+            )
         }
     }
 
@@ -872,20 +884,35 @@ public actor NodeNetworkRuntime: IvyDelegate {
     /// evidence round completes: the moments a retry that lived only in
     /// memory could have been lost, and the moments the parent is there to
     /// serve the block's content or has just served what it was waiting on.
-    /// Idempotent: the acquirer keys attempts by (block, root).
+    /// Detached, so nothing on the caller's path waits behind it; a seed the
+    /// acquirer has no room for is dropped, not waited on — it is re-derived
+    /// at the next seeding by construction. Idempotent: the acquirer keys
+    /// attempts by (block, root), and re-observing one changes nothing.
+    private func scheduleCarriedBlockObligationSeeding(
+        generation: UInt64,
+        process: ChainProcess
+    ) {
+        guard !configuration.address.isNexus else { return }
+        Task { [weak self] in
+            await self?.seedCarriedBlockObligations(
+                generation: generation, process: process
+            )
+        }
+    }
+
     private func seedCarriedBlockObligations(
         generation: UInt64,
         process: ChainProcess
     ) async {
-        guard !configuration.address.isNexus,
+        guard isCurrentRuntime(generation: generation, process: process),
               let seeds = try? await carriedBlockObligationSeeds(process: process)
         else { return }
+        var armed = 0
         for seed in seeds {
-            guard await enqueueRetainedParentCandidate(
-                seed, generation: generation, process: process
-            ) else { return }
+            guard isCurrentRuntime(generation: generation, process: process) else { return }
+            if enqueueCandidate(seed) { armed += 1 }
         }
-        SyncTrace.log("carried-block obligations seeded: \(seeds.count)")
+        SyncTrace.log("carried-block obligations: \(seeds.count) owed, \(armed) armed")
     }
 
     private func prepareParentEvidenceInbox(
@@ -3645,14 +3672,14 @@ public actor NodeNetworkRuntime: IvyDelegate {
                 )
             } else {
                 // The round is complete — its evidence retained, its
-                // candidates queued. A round is what satisfies a deferred
-                // admission waiting on evidence, so every owed block is
-                // re-armed here too; then ask for the runs of the committers
-                // this chain already accepted blocks from (§9.10).
-                await self.seedCarriedBlockObligations(
+                // candidates queued: ask for the runs of the committers this
+                // chain already accepted blocks from (§9.10). A round is also
+                // what satisfies a deferred admission waiting on evidence, so
+                // every owed block is re-armed here too, off this path.
+                await self.requestParentRunReports(
                     generation: generation, process: process
                 )
-                await self.requestParentRunReports(
+                await self.scheduleCarriedBlockObligationSeeding(
                     generation: generation, process: process
                 )
             }
@@ -4249,16 +4276,16 @@ public actor NodeNetworkRuntime: IvyDelegate {
             return
         }
         if case .parent = role {
-            // The parent is back: every carried block still owed an admission
-            // is re-armed first (its content is served by this session), then
-            // the evidence round; the run re-ask follows that round, once the
-            // blocks it brings are held here (`scheduleParentEvidencePage`).
-            await seedCarriedBlockObligations(
-                generation: generation, process: process
-            )
+            // The parent is back: the evidence round starts, and every
+            // carried block still owed an admission is re-armed (its content
+            // is served by this session); the run re-ask follows the round,
+            // once the blocks it brings are held here (`scheduleParentEvidencePage`).
             await requestEvidenceIndex(
                 generation: generation,
                 process: process
+            )
+            scheduleCarriedBlockObligationSeeding(
+                generation: generation, process: process
             )
         } else if case .child(let childPath) = role {
             guard await waitForChildEvidenceReady(peer: peer) else {

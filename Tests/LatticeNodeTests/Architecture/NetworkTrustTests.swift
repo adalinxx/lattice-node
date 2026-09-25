@@ -5465,8 +5465,9 @@ final class NetworkTrustTests: XCTestCase {
         )
         XCTAssertTrue(bootstrapped)
         let genesis = try await process!.canonicalTipBlock()
-        // Deferred deterministically: a clock 3 s ahead.
-        let notYet = Int64(Date().timeIntervalSince1970 * 1_000) + 3_000
+        // Deferred deterministically: a clock 4 s ahead — far past what one
+        // admission takes on a loaded runner.
+        let notYet = Int64(Date().timeIntervalSince1970 * 1_000) + 4_000
         let carried = try await BlockBuilder.buildBlock(
             previous: genesis, timestamp: notYet, nonce: 1, fetcher: process!
         )
@@ -5498,7 +5499,7 @@ final class NetworkTrustTests: XCTestCase {
         XCTAssertEqual(owed.map(\.childCID), [carriedHeader.rawCID])
         // Died before the retry.
         process = nil
-        try await Task.sleep(for: .milliseconds(3_200))
+        try await Task.sleep(for: .milliseconds(4_300))
 
         let runtime = try NodeNetworkRuntime(
             configuration: configuration,

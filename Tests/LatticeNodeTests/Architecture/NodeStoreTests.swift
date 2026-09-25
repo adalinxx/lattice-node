@@ -1235,10 +1235,10 @@ final class NodeStoreTests: XCTestCase {
             ))
         }
         func owed(
-            directory: String = "Child", after: Int64? = nil, limit: Int = 16
+            directory: String = "Child", limit: Int = 16
         ) async throws -> [NodeStore.CarriedBlockObligation] {
             try await store.carriedBlockObligations(
-                directory: directory, afterProofRowID: after, limit: limit
+                directory: directory, beforeProofRowID: nil, limit: limit
             ).obligations
         }
         let first = NodeStore.CarriedBlockObligation(childCID: fixture.childCID, rootCID: fixture.first.rootCID)
@@ -1251,18 +1251,19 @@ final class NodeStoreTests: XCTestCase {
         XCTAssertEqual(one, [first], "a verified edge whose child is not accepted is owed")
         try await persist(fixture.second)
         let both = try await owed()
-        XCTAssertEqual(both, [first, second], "one obligation per (child, root), in evidence order")
+        XCTAssertEqual(both, [second, first], "one obligation per (child, root), newest first")
         let elsewhere = try await owed(directory: "Other")
         XCTAssertEqual(elsewhere, [], "scoped to this chain's directory")
 
-        // Paged by the proof row: the cursor continues exactly where the page ended.
-        let page = try await store.carriedBlockObligations(directory: "Child", afterProofRowID: nil, limit: 1)
-        XCTAssertEqual(page.obligations, [first])
+        // Paged by the proof row, newest first: the cursor continues exactly
+        // where the page ended, so a sweep reaches the oldest row and ends.
+        let page = try await store.carriedBlockObligations(directory: "Child", beforeProofRowID: nil, limit: 1)
+        XCTAssertEqual(page.obligations, [second])
         let cursor = try XCTUnwrap(page.lastProofRowID)
-        let next = try await store.carriedBlockObligations(directory: "Child", afterProofRowID: cursor, limit: 1)
-        XCTAssertEqual(next.obligations, [second])
+        let next = try await store.carriedBlockObligations(directory: "Child", beforeProofRowID: cursor, limit: 1)
+        XCTAssertEqual(next.obligations, [first])
         let end = try await store.carriedBlockObligations(
-            directory: "Child", afterProofRowID: try XCTUnwrap(next.lastProofRowID), limit: 1
+            directory: "Child", beforeProofRowID: try XCTUnwrap(next.lastProofRowID), limit: 1
         )
         XCTAssertEqual(end.obligations, [])
         XCTAssertNil(end.lastProofRowID)
@@ -1305,7 +1306,7 @@ final class NodeStoreTests: XCTestCase {
             }
         }
         await XCTAssertThrowsErrorAsync(
-            try await store.carriedBlockObligations(directory: "Child", afterProofRowID: nil, limit: 0)
+            try await store.carriedBlockObligations(directory: "Child", beforeProofRowID: nil, limit: 0)
         ) { error in
             guard case NodeStoreError.invalidConfiguration = error else {
                 return XCTFail("expected invalidConfiguration, got \(error)")

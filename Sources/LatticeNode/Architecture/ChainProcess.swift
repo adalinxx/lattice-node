@@ -877,31 +877,37 @@ public actor ChainProcess: ContentSource, Fetcher, VolumeStorer {
         )
     }
 
-    /// Which non-accepted outcomes are final for this chain. Anything else
-    /// (evidence not yet held, a rule not yet satisfied, a local failure) is
-    /// retried from the durable obligation, never forgotten.
+    /// Which non-accepted outcomes are final for this chain — verdicts about
+    /// the block's own bytes under this (child, root) pair: the grind missed
+    /// this chain's target, or the block violates the protocol. Read from
+    /// Lattice's failure, not the collapsed node decision: a provider's
+    /// malformed bytes (`providerMalformedEvidence`, which the node also
+    /// reports as invalid) are about the provider, not the block, and are
+    /// retried — Lattice classifies them as transient for the same reason.
+    /// Anything else (evidence not yet held, a rule not yet satisfied, a
+    /// local failure) is retried from the durable obligation, never forgotten.
     static func carriedBlockRefusal(
-        _ decision: NodeAdmissionDecision
+        _ result: ChainLocalBlockResult
     ) -> NodeStore.CarriedBlockRefusal? {
-        switch decision {
+        switch result {
         case .carrier: .carrier
-        case .invalid: .invalid
-        case .canonicalized, .acceptedSide, .duplicate,
-             .unavailable, .temporarilyInvalid, .localFailure: nil
+        case .rejected(.notAcceptedAtCurrentChain, _, _): .carrier
+        case .rejected(.protocolInvalid, _, _): .invalid
+        case .accepted, .duplicate, .rejected: nil
         }
     }
 
-    /// The carried blocks this chain still owes an admission, in evidence
-    /// order, one page; `afterProofRowID` continues a previous page. Derived
-    /// from durable facts on every call.
+    /// The carried blocks this chain still owes an admission, newest first,
+    /// one page; `beforeProofRowID` continues a previous page. Derived from
+    /// durable facts on every call.
     func carriedBlockObligations(
-        afterProofRowID: Int64? = nil,
+        beforeProofRowID: Int64? = nil,
         limit: Int
     ) async throws -> (obligations: [NodeStore.CarriedBlockObligation], lastProofRowID: Int64?) {
         guard !configuration.address.isNexus else { return ([], nil) }
         return try await store.carriedBlockObligations(
             directory: configuration.address.directory,
-            afterProofRowID: afterProofRowID,
+            beforeProofRowID: beforeProofRowID,
             limit: limit
         )
     }
@@ -1196,7 +1202,7 @@ public actor ChainProcess: ContentSource, Fetcher, VolumeStorer {
             // restart can lose it. A refusal for good is recorded as such,
             // so the owed set stays finite: every merged-mining round whose
             // grind missed this chain's target leaves a carrier behind.
-            if let refusal = Self.carriedBlockRefusal(decision) {
+            if let refusal = Self.carriedBlockRefusal(result) {
                 try await store.persistCarriedBlockRefusal(
                     childCID: blockHeader.rawCID,
                     rootCID: link.rootCID,

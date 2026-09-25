@@ -797,8 +797,9 @@ final class ChainProcessTests: XCTestCase {
         )
         XCTAssertTrue(bootstrapped)
         let genesis = try XCTUnwrap(fixture.childHeader.node)
-        // Deferred, deterministically: the block's clock is 2.5 s ahead.
-        let notYet = Int64(Date().timeIntervalSince1970 * 1_000) + 2_500
+        // Deferred, deterministically: the block's clock is 4 s ahead — far
+        // past what one admission takes on a loaded runner.
+        let notYet = Int64(Date().timeIntervalSince1970 * 1_000) + 4_000
         let carried = try await BlockBuilder.buildBlock(
             previous: genesis, timestamp: notYet, nonce: 1, fetcher: parentSource
         )
@@ -843,7 +844,7 @@ final class ChainProcessTests: XCTestCase {
         XCTAssertEqual(recovered?.package.proof.rootCID, proof.rootCID, "the package is recoverable from the edge")
 
         // Once the rule is satisfiable, the same block is accepted.
-        try await Task.sleep(for: .milliseconds(2_700))
+        try await Task.sleep(for: .milliseconds(4_300))
         let accepted = try await process!.admit(
             carriedHeader, authenticatedChildPackage: try XCTUnwrap(recovered), remoteSource: parentSource
         )
