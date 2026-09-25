@@ -6308,10 +6308,10 @@ public actor NodeNetworkRuntime: IvyDelegate {
         process: ChainProcess
     ) async {
         guard !configuration.address.isNexus,
-              let committers = await handlers?.recentCommitters?(),
-              !committers.isEmpty,
               isCurrentRuntime(generation: generation, process: process),
               let parent = configuredParentPeer(),
+              let committers = await handlers?.recentCommitters?(),
+              !committers.isEmpty,
               let payload = try? ParentRunReportRequestMessage(
                   requestID: makeRequestID(),
                   committerCIDs: committers

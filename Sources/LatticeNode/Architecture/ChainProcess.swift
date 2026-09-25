@@ -2338,11 +2338,13 @@ public actor ChainProcess: ContentSource, Fetcher, VolumeStorer {
         return await level.chain.parentRunReport(at: committer, directory: directory)
     }
 
-    /// The committing parent blocks of the child blocks this chain admitted
-    /// with a carrier proof, newest first, bounded to what one re-serve
+    /// The committing parent blocks of the blocks this chain ACCEPTED with a
+    /// carrier proof, distinct, newest first, bounded to what one re-serve
     /// request may name — what it asks its parent to re-serve after a
     /// reconnect. Durable: read from the carrier edges verified at admission,
-    /// so a child restarted while its parent was down still asks.
+    /// joined on acceptance (a carrier of a block this chain refused commits
+    /// nothing here), so a child restarted while its parent was down still
+    /// asks, and asks only about its own blocks.
     func recentCommitters() async throws -> [String] {
         try await store.incomingCarrierCommitters(limit: Self.recentCommitterCapacity)
     }

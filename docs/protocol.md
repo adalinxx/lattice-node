@@ -85,8 +85,8 @@ genesis and parent-state continuity facts and serves the run reports of spec
 choose the child's tip. A run report names a quantity, and only a quantity:
 the child binds it — its own directory, the block THIS chain's verified
 carrier proof says that committer commits (a report naming any other block is
-refused), one of the committer's grinds already credited there — and derives the credit
-itself, `runWork − ownWork`,
+refused), one of the committer's grinds already credited there — and derives
+the credit itself, `runWork − ownWork`,
 under an identity keyed by the committer and directory, applied only as a
 strict increase and never revoked. The quantity is the configured immediate
 parent's word: the same trust the child already extends to that process for
