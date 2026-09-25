@@ -926,6 +926,10 @@ private struct RunReportServeFixture {
     let child: Ivy
     /// Ivy holds its delegate weakly; the fixture keeps the fake child alive.
     let childDelegate: ChildEvidencePeer
+    /// A second child naming a directory this node never anchored.
+    let stranger: Ivy
+    let strangerDelegate: ChildEvidencePeer
+    let strangerRecorder: ChildEvidenceRecorder
     let recorder: ChildEvidenceRecorder
     let carrierCID: String
     let childCID: String
@@ -5494,12 +5498,18 @@ final class NetworkTrustTests: XCTestCase {
                 )
             )
             try await fixture.child.start()
+            try await fixture.stranger.start()
             try await waitUntil("the parent served the real committer's run") {
                 !(await fixture.recorder.runReportsSeen()).isEmpty
+            }
+            try await waitUntil("the stranger's index request was answered") {
+                !(await fixture.strangerRecorder.snapshot()).indexEntries.isEmpty
             }
             // Let a second (wrong) answer arrive if one were ever going to.
             try await Task.sleep(for: .milliseconds(300))
             let served = await fixture.recorder.runReportsSeen()
+            let strangerSaw = await fixture.strangerRecorder.runReportsSeen()
+            XCTAssertTrue(strangerSaw.isEmpty, "a directory this node never anchored is served nothing")
             XCTAssertEqual(served.count, 1, "one report for the one committer; silence for the stranger")
             let report = try XCTUnwrap(served.first)
             XCTAssertEqual(report.committerCID, fixture.carrierCID)
@@ -5508,10 +5518,12 @@ final class NetworkTrustTests: XCTestCase {
             XCTAssertGreaterThan(report.runWork, report.ownWork,
                                  "the successor mined on the carrier is in its run")
             let servedDirectories = await process.servedRunDirectoryList()
-            XCTAssertEqual(servedDirectories, ["Payments"], "served because anchored, when the child wired in")
+            XCTAssertEqual(servedDirectories, ["Payments"], "served because anchored, not because a peer named it")
+            await fixture.stranger.stop()
             await fixture.child.stop()
             await fixture.runtime.stop()
         } catch {
+            await fixture.stranger.stop()
             await fixture.child.stop()
             await fixture.runtime.stop()
             throw error
@@ -8945,6 +8957,32 @@ final class NetworkTrustTests: XCTestCase {
             mode: .privateNetwork
         ))
         await child.installTestDelegate(childDelegate)
+        // A child of a directory this node never anchored asks for the same
+        // committer: the name alone must serve nothing.
+        let strangerPath = ["Nexus", "Markets"]
+        let strangerRecorder = ChildEvidenceRecorder()
+        let strangerDelegate = ChildEvidencePeer(
+            recorder: strangerRecorder,
+            hello: try ChainHello(
+                nexusGenesisCID: configuration.nexusGenesisCID,
+                chainPath: strangerPath
+            ).encode(),
+            childPath: strangerPath,
+            runReportCommitters: [carrierHeader.rawCID]
+        )
+        let stranger = Ivy(config: IvyConfig(
+            signingKey: signingKey(keyByte &+ 2),
+            listenPort: 0,
+            bootstrapPeers: [PeerEndpoint(
+                publicKey: configuration.processPublicKey,
+                host: "127.0.0.1",
+                port: hierarchyPort
+            )],
+            requestTimeout: .milliseconds(200),
+            stunServers: [],
+            mode: .privateNetwork
+        ))
+        await stranger.installTestDelegate(strangerDelegate)
         return RunReportServeFixture(
             storage: storage,
             configuration: configuration,
@@ -8952,6 +8990,9 @@ final class NetworkTrustTests: XCTestCase {
             process: process,
             child: child,
             childDelegate: childDelegate,
+            stranger: stranger,
+            strangerDelegate: strangerDelegate,
+            strangerRecorder: strangerRecorder,
             recorder: recorder,
             carrierCID: carrierHeader.rawCID,
             childCID: try BlockHeader(node: childBlock).rawCID,

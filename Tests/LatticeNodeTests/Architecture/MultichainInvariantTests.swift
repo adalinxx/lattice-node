@@ -245,8 +245,11 @@ final class MultichainInvariantTests: XCTestCase {
         guard case .refused(.unrepresentable) = unrepresentable else {
             return XCTFail("a quantity one contribution cannot carry is refused, got \(unrepresentable)")
         }
+        // The radius of a lie: it lands at the block the parent names, as a
+        // write-once ratchet, so that branch is pinned for good — the trust
+        // an operator extends by configuring a parent. Nothing else moves.
         let tipAfterLie = try await child().status().tipCID
-        XCTAssertEqual(tipAfterLie, childBlockCID, "the lie moved nothing but this block's weight")
+        XCTAssertEqual(tipAfterLie, childBlockCID, "credited at the named block; the tip is where it was")
 
         // The credit is durable: after a restart the same report is still
         // "not stronger", which only a replayed attributed fact explains.
