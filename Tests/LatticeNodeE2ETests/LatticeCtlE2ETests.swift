@@ -830,7 +830,9 @@ final class LatticeCtlE2ETests: XCTestCase {
             }
         }
         // Counters restart with the process: what this one shows is only
-        // what the re-serve after the crash did.
+        // what the re-serve after the crash did — read once the answers have
+        // had time to land, not at the first refusal.
+        try await Task.sleep(for: e2eScaled(.seconds(2)))
         let appliedAfterCrashValue = await metric(stallsRPC, applied)
         let appliedAfterCrash = try XCTUnwrap(appliedAfterCrashValue)
         XCTAssertEqual(appliedAfterCrash, 0, "nothing new to credit: every credit was already durable")
@@ -846,7 +848,7 @@ final class LatticeCtlE2ETests: XCTestCase {
             ) else { return false }
             defer { previous = now }
             if previous == now { return true }
-            try? await Task.sleep(for: .seconds(2))
+            try? await Task.sleep(for: e2eScaled(.seconds(2)))
             return false
         }
     }

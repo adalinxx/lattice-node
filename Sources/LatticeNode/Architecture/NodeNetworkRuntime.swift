@@ -3599,8 +3599,9 @@ public actor NodeNetworkRuntime: IvyDelegate {
                     process: process
                 )
             } else {
-                // The round is complete and everything it brought is held:
-                // ask for the runs of the committers behind it (§9.10).
+                // The round is complete — its evidence retained, its
+                // candidates queued: ask for the runs of the committers this
+                // chain already accepted blocks from (§9.10).
                 await self.requestParentRunReports(
                     generation: generation, process: process
                 )
@@ -3825,18 +3826,17 @@ public actor NodeNetworkRuntime: IvyDelegate {
             )
 
         case (NodeNetworkTopic.parentRunReportRequest, .child(let childPath)):
-            // A child re-asks for the runs of committers it names — the
-            // fallback for a push it missed. One in flight per peer, like the
-            // fact query; each answer is an O(1) read, and a committer this
-            // node does not serve is silence, never a claim.
+            // A child asks for the runs of committers it names — on admitting
+            // a block one of them carried, and after each evidence round.
+            // Not behind the per-peer query guard: answering walks no chain
+            // (each committer is one O(1) read, the request names at most
+            // `maximumParentRunReportRequestCommitters`), and a dropped ask
+            // would be a credit the child recovers only by chance. A
+            // committer this node does not serve is silence, never a claim.
             guard let request = try?
                     ParentRunReportRequestMessage.decoded(message.payload),
-                  let directory = childPath.last,
-                  parentStateQueryGuard.acquire(peer.key)
+                  let directory = childPath.last
             else { return }
-            defer {
-                parentStateQueryGuard.release(peer.key)
-            }
             // A child re-asks right after its hello, while this node's
             // serve-on-hello may still be walking the graph; serve first
             // (idempotent, gated on the directory being anchored here) so the
@@ -6318,12 +6318,12 @@ public actor NodeNetworkRuntime: IvyDelegate {
         }
     }
 
-    /// After (re)connecting to the parent, ask it to re-serve the runs of the
-    /// committers this chain knows: the fallback for pushes missed while the
-    /// session was down. Nothing to ask means nothing is sent.
     /// Ask the parent for the runs of the committers this chain recently
-    /// accepted blocks from — after every evidence catch-up round, when the
-    /// blocks it brought are held here and their committers are known.
+    /// accepted blocks from — after every evidence catch-up round: the
+    /// fallback for pushes missed while the session was down. The blocks a
+    /// round itself brings are queued as candidates, not yet accepted, so
+    /// they are asked for one by one as they are admitted (the service's
+    /// requester). Nothing to ask means nothing is sent.
     private func requestParentRunReports(
         generation: UInt64,
         process: ChainProcess
@@ -6334,8 +6334,9 @@ public actor NodeNetworkRuntime: IvyDelegate {
         )
     }
 
-    /// Ask the parent for the run of one committer whose block was just
-    /// admitted here (§9.10). Public for the service's admission effects.
+    /// Ask the parent for the runs of the committers of a block just
+    /// admitted here (§9.10) — one message for all of them. Public for the
+    /// service's admission effects.
     public func requestParentRunReports(committers: [String]) async {
         guard isRunning, let process else { return }
         await requestParentRunReports(
@@ -6366,8 +6367,9 @@ public actor NodeNetworkRuntime: IvyDelegate {
     }
 
     /// Push one run report to every authenticated child of its directory
-    /// (§9.10). A push that does not land is re-served by the child's request
-    /// on its next hello, so no delivery result is acted on.
+    /// (§9.10). A push that does not land is re-served by the child's own
+    /// ask — on admitting a block that committer carried, and after each
+    /// evidence round — so no delivery result is acted on.
     public func announceParentRunReport(_ report: ParentRunReport) async {
         guard isRunning, let process,
               let payload = try? ParentRunReportMessage(report).encoded()

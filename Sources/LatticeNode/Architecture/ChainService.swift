@@ -243,10 +243,10 @@ public typealias ChildProofPublisher = @Sendable (
 /// A parent pushes the run it credits to a committing block to the children
 /// of that directory (§9.10), on every change to that run.
 public typealias ParentRunReportPublisher = @Sendable (ParentRunReport) async throws -> Void
-/// Ask this chain's configured parent for the run of one committing block
-/// (§9.10): called when a block that committer carries is admitted here, so
-/// the credit for that run never waits for a push or a reconnect.
-public typealias ParentRunReportRequester = @Sendable (String) async -> Void
+/// Ask this chain's configured parent for the runs of the committing blocks
+/// behind one block admitted here (§9.10) — one ask per admission, so the
+/// credit for those runs never waits for a push or a reconnect.
+public typealias ParentRunReportRequester = @Sendable ([String]) async -> Void
 public typealias AcceptedBlockPublisher = @Sendable (_ blockCID: String) async throws -> Void
 public typealias AcceptedTransactionPublisher = @Sendable (
     _ volumeRootCID: String
@@ -2222,7 +2222,14 @@ public actor ChainService {
         // exactly as an admission does, so this chain's own children are
         // pushed the runs it changed — the credit reaches the next level
         // without waiting for a re-ask. Delivery is a hint, as below.
-        SyncTrace.log("run-report applied: \(application)")
+        let traced: String
+        switch application {
+        case .credited(let commit, let childBlock):
+            traced = "credited at \(childBlock.prefix(16)) tip=\(commit?.tipHash.prefix(16) ?? "unchanged")"
+        case .refused(let outcome):
+            traced = "refused \(ChainProcess.refusalName(outcome))"
+        }
+        SyncTrace.log("run-report applied: \(traced)")
         if case .credited(_, let childBlock) = application {
             await pushChangedRuns(of: childBlock)
         }
@@ -2233,8 +2240,10 @@ public actor ChainService {
     /// pushed once per value it reaches: an admission's push and a credit's
     /// push of the same run can race, and the loser would only be refused as
     /// not stronger. One small entry per committer ever pushed — the same
-    /// order as the run table itself. A push is a hint either way; a child
-    /// that missed one re-asks on its next hello.
+    /// order as the run table itself. It records that a value was ANNOUNCED,
+    /// not delivered: a child not connected at the time, or one that joins
+    /// later, recovers it by its own ask — on admitting a block that
+    /// committer carried, and after each evidence round.
     private var pushedRunWork: [String: WorkSum] = [:]
 
     /// §9.10: every admitted block or strengthening with verifiable work
@@ -2326,13 +2335,11 @@ public actor ChainService {
         // caught up on after the hello was never asked for.
         if outcome.decision.isAccepted {
             await pushChangedRuns(of: header.rawCID)
-            if outcome.parentCarrierLink != nil {
-                let committers = (try? await process.incomingCarrierCommitters(
-                    of: header.rawCID
-                )) ?? []
-                for committer in committers {
-                    await parentRunReportRequester(committer)
-                }
+            if outcome.parentCarrierLink != nil,
+               let committers = try? await process.incomingCarrierCommitters(
+                   of: header.rawCID
+               ), !committers.isEmpty {
+                await parentRunReportRequester(committers)
             }
         }
         if outcome.decision.isAccepted, candidateHandoffs == nil {

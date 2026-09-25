@@ -1814,17 +1814,6 @@ actor NodeStore {
     /// carrier proof verified at that block's admission — the edge was derived
     /// from the sparse proof, never taken from the wire — or nil for a
     /// committer of nothing this chain accepted.
-    /// The committing parent blocks behind one block this chain accepted
-    /// with a carrier proof — from this chain's own verified edges, never
-    /// from a wire claim.
-    func incomingCarrierCommitters(of childBlock: String) throws -> [String] {
-        let rows = try database.query(
-            "SELECT e.parent_carrier_cid FROM issued_child_proofs AS p INNER JOIN issued_child_edges AS e ON e.edge_cid = p.edge_cid WHERE p.scope = ?1 AND e.child_cid = ?2 GROUP BY e.parent_carrier_cid ORDER BY e.parent_carrier_cid",
-            params: [.text(IssuedChildProofScope.incomingCarrier.rawValue), .text(childBlock)]
-        )
-        return rows.compactMap { $0["parent_carrier_cid"]?.textValue }
-    }
-
     func incomingCarrierChildBlock(committer: String) throws -> String? {
         let rows = try database.query(
             "SELECT e.child_cid FROM issued_child_proofs AS p INNER JOIN issued_child_edges AS e ON e.edge_cid = p.edge_cid INNER JOIN accepted_blocks AS a ON a.block_cid = e.child_cid WHERE p.scope = ?1 AND e.parent_carrier_cid = ?2 LIMIT 1",

@@ -2315,7 +2315,7 @@ public actor ChainProcess: ContentSource, Fetcher, VolumeStorer {
     /// admitted block or strengthening with verifiable work credits exactly
     /// one run per served directory, so this is O(#served) and complete for
     /// a leaf; the descendants a graft brought in that start their own runs
-    /// are re-served by the child's request on its next hello.
+    /// are re-served by the child's ask when it admits the blocks they carry.
     func runReports(changedBy blockHash: String) async -> [ParentRunReport] {
         guard case .active(let level) = runtimePhase,
               !servedRunDirectories.isEmpty,
@@ -2343,8 +2343,8 @@ public actor ChainProcess: ContentSource, Fetcher, VolumeStorer {
 
     /// The committing parent blocks of the blocks this chain ACCEPTED with a
     /// carrier proof, distinct, newest first, bounded to what one re-serve
-    /// request may name — what it asks its parent to re-serve after a
-    /// reconnect. Durable: read from the carrier edges verified at admission,
+    /// request may name — what it asks its parent to re-serve after each
+    /// evidence round. Durable: read from the carrier edges verified at admission,
     /// joined on acceptance (a carrier of a block this chain refused commits
     /// nothing here), so a child restarted while its parent was down still
     /// asks, and asks only about its own blocks.
@@ -2354,8 +2354,9 @@ public actor ChainProcess: ContentSource, Fetcher, VolumeStorer {
 
     /// The committing parent blocks behind one block accepted here with a
     /// carrier proof (§9.10) — what to ask the parent for on its admission.
+    /// From this chain's own verified edges, never a wire claim.
     func incomingCarrierCommitters(of childBlock: String) async throws -> [String] {
-        try await store.incomingCarrierCommitters(of: childBlock)
+        try await store.incomingParentCarrierBlockCIDs(forChildBlockCID: childBlock).sorted()
     }
 
     static let recentCommitterCapacity = maximumParentRunReportRequestCommitters

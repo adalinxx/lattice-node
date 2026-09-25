@@ -129,7 +129,7 @@ final class MultichainInvariantTests: XCTestCase {
             process: try child(),
             childCandidateProvider: { _ in [] },
             childProofPublisher: { _ in },
-            parentRunReportRequester: { committer in await asked.record(committer) },
+            parentRunReportRequester: { committers in await asked.record(committers) },
             acceptedBlockPublisher: { _ in }
         )
         let admitted = try await XCTUnwrap(childService).admitNetworkCandidate(
@@ -148,7 +148,7 @@ final class MultichainInvariantTests: XCTestCase {
         childService = nil
         XCTAssertTrue(admitted.decision.isAccepted)
         let askedFor = await asked.received()
-        XCTAssertEqual(askedFor, [carrierHeader.rawCID], "the admitted block's carrier is asked for")
+        XCTAssertEqual(askedFor, [[carrierHeader.rawCID]], "one ask, naming the admitted block's carrier")
         let remembered = try await child().recentCommitters()
         XCTAssertEqual(remembered, [carrierHeader.rawCID], "the child remembers whom to re-ask")
         // A directory this chain never anchored a child genesis for is not
@@ -962,9 +962,9 @@ final class MultichainInvariantTests: XCTestCase {
     }
 
     private actor RunReportRequestSink {
-        private var committers: [String] = []
-        func record(_ committer: String) { committers.append(committer) }
-        func received() -> [String] { committers }
+        private var asks: [[String]] = []
+        func record(_ committers: [String]) { asks.append(committers) }
+        func received() -> [[String]] { asks }
     }
 
     private actor ParentRunReportSink {
