@@ -106,10 +106,13 @@ cross-component invariants:
   committer and directory, once — a repeat is refused, never doubled — and the
   credit survives the child's restart from its durable fact log
   (`testParentRunWorkIsCreditedAtTheChildBlockItCommits` in the multichain
-  invariants); a run flows through every level — what Nexus attributes to the
-  middle chain's committing block reaches the grandchild, and the middle
-  chain's service pushes the run that credit changed to its own children
-  without waiting for a re-ask (`testParentRunWorkPropagatesTwoLevelsDown`);
+  invariants), and admitting a block a parent block carried asks the parent
+  for that committer's run, so a push made before the block was held here,
+  or one missed while away, never waits for the next parent block; a run
+  flows through every level — what Nexus attributes to the middle chain's
+  committing block reaches the grandchild, and the middle chain's service
+  pushes the run that credit changed to its own children without waiting
+  for a re-ask (`testParentRunWorkPropagatesTwoLevelsDown`);
 - staged facts and retained Volume roots reopen together, or recovery fails
   closed.
 

@@ -102,7 +102,7 @@ final class MultichainInvariantTests: XCTestCase {
         XCTAssertEqual(carrierReports.count, 1)
         let carrierReport = try XCTUnwrap(carrierReports.first)
         let pushedAfterCarrier = await pushed.received()
-        XCTAssertEqual(pushedAfterCarrier, [carrierReport], "the carrier's own admission pushed its run")
+        XCTAssertEqual(pushedAfterCarrier, [], "the carrier alone attributes nothing: nothing to push")
         XCTAssertEqual(carrierReport.blockHash, carrierHeader.rawCID)
         XCTAssertEqual(carrierReport.directory, "Payments")
         XCTAssertEqual(carrierReport.childBlock, childBlockCID)
@@ -120,7 +120,19 @@ final class MultichainInvariantTests: XCTestCase {
         let childContent = MultichainContentStore()
         try await BlockHeader(node: childBlock).storeBlock(fetcher: parent, storer: childContent)
         let childBlockHeader = BlockHeader(rawCID: childBlockCID, node: nil, encryptionInfo: nil)
-        let admitted = try await child().admit(
+        // Through the service: admitting a block a parent block carried asks
+        // the parent for that committer's run, so the credit never waits for
+        // a push or a reconnect. The service is dropped right after, with
+        // the process, so the storage lock is released for the reopen.
+        let asked = RunReportRequestSink()
+        var childService: ChainService? = ChainService(
+            process: try child(),
+            childCandidateProvider: { _ in [] },
+            childProofPublisher: { _ in },
+            parentRunReportRequester: { committer in await asked.record(committer) },
+            acceptedBlockPublisher: { _ in }
+        )
+        let admitted = try await XCTUnwrap(childService).admitNetworkCandidate(
             childBlockHeader,
             authenticatedChildPackage: AuthenticatedChildPackage(package: ChildValidationPackage(
                 proof: evidence.proof,
@@ -130,9 +142,13 @@ final class MultichainInvariantTests: XCTestCase {
                     toStateCID: childBlock.parentState.rawCID
                 )
             )),
-            remoteSource: childContent
+            preparingChildDirectories: [],
+            contentSource: childContent
         )
+        childService = nil
         XCTAssertTrue(admitted.decision.isAccepted)
+        let askedFor = await asked.received()
+        XCTAssertEqual(askedFor, [carrierHeader.rawCID], "the admitted block's carrier is asked for")
         let remembered = try await child().recentCommitters()
         XCTAssertEqual(remembered, [carrierHeader.rawCID], "the child remembers whom to re-ask")
         // A directory this chain never anchored a child genesis for is not
@@ -165,9 +181,8 @@ final class MultichainInvariantTests: XCTestCase {
         )
         XCTAssertTrue(successorOutcome.decision.isAccepted)
         let pushedReports = await pushed.received()
-        XCTAssertEqual(pushedReports.count, 2, "one push per changed run, per admission")
         let successorReports = await parent.runReports(changedBy: successorHeader.rawCID)
-        XCTAssertEqual(pushedReports.suffix(1).map { $0 }, successorReports, "the push carries exactly the changed run")
+        XCTAssertEqual(pushedReports, successorReports, "the first run a child could credit is the first push")
         XCTAssertEqual(successorReports.count, 1, "the successor's admission changed exactly the carrier's run")
         let grown = try XCTUnwrap(successorReports.first)
         XCTAssertEqual(grown.blockHash, carrierHeader.rawCID, "credited to the nearest committer")
@@ -944,6 +959,12 @@ final class MultichainInvariantTests: XCTestCase {
             }
             throw last
         }
+    }
+
+    private actor RunReportRequestSink {
+        private var committers: [String] = []
+        func record(_ committer: String) { committers.append(committer) }
+        func received() -> [String] { committers }
     }
 
     private actor ParentRunReportSink {

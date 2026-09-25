@@ -175,6 +175,9 @@ struct LatticeNodeCommand: AsyncParsableCommand {
                 guard let network else { throw CancellationError() }
                 await network.announceParentRunReport(report)
             },
+            parentRunReportRequester: { [weak network] committer in
+                await network?.requestParentRunReports(committers: [committer])
+            },
             acceptedBlockPublisher: { [weak network] blockCID in
                 guard let network else { throw CancellationError() }
                 try await network.publishAcceptedBlock(blockCID)

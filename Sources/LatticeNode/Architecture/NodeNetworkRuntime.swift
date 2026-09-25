@@ -3598,6 +3598,12 @@ public actor NodeNetworkRuntime: IvyDelegate {
                     generation: generation,
                     process: process
                 )
+            } else {
+                // The round is complete and everything it brought is held:
+                // ask for the runs of the committers behind it (§9.10).
+                await self.requestParentRunReports(
+                    generation: generation, process: process
+                )
             }
         }
     }
@@ -3839,6 +3845,7 @@ public actor NodeNetworkRuntime: IvyDelegate {
             // sequences what this node publishes, not who may ask.
             guard isCurrentRuntime(generation: generation, process: process) else { return }
             await handlers?.runReportServing?(directory)
+            SyncTrace.log("run-report request from child dir=\(directory) committers=\(request.committerCIDs.count)")
             for committer in request.committerCIDs {
                 guard isCurrentRuntime(generation: generation, process: process),
                       hierarchySessions[peer.key]?.sessionID == peer.sessionID,
@@ -3846,7 +3853,11 @@ public actor NodeNetworkRuntime: IvyDelegate {
                           committer: committer, directory: directory
                       ),
                       let payload = try? ParentRunReportMessage(report).encoded()
-                else { continue }
+                else {
+                    SyncTrace.log("run-report request committer=\(committer.prefix(16)) silence")
+                    continue
+                }
+                SyncTrace.log("run-report answer committer=\(committer.prefix(16)) run=\(report.runWork) own=\(report.ownWork)")
                 _ = await hierarchy.sendMessage(
                     to: peer,
                     topic: NodeNetworkTopic.parentRunReport,
@@ -3860,6 +3871,7 @@ public actor NodeNetworkRuntime: IvyDelegate {
             // own lease; a refusal is counted there, never acted on here.
             guard let report = try? ParentRunReportMessage.decoded(message.payload),
                   let handler = handlers?.parentRunReport else { return }
+            SyncTrace.log("run-report received committer=\(report.report.blockHash.prefix(16)) run=\(report.report.runWork) own=\(report.report.ownWork)")
             try? await handler(report.report)
 
         case (NodeNetworkTopic.childGenesisAnchorRequest,
@@ -4183,11 +4195,9 @@ public actor NodeNetworkRuntime: IvyDelegate {
             return
         }
         if case .parent = role {
+            // The run re-ask follows the evidence round this starts, once
+            // the blocks it brings are held here (`scheduleParentEvidencePage`).
             await requestEvidenceIndex(
-                generation: generation,
-                process: process
-            )
-            await requestParentRunReports(
                 generation: generation,
                 process: process
             )
@@ -6311,25 +6321,48 @@ public actor NodeNetworkRuntime: IvyDelegate {
     /// After (re)connecting to the parent, ask it to re-serve the runs of the
     /// committers this chain knows: the fallback for pushes missed while the
     /// session was down. Nothing to ask means nothing is sent.
+    /// Ask the parent for the runs of the committers this chain recently
+    /// accepted blocks from — after every evidence catch-up round, when the
+    /// blocks it brought are held here and their committers are known.
     private func requestParentRunReports(
+        generation: UInt64,
+        process: ChainProcess
+    ) async {
+        guard let committers = await handlers?.recentCommitters?() else { return }
+        await requestParentRunReports(
+            committers: committers, generation: generation, process: process
+        )
+    }
+
+    /// Ask the parent for the run of one committer whose block was just
+    /// admitted here (§9.10). Public for the service's admission effects.
+    public func requestParentRunReports(committers: [String]) async {
+        guard isRunning, let process else { return }
+        await requestParentRunReports(
+            committers: committers, generation: runtimeGeneration, process: process
+        )
+    }
+
+    private func requestParentRunReports(
+        committers: [String],
         generation: UInt64,
         process: ChainProcess
     ) async {
         guard !configuration.address.isNexus,
               isCurrentRuntime(generation: generation, process: process),
               let parent = configuredParentPeer(),
-              let committers = await handlers?.recentCommitters?(),
               !committers.isEmpty,
               let payload = try? ParentRunReportRequestMessage(
                   requestID: makeRequestID(),
                   committerCIDs: committers
               ).encoded()
         else { return }
-        _ = await hierarchy.sendMessage(
+        let sent = await hierarchy.sendMessage(
             to: parent,
             topic: NodeNetworkTopic.parentRunReportRequest,
             payload: payload
         )
+        SyncTrace.log("run-report request committers=\(committers.count) sent=\(sent)")
     }
 
     /// Push one run report to every authenticated child of its directory

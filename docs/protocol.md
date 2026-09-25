@@ -116,7 +116,10 @@ reports for the directories it hosts: it pushes the changed run of each served
 directory's nearest committer after every accepted admission and after every
 credit it is itself handed by its own parent — so a run flows down every
 level without a re-ask — and re-serves the runs of the committers a child
-names after it reconnects. Those report
+names: a child asks for a committer's run when it admits a block that
+committer carried, and for its recent committers after every evidence
+catch-up round, so a push it could not yet bind or one it missed while away
+is recovered without waiting for the next parent block. Those report
 work; they answer nothing about continuity or validity.) A request naming any
 other `from` is
 malformed, not merely unusual: no correct child can produce one, and serving it

@@ -2352,6 +2352,12 @@ public actor ChainProcess: ContentSource, Fetcher, VolumeStorer {
         try await store.incomingCarrierCommitters(limit: Self.recentCommitterCapacity)
     }
 
+    /// The committing parent blocks behind one block accepted here with a
+    /// carrier proof (§9.10) — what to ask the parent for on its admission.
+    func incomingCarrierCommitters(of childBlock: String) async throws -> [String] {
+        try await store.incomingCarrierCommitters(of: childBlock)
+    }
+
     static let recentCommitterCapacity = maximumParentRunReportRequestCommitters
 
     public enum ParentReportApplication: Sendable {
@@ -2409,9 +2415,10 @@ public actor ChainProcess: ContentSource, Fetcher, VolumeStorer {
         return .credited(commit, childBlock: childBlock)
     }
 
-    /// Refusal counts by case, for `/metrics`: a parent whose reports keep
-    /// being refused is the likeliest symptom of a parent-side accounting
-    /// bug, and `locationConflict` is the one that is permanent.
+    /// Refusal counts by case, for `/metrics`. `notStronger` is routine — a
+    /// re-serve on hello, or a push that lost a race to a stronger one; the
+    /// others are the likeliest symptom of a parent-side accounting bug, and
+    /// `locationConflict` is the one that is permanent.
     func parentReportCounters() -> (applied: UInt64, refusals: [String: UInt64]) {
         (parentReportsAppliedCount, parentReportRefusalCounts)
     }
