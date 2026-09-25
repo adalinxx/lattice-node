@@ -113,8 +113,10 @@ never paid.
 Because that anchor is the only continuity question the protocol defines, it is
 also the only continuity question a parent answers. (A parent also serves run
 reports for the directories it hosts: it pushes the changed run of each served
-directory's nearest committer after every accepted admission, and re-serves
-the runs of the committers a child names after it reconnects. Those report
+directory's nearest committer after every accepted admission and after every
+credit it is itself handed by its own parent — so a run flows down every
+level without a re-ask — and re-serves the runs of the committers a child
+names after it reconnects. Those report
 work; they answer nothing about continuity or validity.) A request naming any
 other `from` is
 malformed, not merely unusual: no correct child can produce one, and serving it

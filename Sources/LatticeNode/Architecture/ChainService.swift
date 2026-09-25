@@ -2205,12 +2205,22 @@ public actor ChainService {
         // A canonical change is reconciled exactly once, on the queued
         // worker under the service gate — the same path every admission's
         // commit takes.
-        return try await process.applyParentRunReport(
+        let application = try await process.applyParentRunReport(
             report,
             canonicalCommitPublisher: { [self] commit in
                 await enqueueCanonicalCommit(commit)
             }
         )
+        // §9.10: a strengthening credits one run per served directory
+        // exactly as an admission does, so this chain's own children are
+        // pushed the runs it changed — the credit reaches the next level
+        // without waiting for a re-ask. Delivery is a hint, as below.
+        if case .credited(_, let childBlock) = application {
+            for changed in await process.runReports(changedBy: childBlock) {
+                try? await parentRunReportPublisher(changed)
+            }
+        }
+        return application
     }
 
     private func reconcileCanonicalCommitOrResetLocked(

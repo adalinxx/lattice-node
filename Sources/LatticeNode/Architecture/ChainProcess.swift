@@ -2357,7 +2357,9 @@ public actor ChainProcess: ContentSource, Fetcher, VolumeStorer {
     public enum ParentReportApplication: Sendable {
         /// The attributed batch is durable and applied; the commit, if the
         /// canonical chain moved.
-        case credited(ChainCommit?)
+        /// Credited at `childBlock`: the block this chain's own carrier
+        /// proof says the reported committer commits.
+        case credited(ChainCommit?, childBlock: String)
         /// Refused by Lattice — typed, so the node can make it visible.
         case refused(ParentReportStrengthening)
     }
@@ -2404,7 +2406,7 @@ public actor ChainProcess: ContentSource, Fetcher, VolumeStorer {
         if let commit, commit.canonicalChanged, let canonicalCommitPublisher {
             _ = await canonicalCommitPublisher(commit)
         }
-        return .credited(commit)
+        return .credited(commit, childBlock: childBlock)
     }
 
     /// Refusal counts by case, for `/metrics`: a parent whose reports keep

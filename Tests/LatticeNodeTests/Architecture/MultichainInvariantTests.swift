@@ -392,7 +392,17 @@ final class MultichainInvariantTests: XCTestCase {
         let nexusReport = try XCTUnwrap(nexusReports.first { $0.childBlock == a2CID })
         XCTAssertEqual(nexusReport.blockHash, n2Header.rawCID)
         XCTAssertGreaterThan(nexusReport.runWork, nexusReport.ownWork)
-        let aCredited = try await a.applyParentRunReport(nexusReport)
+        // A credits through its service, which pushes B the run the credit
+        // changed — the middle chain does not wait for B to ask.
+        let pushedToB = ParentRunReportSink()
+        let aService = ChainService(
+            process: a,
+            childCandidateProvider: { _ in [] },
+            childProofPublisher: { _ in },
+            parentRunReportPublisher: { report in await pushedToB.record(report) },
+            acceptedBlockPublisher: { _ in }
+        )
+        let aCredited = try await aService.applyParentRunReport(nexusReport)
         guard case .credited = aCredited else { return XCTFail("A must credit Nexus's run: \(aCredited)") }
 
         // The credit landed at A2, which roots its own run for B: the run A
@@ -408,6 +418,8 @@ final class MultichainInvariantTests: XCTestCase {
             nexusReport.runWork.subtracting(nexusReport.ownWork),
             "what Nexus attributed at A2 is what A's run for B grew by"
         )
+        let pushed = await pushedToB.received()
+        XCTAssertEqual(pushed, [runAfter], "the credit pushed exactly the run it changed, to B")
         let bCredited = try await b.applyParentRunReport(runAfter)
         guard case .credited = bCredited else { return XCTFail("B must credit A's grown run: \(bCredited)") }
         let bCounters = await b.parentReportCounters()
