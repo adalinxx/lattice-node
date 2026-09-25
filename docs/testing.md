@@ -46,10 +46,15 @@ The suites are grouped by the boundary they actually cross:
   opt-in with `E2E_CTL=1`, their own CI lane) drive the shipped `lattice`
   verbs with real CPU mining: multichain hosts that sync, child and grandchild
   token swaps, deploy interruption and resumption, and §9.10 run attribution
-  through three nodes across a middle-chain outage — Nexus mines alone while
-  the middle chain's node is down, the returning node is credited that work
-  and pushes it to the grandchild, and the grandchild's credit survives its
-  own restart (`testNexusWorkReachesTheGrandchildAcrossAMiddleChainOutage`).
+  through three nodes across a middle-chain outage — full Nexus blocks mined
+  by hand through the coordinator's RPC carry both descendants, Nexus then
+  mines alone while the middle chain's node is down, the returning node is
+  credited that work and pushes it to the grandchild, and the grandchild's
+  credit survives a crash restart
+  (`testNexusWorkReachesTheGrandchildAcrossAMiddleChainOutage`). The
+  coordinator is stopped for that phase because it hunts the easiest target
+  and so also produces child-only carriers, whose child blocks have no chain
+  committer to be credited through.
 - `LatticeMinerCoreTests` and `LatticeMiningCoordinatorTests`: nonce search, work allocation, staleness, subprocess cancellation, and current RPC payloads.
 
 The test bar is boundary-focused rather than timing-focused. Tests inject missing

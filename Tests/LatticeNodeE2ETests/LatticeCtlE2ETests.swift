@@ -2,6 +2,9 @@ import Foundation
 #if canImport(FoundationNetworking)
 import FoundationNetworking
 #endif
+import Lattice
+import LatticeMinerCore
+import LatticeNode
 import XCTest
 
 /// Black-box E2Es for the `lattice` operator CLI: real shipped binaries,
@@ -717,14 +720,17 @@ final class LatticeCtlE2ETests: XCTestCase {
     /// chain's node, the case where the parent mines blocks that commit
     /// nothing into the child and only the run report carries them.
     ///
-    /// Shape: a CLI host mines Nexus and co-mines Market and its grandchild
-    /// Stalls. Market's node goes down; Nexus keeps mining alone, so the run
-    /// of the last block that carried Market grows. Mining then STOPS before
-    /// Market returns, so the outage blocks are the only work anyone can be
-    /// credited: Market is credited by Nexus's re-serve on its hello, and
-    /// Stalls — which never went away and mined nothing — through Market
-    /// (Market's push of the run the credit changed, or Stalls's own re-ask
-    /// when it reconnects; the wire cannot order those two, so the push
+    /// Shape: a CLI host brings up Nexus, Market and its grandchild Stalls
+    /// and the coordinator co-mines them. The coordinator then stops, and
+    /// full Nexus blocks are mined by hand through the RPC it uses — to
+    /// Nexus's own target, so each is a chain block carrying Market's
+    /// candidate (which carries Stalls's) — until both descendants' tips sit
+    /// on chain committers. Market's node goes down; three more full Nexus
+    /// blocks are mined alone, so the run of the last block that carried
+    /// Market grows and nothing else mints. Market returns and is credited
+    /// on its re-ask; Stalls — which never went away and mined nothing — is
+    /// credited through Market (Market's push of the run the credit changed,
+    /// or Stalls's own ask; the wire cannot order those two, so the push
     /// itself is pinned by the multichain unit test). Then Stalls restarts
     /// twice, the second time by SIGKILL: each hello re-serves its
     /// committers' runs and every one is refused as not stronger, and after
@@ -776,20 +782,34 @@ final class LatticeCtlE2ETests: XCTestCase {
             let stalls = await height(stallsRPC) ?? 0
             return market >= 1 && stalls >= 1
         }
+        // From here the blocks are mined by hand through the RPC the
+        // coordinator itself uses, searching to Nexus's OWN target so every
+        // block is a chain block. The coordinator hunts the easiest target
+        // and so also produces child-only carriers — Nexus-shaped blocks that
+        // meet a child's target but not Nexus's, which Nexus never admits;
+        // a child whose tip sits on one has no chain committer to be credited
+        // through. Stopping it also means nothing pushes from here on, so the
+        // outage blocks are the only work a credit can be.
+        _ = try await runCtl(["mine", "stop"], root: host.root)
+        try await waitForStableHeight(host.nexusRPC)
+        // Each descendant's tip is carried by a chain block: a full Nexus
+        // block collects Market's candidate, which carries Stalls's.
+        let marketBeforeCarryValue = await height(marketRPC)
+        let stallsBeforeCarryValue = await height(stallsRPC)
+        let marketBeforeCarry = try XCTUnwrap(marketBeforeCarryValue)
+        let stallsBeforeCarry = try XCTUnwrap(stallsBeforeCarryValue)
+        try await waitFor("descendants carried by full Nexus blocks", seconds: 180) {
+            _ = try? await self.mineFullBlock(host.nexusRPC)
+            let market = await height(marketRPC) ?? 0
+            let stalls = await height(stallsRPC) ?? 0
+            return market > marketBeforeCarry && stalls > stallsBeforeCarry
+        }
 
-        // Outage: Market's node goes down. Nexus keeps mining, and with no
+        // Outage: Market's node goes down. Nexus mines on alone, and with no
         // Market candidate to carry, its blocks commit nothing into Market —
         // work only a run report can deliver.
         try await stopChain(host, "Nexus/Market")
-        let nexusAtOutageValue = await nexusWeighedHeight()
-        let nexusAtOutage = try XCTUnwrap(nexusAtOutageValue, "Nexus metrics")
-        try await waitFor("Nexus mined alone through the outage", seconds: 120) {
-            (await nexusWeighedHeight() ?? 0) >= nexusAtOutage + 3
-        }
-        // Mining stops BEFORE Market returns: from here no admission pushes
-        // anything, so the outage blocks are the only work a credit can be.
-        _ = try await runCtl(["mine", "stop"], root: host.root)
-        try await waitForStableHeight(host.nexusRPC)
+        for _ in 0..<3 { _ = try await mineFullBlock(host.nexusRPC) }
         let stallsAppliedBeforeValue = await metric(stallsRPC, applied)
         let stallsAppliedBefore = try XCTUnwrap(stallsAppliedBeforeValue)
 
@@ -836,6 +856,44 @@ final class LatticeCtlE2ETests: XCTestCase {
         let appliedAfterCrashValue = await metric(stallsRPC, applied)
         let appliedAfterCrash = try XCTUnwrap(appliedAfterCrashValue)
         XCTAssertEqual(appliedAfterCrash, 0, "nothing new to credit: every credit was already durable")
+    }
+
+    /// Mine one FULL block through the RPC the coordinator uses — the
+    /// template collects the children's candidates — searching to the chain's
+    /// own target rather than the easiest one, so the block is a chain block
+    /// and never a child-only carrier. Returns the accepted block's CID.
+    private func mineFullBlock(_ rpc: UInt16) async throws -> String {
+        let template: MiningTemplateResponse = try await postJSON(
+            rpc, "/v1/mining/templates", MiningTemplateRequest(rewards: []), timeout: 40
+        )
+        let midstate = ProofOfWork.midstate(for: template.block)
+        var nonce: UInt64 = 0
+        while ProofOfWork.hash(midstate: midstate, nonce: nonce) > template.block.target {
+            nonce += 1
+        }
+        let response: SubmitWorkResponse = try await postJSON(
+            rpc, "/v1/mining/work",
+            SubmitWorkRequest(workID: template.workID, nonce: nonce), timeout: 60
+        )
+        guard response.accepted else { throw CtlE2EError("full block refused") }
+        return try BlockHeader(node: ProofOfWork.withNonce(template.block, nonce: nonce)).rawCID
+    }
+
+    private func postJSON<Request: Encodable, Response: Decodable>(
+        _ rpc: UInt16, _ path: String, _ body: Request, timeout: TimeInterval
+    ) async throws -> Response {
+        guard let url = URL(string: "http://127.0.0.1:\(rpc)\(path)") else {
+            throw CtlE2EError("bad url \(path)")
+        }
+        var request = URLRequest(url: url, timeoutInterval: timeout)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(body)
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard (response as? HTTPURLResponse)?.statusCode == 200 else {
+            throw CtlE2EError("\(path): \(String(decoding: data.prefix(200), as: UTF8.self))")
+        }
+        return try JSONDecoder().decode(Response.self, from: data)
     }
 
     /// A block in flight when the miner stops can still land; settled is two
