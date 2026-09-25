@@ -164,6 +164,43 @@ struct ParentRunReportMessage: NodeJSONMessage, Equatable, Sendable {
     let ownWork: WorkSum
     let revision: UInt64
 
+    init(
+        directory: String, committerCID: String, childBlockCID: String,
+        grinds: [String], runWork: WorkSum, ownWork: WorkSum, revision: UInt64
+    ) {
+        self.directory = directory
+        self.committerCID = committerCID
+        self.childBlockCID = childBlockCID
+        self.grinds = grinds
+        self.runWork = runWork
+        self.ownWork = ownWork
+        self.revision = revision
+    }
+
+    init(_ report: ParentRunReport) {
+        self.init(
+            directory: report.directory,
+            committerCID: report.blockHash,
+            childBlockCID: report.childBlock,
+            grinds: report.grinds.sorted(),
+            runWork: report.runWork,
+            ownWork: report.ownWork,
+            revision: report.revision
+        )
+    }
+
+    var report: ParentRunReport {
+        ParentRunReport(
+            blockHash: committerCID,
+            directory: directory,
+            childBlock: childBlockCID,
+            grinds: Set(grinds),
+            runWork: runWork,
+            ownWork: ownWork,
+            revision: revision
+        )
+    }
+
     func validate() throws {
         guard _isBoundedWireAtom(directory), !directory.isEmpty,
               _isCanonicalWireCID(committerCID),

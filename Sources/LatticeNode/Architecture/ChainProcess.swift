@@ -1139,6 +1139,10 @@ public actor ChainProcess: ContentSource, Fetcher, VolumeStorer {
 
         let decision = NodeAdmissionDecision(result)
         let admissionStaged = result.commit != nil
+        if decision.isAccepted, let proof = authenticatedPackage?.package.proof,
+           let edge = await DirectChildEdge.derive(from: proof) {
+            rememberCommitter(edge.parentCarrierCID)
+        }
         // A disconnected accepted block is not yet a parent-fact issuer, but
         // its content-verified carrier remains valid relay data for deeper
         // chains. Persist that relay with no genesis facts; a later duplicate
@@ -1694,6 +1698,11 @@ public actor ChainProcess: ContentSource, Fetcher, VolumeStorer {
     /// cached block that left the main chain, or whose marker is no longer
     /// validated when re-read, falls back to the full walk.
     private var validatedTipCache: (cid: String, height: UInt64)?
+    private var servedRunDirectories: Set<String> = []
+    private var parentReportsAppliedCount: UInt64 = 0
+    private var parentReportRefusalCounts: [String: UInt64] = [:]
+    private var recentCommitterOrder: [String] = []
+    private var recentCommitterSet: Set<String> = []
     /// The prefix assumption has one hole: a demoted block (eviction of an
     /// off-main-chain block; boot reconciliation of a marker whose owner pin
     /// is gone) can sit on the main chain BENEATH still-validated blocks —
@@ -1779,6 +1788,16 @@ public actor ChainProcess: ContentSource, Fetcher, VolumeStorer {
                 return (tipHeight, (cid, height))
             }
             if height == 0 {
+                // The chain's own genesis is executed by construction — the
+                // restore seeds it as trusted, so Lattice's executed frontier
+                // holds it even when the store's marker was demoted. Without
+                // this the walk would target height 0 forever, and on the
+                // root chain that verdict is parked (§9.9), never staged.
+                if let cid = await level.chain.getMainChainBlockHash(atIndex: 0),
+                   await level.chain.hasExecutedAncestry(blockHash: cid) {
+                    validatedTipCache = (cid, 0)
+                    return (tipHeight, (cid, 0))
+                }
                 validatedTipCache = nil
                 return (tipHeight, nil)
             }
@@ -2267,6 +2286,129 @@ public actor ChainProcess: ContentSource, Fetcher, VolumeStorer {
             height: validated?.height,
             revision: await level.chain.currentRevision()
         )
+    }
+
+    // MARK: - Parent-attributed run work (§9.10)
+
+    /// Start serving run reports for `directory`: this process hosts a child
+    /// chain there. Operator choice, expressed by which children this node
+    /// wires or prepares proofs for. Idempotent; the served set is NOT
+    /// persisted (Lattice's lives in memory), so callers re-serve after every
+    /// restart. One whole-graph walk per directory, on the consensus actor.
+    func serveRuns(for directory: String) async {
+        guard case .active(let level) = runtimePhase,
+              !servedRunDirectories.contains(directory) else { return }
+        servedRunDirectories.insert(directory)
+        await level.chain.serveRuns(for: directory)
+    }
+
+    func servedRunDirectoryList() -> [String] {
+        servedRunDirectories.sorted()
+    }
+
+    /// The run reports an admission of `blockHash` changed: for each served
+    /// directory, the run of the block's nearest committer into it. Every
+    /// admitted block or strengthening with verifiable work credits exactly
+    /// one run per served directory, so this is O(#served) and complete for
+    /// a leaf; the descendants a graft brought in that start their own runs
+    /// are re-served by the child's request on its next hello.
+    func runReports(changedBy blockHash: String) async -> [ParentRunReport] {
+        guard case .active(let level) = runtimePhase,
+              !servedRunDirectories.isEmpty,
+              let meta = await level.chain.getConsensusBlock(hash: blockHash)
+        else { return [] }
+        var reports: [ParentRunReport] = []
+        for directory in servedRunDirectories.sorted() {
+            guard let committer = meta.nearestCommitter[directory],
+                  let report = await level.chain.parentRunReport(
+                      at: committer, directory: directory
+                  ) else { continue }
+            reports.append(report)
+        }
+        return reports
+    }
+
+    /// One committer's run report, for a child's re-serve request. Nil when
+    /// the directory is not served here or the block is not a committer into
+    /// it — silence, never a claim.
+    func runReport(committer: String, directory: String) async -> ParentRunReport? {
+        guard case .active(let level) = runtimePhase,
+              servedRunDirectories.contains(directory) else { return nil }
+        return await level.chain.parentRunReport(at: committer, directory: directory)
+    }
+
+    /// The committing parent blocks of the child blocks this process admitted
+    /// with a package, newest last — what it asks its parent to re-serve after
+    /// a reconnect. In memory only, bounded by `recentCommitterCapacity`; an
+    /// older committer's run changes only when parent work lands under it,
+    /// which the parent pushes on the live session.
+    func recentCommitters() -> [String] {
+        recentCommitterOrder
+    }
+
+    static let recentCommitterCapacity = 256
+
+    private func rememberCommitter(_ committer: String) {
+        guard recentCommitterSet.insert(committer).inserted else { return }
+        recentCommitterOrder.append(committer)
+        if recentCommitterOrder.count > Self.recentCommitterCapacity {
+            let evicted = recentCommitterOrder.removeFirst()
+            recentCommitterSet.remove(evicted)
+        }
+    }
+
+    public enum ParentReportApplication: Sendable {
+        /// The attributed batch is durable and applied; the commit, if the
+        /// canonical chain moved.
+        case credited(ChainCommit?)
+        /// Refused by Lattice — typed, so the node can make it visible.
+        case refused(ParentReportStrengthening)
+    }
+
+    /// Credit a parent's run report at the child block it names (§9.10).
+    /// Derived UNDER the mutation lease, staged durably, then replayed — the
+    /// lease is held from the derive through the write and the replay, so a
+    /// report that loses a write-once location (`.locationConflict`) is a
+    /// refusal and never a fact: staged anyway it would be a corrupt graph on
+    /// every restart.
+    func applyParentRunReport(
+        _ report: ParentRunReport,
+        canonicalCommitPublisher: CanonicalCommitPublisher? = nil
+    ) async throws -> ParentReportApplication {
+        guard case .active(let level) = runtimePhase,
+              let directory = configuration.chainPath.last else {
+            return .refused(.wrongDirectory)
+        }
+        try await acquireMutationOperation()
+        defer { releaseOperation() }
+        let outcome = await level.chain.strengthenFromParentReport(
+            child: report.childBlock, directory: directory, report: report
+        )
+        guard case .strengthened(let batch) = outcome else {
+            parentReportRefusalCounts[Self.refusalName(outcome), default: 0] += 1
+            return .refused(outcome)
+        }
+        // A work-only batch carries no block, so — like a validation batch — it
+        // advances no consensus-revision floor.
+        try await store.stage(batch, volumeRoots: [])
+        let commit = try await level.chain.replay(batch)
+        parentReportsAppliedCount += 1
+        if let commit, commit.canonicalChanged, let canonicalCommitPublisher {
+            _ = await canonicalCommitPublisher(commit)
+        }
+        return .credited(commit)
+    }
+
+    /// Refusal counts by case, for `/metrics`: a parent whose reports keep
+    /// being refused is the likeliest symptom of a parent-side accounting
+    /// bug, and `locationConflict` is the one that is permanent.
+    func parentReportCounters() -> (applied: UInt64, refusals: [String: UInt64]) {
+        (parentReportsAppliedCount, parentReportRefusalCounts)
+    }
+
+    static func refusalName(_ outcome: ParentReportStrengthening) -> String {
+        let description = String(describing: outcome)
+        return String(description.prefix { $0 != "(" })
     }
 
     /// Ungated tip heights for `/metrics`, from ONE validated-tip walk: the
