@@ -120,8 +120,9 @@ level without a re-ask — for each run a child could actually credit (its
 the runs of the committers a child names: a child asks for a block's
 committers when it admits a block they carried, and for its recent committers
 after every evidence catch-up round, so a push it could not yet bind or one
-it missed while away is recovered without waiting for the next parent block. Those report
-work; they answer nothing about continuity or validity.) A request naming any
+it missed while away is recovered without waiting for the next parent block.
+Those report work; they answer nothing about continuity or validity.) A
+request naming any
 other `from` is
 malformed, not merely unusual: no correct child can produce one, and serving it
 would mean running a general ancestry walk on the consensus actor on a peer's

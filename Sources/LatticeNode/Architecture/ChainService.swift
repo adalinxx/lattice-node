@@ -2199,7 +2199,8 @@ public actor ChainService {
         await process.runReport(committer: committer, directory: directory)
     }
 
-    /// The committers this chain asks its parent to re-serve on a reconnect.
+    /// The committers this chain asks its parent to re-serve after each
+    /// evidence catch-up round.
     public func recentCommitters() async throws -> [String] {
         try await process.recentCommitters()
     }

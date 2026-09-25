@@ -2354,9 +2354,15 @@ public actor ChainProcess: ContentSource, Fetcher, VolumeStorer {
 
     /// The committing parent blocks behind one block accepted here with a
     /// carrier proof (§9.10) — what to ask the parent for on its admission.
-    /// From this chain's own verified edges, never a wire claim.
+    /// From this chain's own verified edges, never a wire claim; a malformed
+    /// edge fails the whole ask closed (the round re-ask still covers it).
+    /// Bounded at the source to what one request may name, so a block
+    /// carried by more parent forks than that never builds an unsendable ask.
     func incomingCarrierCommitters(of childBlock: String) async throws -> [String] {
-        try await store.incomingParentCarrierBlockCIDs(forChildBlockCID: childBlock).sorted()
+        Array(
+            try await store.incomingParentCarrierBlockCIDs(forChildBlockCID: childBlock)
+                .sorted().prefix(Self.recentCommitterCapacity)
+        )
     }
 
     static let recentCommitterCapacity = maximumParentRunReportRequestCommitters
@@ -2417,7 +2423,8 @@ public actor ChainProcess: ContentSource, Fetcher, VolumeStorer {
     }
 
     /// Refusal counts by case, for `/metrics`. `notStronger` is routine — a
-    /// re-serve on hello, or a push that lost a race to a stronger one; the
+    /// re-serve the child asked for, or a push that lost a race to a stronger
+    /// one; the
     /// others are the likeliest symptom of a parent-side accounting bug, and
     /// `locationConflict` is the one that is permanent.
     func parentReportCounters() -> (applied: UInt64, refusals: [String: UInt64]) {

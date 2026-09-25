@@ -87,7 +87,8 @@ public typealias NetworkParentRunReportHandler = @Sendable (
 public typealias NetworkRunReportServingHandler = @Sendable (
     _ directory: String
 ) async -> Void
-/// The committers this chain asks its parent to re-serve on a reconnect.
+/// The committers this chain asks its parent to re-serve after each
+/// evidence catch-up round.
 public typealias NetworkRecentCommitterProvider = @Sendable () async -> [String]
 
 /// All service callbacks used by one network-runtime generation. Supplying the
@@ -3828,11 +3829,15 @@ public actor NodeNetworkRuntime: IvyDelegate {
         case (NodeNetworkTopic.parentRunReportRequest, .child(let childPath)):
             // A child asks for the runs of committers it names — on admitting
             // a block one of them carried, and after each evidence round.
-            // Not behind the per-peer query guard: answering walks no chain
-            // (each committer is one O(1) read, the request names at most
-            // `maximumParentRunReportRequestCommitters`), and a dropped ask
-            // would be a credit the child recovers only by chance. A
-            // committer this node does not serve is silence, never a claim.
+            // Not behind the per-peer query guard: a dropped ask would be a
+            // credit the child recovers only by chance, and the guard never
+            // bounded rate anyway (one message per session is handled at a
+            // time; Tally paces the plane). The serve below is a set lookup
+            // for a directory already served, one anchored-genesis lookup
+            // for one that is not, like the genesis-anchor arm; each named
+            // committer is then one O(1) read, at most
+            // `maximumParentRunReportRequestCommitters` of them. A committer
+            // this node does not serve is silence, never a claim.
             guard let request = try?
                     ParentRunReportRequestMessage.decoded(message.payload),
                   let directory = childPath.last
