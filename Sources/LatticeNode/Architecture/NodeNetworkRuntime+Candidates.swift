@@ -47,7 +47,7 @@ extension NodeNetworkRuntime {
             // The service's mailbox drains these, never the network.
             break
         case .carried(let carriage):
-            await parentCarried(carriage)
+            _ = await parentCarried(carriage)
         }
     }
 
@@ -57,10 +57,13 @@ extension NodeNetworkRuntime {
     /// chain awaits its genesis, when the block is already accepted or its
     /// evidence for that root already stored, and when the carrier's child
     /// index cannot be read: the portable path still delivers the block.
-    func parentCarried(_ carriage: Carriage) async {
-        guard isRunning, let parentLevel, let process else { return }
+    /// False only when the fetcher refused the seed (its derived attempts
+    /// are at capacity): reconciliation owes it.
+    @discardableResult
+    func parentCarried(_ carriage: Carriage) async -> Bool {
+        guard isRunning, let parentLevel, let process else { return true }
         let generation = runtimeGeneration
-        guard await !process.awaitsGenesis else { return }
+        guard await !process.awaitsGenesis else { return true }
         let directory = configuration.address.directory
         let childCID: String
         if let committed = carriage.childCID {
@@ -70,17 +73,17 @@ extension NodeNetworkRuntime {
                 carrierCID: carriage.carrierCID,
                 directory: directory,
                 source: parentLevel.carrierContent(carriage.carrierCID)
-            ) else { return }
+            ) else { return true }
             childCID = resolved
         }
-        if await process.hasAcceptedBlock(childCID) { return }
+        if await process.hasAcceptedBlock(childCID) { return true }
         if (try? await process.store.incomingCarrierEvidence(
             childCID: childCID,
             directory: directory,
             rootCID: carriage.rootCID
-        )) != nil { return }
-        guard isRunning, isCurrentGeneration(generation) else { return }
-        enqueueCandidate(CandidateSeed(
+        )) != nil { return true }
+        guard isRunning, isCurrentGeneration(generation) else { return true }
+        return enqueueCandidate(CandidateSeed(
             blockCID: childCID,
             package: nil,
             weighed: true,
@@ -128,18 +131,6 @@ extension NodeNetworkRuntime {
         configuration.chainPath.count == 2
     }
 
-    /// Debug and test builds: a proof derived in-host for a block that also
-    /// holds a package for the same root is byte-identical to it (§3.4).
-    nonisolated static func assertDerivedProof(
-        _ derived: ChildBlockProof, matches issued: ChildBlockProof
-    ) {
-        assert(
-            derived.rootCID != issued.rootCID
-                || derived.directoryPath != issued.directoryPath
-                || (try? derived.serialize()) == (try? issued.serialize()),
-            "derived child proof differs from the issued one"
-        )
-    }
 
     /// Re-readies the parks whose parent fact the parent level holds now.
     /// Each distinct fact is read once, however many parks wait on it, and
@@ -328,16 +319,11 @@ extension NodeNetworkRuntime {
         } else {
             authenticatedPackage = nil
         }
-        // A carriage derives the proof in-host when nothing supplies it; in
-        // debug builds also beside a package, to check they are the same.
+        // A carriage derives the proof in-host, and the local derivation
+        // wins over a package on the same key: a peer's package is not
+        // verified before admission, so a bad one must not stall the key.
         var derivation: (carriage: Carriage, upstream: ChildBlockProof?)?
-        #if DEBUG
-        let derivesBesidePackage = true
-        #else
-        let derivesBesidePackage = false
-        #endif
-        if let carriage = candidate.derivation,
-           authenticatedPackage == nil || derivesBesidePackage {
+        if let carriage = candidate.derivation {
             derivation = await derivationInputs(carriage)
         }
         if candidate.recoveryRootCID != nil, candidate.package == nil,
@@ -499,37 +485,46 @@ extension NodeNetworkRuntime {
                     )
                     var package = authenticatedPackage
                     if let derivation = derivationDetached, let parentLevel {
-                        // Carrier and index from the parent level's store;
-                        // the child block from this level's store (a block
-                        // this host built) or its overlay, by exact CID. The
-                        // parent's overlay is the last resort, so no local
-                        // hit ever waits behind a remote miss.
+                        // Carrier and index from the parent level (its store,
+                        // then its overlay); the child block from this level's
+                        // store (a block this host built), then this
+                        // session, asked for that one CID only: a carrier
+                        // miss never costs this session's overlay.
+                        let blockCID = candidate.blockCID
                         let fetcher = CoalescingFetcher(CompositeContentSource([
-                            parentLevel.contentSource,
+                            FilteredContentSource(
+                                base: parentLevel.carrierContent(
+                                    derivation.carriage.carrierCID
+                                ),
+                                admits: { $0 != blockCID }
+                            ),
                             process,
-                            session,
-                            parentLevel.carrierContent(derivation.carriage.carrierCID),
+                            FilteredContentSource(
+                                base: session, admits: { $0 == blockCID }
+                            ),
                         ]))
-                        if let issued = package {
-                            if let derived = try? await derivation.carriage.proof(
+                        do {
+                            if let derived = try await derivation.carriage.proof(
                                 directory: derivedDirectory,
                                 parentIsNexus: parentIsNexus,
                                 upstream: derivation.upstream,
                                 fetcher: fetcher
                             ) {
-                                Self.assertDerivedProof(
-                                    derived, matches: issued.package.proof
+                                // The parent facts a package holds are
+                                // merged locally and verified at admission.
+                                package = AuthenticatedChildPackage(
+                                    package: ChildValidationPackage(
+                                        proof: derived,
+                                        parentGenesisLink:
+                                            package?.package.parentGenesisLink,
+                                        parentStateContinuityLink:
+                                            package?.package.parentStateContinuityLink
+                                    )
                                 )
                             }
-                        } else if let derived = try await derivation.carriage.proof(
-                            directory: derivedDirectory,
-                            parentIsNexus: parentIsNexus,
-                            upstream: derivation.upstream,
-                            fetcher: fetcher
-                        ) {
-                            package = AuthenticatedChildPackage(
-                                package: ChildValidationPackage(proof: derived)
-                            )
+                        } catch {
+                            // Not derivable yet: a package still admits.
+                            if package == nil { throw error }
                         }
                     }
                     let admitted = try await chain.importNetworkCandidate(NetworkCandidateImport(
@@ -1067,5 +1062,16 @@ extension NodeNetworkRuntime {
               isCurrentGeneration(generation), isRunning else { return }
         blockFetcher.retry()
         serviceBlockFetcher()
+    }
+}
+
+/// `base`, asked only for the CIDs `admits` lets through.
+private struct FilteredContentSource: ContentSource {
+    let base: any ContentSource
+    let admits: @Sendable (String) -> Bool
+
+    func fetch(_ cids: Set<String>) async -> [String: Data] {
+        let admitted = cids.filter(admits)
+        return admitted.isEmpty ? [:] : await base.fetch(admitted)
     }
 }

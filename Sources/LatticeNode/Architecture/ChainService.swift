@@ -2482,14 +2482,15 @@ public actor ChainService {
     /// only, rebuilds it from a third. `candidateGate` says whether this level
     /// may build a candidate now; `candidateChanged` tells the parent level
     /// this level's snapshot changed. Carriages run `parentCarried` on a
-    /// fourth task, in the order sent, from a bounded queue. `shutdown`
+    /// fourth task, in the order sent, from a bounded queue; one it returns
+    /// false for (refused at capacity) sets `carriedReconcileNeeded`. `shutdown`
     /// finishes all four and joins them.
     func openParentMailbox(
         tipChanged: @escaping @Sendable () async -> Void,
         serveParentRuns: @escaping @Sendable () async -> Void,
         candidateGate: @escaping @Sendable (_ pendingHandoff: [String]) async -> Bool,
         candidateChanged: @escaping @Sendable () async -> Void,
-        parentCarried: @escaping @Sendable (Carriage) async -> Void = { _ in }
+        parentCarried: @escaping @Sendable (Carriage) async -> Bool = { _ in true }
     ) -> ParentMailbox {
         precondition(parentMailbox == nil, "one parent mailbox per level")
         let (stream, continuation) = AsyncStream.makeStream(
@@ -2549,8 +2550,12 @@ public actor ChainService {
             parentPlanDrain = Task { [weak self] in
                 for await _ in plans { await self?.scheduleCandidateRebuild() }
             }
+            let reconcile = carriedReconcile
             parentCarriedDrain = Task {
-                for await carriage in carriages { await parentCarried(carriage) }
+                for await carriage in carriages {
+                    // Refused at the child's derived-attempt capacity.
+                    if await !parentCarried(carriage) { reconcile.swap(true) }
+                }
             }
             continuation.yield(.serveParentRuns)
             scheduleCandidateRebuild()
