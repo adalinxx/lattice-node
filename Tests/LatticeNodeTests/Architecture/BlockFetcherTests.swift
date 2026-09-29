@@ -1273,4 +1273,32 @@ final class BlockFetcherTests: XCTestCase {
             "the package is untouched"
         )
     }
+
+    /// A links-only seed annotates an existing attempt at its root and
+    /// never recreates a removed one.
+    func testParentFactLinksNeverRecreateARemovedAttempt() throws {
+        let links = ParentFactLinks(continuity: ParentStateContinuityLink(
+            parentPath: ["Nexus"], fromStateCID: "empty", toStateCID: "state"
+        ))
+        var fetcher = BlockFetcher()
+        let linksOnly = BlockFetcher.Seed(
+            blockCID: "block", package: nil, recoveryRootCID: "root", parentFactLinks: links
+        )
+        let refused = fetcher.observe(linksOnly)
+        XCTAssertFalse(refused.accepted)
+        XCTAssertNil(refused.key)
+        XCTAssertFalse(fetcher.tracks("block"))
+        XCTAssertNil(fetcher.next())
+
+        // Removed after its admission: links arriving late create nothing.
+        XCTAssertTrue(fetcher.observe(.init(
+            blockCID: "block", package: try childPackage(rootCID: "root"), weighed: true
+        )).accepted)
+        let active = try XCTUnwrap(fetcher.next())
+        XCTAssertTrue(fetcher.complete(active.ticket, resolution: .terminal))
+        XCTAssertFalse(fetcher.tracks("block"))
+        XCTAssertNil(fetcher.observe(linksOnly).key)
+        XCTAssertFalse(fetcher.tracks("block"))
+        XCTAssertNil(fetcher.next())
+    }
 }

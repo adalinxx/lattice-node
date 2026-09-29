@@ -323,6 +323,12 @@ struct BlockFetcher {
         accepted: Bool,
         key: AttemptKey?
     ) {
+        // Links alone only annotate an existing attempt at their root: they
+        // never recreate one that was removed.
+        if seed.package == nil, seed.derivation == nil, seed.parentFactLinks != nil,
+           records[seed.blockCID]?.attempts[seed.recoveryRootCID] == nil {
+            return (false, nil)
+        }
         if seed.derivation != nil,
            records[seed.blockCID]?.attempts[seed.recoveryRootCID]?.derivation == nil,
            derivedAttemptCount >= Self.derivedCapacity {
