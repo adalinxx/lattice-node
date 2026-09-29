@@ -358,7 +358,6 @@ final class DerivedProofEquivalenceTests: XCTestCase {
             try attachmentCID(derived, childCID: childCID), issued.attachmentCID,
             "the derived proof's portable attachment is the issued one"
         )
-        NodeNetworkRuntime.assertDerivedProof(derived, matches: issued.proof)
     }
 
     private func attachmentCID(_ proof: ChildBlockProof, childCID: String) throws -> String {

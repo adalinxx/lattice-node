@@ -24,6 +24,11 @@ struct BlockFetcher {
     // the fresh one — an evicted obligation re-enters through a later
     // announcement, frontier page or range-sync page.
     static let parkedCapacity = 512
+    /// Derived attempts are scheduled over `readyCapacity` (see
+    /// `scheduleIfReady`), so they are bounded on their own: as many as the
+    /// parent's carried queue holds. Past it a carriage is refused, and
+    /// reconciliation re-derives it from parent state.
+    static let derivedCapacity = ChainService.carriedQueueCapacity
 
     enum WaitReason: Equatable, Sendable {
         case evidence
@@ -191,6 +196,12 @@ struct BlockFetcher {
     }
 
     var hasReadyCandidate: Bool { !readySet.isEmpty }
+    /// Attempts that derive their proof in-host, in whatever state.
+    var derivedAttemptCount: Int {
+        records.values.reduce(0) { count, record in
+            count + record.attempts.values.filter { $0.derivation != nil }.count
+        }
+    }
     /// Whether some held block is parked on a predecessor this node does not
     /// hold: a recovered frontier, or a live predecessor walk.
     var awaitsMissingAncestry: Bool { !waitingOn.isEmpty }
@@ -302,6 +313,11 @@ struct BlockFetcher {
         accepted: Bool,
         key: AttemptKey?
     ) {
+        if seed.derivation != nil,
+           records[seed.blockCID]?.attempts[seed.recoveryRootCID]?.derivation == nil,
+           derivedAttemptCount >= Self.derivedCapacity {
+            return (false, nil)
+        }
         var record = records[seed.blockCID] ?? BlockRecord()
         if let provider = seed.provider,
            record.providers[provider.publicKey] != provider {

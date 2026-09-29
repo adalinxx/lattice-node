@@ -1744,6 +1744,86 @@ final class NetworkTrustCandidateTests: NetworkTrustTestCase {
         XCTAssertTrue(carried.decision.isAccepted, "\(carried.decision)")
     }
 
+    // MARK: - Derived proofs
+
+    /// A carriage's local derivation wins over a peer's package on the same
+    /// `(block, root)` key: a padded package (the honest path plus one extra
+    /// canonical entry) neither stalls the block nor is what gets stored.
+    func testALocalDerivationWinsOverAPaddedPeerPackage() async throws {
+        let fixture = try await provisionalRootFixture(keyByte: 0xa7)
+        let childService = networkService(
+            process: fixture.childProcess, runtime: fixture.childRuntime
+        )
+        // The parent's runtime never starts: no hierarchy publication can
+        // deliver the honest proof.
+        try await fixture.childRuntime.start(
+            process: fixture.childProcess,
+            chain: ClosureChainInterface(admission: { admission in
+                try await childService.importNetworkCandidate(
+                    admission.header,
+                    authenticatedChildPackage: admission.authenticatedChildPackage,
+                    preparingChildDirectories: admission.preparingChildDirectories,
+                    contentSource: admission.contentSource,
+                    weighed: admission.weighed
+                )
+            })
+        )
+        do {
+            let block = fixture.candidate.block
+            let both = CoalescingFetcher(CompositeContentSource([
+                fixture.parentProcess, fixture.childProcess,
+            ]))
+            let carrier = try await storeCarrier(of: fixture.candidate, fixture: fixture)
+            let carried = try await fixture.parentProcess.importBlock(
+                carrier, preparingChildDirectories: ["Payments"]
+            )
+            XCTAssertTrue(carried.decision.isAccepted, "\(carried.decision)")
+            // A block this host built: in the child's own store.
+            try await BlockHeader(node: block).storeBlock(
+                fetcher: both, storer: fixture.childProcess
+            )
+            let childCID = try BlockHeader(node: block).rawCID
+            let carriage = Carriage(
+                carrierCID: carrier.rawCID, rootCID: carrier.rawCID, childCID: childCID
+            )
+            let honestValue = try await carriage.proof(
+                directory: "Payments", parentIsNexus: true, upstream: nil, fetcher: both
+            )
+            let honest = try XCTUnwrap(honestValue)
+            let extra = try BlockHeader(node: fixture.context.parentCarrier)
+            let padded = ChildBlockProof(
+                rootCID: honest.rootCID,
+                directoryPath: honest.directoryPath,
+                entries: honest.entries + [(cid: extra.rawCID, data: try extra.mapToData())]
+            )
+            XCTAssertNotEqual(try padded.serialize(), try honest.serialize())
+            let generation = await fixture.childRuntime.runtimeGeneration
+            let seeded = await fixture.childRuntime.enqueueCandidate(BlockFetcher.Seed(
+                blockCID: childCID,
+                package: AuthenticatedChildPackage(
+                    package: ChildValidationPackage(proof: padded)
+                ),
+                weighed: true,
+                derivation: carriage
+            ), generation: generation)
+            XCTAssertTrue(seeded)
+            try await eventually("the carried block is admitted") {
+                await fixture.childProcess.hasAcceptedBlock(childCID)
+            }
+            let storedValue = try await fixture.childProcess
+                .recoveredAuthenticatedChildPackage(for: childCID, rootCID: carrier.rawCID)
+            let stored = try XCTUnwrap(storedValue)
+            XCTAssertEqual(
+                try stored.package.proof.serialize(), try honest.serialize(),
+                "the derived proof was admitted, not the peer's package"
+            )
+        } catch {
+            await fixture.childRuntime.stop()
+            throw error
+        }
+        await fixture.childRuntime.stop()
+    }
+
     // MARK: - Local parent facts
 
     /// The parent state the carried block's scripted admission requires

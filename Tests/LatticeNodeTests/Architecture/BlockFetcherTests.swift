@@ -1216,4 +1216,30 @@ final class BlockFetcherTests: XCTestCase {
             derivation: Carriage(carrierCID: "carrier", rootCID: "root", childCID: "carried")
         )).accepted)
     }
+
+    /// Derived attempts bypass the ready pool's bound, so they are bounded
+    /// on their own: past `derivedCapacity` a new carriage is refused (its
+    /// caller owes reconciliation), while one merging into an attempt that
+    /// already derives is not; a decided attempt frees its slot.
+    func testDerivedAttemptsAreCapped() throws {
+        var fetcher = BlockFetcher()
+        func carriage(_ index: Int) -> Carriage {
+            Carriage(carrierCID: "carrier-\(index)", rootCID: "root-\(index)", childCID: "block-\(index)")
+        }
+        func seed(_ index: Int) -> BlockFetcher.Seed {
+            .init(blockCID: "block-\(index)", package: nil, weighed: true, derivation: carriage(index))
+        }
+        for index in 0..<BlockFetcher.derivedCapacity {
+            XCTAssertTrue(fetcher.observe(seed(index)).accepted)
+        }
+        XCTAssertEqual(fetcher.derivedAttemptCount, BlockFetcher.derivedCapacity)
+        let refused = fetcher.observe(seed(BlockFetcher.derivedCapacity))
+        XCTAssertFalse(refused.accepted)
+        XCTAssertNil(refused.key)
+        XCTAssertFalse(fetcher.tracks("block-\(BlockFetcher.derivedCapacity)"))
+        XCTAssertTrue(fetcher.observe(seed(0)).accepted, "a repeat merges")
+        let first = try XCTUnwrap(fetcher.next())
+        XCTAssertTrue(fetcher.complete(first.ticket, resolution: .connected))
+        XCTAssertTrue(fetcher.observe(seed(BlockFetcher.derivedCapacity)).accepted)
+    }
 }

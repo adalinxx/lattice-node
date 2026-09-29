@@ -193,7 +193,7 @@ public actor ChainHost {
                     await parentService?.childCandidateChanged()
                 },
                 parentCarried: { [weak network = node.network] carriage in
-                    await network?.parentChanged(.carried(carriage))
+                    await network?.parentCarried(carriage) ?? true
                 }
             )
             await parent.service.attachChildLevel(LocalChildLevel(
