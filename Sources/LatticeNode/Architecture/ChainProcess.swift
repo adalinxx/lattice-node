@@ -2000,6 +2000,15 @@ public actor ChainProcess: ContentSource, Fetcher, VolumeStorer {
         return carried
     }
 
+    /// Ungated: the child blocks `carrierCID` commits, by directory, from
+    /// its consensus metadata. Nil when this level holds no such metadata
+    /// (a relay-only carrier, or a process not active).
+    func childCommitments(ofCarrier carrierCID: String) async -> [String: String]? {
+        guard case .active(let level) = runtimePhase else { return nil }
+        return await level.chain.getConsensusBlock(hash: carrierCID)?
+            .childCommitments
+    }
+
     /// The committing parent blocks of the blocks this chain ACCEPTED with a
     /// carrier proof, distinct, newest first, bounded to
     /// `recentCarrierCapacity` — the runs it re-reads from its co-hosted

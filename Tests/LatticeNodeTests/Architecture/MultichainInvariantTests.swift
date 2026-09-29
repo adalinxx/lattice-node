@@ -1242,6 +1242,14 @@ final class MultichainInvariantTests: XCTestCase {
 
         nonisolated var contentSource: any ContentSource { base.contentSource }
 
+        nonisolated func carrierContent(_ carrierCID: String) -> any ContentSource {
+            base.carrierContent(carrierCID)
+        }
+
+        func incomingProof(carrier: String, root: String) async -> ChildBlockProof? {
+            await base.incomingProof(carrier: carrier, root: root)
+        }
+
         func hasProducedState(_ stateCID: String) async -> Bool {
             await base.hasProducedState(stateCID)
         }

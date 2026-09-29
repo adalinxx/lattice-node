@@ -1113,4 +1113,107 @@ final class BlockFetcherTests: XCTestCase {
             "weighed && weighed stays weighed"
         )
     }
+
+    /// A carriage seeds a rooted attempt that derives its proof in-host: it
+    /// supersedes the rootless (overlay) attempt parked on evidence, and a
+    /// later rootless seed is absorbed rather than re-created.
+    func testDerivedSeedSupersedesTheRootlessAttempt() throws {
+        let exact = provider("provider", session: 1)
+        let carriage = Carriage(carrierCID: "carrier", rootCID: "root", childCID: "block")
+        var fetcher = BlockFetcher()
+        XCTAssertTrue(fetcher.observe(.init(
+            blockCID: "block", package: nil, provider: exact
+        )).accepted)
+        let rootless = try XCTUnwrap(fetcher.next())
+        XCTAssertNil(rootless.derivation)
+        XCTAssertTrue(fetcher.complete(rootless.ticket, resolution: .wait(.evidence)))
+        XCTAssertTrue(fetcher.hasTimedWait)
+
+        let seeded = fetcher.observe(.init(
+            blockCID: "block", package: nil, weighed: true, derivation: carriage
+        ))
+        XCTAssertEqual(seeded.key, .init(blockCID: "block", rootCID: "root"))
+        let derived = try XCTUnwrap(fetcher.next())
+        XCTAssertEqual(derived.recoveryRootCID, "root")
+        XCTAssertEqual(derived.derivation, carriage)
+        XCTAssertNil(derived.package)
+        XCTAssertEqual(derived.providers, [exact], "the overlay provider still serves the body")
+        XCTAssertTrue(fetcher.observe(.init(
+            blockCID: "block", package: nil, provider: exact
+        )).key == nil, "a rootless seed is absorbed by the derived attempt")
+        XCTAssertTrue(fetcher.complete(derived.ticket, resolution: .connected))
+        XCTAssertFalse(fetcher.hasTimedWait)
+        XCTAssertNil(fetcher.next())
+    }
+
+    /// A carriage under another root than the seed's is not the seed's.
+    func testDerivationIsKeptOnlyUnderItsOwnRoot() {
+        let carriage = Carriage(carrierCID: "carrier", rootCID: "root", childCID: "block")
+        let seed = BlockFetcher.Seed(
+            blockCID: "block", package: nil, recoveryRootCID: "other", derivation: carriage
+        )
+        XCTAssertEqual(seed.recoveryRootCID, "other")
+        XCTAssertNil(seed.derivation)
+    }
+
+    /// Both proof sources land on one attempt, keyed `(block, root)`: the
+    /// parent-issued package merges into the derived attempt (and wakes it
+    /// from an evidence park), and a carriage merges into a package attempt;
+    /// the candidate carries both.
+    func testPackageAndDerivationMergeOnOneAttempt() throws {
+        let carriage = Carriage(carrierCID: "carrier", rootCID: "root", childCID: "block")
+        let package = try childPackage(rootCID: "root")
+
+        var derivedFirst = BlockFetcher()
+        XCTAssertTrue(derivedFirst.observe(.init(
+            blockCID: "block", package: nil, weighed: true, derivation: carriage
+        )).accepted)
+        let active = try XCTUnwrap(derivedFirst.next())
+        XCTAssertTrue(derivedFirst.complete(active.ticket, resolution: .wait(.evidence)))
+        XCTAssertNil(derivedFirst.next(), "parked on evidence")
+        XCTAssertTrue(derivedFirst.observe(.init(
+            blockCID: "block", package: package, fromParent: true
+        )).accepted)
+        let merged = try XCTUnwrap(derivedFirst.next(), "the package wakes the park")
+        XCTAssertEqual(merged.recoveryRootCID, "root")
+        XCTAssertEqual(merged.derivation, carriage)
+        XCTAssertNotNil(merged.package)
+        XCTAssertTrue(merged.weighed, "a package seed never re-eagers a weighed attempt")
+        XCTAssertTrue(derivedFirst.complete(merged.ticket, resolution: .connected))
+        XCTAssertNil(derivedFirst.next())
+
+        var packageFirst = BlockFetcher()
+        XCTAssertTrue(packageFirst.observe(.init(
+            blockCID: "block", package: package, weighed: true
+        )).accepted)
+        let first = try XCTUnwrap(packageFirst.next())
+        XCTAssertTrue(packageFirst.complete(first.ticket, resolution: .wait(.evidence)))
+        XCTAssertTrue(packageFirst.observe(.init(
+            blockCID: "block", package: nil, weighed: true, derivation: carriage
+        )).accepted)
+        let both = try XCTUnwrap(packageFirst.next(), "a new carriage wakes the park")
+        XCTAssertEqual(both.derivation, carriage)
+        XCTAssertNotNil(both.package)
+        XCTAssertTrue(packageFirst.complete(both.ticket, resolution: .connected))
+        XCTAssertNil(packageFirst.next(), "one attempt, not two")
+    }
+
+    /// A carriage comes from a bounded parent queue: like the parent's
+    /// evidence, it is never refused for a ready pool the overlay filled.
+    func testDerivedSeedIsScheduledOverAFullReadyPool() throws {
+        var fetcher = BlockFetcher()
+        for index in 0..<BlockFetcher.readyCapacity {
+            XCTAssertTrue(fetcher.observe(.init(
+                blockCID: "overlay-\(index)", package: nil,
+                provider: provider("p\(index)", session: 1)
+            )).accepted)
+        }
+        XCTAssertFalse(fetcher.observe(.init(
+            blockCID: "overflow", package: nil, provider: provider("late", session: 1)
+        )).accepted)
+        XCTAssertTrue(fetcher.observe(.init(
+            blockCID: "carried", package: nil, weighed: true,
+            derivation: Carriage(carrierCID: "carrier", rootCID: "root", childCID: "carried")
+        )).accepted)
+    }
 }

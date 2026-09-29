@@ -46,7 +46,99 @@ extension NodeNetworkRuntime {
         case .runs, .plan:
             // The service's mailbox drains these, never the network.
             break
+        case .carried(let carriage):
+            await parentCarried(carriage)
         }
+    }
+
+    /// The co-hosted parent level carried a block into this chain's
+    /// directory (§2.3): seed its admission with the carriage, from which
+    /// the attempt derives the block's proof in-host. Dropped while this
+    /// chain awaits its genesis, when the block is already accepted or its
+    /// evidence for that root already stored, and when the carrier's child
+    /// index cannot be read: the portable path still delivers the block.
+    func parentCarried(_ carriage: Carriage) async {
+        guard isRunning, let parentLevel, let process else { return }
+        let generation = runtimeGeneration
+        guard await !process.awaitsGenesis else { return }
+        let directory = configuration.address.directory
+        let childCID: String
+        if let committed = carriage.childCID {
+            childCID = committed
+        } else {
+            guard let resolved = await Self.carriedChildCID(
+                carrierCID: carriage.carrierCID,
+                directory: directory,
+                source: parentLevel.carrierContent(carriage.carrierCID)
+            ) else { return }
+            childCID = resolved
+        }
+        if await process.hasAcceptedBlock(childCID) { return }
+        if (try? await process.store.incomingCarrierEvidence(
+            childCID: childCID,
+            directory: directory,
+            rootCID: carriage.rootCID
+        )) != nil { return }
+        guard isRunning, isCurrentGeneration(generation) else { return }
+        enqueueCandidate(CandidateSeed(
+            blockCID: childCID,
+            package: nil,
+            weighed: true,
+            derivation: Carriage(
+                carrierCID: carriage.carrierCID,
+                rootCID: carriage.rootCID,
+                childCID: childCID
+            )
+        ), generation: generation)
+    }
+
+    /// The child block `carrierCID` commits into `directory`, read from the
+    /// carrier's child index. Nil when absent or unavailable.
+    nonisolated static func carriedChildCID(
+        carrierCID: String,
+        directory: String,
+        source: any ContentSource
+    ) async -> String? {
+        let carrier = BlockHeader(rawCID: carrierCID, node: nil, encryptionInfo: nil)
+        guard let resolved = try? await carrier.resolve(
+            paths: [["children"]: .targeted],
+            fetcher: CoalescingFetcher(CompositeContentSource([source]))
+        ), let children = resolved.node?.children.node else { return nil }
+        return children[directory]?.rawCID
+    }
+
+    /// The proof a derived attempt composes from: nil upstream for a Nexus
+    /// carriage, the parent level's own incoming proof otherwise. Nil when
+    /// the carriage cannot be composed (see `Carriage.proof`).
+    private func derivationInputs(
+        _ carriage: Carriage
+    ) async -> (carriage: Carriage, upstream: ChildBlockProof?)? {
+        guard let parentLevel else { return nil }
+        if parentIsNexus {
+            guard carriage.rootCID == carriage.carrierCID else { return nil }
+            return (carriage, nil)
+        }
+        guard let upstream = await parentLevel.incomingProof(
+            carrier: carriage.carrierCID, root: carriage.rootCID
+        ) else { return nil }
+        return (carriage, upstream)
+    }
+
+    private nonisolated var parentIsNexus: Bool {
+        configuration.chainPath.count == 2
+    }
+
+    /// Debug and test builds: a proof derived in-host for a block that also
+    /// holds a package for the same root is byte-identical to it (§3.4).
+    nonisolated static func assertDerivedProof(
+        _ derived: ChildBlockProof, matches issued: ChildBlockProof
+    ) {
+        assert(
+            derived.rootCID != issued.rootCID
+                || derived.directoryPath != issued.directoryPath
+                || (try? derived.serialize()) == (try? issued.serialize()),
+            "derived child proof differs from the issued one"
+        )
     }
 
     /// Re-readies the parks whose parent fact the parent level holds now.
@@ -226,22 +318,44 @@ extension NodeNetworkRuntime {
         if let package = candidate.package {
             authenticatedPackage = package
         } else if let rootCID = candidate.recoveryRootCID {
-            guard let recovered = try? await process
+            // Stored (incoming) evidence first; else derived below, inside
+            // the content session.
+            authenticatedPackage = (try? await process
                 .recoveredAuthenticatedChildPackage(
                     for: candidate.blockCID,
                     rootCID: rootCID
-                ) else {
-                completeCandidate(candidate, resolution: .wait(.evidence))
-                return
-            }
-            authenticatedPackage = recovered
+                ))
         } else {
             authenticatedPackage = nil
         }
+        // A carriage derives the proof in-host when nothing supplies it; in
+        // debug builds also beside a package, to check they are the same.
+        var derivation: (carriage: Carriage, upstream: ChildBlockProof?)?
+        #if DEBUG
+        let derivesBesidePackage = true
+        #else
+        let derivesBesidePackage = false
+        #endif
+        if let carriage = candidate.derivation,
+           authenticatedPackage == nil || derivesBesidePackage {
+            derivation = await derivationInputs(carriage)
+        }
+        if candidate.recoveryRootCID != nil, candidate.package == nil,
+           authenticatedPackage == nil, derivation == nil {
+            completeCandidate(candidate, resolution: .wait(.evidence))
+            return
+        }
+        guard isCurrentRuntime(generation: generation, process: process) else {
+            return
+        }
+        let derivedDirectory = configuration.address.directory
+        let parentIsNexus = self.parentIsNexus
+        let derivationDetached = derivation
+        let parentLevel = self.parentLevel
         var failedOverlayProviders = Set<CandidateProvider>()
         let childDirectories = authenticatedChildDirectories()
         var attempt: (
-            value: NodeImportOutcome,
+            value: (NodeImportOutcome, AuthenticatedChildPackage?),
             attribution: IvyRootContentSource.Attribution
         )?
         let header = BlockHeader(
@@ -383,14 +497,49 @@ extension NodeNetworkRuntime {
                         source: CompositeContentSource([process, session]),
                         configuration: configuration
                     )
+                    var package = authenticatedPackage
+                    if let derivation = derivationDetached, let parentLevel {
+                        // Carrier and index from the parent level's store;
+                        // the child block from this level's store (a block
+                        // this host built) or its overlay, by exact CID. The
+                        // parent's overlay is the last resort, so no local
+                        // hit ever waits behind a remote miss.
+                        let fetcher = CoalescingFetcher(CompositeContentSource([
+                            parentLevel.contentSource,
+                            process,
+                            session,
+                            parentLevel.carrierContent(derivation.carriage.carrierCID),
+                        ]))
+                        if let issued = package {
+                            if let derived = try? await derivation.carriage.proof(
+                                directory: derivedDirectory,
+                                parentIsNexus: parentIsNexus,
+                                upstream: derivation.upstream,
+                                fetcher: fetcher
+                            ) {
+                                Self.assertDerivedProof(
+                                    derived, matches: issued.package.proof
+                                )
+                            }
+                        } else if let derived = try await derivation.carriage.proof(
+                            directory: derivedDirectory,
+                            parentIsNexus: parentIsNexus,
+                            upstream: derivation.upstream,
+                            fetcher: fetcher
+                        ) {
+                            package = AuthenticatedChildPackage(
+                                package: ChildValidationPackage(proof: derived)
+                            )
+                        }
+                    }
                     let admitted = try await chain.importNetworkCandidate(NetworkCandidateImport(
                         header: header,
-                        authenticatedChildPackage: authenticatedPackage,
+                        authenticatedChildPackage: package,
                         preparingChildDirectories: childDirectories,
                         contentSource: session,
                         weighed: candidate.weighed
                     ))
-                    return admitted
+                    return (admitted, package)
                 }
                 await reportDeficientVolumes(resolved.attribution)
                 // Admission durably records any unresolved direct-child
@@ -503,7 +652,8 @@ extension NodeNetworkRuntime {
         guard isCurrentRuntime(generation: generation, process: process) else {
             return
         }
-        let outcome = attempt.value
+        // What admission used: the package, or the proof derived in-session.
+        let (outcome, admittedPackage) = attempt.value
         guard isCurrentRuntime(generation: generation, process: process) else {
             return
         }
@@ -522,7 +672,7 @@ extension NodeNetworkRuntime {
             guard isCurrentRuntime(generation: generation, process: process) else {
                 return
             }
-            if let authenticated = authenticatedPackage,
+            if let authenticated = admittedPackage,
                let edge = await DirectChildEdge.derive(
                     from: authenticated.package.proof
                ), let edgeCID = edge.edgeCID {
@@ -571,11 +721,11 @@ extension NodeNetworkRuntime {
             parentFact = ParentFact(requirement, child: configuration.address)
         }
         if case .unavailable(let requirement?) = outcome.decision,
-           let authenticatedPackage, let parentLevel {
+           let admittedPackage, let parentLevel {
             parentFactPackage = await parentLevel.evidence(
                 for: requirement,
                 child: configuration.address,
-                package: authenticatedPackage
+                package: admittedPackage
             )
             guard isCurrentRuntime(generation: generation, process: process) else {
                 return
@@ -585,7 +735,7 @@ extension NodeNetworkRuntime {
         // carries. When it needs a child proof this node cannot recover locally
         // (its own parent never mined the carriers), solicit the package from the
         // block's supplier so the retry admits it exactly like the live path.
-        if authenticatedPackage == nil,
+        if admittedPackage == nil,
            case .unavailable(.childProof(_, let childCID)?) = outcome.decision {
             await requestPortableAttachmentLocate(
                 for: childCID,

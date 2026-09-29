@@ -304,6 +304,47 @@ final class ChainHostTests: XCTestCase {
     /// mined Nexus block carries both — each level admits its carried block,
     /// and its snapshot follows its moved tip into a later Nexus block.
     func testOneNexusBlockCarriesTheHostedChildAndGrandchild() async throws {
+        try await oneNexusBlockCarriesTheHostedChildAndGrandchild(hierarchyPlane: true)
+    }
+
+    /// The same, with no level wired to its parent's fact plane: each level
+    /// derives its carried blocks' proofs in-host (the grandchild composes
+    /// its hop onto the child's own incoming proof).
+    func testOneNexusBlockCarriesTheHostedChildAndGrandchildWithoutTheHierarchyPlane()
+        async throws
+    {
+        try await oneNexusBlockCarriesTheHostedChildAndGrandchild(hierarchyPlane: false)
+    }
+
+    /// A carried child block is admitted with no hierarchy plane: the child
+    /// hears the carriage in-process and derives its proof from local blocks.
+    func testACarriedChildIsAdmittedWithoutTheHierarchyPlane() async throws {
+        let root = temporaryDirectory(create: true)
+        let (_, genesisCID) = try await seedChild(root: root, timestamp: 1_000)
+        let host = try ChainHost(chains: [
+            nexus: configure(nexus, root: root, keyByte: 1),
+            child: configure(child, root: root, keyByte: 2),
+        ], hierarchyPlane: false)
+        let failed = try await host.startAll()
+        XCTAssertTrue(failed.isEmpty)
+        let childConfiguration = await host.configuration(child)
+        XCTAssertNil(childConfiguration?.parentEndpoint, "no fact plane is wired")
+        let parent = try await service(host, nexus)
+        try await anchor(genesisCID, on: host)
+        try await eventually("the child activates on its genesis", within: .seconds(60)) {
+            let status = await self.childStatus(host)
+            return status?.phase == .active && status?.tipCID == genesisCID
+        }
+        try await eventually("a carried child block is admitted", within: .seconds(120)) {
+            _ = try? await self.mine(parent)
+            return (await self.childStatus(host)?.height ?? 0) >= 2
+        }
+        await host.stopAll()
+    }
+
+    private func oneNexusBlockCarriesTheHostedChildAndGrandchild(
+        hierarchyPlane: Bool
+    ) async throws {
         let root = temporaryDirectory(create: true)
         let (_, childGenesis) = try await seedChild(root: root, timestamp: 1_000)
         let (_, grandchildGenesis) = try await seedChild(
@@ -313,7 +354,7 @@ final class ChainHostTests: XCTestCase {
             nexus: configure(nexus, root: root, keyByte: 1),
             child: configure(child, root: root, keyByte: 2),
             grandchild: configure(grandchild, root: root, keyByte: 3),
-        ])
+        ], hierarchyPlane: hierarchyPlane)
         let failed = try await host.startAll()
         XCTAssertTrue(failed.isEmpty)
         let parent = try await service(host, nexus)
@@ -598,4 +639,12 @@ private actor GatedAnchorParentLevel: ParentLevel {
     func validatedTip() async -> (cid: String, block: Block)? { nil }
 
     nonisolated var contentSource: any ContentSource { InMemoryContentSource([:]) }
+
+    nonisolated func carrierContent(_ carrierCID: String) -> any ContentSource {
+        InMemoryContentSource([:])
+    }
+
+    func incomingProof(carrier: String, root: String) async -> ChildBlockProof? {
+        nil
+    }
 }

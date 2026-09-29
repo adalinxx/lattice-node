@@ -37,6 +37,15 @@ public protocol ParentLevel: AnyObject, Sendable {
     /// The parent's local content, for a candidate build against its
     /// provisional carrier: broker-local reads only, never the network.
     var contentSource: any ContentSource { get }
+    /// Carrier content for proof derivation: broker-local reads of the
+    /// carrier's block node and `ChildIndex` node, and a remote fetch by CID
+    /// through the parent level's own overlay when absent (never the
+    /// parent's operation gate or lease).
+    func carrierContent(_ carrierCID: String) -> any ContentSource
+    /// The parent level's own verified proof `root → carrier` (its incoming
+    /// evidence for `carrier`), per root. Nil on Nexus, which has no
+    /// upstream proof, and while the parent holds none for that root.
+    func incomingProof(carrier: String, root: String) async -> ChildBlockProof?
 }
 
 /// A parent level's view of a co-hosted child level. Nothing here waits on
@@ -125,6 +134,56 @@ public enum ParentChange: Sendable {
     /// The miner's plan for the child's subtree changed: the child rebuilds
     /// its candidate against it.
     case plan(DescendantPlan)
+    /// The parent issued a relay link for a block of its own that commits
+    /// into the child's directory: the child derives the carried block's
+    /// proof from local blocks and imports it.
+    case carried(Carriage)
+}
+
+/// A parent block that carries a child block, under one PoW root: what a
+/// child needs to derive that block's `ChildBlockProof` in-host.
+public struct Carriage: Hashable, Sendable {
+    /// The parent block committing into the child's directory.
+    public let carrierCID: String
+    /// The PoW root the parent's relay link names (the carrier itself on
+    /// Nexus).
+    public let rootCID: String
+    /// The committed child block, when the parent read it from the carrier's
+    /// metadata; nil when the child resolves `carrier.children[directory]`.
+    public let childCID: String?
+
+    public init(carrierCID: String, rootCID: String, childCID: String?) {
+        self.carrierCID = carrierCID
+        self.rootCID = rootCID
+        self.childCID = childCID
+    }
+
+    /// The proof `root → … → carrier → child`: the hop `carrier → child`
+    /// generated over `fetcher`, composed onto `upstream`, the parent's own
+    /// proof `root → carrier`. A Nexus carrier is its own root and takes no
+    /// upstream. Throws when the path's content is not available; nil when
+    /// the carriage cannot be composed (a Nexus carriage under another root,
+    /// or a deeper one without its upstream proof). Byte-identical to the
+    /// proof the parent issues for the same path: generation depends only
+    /// on the path, and entries are sorted and de-duplicated by CID.
+    func proof(
+        directory: String,
+        parentIsNexus: Bool,
+        upstream: ChildBlockProof?,
+        fetcher: any Fetcher
+    ) async throws -> ChildBlockProof? {
+        if parentIsNexus {
+            guard rootCID == carrierCID, upstream == nil else { return nil }
+        } else {
+            guard let upstream, upstream.rootCID == rootCID else { return nil }
+        }
+        let hop = try await ChildBlockProof.generate(
+            rootHeader: BlockHeader(rawCID: carrierCID, node: nil, encryptionInfo: nil),
+            childDirectory: directory,
+            fetcher: fetcher
+        )
+        return upstream.map { $0.composing(hop: hop) } ?? hop
+    }
 }
 
 /// A parent fact a child admission can read from its co-hosted parent
@@ -217,9 +276,12 @@ extension ParentLevel {
 /// the parent level, and a stopped parent answers nothing.
 final class LocalParentLevel: @unchecked Sendable, ParentLevel, ContentSource {
     private weak var process: ChainProcess?
+    /// The parent level's own overlay, for carrier content it does not hold.
+    private let remoteContentSource: IvyRootContentSource?
 
-    init(_ process: ChainProcess) {
+    init(_ process: ChainProcess, remoteContentSource: IvyRootContentSource? = nil) {
         self.process = process
+        self.remoteContentSource = remoteContentSource
     }
 
     func hasProducedState(_ stateCID: String) async -> Bool {
@@ -255,6 +317,41 @@ final class LocalParentLevel: @unchecked Sendable, ParentLevel, ContentSource {
 
     func fetch(_ cids: Set<String>) async -> [String: Data] {
         await process?.fetch(cids) ?? [:]
+    }
+
+    func carrierContent(_ carrierCID: String) -> any ContentSource {
+        CarrierContent(level: self, carrierCID: carrierCID)
+    }
+
+    func incomingProof(carrier: String, root: String) async -> ChildBlockProof? {
+        (try? await process?.recoveredAuthenticatedChildPackage(
+            for: carrier, rootCID: root
+        ))?.package.proof
+    }
+
+    /// Local first; what the parent does not hold, by CID through the
+    /// parent's overlay under the carrier's root.
+    fileprivate func fetch(
+        _ cids: Set<String>, carrierCID: String
+    ) async -> [String: Data] {
+        var found = await process?.fetch(cids) ?? [:]
+        let missing = cids.subtracting(found.keys)
+        if !missing.isEmpty, let remoteContentSource {
+            let remote = await remoteContentSource.withRoot(carrierCID) {
+                await $0.fetch(missing)
+            }
+            found.merge(remote) { local, _ in local }
+        }
+        return found
+    }
+
+    private struct CarrierContent: ContentSource {
+        let level: LocalParentLevel
+        let carrierCID: String
+
+        func fetch(_ cids: Set<String>) async -> [String: Data] {
+            await level.fetch(cids, carrierCID: carrierCID)
+        }
     }
 }
 
