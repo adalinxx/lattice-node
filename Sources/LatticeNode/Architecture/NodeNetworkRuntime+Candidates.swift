@@ -862,7 +862,7 @@ extension NodeNetworkRuntime {
         guard blockFetcher.hasTimedWait else { return }
         let generation = runtimeGeneration
         waitingCandidateRetryTask.start { token in
-            Timers.deadline(
+            timers.deadline(
                 after: Self.futureCandidateRetryInterval,
                 generation: generation
             ) { [weak self] generation in

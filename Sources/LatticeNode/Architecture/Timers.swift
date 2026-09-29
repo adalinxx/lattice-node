@@ -1,26 +1,22 @@
 import Foundation
 
-/// The node's one suspension primitive and the timer shapes built on it.
+/// The timer shapes built on the node's clock port.
 ///
-/// Every sleep goes through `sleep(nanoseconds:)`, which uses
-/// `Task.sleep(nanoseconds:)` ONLY. Never `Task.sleep(for:)` and never
-/// `Clock.sleep(for:)`: both bodies are emitted into the client and miscompile
-/// under Swift 6.3 -O (swift_task_dealloc aborts with "freed pointer was not
-/// the last allocation" on resume). `Duration` is converted to nanoseconds
-/// before any task is created or any suspension happens, so it never sits in
-/// an optimized async task frame.
+/// Every sleep goes through `clock.sleep(nanoseconds:)` (`NodeEnvironment.swift`),
+/// so a test binding decides when every timer fires. `Duration` is converted
+/// to nanoseconds before any task is created or any suspension happens, so it
+/// never sits in an optimized async task frame (Swift 6.3 -O; see
+/// `SystemClock`).
 ///
 /// Timers does no generation gating. `deadline` passes `generation` through
 /// to its fire closure and every fire target does its own check.
-enum Timers {
-    /// Sleeps `nanoseconds`. Returns `false` iff the task was cancelled.
-    static func sleep(nanoseconds: UInt64) async -> Bool {
-        do {
-            try await Task.sleep(nanoseconds: nanoseconds)
-        } catch {
-            return false
-        }
-        return !Task.isCancelled
+struct Timers: Sendable {
+    let clock: any NodeClock
+
+    /// Sleeps `nanoseconds` on the clock. Returns `false` iff the task was
+    /// cancelled.
+    func sleep(nanoseconds: UInt64) async -> Bool {
+        await clock.sleep(nanoseconds: nanoseconds)
     }
 
     /// `duration` in nanoseconds, zero for a negative duration, saturating at
@@ -43,14 +39,15 @@ enum Timers {
     /// must still inherit. Callers capture `[weak self]` in `fire` so a
     /// sleeping timer does not retain its owner.
     @discardableResult
-    static func deadline(
+    func deadline(
         after delay: Duration,
         generation: UInt64,
         _ fire: @escaping @Sendable (UInt64) async -> Void
     ) -> Task<Void, Never> {
         let delayNanoseconds = Timers.nanoseconds(delay)
+        let clock = self.clock
         return Task {
-            guard await Timers.sleep(nanoseconds: delayNanoseconds) else { return }
+            guard await clock.sleep(nanoseconds: delayNanoseconds) else { return }
             await fire(generation)
         }
     }
@@ -64,7 +61,7 @@ enum Timers {
     /// `attempt`; while its result is `capacityUnavailable`, sleep `every`,
     /// then re-check `stillCurrent` and attempt again. The closures run on
     /// the caller's actor.
-    static func retryWhileCapacityUnavailable<T: Sendable>(
+    func retryWhileCapacityUnavailable<T: Sendable>(
         every interval: Duration,
         isolation: isolated (any Actor)? = #isolation,
         attempt: () async -> T,
@@ -75,7 +72,7 @@ enum Timers {
         while true {
             let result = await attempt()
             guard capacityUnavailable(result) else { return .value(result) }
-            guard await Timers.sleep(nanoseconds: intervalNanoseconds) else {
+            guard await clock.sleep(nanoseconds: intervalNanoseconds) else {
                 return .cancelled
             }
             guard stillCurrent() else { return .stale }
@@ -90,7 +87,7 @@ enum Timers {
     /// `step`; while it answers `.again`, sleep `every` and step again.
     /// Returns `onCancel` when a sleep is cancelled. The step runs on the
     /// caller's actor.
-    static func poll<T: Sendable>(
+    func poll<T: Sendable>(
         every interval: Duration,
         onCancel: T,
         isolation: isolated (any Actor)? = #isolation,
@@ -99,7 +96,7 @@ enum Timers {
         let intervalNanoseconds = Timers.nanoseconds(interval)
         while true {
             if case .done(let value) = await step() { return value }
-            guard await Timers.sleep(nanoseconds: intervalNanoseconds) else {
+            guard await clock.sleep(nanoseconds: intervalNanoseconds) else {
                 return onCancel
             }
         }
@@ -107,7 +104,7 @@ enum Timers {
 
     /// While `while` holds: `body`, then sleep `every`. Acts first, then
     /// sleeps; returns when a sleep is cancelled. Runs on the caller's actor.
-    static func repeating(
+    func repeating(
         every interval: Duration,
         isolation: isolated (any Actor)? = #isolation,
         while condition: () -> Bool,
@@ -116,7 +113,7 @@ enum Timers {
         let intervalNanoseconds = Timers.nanoseconds(interval)
         while condition() {
             await body()
-            guard await Timers.sleep(nanoseconds: intervalNanoseconds) else {
+            guard await clock.sleep(nanoseconds: intervalNanoseconds) else {
                 return
             }
         }

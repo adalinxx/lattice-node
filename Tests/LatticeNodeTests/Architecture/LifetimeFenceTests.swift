@@ -87,7 +87,7 @@ final class LifetimeFenceTests: NetworkTrustTestCase {
         slot.start { _ in
             Task {
                 await started.open()
-                _ = await Timers.sleep(nanoseconds: 60_000_000_000)
+                _ = await SystemClock().sleep(nanoseconds: 60_000_000_000)
             }
         }
         await started.wait()

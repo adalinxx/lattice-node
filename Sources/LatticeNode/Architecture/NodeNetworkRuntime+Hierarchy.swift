@@ -1035,7 +1035,7 @@ extension NodeNetworkRuntime {
                 // The evidence lane is momentarily full. Keep the session and
                 // retry THIS page after a beat — the scan must make progress
                 // through congestion, not restart from a fresh reconnect.
-                Timers.deadline(
+                timers.deadline(
                     after: planeConfigurations.hierarchy.requestTimeout,
                     generation: generation
                 ) { [weak self] generation in
@@ -1416,7 +1416,7 @@ extension NodeNetworkRuntime {
             value: ChildEvidenceVolume?,
             attribution: IvyRootContentSource.Attribution
         )
-        switch await Timers.retryWhileCapacityUnavailable(
+        switch await timers.retryWhileCapacityUnavailable(
             every: planeConfigurations.hierarchy.requestTimeout,
             attempt: {
                 await source.withRootTracing(
@@ -2195,7 +2195,7 @@ extension NodeNetworkRuntime {
     ) {
         removeHierarchyHelloDeadline(for: peer.key, session: nil)?.task.cancel()
         let token = LifetimeToken.next()
-        let task = Timers.deadline(
+        let task = timers.deadline(
             after: planeConfigurations.hierarchy.requestTimeout,
             generation: generation
         ) { [weak self] generation in
@@ -2276,13 +2276,14 @@ extension NodeNetworkRuntime {
                     request: request,
                     continuation: continuation
                 )
+            let timers = self.timers
             Task { [weak self] in
                 _ = await self?.hierarchy.sendMessage(
                     to: parent,
                     topic: NodeNetworkTopic.parentChainFactRequest,
                     payload: payload
                 )
-                _ = await Timers.sleep(nanoseconds: delay)
+                _ = await timers.sleep(nanoseconds: delay)
                 await self?.resolveGenesisVerification(
                     request.requestID,
                     confirmed: false
@@ -2324,13 +2325,14 @@ extension NodeNetworkRuntime {
                 peer: parent,
                 continuation: continuation
             )
+            let timers = self.timers
             Task { [weak self] in
                 _ = await self?.hierarchy.sendMessage(
                     to: parent,
                     topic: NodeNetworkTopic.childGenesisAnchorRequest,
                     payload: payload
                 )
-                _ = await Timers.sleep(nanoseconds: delay)
+                _ = await timers.sleep(nanoseconds: delay)
                 await self?.resolveGenesisAnchor(requestID, genesisCID: nil)
             }
         }
@@ -2382,7 +2384,7 @@ extension NodeNetworkRuntime {
             lastTraced = outcome
             SyncTrace.log("adopt-genesis \(outcome)")
         }
-        await Timers.poll(every: .seconds(1), onCancel: ()) {
+        await timers.poll(every: .seconds(1), onCancel: ()) {
             guard isRunning, runtimeGeneration == generation else {
                 return .done(())
             }
@@ -2719,7 +2721,7 @@ extension NodeNetworkRuntime {
         // enqueue is transient — the same timeout used for an unanswered
         // parent response requeues the candidate (or resolves the walk's
         // request nil); a disconnect does so sooner.
-        Timers.deadline(
+        timers.deadline(
             after: planeConfigurations.hierarchy.requestTimeout,
             generation: generation
         ) { [weak self] generation in
@@ -2910,7 +2912,7 @@ extension NodeNetworkRuntime {
         generation: UInt64
     ) {
         let timeout = planeConfigurations.hierarchy.requestTimeout
-        Timers.deadline(
+        timers.deadline(
             after: timeout,
             generation: generation
         ) { [weak self] generation in

@@ -3838,6 +3838,58 @@ final class ChainServiceTests: XCTestCase {
         XCTAssertEqual(resumedTipCID, canonicalTipCID)
     }
 
+    /// The walk's retry timer runs on the node's clock: after the body is
+    /// released, nothing re-drives the parked walk until the clock reaches the
+    /// retry interval, and then the walk resumes to the tip.
+    func testExecutionWalkRetryFiresOnlyWhenTheNodeClockReachesIt()
+        async throws {
+        let depth = 4
+        let gapAt: UInt64 = 2
+        let miner = CryptoUtils.generateKeyPair()
+        let producer = try await nexusProcess()
+        let canonical = try await mineNexusRewardChain(
+            on: producer, depth: depth, miner: miner
+        )
+        let gapCID = try BlockHeader(node: canonical[Int(gapAt) - 1]).rawCID
+
+        let clock = ManualClock()
+        let consumerProcess = try await nexusProcess(clock: clock)
+        let bodySource = CountingValidateBodySource(producer: producer)
+        bodySource.withhold(gapCID)
+        let consumer = makeService(
+            process: consumerProcess,
+            executionBodySource: bodySource.admission(),
+            executionWalkRetryInterval: .seconds(4)
+        )
+        for block in canonical {
+            let outcome = try await consumerProcess.importBlock(
+                BlockHeader(node: block),
+                remoteSource: FetcherContentSource(producer),
+                mode: .header
+            )
+            XCTAssertTrue(outcome.decision.isAccepted)
+        }
+
+        await consumer.runExecutionWalkPass()
+        bodySource.release(gapCID)
+        // The park armed exactly one retry, asleep on the node's clock.
+        try await clock.waitForSleepers(1)
+        clock.advance(by: .seconds(3))
+        XCTAssertEqual(
+            clock.sleeperCount, 1,
+            "three of four seconds: the retry is still asleep on the node's clock"
+        )
+        try await alwaysDuring("the retry has not fired", .milliseconds(100)) {
+            await consumerProcess.deepestValidatedCanonicalTip()?.height == gapAt - 1
+        }
+
+        clock.advance(by: .seconds(1))
+        try await eventually("the retry re-drives the walk to the tip") {
+            await consumerProcess.deepestValidatedCanonicalTip()?.height == UInt64(depth)
+        }
+        XCTAssertEqual(clock.sleeperCount, 0, "a resumed walk arms no further retry")
+    }
+
     /// Injectable validate-body source that records every block whose body it is
     /// asked to fetch and can withhold a specific block's body (serving an empty
     /// source so the deferred body stays missing → `.unavailable`).
@@ -3921,7 +3973,9 @@ final class ChainServiceTests: XCTestCase {
         return blocks
     }
 
-    private func nexusProcess() async throws -> ChainProcess {
+    private func nexusProcess(
+        clock: any NodeClock = SystemClock()
+    ) async throws -> ChainProcess {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("lattice-chain-service-\(UUID().uuidString)")
         addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
@@ -3929,7 +3983,8 @@ final class ChainServiceTests: XCTestCase {
             configuration: NodeConfiguration(
                 chainPath: ["Nexus"],
                 storagePath: directory,
-                privateKeyHex: String(repeating: "01", count: 32)
+                privateKeyHex: String(repeating: "01", count: 32),
+                clock: clock
             )
         )
     }

@@ -573,7 +573,7 @@ extension NodeNetworkRuntime {
             afterRootCID: after
         )
         guard let payload = try? request.encoded() else { return }
-        let timeout = Timers.deadline(
+        let timeout = timers.deadline(
             after: planeConfigurations.overlay.requestTimeout,
             generation: generation
         ) { [weak self] generation in
@@ -787,7 +787,7 @@ extension NodeNetworkRuntime {
         }
 
         let response: AttributedVolumeResponse
-        switch await Timers.retryWhileCapacityUnavailable(
+        switch await timers.retryWhileCapacityUnavailable(
             every: planeConfigurations.overlay.requestTimeout,
             attempt: { await overlay.fetchVolume(rootCID: rootCID, from: peer) },
             capacityUnavailable: { $0.failure == .localCapacityUnavailable },
@@ -1118,7 +1118,7 @@ extension NodeNetworkRuntime {
         // cannot starve consensus-critical hierarchy evidence.
         // nil: a slot is free. The stale and lease checks also pass on the
         // first step: both were just made above with no suspension between.
-        let slotWait: Bool? = await Timers.poll(
+        let slotWait: Bool? = await timers.poll(
             every: planeConfigurations.overlay.requestTimeout,
             onCancel: false
         ) {
@@ -1177,7 +1177,7 @@ extension NodeNetworkRuntime {
             value: ChildEvidenceVolume?,
             attribution: IvyRootContentSource.Attribution
         )
-        switch await Timers.retryWhileCapacityUnavailable(
+        switch await timers.retryWhileCapacityUnavailable(
             every: planeConfigurations.overlay.requestTimeout,
             attempt: {
                 await source.withRootTracing(
@@ -1304,7 +1304,7 @@ extension NodeNetworkRuntime {
     ) {
         removeOverlayHelloDeadline(for: peer.key, session: nil)?.task.cancel()
         let token = LifetimeToken.next()
-        let task = Timers.deadline(
+        let task = timers.deadline(
             after: planeConfigurations.overlay.requestTimeout,
             generation: generation
         ) { [weak self] generation in

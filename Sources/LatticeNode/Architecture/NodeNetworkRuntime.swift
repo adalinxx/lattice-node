@@ -566,6 +566,7 @@ public actor NodeNetworkRuntime: IvyDelegate {
     let hierarchy: Ivy
     /// Owner: init; immutable.
     let configuration: NodeConfiguration
+    nonisolated var timers: Timers { Timers(clock: configuration.clock) }
     /// Owner: init; immutable.
     let overlay: Ivy
     private let hello: ChainHello
@@ -906,7 +907,7 @@ public actor NodeNetworkRuntime: IvyDelegate {
                 }
                 evidenceSlotWaiters[id] = EvidenceSlotWaiter(
                     continuation: continuation,
-                    timeout: Timers.deadline(
+                    timeout: timers.deadline(
                         after: timeout, generation: generation
                     ) { [weak self] _ in
                         await self?.wakeEvidenceSlotWaiter(id)
@@ -1299,7 +1300,7 @@ public actor NodeNetworkRuntime: IvyDelegate {
         _ search: StaleTipPeerSearch,
         generation: UInt64
     ) async {
-        await Timers.repeating(
+        await timers.repeating(
             every: .seconds(Self.peerSearchPollSeconds(
                 configuration.peerSearchInterval
             )),
@@ -1437,7 +1438,7 @@ public actor NodeNetworkRuntime: IvyDelegate {
         // Re-announce well within the TTL, and often enough to pick up a
         // newly-wired child within a minute (records are small).
         let interval = max(UInt64(30), min(ttl / 2, UInt64(60)))
-        await Timers.repeating(
+        await timers.repeating(
             every: .seconds(interval),
             while: { isRunning && runtimeGeneration == generation }
         ) {
