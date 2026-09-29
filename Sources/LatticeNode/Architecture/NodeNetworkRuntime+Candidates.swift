@@ -121,6 +121,8 @@ extension NodeNetworkRuntime {
             guard carriage.rootCID == carriage.carrierCID else { return nil }
             return (carriage, nil)
         }
+        // No upstream proof yet: nothing is derived, and a package on the
+        // key, if any, is used.
         guard let upstream = await parentLevel.incomingProof(
             carrier: carriage.carrierCID, root: carriage.rootCID
         ) else { return nil }
@@ -504,28 +506,31 @@ extension NodeNetworkRuntime {
                             ),
                         ]))
                         do {
+                            // Nil (a carriage under a root it cannot compose
+                            // for): the package, if any, is used.
                             if let derived = try await derivation.carriage.proof(
                                 directory: derivedDirectory,
                                 parentIsNexus: parentIsNexus,
                                 upstream: derivation.upstream,
                                 fetcher: fetcher
                             ) {
-                                // The parent facts a package holds are
-                                // merged locally and verified at admission.
-                                package = AuthenticatedChildPackage(
-                                    package: ChildValidationPackage(
-                                        proof: derived,
-                                        parentGenesisLink:
-                                            package?.package.parentGenesisLink,
-                                        parentStateContinuityLink:
-                                            package?.package.parentStateContinuityLink
-                                    )
+                                let derivedPackage = AuthenticatedChildPackage(
+                                    package: ChildValidationPackage(proof: derived)
                                 )
+                                // Links the replaced package held carry over.
+                                package = package.map {
+                                    ParentFactLinks($0).attached(to: derivedPackage)
+                                } ?? derivedPackage
                             }
                         } catch {
                             // Not derivable yet: a package still admits.
                             if package == nil { throw error }
                         }
+                    }
+                    // The parent-fact links this level read, on whichever
+                    // proof admission uses; verified at admission.
+                    if let links = candidate.parentFactLinks {
+                        package = package.map { links.attached(to: $0) }
                     }
                     let admitted = try await chain.importNetworkCandidate(NetworkCandidateImport(
                         header: header,
@@ -780,9 +785,14 @@ extension NodeNetworkRuntime {
             parentFact: parentFact
         )
         if let parentFactPackage {
+            // The links are set on the attempt, never merged as a package:
+            // they must hold whichever proof its next admission uses, and a
+            // package with other proof bytes on the key would refuse them.
             reReadyCandidates([CandidateSeed(
                 blockCID: candidate.blockCID,
-                package: parentFactPackage
+                package: nil,
+                recoveryRootCID: parentFactPackage.package.proof.rootCID,
+                parentFactLinks: ParentFactLinks(parentFactPackage)
             )])
         } else if case .wait(.parentFact) = resolution,
                   self.parentTipChanges != parentTipChanges {

@@ -186,6 +186,45 @@ public struct Carriage: Hashable, Sendable {
     }
 }
 
+/// The parent-fact links this level read from its co-hosted parent level
+/// for one attempt: local facts, never peer input, attached to whichever
+/// proof its admission uses (a package's or a derived one).
+struct ParentFactLinks: Equatable, Sendable {
+    var genesis: ParentGenesisLink?
+    var continuity: ParentStateContinuityLink?
+
+    init(genesis: ParentGenesisLink? = nil, continuity: ParentStateContinuityLink? = nil) {
+        self.genesis = genesis
+        self.continuity = continuity
+    }
+
+    /// The links `package` holds.
+    init(_ package: AuthenticatedChildPackage) {
+        self.init(
+            genesis: package.package.parentGenesisLink,
+            continuity: package.package.parentStateContinuityLink
+        )
+    }
+
+    /// These links, filled in from `other` where absent.
+    func merging(_ other: ParentFactLinks?) -> ParentFactLinks {
+        ParentFactLinks(
+            genesis: genesis ?? other?.genesis,
+            continuity: continuity ?? other?.continuity
+        )
+    }
+
+    /// `package` with these links where it holds none.
+    func attached(to package: AuthenticatedChildPackage) -> AuthenticatedChildPackage {
+        let links = ParentFactLinks(package).merging(self)
+        return AuthenticatedChildPackage(package: ChildValidationPackage(
+            proof: package.package.proof,
+            parentGenesisLink: links.genesis,
+            parentStateContinuityLink: links.continuity
+        ))
+    }
+}
+
 /// A parent fact a child admission can read from its co-hosted parent
 /// level: the key a `.wait(.parentFact)` park waits on.
 enum ParentFact: Hashable, Sendable {

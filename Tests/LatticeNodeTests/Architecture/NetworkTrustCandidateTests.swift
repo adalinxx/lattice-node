@@ -1750,16 +1750,74 @@ final class NetworkTrustCandidateTests: NetworkTrustTestCase {
     /// `(block, root)` key: a padded package (the honest path plus one extra
     /// canonical entry) neither stalls the block nor is what gets stored.
     func testALocalDerivationWinsOverAPaddedPeerPackage() async throws {
-        let fixture = try await provisionalRootFixture(keyByte: 0xa7)
+        try await assertDerivationWinsOverAPaddedPeerPackage(keyByte: 0xa7, needs: .none)
+    }
+
+    /// The same when admission needs the parent's state continuity: the
+    /// link read from the parent level is kept on the attempt and attached
+    /// to the derived proof, never merged into the padded package (whose
+    /// proof bytes differ, so a merge would drop it and livelock the key).
+    func testADerivationWinsOverAPaddedPackageWhenAdmissionNeedsContinuity() async throws {
+        try await assertDerivationWinsOverAPaddedPeerPackage(keyByte: 0xa9, needs: .continuity)
+    }
+
+    /// The same when admission needs the parent's genesis link.
+    func testADerivationWinsOverAPaddedPackageWhenAdmissionNeedsTheGenesisLink() async throws {
+        try await assertDerivationWinsOverAPaddedPeerPackage(keyByte: 0xab, needs: .genesis)
+    }
+
+    private enum ScriptedParentFact { case none, continuity, genesis }
+
+    private func assertDerivationWinsOverAPaddedPeerPackage(
+        keyByte: UInt8, needs: ScriptedParentFact
+    ) async throws {
+        let fixture = try await provisionalRootFixture(keyByte: keyByte) {
+            StubParentLevel(produced: [Self.carriedParentState], base: $0)
+        }
         let childService = networkService(
             process: fixture.childProcess, runtime: fixture.childRuntime
         )
+        let block = fixture.candidate.block
+        let childGenesisCID = try XCTUnwrap(block.parent?.rawCID)
+        // Admission needs the scripted parent fact until the package holds it.
+        let requirement: CrossChainEvidenceRequirement?
+        switch needs {
+        case .none: requirement = nil
+        case .continuity:
+            requirement = .parentStateContinuity(
+                parentPath: ["Nexus"],
+                fromStateCID: LatticeState.emptyHeader.rawCID,
+                toStateCID: Self.carriedParentState
+            )
+        case .genesis:
+            requirement = .parentGenesis(
+                parentPath: ["Nexus"],
+                directory: "Payments",
+                childGenesisCID: childGenesisCID,
+                parentStateCID: LatticeState.emptyHeader.rawCID
+            )
+        }
         // The parent's runtime never starts: no hierarchy publication can
         // deliver the honest proof.
         try await fixture.childRuntime.start(
             process: fixture.childProcess,
             chain: ClosureChainInterface(admission: { admission in
-                try await childService.importNetworkCandidate(
+                let package = admission.authenticatedChildPackage?.package
+                let held = switch needs {
+                case .none: true
+                case .continuity:
+                    package?.parentStateContinuityLink?.toStateCID == Self.carriedParentState
+                case .genesis:
+                    package?.parentGenesisLink?.childGenesisCID == childGenesisCID
+                }
+                guard held else {
+                    return NodeImportOutcome(
+                        decision: .unavailable(requirement),
+                        parentCarrierLink: nil,
+                        sameChainPredecessor: nil
+                    )
+                }
+                return try await childService.importNetworkCandidate(
                     admission.header,
                     authenticatedChildPackage: admission.authenticatedChildPackage,
                     preparingChildDirectories: admission.preparingChildDirectories,
@@ -1769,7 +1827,6 @@ final class NetworkTrustCandidateTests: NetworkTrustTestCase {
             })
         )
         do {
-            let block = fixture.candidate.block
             let both = CoalescingFetcher(CompositeContentSource([
                 fixture.parentProcess, fixture.childProcess,
             ]))

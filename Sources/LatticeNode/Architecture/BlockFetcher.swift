@@ -66,6 +66,8 @@ struct BlockFetcher {
         /// The carriage this candidate's proof derives from in-host, when no
         /// package or stored evidence supplies it (`Seed.derivation`).
         let derivation: Carriage?
+        /// Parent-fact links read locally for this attempt.
+        let parentFactLinks: ParentFactLinks?
     }
 
     struct Seed: Sendable {
@@ -88,6 +90,10 @@ struct BlockFetcher {
         /// package, by the carriage's root, and scheduled with the same
         /// priority as the parent's evidence. Kept once set.
         let derivation: Carriage?
+        /// Parent-fact links this level read from its parent level for the
+        /// attempt (`ParentFactLinks`): set on it, never merged into a
+        /// package, so they hold whichever proof admission uses.
+        let parentFactLinks: ParentFactLinks?
 
         init(
             blockCID: String,
@@ -96,7 +102,8 @@ struct BlockFetcher {
             provider: CandidateProvider? = nil,
             weighed: Bool = false,
             fromParent: Bool = false,
-            derivation: Carriage? = nil
+            derivation: Carriage? = nil,
+            parentFactLinks: ParentFactLinks? = nil
         ) {
             self.blockCID = blockCID
             self.package = package
@@ -107,6 +114,7 @@ struct BlockFetcher {
             self.weighed = weighed
             self.fromParent = fromParent && package != nil
             self.derivation = derivation?.rootCID == rootCID ? derivation : nil
+            self.parentFactLinks = parentFactLinks
         }
 
         /// A rooted seed that supplies the block's proof, by package or by
@@ -150,6 +158,8 @@ struct BlockFetcher {
         var fromParent = false
         /// Derives its proof in-host (`Seed.derivation`).
         var derivation: Carriage?
+        /// Local parent-fact links (`Seed.parentFactLinks`).
+        var parentFactLinks: ParentFactLinks?
         /// Whether the attempt holds a proof, or the means to derive one.
         var suppliesProof: Bool { package != nil || derivation != nil }
         /// The parent fact a `.wait(.parentFact)` park waits on; nil when no
@@ -351,11 +361,21 @@ struct BlockFetcher {
             // A package seed carries no tier of its own (it only delivers
             // evidence), so it never downgrades — otherwise a second peer
             // advertising the same attachment would re-eager a weighed block.
+            // Parent-fact links, likewise, carry no tier.
             attempt.weighed = attempt.weighed
-                && (seed.weighed || seed.package != nil)
+                && (seed.weighed || seed.package != nil
+                    || seed.parentFactLinks != nil)
             attempt.fromParent = attempt.fromParent || seed.fromParent
             let previous = attempt.package
             var packageChanged = false
+            if let links = seed.parentFactLinks {
+                let merged = links.merging(attempt.parentFactLinks)
+                if merged != attempt.parentFactLinks {
+                    attempt.parentFactLinks = merged
+                    attempt.revision &+= 1
+                    packageChanged = true
+                }
+            }
             if attempt.derivation == nil, let derivation = seed.derivation {
                 // A new means to the proof: wakes an evidence wait like a
                 // new package.
@@ -397,7 +417,8 @@ struct BlockFetcher {
                 weighed: seed.weighed
                     || (record.attempts[nil]?.weighed ?? false),
                 fromParent: seed.fromParent,
-                derivation: seed.derivation
+                derivation: seed.derivation,
+                parentFactLinks: seed.parentFactLinks
             )
         }
         records[seed.blockCID] = record
@@ -499,7 +520,8 @@ struct BlockFetcher {
                     $0.publicKey < $1.publicKey
                 },
                 weighed: attempt.weighed,
-                derivation: attempt.derivation
+                derivation: attempt.derivation,
+                parentFactLinks: attempt.parentFactLinks
             )
         }
         return nil
