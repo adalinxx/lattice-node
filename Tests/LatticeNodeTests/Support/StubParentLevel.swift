@@ -62,6 +62,14 @@ actor StubParentLevel: ParentLevel {
         await base?.validatedTip()
     }
 
+    nonisolated func carrierContent(_ carrierCID: String) -> any ContentSource {
+        base?.carrierContent(carrierCID) ?? InMemoryContentSource([:])
+    }
+
+    func incomingProof(carrier: String, root: String) async -> ChildBlockProof? {
+        await base?.incomingProof(carrier: carrier, root: root)
+    }
+
     /// The parent now answers from what it holds.
     func release() { withheld = false }
 

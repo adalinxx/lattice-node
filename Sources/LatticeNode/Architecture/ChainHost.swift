@@ -51,11 +51,23 @@ public actor ChainHost {
         chains: [ChainAddress: Configure],
         services: (any ChainHostServices)? = nil
     ) throws {
+        try self.init(chains: chains, services: services, hierarchyPlane: true)
+    }
+
+    /// `hierarchyPlane: false` (tests) wires no child to its parent's fact
+    /// plane: a child hears its parent only in-process, and derives the
+    /// proofs of the blocks its parent carries.
+    init(
+        chains: [ChainAddress: Configure],
+        services: (any ChainHostServices)? = nil,
+        hierarchyPlane: Bool
+    ) throws {
         self.services = services
         for address in chains.keys.sorted(by: Self.parentFirst) {
             levels[address] = Level(
                 configuration: try Self.configure(
-                    address, chains[address]!, in: levels
+                    address, chains[address]!, in: levels,
+                    hierarchyPlane: hierarchyPlane
                 ),
                 running: nil
             )
@@ -137,7 +149,12 @@ public actor ChainHost {
         }
         let node = try await Node.build(
             configuration: level.configuration,
-            parentLevel: parent.map { LocalParentLevel($0.process) }
+            parentLevel: parent.map {
+                LocalParentLevel(
+                    $0.process,
+                    remoteContentSource: $0.network.remoteContentSource
+                )
+            }
         )
         if let parent {
             // The child's one ordered mailbox from its parent. The parent
@@ -160,6 +177,9 @@ public actor ChainHost {
                 // Marks the parent's own rebuild; takes no lease (§2.4).
                 candidateChanged: { [weak parentService = parent.service] in
                     await parentService?.childCandidateChanged()
+                },
+                parentCarried: { [weak network = node.network] carriage in
+                    await network?.parentChanged(.carried(carriage))
                 }
             )
             await parent.service.attachChildLevel(LocalChildLevel(
@@ -180,7 +200,8 @@ public actor ChainHost {
     private static func configure(
         _ address: ChainAddress,
         _ configure: Configure,
-        in levels: [ChainAddress: Level]
+        in levels: [ChainAddress: Level],
+        hierarchyPlane: Bool
     ) throws -> NodeConfiguration {
         guard let parentAddress = address.parent else {
             return try configure()
@@ -190,6 +211,7 @@ public actor ChainHost {
                 child: address.key, missingParent: parentAddress.key
             )
         }
+        guard hierarchyPlane else { return try configure() }
         return try configure().withParentEndpoint(ParentEndpoint(
             publicKey: parent.configuration.processPublicKey,
             host: "127.0.0.1",

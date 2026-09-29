@@ -58,6 +58,9 @@ struct BlockFetcher {
         /// fork choice on verified work without executing it. Set for every
         /// network-sourced candidate; eager-wins (see `Seed.weighed`).
         let weighed: Bool
+        /// The carriage this candidate's proof derives from in-host, when no
+        /// package or stored evidence supplies it (`Seed.derivation`).
+        let derivation: Carriage?
     }
 
     struct Seed: Sendable {
@@ -75,6 +78,11 @@ struct BlockFetcher {
         /// push, or its durable inbox), not an overlay peer's. Monotone:
         /// once a parent seed touches an attempt it stays parent-backed.
         let fromParent: Bool
+        /// The co-hosted parent's carriage of this block under its root: the
+        /// attempt derives its proof in-host (`Carriage.proof`). Keyed like a
+        /// package, by the carriage's root, and scheduled with the same
+        /// priority as the parent's evidence. Kept once set.
+        let derivation: Carriage?
 
         init(
             blockCID: String,
@@ -82,16 +90,23 @@ struct BlockFetcher {
             recoveryRootCID: String? = nil,
             provider: CandidateProvider? = nil,
             weighed: Bool = false,
-            fromParent: Bool = false
+            fromParent: Bool = false,
+            derivation: Carriage? = nil
         ) {
             self.blockCID = blockCID
             self.package = package
-            self.recoveryRootCID = package?.package.proof.rootCID
-                ?? recoveryRootCID
+            let rootCID = package?.package.proof.rootCID
+                ?? recoveryRootCID ?? derivation?.rootCID
+            self.recoveryRootCID = rootCID
             self.provider = provider
             self.weighed = weighed
             self.fromParent = fromParent && package != nil
+            self.derivation = derivation?.rootCID == rootCID ? derivation : nil
         }
+
+        /// A rooted seed that supplies the block's proof, by package or by
+        /// derivation: it supersedes the rootless attempt.
+        var suppliesProof: Bool { package != nil || derivation != nil }
     }
 
     struct DurableDescendant: Hashable, Sendable {
@@ -128,6 +143,10 @@ struct BlockFetcher {
         var evidenceRetries: Int = 0
         /// Seeded with the configured parent's evidence (`Seed.fromParent`).
         var fromParent = false
+        /// Derives its proof in-host (`Seed.derivation`).
+        var derivation: Carriage?
+        /// Whether the attempt holds a proof, or the means to derive one.
+        var suppliesProof: Bool { package != nil || derivation != nil }
         /// The parent fact a `.wait(.parentFact)` park waits on; nil when no
         /// parent level can answer it, so no tip change wakes it.
         var parentFact: ParentFact?
@@ -300,7 +319,7 @@ struct BlockFetcher {
         let rootCID = seed.recoveryRootCID
         if rootCID == nil, seed.package == nil,
            record.attempts.contains(where: {
-               $0.key != nil && $0.value.package != nil
+               $0.key != nil && $0.value.suppliesProof
            }) {
             records[seed.blockCID] = record
             fillReadyCapacity()
@@ -321,6 +340,13 @@ struct BlockFetcher {
             attempt.fromParent = attempt.fromParent || seed.fromParent
             let previous = attempt.package
             var packageChanged = false
+            if attempt.derivation == nil, let derivation = seed.derivation {
+                // A new means to the proof: wakes an evidence wait like a
+                // new package.
+                attempt.derivation = derivation
+                attempt.revision &+= 1
+                packageChanged = true
+            }
             if let package = seed.package,
                let merged = Self.mergePackages(previous, package) {
                 attempt.package = merged
@@ -354,11 +380,12 @@ struct BlockFetcher {
                 state: .ready,
                 weighed: seed.weighed
                     || (record.attempts[nil]?.weighed ?? false),
-                fromParent: seed.fromParent
+                fromParent: seed.fromParent,
+                derivation: seed.derivation
             )
         }
         records[seed.blockCID] = record
-        if rootCID != nil, seed.package != nil {
+        if rootCID != nil, seed.suppliesProof {
             removeSupersededRootlessAttempt(for: seed.blockCID)
         }
 
@@ -455,7 +482,8 @@ struct BlockFetcher {
                 providers: record.providers.values.sorted {
                     $0.publicKey < $1.publicKey
                 },
-                weighed: attempt.weighed
+                weighed: attempt.weighed,
+                derivation: attempt.derivation
             )
         }
         return nil
@@ -504,7 +532,7 @@ struct BlockFetcher {
             if reason == .evidence,
                ticket.key.rootCID == nil,
                record.attempts.contains(where: {
-                   $0.key != nil && $0.value.package != nil
+                   $0.key != nil && $0.value.suppliesProof
                }) {
                 record.attempts[ticket.key.rootCID] = attempt
                 records[ticket.key.blockCID] = record
@@ -516,7 +544,7 @@ struct BlockFetcher {
                     ? record.providerRevision > ticket.providerRevision
                     : reason == .evidence
                         && attempt.revision > ticket.attemptRevision
-                        && attempt.package != nil
+                        && attempt.suppliesProof
             if gainedRelevantFact {
                 attempt.state = .ready
                 record.attempts[ticket.key.rootCID] = attempt
@@ -768,10 +796,12 @@ struct BlockFetcher {
         }
         guard !readySet.contains(key) else { return true }
         // The parent's evidence is bounded by the parent (and durable in
-        // the inbox): it is never refused for a pool an overlay peer can
-        // fill with announcements.
+        // the inbox), and so are its carriages (a bounded queue): neither is
+        // refused for a pool an overlay peer can fill with announcements.
+        let attempt = records[key.blockCID]?.attempts[key.rootCID]
         guard readySet.count < Self.readyCapacity
-                || records[key.blockCID]?.attempts[key.rootCID]?.fromParent == true
+                || attempt?.fromParent == true
+                || attempt?.derivation != nil
         else {
             return false
         }

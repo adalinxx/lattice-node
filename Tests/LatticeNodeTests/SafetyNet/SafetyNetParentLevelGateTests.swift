@@ -26,6 +26,7 @@ final class SafetyNetParentLevelGateTests: XCTestCase {
         "runReport",
         "ungatedValidatedTip",
         "fetch",
+        "recoveredAuthenticatedChildPackage",
     ]
 
     /// Every member `LocalChildLevel` may call, as `<receiver>.<member>`:

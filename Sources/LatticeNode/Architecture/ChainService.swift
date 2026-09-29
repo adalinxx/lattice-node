@@ -136,6 +136,14 @@ public actor ChainService {
     /// by its own task.
     private var parentPlanSignal: AsyncStream<Void>.Continuation?
     private var parentPlanDrain: Task<Void, Never>?
+    /// The carriages the parent sends (`ParentChange.carried`), bounded
+    /// (`carriedQueueCapacity`) and drained by their own task, never behind
+    /// the ordered runs. A carriage the full queue drops sets
+    /// `carriedReconcile`: reconciliation re-derives it from parent state.
+    private var parentCarriedSignal: AsyncStream<Carriage>.Continuation?
+    private var parentCarriedDrain: Task<Void, Never>?
+    private nonisolated let carriedReconcile = Published<Bool>()
+    static let carriedQueueCapacity = 1_024
     private let maximumChildCandidates: Int
     private var liveMempoolRoots = Set<String>()
     private var mempoolUnavailable = false
@@ -256,6 +264,8 @@ public actor ChainService {
         parentTipSignal = nil
         parentPlanSignal?.finish()
         parentPlanSignal = nil
+        parentCarriedSignal?.finish()
+        parentCarriedSignal = nil
         if let drain = parentMailboxDrain {
             await drain.value
             parentMailboxDrain = nil
@@ -267,6 +277,10 @@ public actor ChainService {
         if let drain = parentPlanDrain {
             await drain.value
             parentPlanDrain = nil
+        }
+        if let drain = parentCarriedDrain {
+            await drain.value
+            parentCarriedDrain = nil
         }
         // A rebuild re-checks `stopped` between builds; join the one running.
         await candidateRebuild.take()?.value
@@ -311,7 +325,8 @@ public actor ChainService {
             && executionWalkWorker == nil && executionWalkRetryTask == nil
             && transactionPublicationWorker == nil
             && parentMailboxDrain == nil && parentTipDrain == nil
-            && parentPlanDrain == nil && candidateRebuild.isEmpty
+            && parentPlanDrain == nil && parentCarriedDrain == nil
+            && candidateRebuild.isEmpty
             && carrierProofDeliveries.isEmpty && ingressInFlight == 0
     }
     #endif
@@ -2105,6 +2120,24 @@ public actor ChainService {
         outcome: NodeImportOutcome
     ) async {
         guard let link = outcome.parentCarrierLink else { return }
+        // Each hosted child derives the carried block's proof in-host from
+        // this relay link, durable now that `importBlock` returned. Only an
+        // enqueue: the child's derivation never holds this level's lease.
+        if !childLevels.isEmpty {
+            let commitments = await process.childCommitments(
+                ofCarrier: header.rawCID
+            )
+            for (directory, level) in childLevels {
+                let childCID = commitments?[directory]
+                // Known commitments without this directory: nothing carried.
+                if commitments != nil, childCID == nil { continue }
+                level.parentChanged(.carried(Carriage(
+                    carrierCID: header.rawCID,
+                    rootCID: link.rootCID,
+                    childCID: childCID
+                )))
+            }
+        }
         // Admission and the miner response depend only on the durable proof,
         // never on child availability. Delivery is an asynchronous hint; the
         // retained route remains pullable and retryable after failure/restart.
@@ -2405,6 +2438,8 @@ public actor ChainService {
         fileprivate let tipSignal: AsyncStream<Void>.Continuation
         fileprivate let plan: Published<DescendantPlan>
         fileprivate let planSignal: AsyncStream<Void>.Continuation
+        fileprivate let carried: AsyncStream<Carriage>.Continuation
+        fileprivate let reconcile: Published<Bool>
 
         func send(_ change: ParentChange) {
             switch change {
@@ -2413,8 +2448,19 @@ public actor ChainService {
             case .plan(let plan):
                 self.plan.swap(plan)
                 planSignal.yield()
+            case .carried(let carriage):
+                // Full: dropped, and reconciliation owes it.
+                if case .dropped = carried.yield(carriage) {
+                    reconcile.swap(true)
+                }
             }
         }
+    }
+
+    /// Whether the carried queue dropped a carriage since this level
+    /// started: reconciliation with the parent is owed.
+    nonisolated var carriedReconcileNeeded: Bool {
+        carriedReconcile.value ?? false
     }
 
     /// Opens this child level's parent mailbox; the host calls it once, when
@@ -2435,13 +2481,15 @@ public actor ChainService {
     /// and then rebuild this level's snapshot; a plan change, kept newest
     /// only, rebuilds it from a third. `candidateGate` says whether this level
     /// may build a candidate now; `candidateChanged` tells the parent level
-    /// this level's snapshot changed. `shutdown` finishes all three and
-    /// joins them.
+    /// this level's snapshot changed. Carriages run `parentCarried` on a
+    /// fourth task, in the order sent, from a bounded queue. `shutdown`
+    /// finishes all four and joins them.
     func openParentMailbox(
         tipChanged: @escaping @Sendable () async -> Void,
         serveParentRuns: @escaping @Sendable () async -> Void,
         candidateGate: @escaping @Sendable (_ pendingHandoff: [String]) async -> Bool,
-        candidateChanged: @escaping @Sendable () async -> Void
+        candidateChanged: @escaping @Sendable () async -> Void,
+        parentCarried: @escaping @Sendable (Carriage) async -> Void = { _ in }
     ) -> ParentMailbox {
         precondition(parentMailbox == nil, "one parent mailbox per level")
         let (stream, continuation) = AsyncStream.makeStream(
@@ -2453,16 +2501,22 @@ public actor ChainService {
         let (plans, planSignal) = AsyncStream.makeStream(
             of: Void.self, bufferingPolicy: .bufferingNewest(1)
         )
+        let (carriages, carriedSignal) = AsyncStream.makeStream(
+            of: Carriage.self,
+            bufferingPolicy: .bufferingOldest(Self.carriedQueueCapacity)
+        )
         if stopped {
             continuation.finish()
             tipSignal.finish()
             planSignal.finish()
+            carriedSignal.finish()
         } else {
             self.candidateGate = candidateGate
             self.candidateChanged = candidateChanged
             parentMailbox = continuation
             parentTipSignal = tipSignal
             parentPlanSignal = planSignal
+            parentCarriedSignal = carriedSignal
             parentMailboxDrain = Task { [weak self] in
                 for await item in stream {
                     guard let self else { return }
@@ -2495,6 +2549,9 @@ public actor ChainService {
             parentPlanDrain = Task { [weak self] in
                 for await _ in plans { await self?.scheduleCandidateRebuild() }
             }
+            parentCarriedDrain = Task {
+                for await carriage in carriages { await parentCarried(carriage) }
+            }
             continuation.yield(.serveParentRuns)
             scheduleCandidateRebuild()
         }
@@ -2502,7 +2559,9 @@ public actor ChainService {
             continuation: continuation,
             tipSignal: tipSignal,
             plan: parentPlan,
-            planSignal: planSignal
+            planSignal: planSignal,
+            carried: carriedSignal,
+            reconcile: carriedReconcile
         )
     }
 
