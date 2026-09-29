@@ -1242,4 +1242,35 @@ final class BlockFetcherTests: XCTestCase {
         XCTAssertTrue(fetcher.complete(first.ticket, resolution: .connected))
         XCTAssertTrue(fetcher.observe(seed(BlockFetcher.derivedCapacity)).accepted)
     }
+
+    /// Parent-fact links read locally are set on the attempt, beside its
+    /// package: a package with other proof bytes cannot refuse them, and they
+    /// carry no tier (a weighed attempt stays weighed).
+    func testParentFactLinksAreSetOnTheAttemptBesideItsPackage() throws {
+        let carriage = Carriage(carrierCID: "carrier", rootCID: "root", childCID: "block")
+        let peerPackage = try childPackage(rootCID: "root")
+        var fetcher = BlockFetcher()
+        XCTAssertTrue(fetcher.observe(.init(
+            blockCID: "block", package: peerPackage, weighed: true, derivation: carriage
+        )).accepted)
+        let first = try XCTUnwrap(fetcher.next())
+        XCTAssertNil(first.parentFactLinks)
+        XCTAssertTrue(fetcher.complete(first.ticket, resolution: .wait(.parentFact)))
+        let links = ParentFactLinks(continuity: ParentStateContinuityLink(
+            parentPath: ["Nexus"], fromStateCID: "empty", toStateCID: "state"
+        ))
+        _ = fetcher.observe(.init(
+            blockCID: "block", package: nil, recoveryRootCID: "root", parentFactLinks: links
+        ))
+        fetcher.retryExternalDependency(blockCID: "block", rootCID: "root")
+        let second = try XCTUnwrap(fetcher.next())
+        XCTAssertEqual(second.parentFactLinks, links)
+        XCTAssertTrue(second.weighed)
+        XCTAssertEqual(second.derivation, carriage)
+        XCTAssertEqual(
+            try second.package?.package.proof.serialize(),
+            try peerPackage.package.proof.serialize(),
+            "the package is untouched"
+        )
+    }
 }
