@@ -11,7 +11,7 @@ import XCTest
 ///   declared type or initializer names a task in any spelling it knows
 ///   (`Task<…>`, `Optional<Task<…>>`, a collection or tuple of tasks, a
 ///   typealias of one, `= Task {…}`, `= Task.detached`, a
-///   `Timers.deadline(…)` initializer), across lines. The allowlist names
+///   `timers.deadline(…)` initializer), across lines. The allowlist names
 ///   each other stored task and why no stale task can clobber it.
 /// - In the network runtime (`NodeNetworkRuntime*.swift`) a per-peer record
 ///   is created only where a session is established, and removed by key
@@ -115,7 +115,7 @@ final class SafetyNetLifetimeGateTests: XCTestCase {
     private static func mentionsTask(_ text: String, aliases: Set<String>) throws -> Bool {
         let range = NSRange(text.startIndex..., in: text)
         let task = try NSRegularExpression(
-            pattern: #"(?<![\w.])Task\s*(?:<|\{|\(|\.detached\b|\.immediate\b|\?|\]|,|\)|$)|\bTimers\.deadline\s*\("#,
+            pattern: #"(?<![\w.])Task\s*(?:<|\{|\(|\.detached\b|\.immediate\b|\?|\]|,|\)|$)|\b(?:timers|Timers\([^)]*\))\.deadline\s*\("#,
             options: [.anchorsMatchLines]
         )
         if task.firstMatch(in: text, range: range) != nil { return true }
@@ -260,7 +260,8 @@ final class SafetyNetLifetimeGateTests: XCTestCase {
             var detached = Task.detached { }
             var prioritized = Task(priority: .low) { }
             var immediate = Task.immediate { }
-            var timer = Timers.deadline(after: .seconds(1), generation: 0) { _ in }
+            var timer = timers.deadline(after: .seconds(1), generation: 0) { _ in }
+            var built = Timers(clock: clock).deadline(after: .seconds(1), generation: 0) { _ in }
             var slot = TaskSlot()
             var group: TaskGroup<Int>?
             var computed: Task<Void, Never>? { nil }
@@ -278,7 +279,7 @@ final class SafetyNetLifetimeGateTests: XCTestCase {
                 "Sample.plain", "Sample.fixed", "Sample.wrapped", "Sample.byKey",
                 "Sample.list", "Sample.pair", "Sample.aliased", "Sample.aliasedList",
                 "Sample.split", "Sample.spread", "Sample.inferred", "Sample.detached",
-                "Sample.prioritized", "Sample.immediate", "Sample.timer",
+                "Sample.prioritized", "Sample.immediate", "Sample.timer", "Sample.built",
             ]
         )
     }

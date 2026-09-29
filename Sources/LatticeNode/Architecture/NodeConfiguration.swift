@@ -122,6 +122,8 @@ public struct NodeConfiguration: Sendable {
     /// peer, and it has no bearing on validation or fork choice. `0` disables.
     public let peerSearchInterval: TimeInterval
     public let resourcePolicy: NodeResourcePolicy
+    /// The clock every node timer sleeps on.
+    let clock: any NodeClock
 
     /// Overlay slots kept in reserve for outbound dials so a burst of inbound
     /// connections (from one source, especially behind a proxy where the
@@ -143,7 +145,8 @@ public struct NodeConfiguration: Sendable {
         externalAddress: String? = nil,
         publicReadURL: String? = nil,
         peerSearchInterval: TimeInterval = 600,
-        resourcePolicy: NodeResourcePolicy = .default
+        resourcePolicy: NodeResourcePolicy = .default,
+        clock: any NodeClock = SystemClock()
     ) throws {
         guard let address = ChainAddress(chainPath) else {
             throw NodeConfigurationError.invalidChainPath
@@ -215,6 +218,7 @@ public struct NodeConfiguration: Sendable {
         self.publicReadURL = declaredReadURL
         self.peerSearchInterval = max(0, peerSearchInterval)
         self.resourcePolicy = resourcePolicy
+        self.clock = clock
     }
 
     public var chainPath: [String] { address.components }

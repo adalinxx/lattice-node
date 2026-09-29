@@ -99,7 +99,7 @@ extension NodeNetworkRuntime {
         }
         current.awaitResponse(
             requestID: requestID,
-            timeout: Timers.deadline(
+            timeout: timers.deadline(
                 after: planeConfigurations.overlay.requestTimeout,
                 generation: generation
             ) { [weak self] generation in
@@ -252,7 +252,7 @@ extension NodeNetworkRuntime {
         }
         current.awaitResponse(
             requestID: requestID,
-            timeout: Timers.deadline(
+            timeout: timers.deadline(
                 after: planeConfigurations.overlay.requestTimeout,
                 generation: generation
             ) { [weak self] generation in
@@ -392,7 +392,7 @@ extension NodeNetworkRuntime {
         let epoch = overlayState.rangeSync.advanceProgressEpoch()
         sync.progressEpoch = epoch
         sync.progressTimeout?.cancel()
-        sync.progressTimeout = Timers.deadline(
+        sync.progressTimeout = timers.deadline(
             after: planeConfigurations.overlay.requestTimeout * 3,
             generation: generation
         ) { [weak self] generation in
@@ -516,7 +516,7 @@ extension NodeNetworkRuntime {
         let generation = runtimeGeneration
         let delay = planeConfigurations.overlay.requestTimeout
         overlayState.rangeSync.reentryTask.start { token in
-            Timers.deadline(
+            timers.deadline(
                 after: delay,
                 generation: generation
             ) { [weak self] generation in

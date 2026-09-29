@@ -136,7 +136,7 @@ extension NodeNetworkRuntime {
         // explorer route's critical path.
         let timeout = ReadURLDiscovery.readEndpointAskTimeout
         return await withCheckedContinuation { continuation in
-            let timeoutTask = Timers.deadline(
+            let timeoutTask = timers.deadline(
                 after: timeout,
                 generation: generation
             ) { [weak self] _ in

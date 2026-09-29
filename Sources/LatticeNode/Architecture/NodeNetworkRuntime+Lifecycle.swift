@@ -176,7 +176,7 @@ extension NodeNetworkRuntime {
         generation: UInt64,
         process: ChainProcess
     ) async -> Bool {
-        await Timers.poll(every: .milliseconds(10), onCancel: false) {
+        await timers.poll(every: .milliseconds(10), onCancel: false) {
             guard isCurrentRuntime(generation: generation, process: process),
                   peer.map({
                       hierarchyState.hierarchyRecords[$0.key]?.session?.sessionID == $0.sessionID

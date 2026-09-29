@@ -78,6 +78,7 @@ public actor ChainService {
     }
 
     private let process: ChainProcess
+    private nonisolated var timers: Timers { Timers(clock: process.configuration.clock) }
     private let pool: TransactionPool
     private let templates: MiningTemplateBook
     private let network: any NetworkInterface
@@ -1570,7 +1571,7 @@ public actor ChainService {
     /// source.
     private func scheduleExecutionWalkRetry() {
         guard executionWalkRetryTask == nil else { return }
-        executionWalkRetryTask = Timers.deadline(
+        executionWalkRetryTask = timers.deadline(
             after: executionWalkRetryInterval,
             generation: 0
         ) { [weak self] _ in
