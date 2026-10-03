@@ -23,12 +23,12 @@ public enum NexusGenesis {
         // The real launch time, in milliseconds. Changing it changes
         // `expectedBlockHash` and every derived identity; set it only with
         // scripts/set-nexus-genesis-timestamp.sh.
-        timestamp: 0
+        timestamp: 1791044285000
     )
 
     /// Canonical identity of the Nexus bootstrap block.
     public static let expectedBlockHash =
-        "bafyreigsvcxa7kveg7ywaykwqqwvakgtcujds634k4cc6mejyh43pmoqny"
+        "bafyreidqfbuxdbjzvk2vziyulor5igqlker2it2w6dno73vlv3vh2pa46y"
 
     public static func buildGenesisBlock(fetcher: any Fetcher) async throws -> Block {
         let body = TransactionBody(

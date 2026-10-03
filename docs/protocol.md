@@ -24,7 +24,7 @@ level validates its own sparse route and chooses its own canonical projection.
 The pinned Nexus genesis CID is:
 
 ```text
-bafyreigsvcxa7kveg7ywaykwqqwvakgtcujds634k4cc6mejyh43pmoqny
+bafyreidqfbuxdbjzvk2vziyulor5igqlker2it2w6dno73vlv3vh2pa46y
 ```
 
 It contains the deterministic premine transaction for public key

@@ -21,7 +21,7 @@ for command in curl jq; do
     }
 done
 
-readonly expected_genesis="bafyreigsvcxa7kveg7ywaykwqqwvakgtcujds634k4cc6mejyh43pmoqny"
+readonly expected_genesis="bafyreidqfbuxdbjzvk2vziyulor5igqlker2it2w6dno73vlv3vh2pa46y"
 readonly tmp="$(mktemp -d)"
 readonly port="$((20000 + RANDOM % 20000))"
 readonly rpc_port="$((port + 2))"

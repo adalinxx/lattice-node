@@ -17,7 +17,7 @@ workers.
 5. Use one reviewed revision for the node, coordinator, workers, CLI, and
    deployment image.
 6. Pin Nexus to
-   `bafyreigsvcxa7kveg7ywaykwqqwvakgtcujds634k4cc6mejyh43pmoqny`.
+   `bafyreidqfbuxdbjzvk2vziyulor5igqlker2it2w6dno73vlv3vh2pa46y`.
 7. Start with a fresh runtime store after any incompatible release. There are
    no storage migrations or compatibility readers.
 
