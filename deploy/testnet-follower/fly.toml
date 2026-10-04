@@ -53,5 +53,5 @@ primary_region = "iad"
 # One process hosts the whole tree. Keep headroom for cold-sync execution and
 # the shared content store.
 [[vm]]
-  size = "shared-cpu-1x"
+  size = "performance-1x"
   memory = "2gb"
