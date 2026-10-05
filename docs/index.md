@@ -58,5 +58,6 @@ Background on *why* things are shaped the way they are — design notes, not API
 - [design/process-trust-model.md](design/process-trust-model.md) — co-hosted parent authority, in-process parent facts, loopback evidence, and independent content verification.
 - [design/mining-role-boundaries.md](design/mining-role-boundaries.md) — the node/coordinator/worker mining contract.
 - [design/consensus-fork-choice.md](design/consensus-fork-choice.md) — the node's operational duties around Lattice-owned consensus.
+- [design/bitcoin-anchored-genesis.md](design/bitcoin-anchored-genesis.md) — the Bitcoin transaction that commits the Nexus genesis CID, and how to verify it independently.
 - [design/proof-derived-work.md](design/proof-derived-work.md) — proof-derived child work, run attribution, and parent-state continuity.
 - [design/deterministic-simulation-testing.md](design/deterministic-simulation-testing.md) — rationale for the implemented seeded simulator covering ordering, crash, partition, skew, and peer misbehaviour.
