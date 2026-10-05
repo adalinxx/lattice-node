@@ -134,9 +134,11 @@ Nexus is pinned to the deterministic local genesis CID:
 `bafyreiggtg4ezifboyekbf4gxst2jr3mpjqcxsbmopy7w6fp46g4ngpgxa`
 
 Its timestamp is the real launch time (Unix milliseconds) in
-`Sources/LatticeNode/Configuration/NexusGenesis.swift`, set only with
-`scripts/set-nexus-genesis-timestamp.sh`. The full constants are documented in
-[docs/protocol.md](docs/protocol.md).
+`Sources/LatticeNode/Configuration/NexusGenesis.swift`. The full constants are
+documented in [docs/protocol.md](docs/protocol.md).
+
+The genesis is final: its CID is committed in a Bitcoin transaction. See
+[docs/design/bitcoin-anchored-genesis.md](docs/design/bitcoin-anchored-genesis.md).
 
 ## Storage compatibility
 
