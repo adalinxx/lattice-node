@@ -24,7 +24,7 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/adalinxx/cashew.git",
       "state" : {
-        "revision" : "424757e724a0861cd7522481889e45b8de859d92",
+        "revision" : "f5c3721e31c129fa46827d6f176f491c7ffdb5a8",
         "version" : "5.0.0"
       }
     },
@@ -60,7 +60,7 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/adalinxx/Ivy.git",
       "state" : {
-        "revision" : "9d9e14237847f23d929298b271217461c81e8146",
+        "revision" : "33c4690839bc93db747d95254cfb5edf8f429850",
         "version" : "13.1.0"
       }
     },
@@ -69,7 +69,7 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/adalinxx/Lattice.git",
       "state" : {
-        "revision" : "bcffa73336d988a437787341a9f0244e427094f8",
+        "revision" : "5e49e435844e4f7ebb8aa7920e2e787f9e252b09",
         "version" : "44.0.0"
       }
     },
