@@ -214,11 +214,55 @@ final class SessionOutboxDeliveryTests: XCTestCase {
         XCTAssertTrue(sent.isEmpty)
     }
 
+    func testTheOperatorsQueuedByteBudgetBoundsASession() async throws {
+        let transport = ScriptedTransport()
+        let outbox = SessionOutbox(
+            send: { _, topic, _ in await transport.send(topic) },
+            waitUntilWritable: { _ in await transport.waitUntilWritable() },
+            maximumQueuedBytesPerSession: 2_048
+        )
+        let page = Data(count: 1_024)
+        _ = await outbox.send(to: peer, topic: "page-0", payload: page)
+        _ = await outbox.send(to: peer, topic: "page-1", payload: page)
+        let overflow = await outbox.send(to: peer, topic: "overflow", payload: page)
+        let refused = await finishes(overflow, within: .seconds(2))
+        XCTAssertEqual(refused, false, "past the operator's byte budget a send is refused at once")
+        await transport.end()
+    }
+
+    /// The byte budget bounds backlog: a session with nothing queued takes
+    /// one message of any size, so the smallest budget still delivers.
+    func testAMessageIntoAnEmptySessionIsTakenWhateverTheByteBudget() async throws {
+        let transport = ScriptedTransport()
+        let outbox = SessionOutbox(
+            send: { _, topic, _ in await transport.send(topic) },
+            waitUntilWritable: { _ in await transport.waitUntilWritable() },
+            maximumQueuedBytesPerSession: 1
+        )
+        let page = Data(count: 1_024 * 1_024)
+        let first = await outbox.send(to: peer, topic: "first", payload: page)
+        let behind = await outbox.send(to: peer, topic: "behind", payload: page)
+        let refused = await finishes(behind, within: .seconds(2))
+        XCTAssertEqual(refused, false, "the budget bounds what queues behind the first message")
+        await transport.drain()
+        let firstDelivered = await first.value
+        XCTAssertTrue(firstDelivered)
+        // The lane empties in the delivery's follow-up; allow it a moment.
+        var delivered = false
+        for _ in 0..<100 where !delivered {
+            delivered = await outbox.send(to: peer, topic: "after-drain", payload: page).value
+            if !delivered { try await Task.sleep(for: .milliseconds(20)) }
+        }
+        XCTAssertTrue(delivered)
+        let sent = await transport.sent
+        XCTAssertEqual(sent, ["first", "after-drain"])
+    }
+
     func testASessionsQueuedBytesAreBounded() async throws {
         let transport = ScriptedTransport()
         let outbox = outbox(transport)
         let page = Data(count: 1_024 * 1_024)
-        let fitting = SessionOutbox.maximumQueuedBytesPerSession / page.count
+        let fitting = outbox.maximumQueuedBytesPerSession / page.count
         var queued: [Task<Bool, Never>] = []
         for index in 0..<fitting {
             queued.append(await outbox.send(to: peer, topic: "page-\(index)", payload: page))
