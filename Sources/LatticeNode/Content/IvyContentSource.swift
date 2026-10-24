@@ -64,9 +64,10 @@ public struct IvyRootContentSource: Sendable {
         public let servedByPublicKeys: Set<String>
         public let allResponsesComplete: Bool
         public let localCapacityUnavailable: Bool
-        /// Verified content this session received was past its byte budget
-        /// by this node's own count: this node's choice, not content nobody
-        /// served. Never a size a peer only declared.
+        /// Content past this session's byte budget: verified content by this
+        /// node's own count, or a Volume whose declared size Ivy declined
+        /// with the session's whole allowance reserved. This node's choice,
+        /// not content nobody served; it blames no peer.
         public let byteBudgetExceeded: Bool
         public let contentUnavailable: Bool
 
@@ -443,10 +444,12 @@ public struct IvyRootContentSource: Sendable {
                     continue
                 }
                 if declined {
-                    // A size the peer only declared is its claim: past the
-                    // session's whole allowance it is not taken, and says
-                    // nothing about this node's budget.
+                    // Declined with the session's whole allowance reserved:
+                    // this node's own bound refused the size the peer
+                    // declared, before taking it in. Named as this node's
+                    // budget, and no one is blamed for it.
                     await context.budget.release(bytes)
+                    context.trace.markOverBudget()
                     return (response, false, false)
                 }
                 // An answer past the session's whole allowance (from a

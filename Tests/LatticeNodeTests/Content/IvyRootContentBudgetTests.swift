@@ -98,15 +98,30 @@ final class IvyRootContentBudgetTests: XCTestCase {
         XCTAssertTrue(declined.attribution.byteBudgetExceeded)
     }
 
-    /// A size a peer declares is its claim, verified by nothing: an answer
-    /// refused for it says nothing about this node's budget.
-    func testASizeAPeerOnlyDeclaredIsNotThisNodesBudget() async throws {
+    /// A size a peer declares is refused before its bytes are taken: first
+    /// past a small reservation, when the Volume is asked for again with the
+    /// session's whole allowance, then past that, which is this node's
+    /// budget declining it. Nobody is blamed.
+    func testADeclaredSizePastTheWholeAllowanceIsThisNodesBudget() async throws {
         let item = try content(1)
-        let source = IvyRootContentSource { _ in
-            AttributedVolumeResponse(rootCID: "", entries: [:], servedBy: nil, failure: .callerBoundaryExceeded)
-        }
+        let asks = Asks()
+        let source = IvyRootContentSource(fetch: { _ in
+            await asks.add()
+            return AttributedVolumeResponse(rootCID: "", entries: [:], servedBy: nil, failure: .callerBoundaryExceeded)
+        }, report: { _, _ in await asks.report() })
         let refused = await source.withRootTracing(item.cid) { session in await session.fetch([item.cid]) }
         XCTAssertTrue(refused.value.isEmpty)
-        XCTAssertFalse(refused.attribution.byteBudgetExceeded)
+        XCTAssertTrue(refused.attribution.byteBudgetExceeded)
+        let count = await asks.count
+        let reports = await asks.reports
+        XCTAssertEqual(count, 2, "a small reservation, then the whole allowance")
+        XCTAssertEqual(reports, 0)
+    }
+
+    private actor Asks {
+        private(set) var count = 0
+        private(set) var reports = 0
+        func add() { count += 1 }
+        func report() { reports += 1 }
     }
 }
