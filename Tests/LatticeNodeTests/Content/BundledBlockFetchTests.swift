@@ -191,9 +191,13 @@ final class BundledBlockFetchTests: XCTestCase {
             timestamp: chain.transfer.timestamp, nonce: chain.transfer.nonce, fetcher: joiner
         )
         XCTAssertEqual(replayed.postState.rawCID, chain.transfer.postState.rawCID)
-        // Nothing a peer sent is stored before the block is found valid.
-        let unrecorded = await joiner.volumeBundle(cid)
-        XCTAssertEqual(unrecorded, [cid])
+        // What a peer sent is written to the store as it verifies, held
+        // under the block's fetched scope and pinned by nothing else until
+        // the block is found valid.
+        let fetched = try await joiner.broker.retainedScopes(prefix: joiner.scopes.fetched(cid))
+        XCTAssertFalse(fetched.isEmpty)
+        let unpinned = try await joiner.broker.retainedRoots(scope: joiner.scopes.body(cid))
+        XCTAssertEqual(unpinned, [])
         // Once it is, the joiner records the same bundle, so it serves the
         // block the same way.
         try await joiner.storeValidBlock(cid, at: ["Nexus"], from: Self.held(joiner))
@@ -255,14 +259,16 @@ final class BundledBlockFetchTests: XCTestCase {
         let volumes = await requests.volumes
         XCTAssertEqual(bundles, [root.cid])
         XCTAssertEqual(volumes, [member.cid])
-        // Only verified Volumes the session used are credited and charged:
-        // not the corrupted one, nor the one nothing asked for.
+        // Only verified Volumes the session used are credited: not the
+        // corrupted one, nor the one nothing asked for. Every verified one
+        // the session wrote is charged, that one too; the corrupted one is not.
         let credited = await credits.volumes
         XCTAssertEqual(credited, ["\(root.data.count)", "\(member.data.count)"])
         XCTAssertEqual(
             result.value.2,
             root.cid.utf8.count + root.data.count + member.cid.utf8.count + member.data.count
-                + 2 * IvyRootContentSource.retainedEntryOverhead
+                + unused.cid.utf8.count + unused.data.count
+                + 3 * IvyRootContentSource.retainedEntryOverhead
         )
     }
 
@@ -587,10 +593,10 @@ final class BundledBlockFetchTests: XCTestCase {
         XCTAssertEqual(remote.peerCapabilities.sessions(speaking: ChainHandshake.volumeBundle), [serverPeer])
     }
 
-    /// Held-aside bundle Volumes and stored content share one byte budget:
-    /// content the traversal stores takes it from a Volume only held aside,
-    /// which is dropped and then requested like any other.
-    func testHeldAsideVolumesShareTheSessionsOneByteBudget() async throws {
+    /// Bundle Volumes and requested content share the session's one byte
+    /// budget: a bundled Volume is written, and charged, as it arrives, and
+    /// what it took is not there for a Volume requested later.
+    func testBundledVolumesShareTheSessionsOneByteBudget() async throws {
         let root = try content(1)
         let held = try content(2)
         let other = try content(3)
@@ -619,13 +625,14 @@ final class BundledBlockFetchTests: XCTestCase {
             return (first, second, third)
         }
         XCTAssertEqual(result.value.0, [root.cid: root.data])
-        XCTAssertEqual(result.value.1, [other.cid: other.data])
-        // Stored content left no room for the held Volume: it was dropped,
-        // so the traversal requested it, and the budget declined it once.
-        XCTAssertEqual(result.value.2, [:])
+        // The bundle left no room for the requested Volume: the budget
+        // declined it once.
+        XCTAssertEqual(result.value.1, [:])
         XCTAssertTrue(result.attribution.byteBudgetExceeded)
+        // The bundled one is held: read without a request.
+        XCTAssertEqual(result.value.2, [held.cid: held.data])
         let volumes = await requests.volumes
-        XCTAssertEqual(volumes, [other.cid, held.cid])
+        XCTAssertEqual(volumes, [other.cid])
     }
 
     /// A capable peer answers every bundle with a Volume that verifies and
@@ -713,9 +720,62 @@ final class BundledBlockFetchTests: XCTestCase {
         }
     }
 
-    /// What the node holds and what its reads keep in memory: what a block
-    /// found valid is stored from.
+    /// A body is fetched from peers once: its connect reads it from the
+    /// store, asking peers nothing, and pins it under the block's name;
+    /// what was fetched for the block then goes from the fetched scope.
+    func testAFetchedBodyIsConnectedWithoutASecondFetch() async throws {
+        let producer = try await storage(keyByte: 0x66)
+        let joiner = try await storage(keyByte: 0x67)
+        let chain = try await transferChain(by: producer)
+        let cid = try BlockHeader(node: chain.transfer).rawCID
+        let requests = Requests()
+        let remote = remote(producer, requests: requests)
+        let stored = try await joiner.fetchChainBody(cid, remote: remote)
+        let fetchedBundles = await requests.bundles
+        let fetchedVolumes = await requests.volumes
+        XCTAssertEqual(fetchedBundles, [cid])
+
+        // The connect's read: the block's own Volume first, then its body,
+        // through a session that would ask peers for whatever is missing.
+        let connected = await NodeRuntime.reading(cid, storage: joiner, remote: remote) { fetcher in
+            (try? await joiner.storeValidBlock(cid, at: ["Nexus"], from: fetcher)) != nil
+        }
+        XCTAssertTrue(connected)
+        let bundles = await requests.bundles
+        let volumes = await requests.volumes
+        XCTAssertEqual(bundles, fetchedBundles, "no second bundle request")
+        XCTAssertEqual(volumes, fetchedVolumes, "no Volume requested again")
+
+        let pinned = try await joiner.broker.retainedRoots(scope: joiner.scopes.body(cid))
+        XCTAssertTrue(pinned.contains(cid))
+        await joiner.releaseFetched(cid)
+        let fetched = try await joiner.broker.retainedScopes(prefix: joiner.scopes.fetchedPrefix)
+        XCTAssertEqual(fetched, [])
+        for root in stored {
+            let held = await joiner.volume(root)
+            XCTAssertNotNil(held, "what the block pinned stays: \(root)")
+        }
+    }
+
+    /// A body the node no longer wants goes from the store with its
+    /// fetched scope; nothing pinned it.
+    func testAReleasedBodyLeavesNothingBehind() async throws {
+        let producer = try await storage(keyByte: 0x68)
+        let joiner = try await storage(keyByte: 0x69)
+        let cid = try BlockHeader(node: try await transferChain(by: producer).transfer).rawCID
+        _ = try await joiner.fetchChainBody(cid, remote: remote(producer, requests: Requests()))
+        let held = await joiner.volume(cid)
+        XCTAssertNotNil(held)
+        await joiner.releaseFetched(cid)
+        let scopes = try await joiner.broker.retainedScopes(prefix: joiner.scopes.fetchedPrefix)
+        XCTAssertEqual(scopes, [])
+        let gone = await joiner.volume(cid)
+        XCTAssertNil(gone)
+    }
+
+    /// What the node holds, a fetched body with it: what a block found
+    /// valid is stored from.
     private static func held(_ storage: NodeStorage) async -> any Fetcher {
-        CoalescingFetcher(CompositeContentSource([await storage.broker, storage.readCache]))
+        CoalescingFetcher(CompositeContentSource([await storage.broker]))
     }
 }

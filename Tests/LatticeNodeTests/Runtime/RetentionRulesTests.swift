@@ -157,7 +157,7 @@ final class RetentionRulesTests: XCTestCase {
             let joinerBroker = await joiner.broker
             try await joiner.storeValidBlock(
                 header.rawCID, at: ["Nexus"],
-                from: CoalescingFetcher(CompositeContentSource([joinerBroker, joiner.readCache]))
+                from: CoalescingFetcher(CompositeContentSource([joinerBroker]))
             )
             let pinned = try await Set(joiner.broker.retainedRoots(scope: joiner.scopes.body(header.rawCID)))
             XCTAssertEqual(pinned, [header.rawCID, try Mempool.cid(of: carried)], "key \(key)")

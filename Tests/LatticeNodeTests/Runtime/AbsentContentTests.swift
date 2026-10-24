@@ -118,18 +118,19 @@ final class AbsentContentTests: XCTestCase {
         XCTAssertNil(unread, "the public reads answer from this store alone")
 
         // Its tip's spec and state come from the producer once it is reached.
-        // What the template read is remembered, not written to the store: a
-        // peer decides what it sends with a Volume, and the store's Volumes
-        // are only the ones this node derives when it stores a block.
+        // What the template read is written to the store as it verifies,
+        // held under the tip's fetched scope only, pinned by nothing else.
         try await eventually("the joiner builds a template on its tip") {
             (try? await runtime.miningTemplate(self.paying(second))) != nil
         }
         let tipBytes = await storage.blockNodeBytes(tip)
         let state = try XCTUnwrap(tipBytes.flatMap(Block.init(data:))).postState.rawCID
-        let unstored = await storage.volume(state)
-        XCTAssertNil(unstored, "a template's reads are not written to the store")
-        let remembered = await storage.readCache.isEmpty
-        XCTAssertFalse(remembered)
+        let read = await storage.volume(state)
+        XCTAssertNotNil(read, "a template's reads are held while its tip is")
+        let fetched = try await storage.broker.retainedScopes(prefix: storage.scopes.fetched(tip))
+        XCTAssertFalse(fetched.isEmpty, "held under the tip's fetched scope")
+        let pinned = try await storage.broker.retainedRoots(scope: storage.retentionScope)
+        XCTAssertFalse(pinned.contains(state), "and pinned by nothing else")
 
         // The producer goes: the block mined on that template needs nothing more from it.
         await producerRuntime.stop()
@@ -317,7 +318,7 @@ final class AbsentContentTests: XCTestCase {
         )
         _ = try? await runtime.submitTransaction(SubmitTransactionRequest(transaction: transaction))
         try await alwaysDuring("no content is taken from a peer for the check", .milliseconds(300)) {
-            await storage.readCache.isEmpty
+            (try? await storage.broker.retainedScopes(prefix: storage.scopes.fetchedPrefix))?.isEmpty == true
         }
         await runtime.stop()
         await producerRuntime.stop()
@@ -341,39 +342,5 @@ final class AbsentContentTests: XCTestCase {
         let retained = try await storage.broker.retainedRoots(scope: storage.retentionScope)
         XCTAssertTrue(retained.contains(genesis))
         XCTAssertFalse(retained.contains(absent))
-    }
-
-    /// What a read asked of peers is remembered: only what it asked for,
-    /// an answer whole or not at all, and within the bound.
-    func testTheReadCacheRemembersOnlyWhatWasAskedWithinItsBound() async throws {
-        struct Peer: ContentSource {
-            let held: [String: Data]
-            func fetch(_ cids: Set<String>) async -> [String: Data] { held }
-        }
-        let entry = { (name: String) in (name, Data(repeating: 7, count: 100)) }
-        let charge = 1 + 100 + IvyRootContentSource.retainedEntryOverhead
-        let cache = ReadCache(maximumBytes: 2 * charge)
-
-        // A peer answers with more than it was asked for: none of the rest is kept.
-        let padded = cache.remembering(Peer(held: Dictionary(uniqueKeysWithValues: ["a", "x", "y"].map(entry))))
-        let answer = await padded.fetch(["a"])
-        XCTAssertEqual(answer.count, 3)
-        let afterPadding = await cache.fetch(["a", "x", "y"])
-        XCTAssertEqual(Set(afterPadding.keys), ["a"])
-
-        // The second answer fits beside the first.
-        await cache.put(Dictionary(uniqueKeysWithValues: ["b"].map(entry)))
-        let both = await cache.fetch(["a", "b"])
-        XCTAssertEqual(Set(both.keys), ["a", "b"])
-
-        // One that would pass the bound starts the cache again, and is kept whole.
-        await cache.put(Dictionary(uniqueKeysWithValues: ["c", "d"].map(entry)))
-        let afterFull = await cache.fetch(["a", "b", "c", "d"])
-        XCTAssertEqual(Set(afterFull.keys), ["c", "d"])
-
-        // One larger than the bound is not kept, and costs nothing held.
-        await cache.put(Dictionary(uniqueKeysWithValues: ["e", "f", "g"].map(entry)))
-        let afterTooLarge = await cache.fetch(["c", "d", "e", "f", "g"])
-        XCTAssertEqual(Set(afterTooLarge.keys), ["c", "d"])
     }
 }

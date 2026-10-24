@@ -449,7 +449,9 @@ extension NodeRuntime {
         case .buildTemplate(let job):
             return RuntimeJob(path: path, epoch: job.tipEpoch) {
                 let anchor = await level?.chain.difficultyAnchor(forBlockHash: job.tipCID)
-                let built = await reading(job.tipCID, storage: storage, remote: remote) { fetcher in
+                // What it reads from peers stays while the tip does: the
+                // block mined on it, and the next template, read it here.
+                let built = await reading(job.tipCID, storage: storage, remote: remote, keep: true) { fetcher in
                     await buildTemplate(
                         job, difficultyAnchor: anchor, fetcher: fetcher, chainPath: path, children: children
                     )
@@ -496,7 +498,7 @@ extension NodeRuntime {
         guard let remote, await !storage.broker.hasVolume(root: cid) else {
             return await transactions(ofBlock: cid, fetcher: storage.localFetcher)
         }
-        return await remote.withRootTracing(cid, bundle: false) { session in
+        return await remote.withRootTracing(cid, bundle: false, store: storage) { session in
             await transactions(ofBlock: cid, fetcher: CoalescingFetcher(CompositeContentSource([storage.broker, session])))
         }.value
     }
@@ -542,6 +544,9 @@ extension NodeRuntime {
                         storage.syncTrace("body of \(job.blockHash) not stored: \(error)")
                     }
                 }
+                // Decided: what was fetched for the block goes, but what
+                // storing a valid block pinned under its own names.
+                if verdict.retryFailure == nil { await storage.releaseFetched(job.blockHash) }
                 let transactions = valid ? await transactionIDs(ofBlock: job.blockHash, fetcher: fetcher) : []
                 return [.level(path, .connected(verdict, transactions: transactions))]
             }
@@ -559,20 +564,20 @@ extension NodeRuntime {
     }
 
     /// The operator's own work reads content the one way: what this store
-    /// holds, then a block's header record, then what its earlier reads
-    /// asked of peers, then peers, each answer checked against its CID by
-    /// the reader. What a read asked for is remembered in memory, never
-    /// written to the store: only the node's own storing of a block does
-    /// that.
+    /// holds, then a block's header record, then peers, each answer checked
+    /// against its CID before it is written to the store, where it stays
+    /// while the read runs.
     /// Without an overlay (`remote` nil) the read is from this store.
+    /// What is `keep`t stays under the root's fetched scope after the read.
     static func reading<T: Sendable>(
         _ rootCID: String,
         storage: NodeStorage,
         remote: IvyRootContentSource?,
+        keep: Bool = false,
         _ work: @Sendable (any Fetcher) async -> T
     ) async -> T {
         guard let remote else { return await work(storage.workFetcher) }
-        return await remote.withRootTracing(rootCID, bundle: false) { session in
+        return await remote.withRootTracing(rootCID, bundle: false, store: storage, keep: keep) { session in
             // Peers serve whole Volumes by their roots. A block's own Volume
             // this store does not hold is read whole first, so what it lists
             // is read from it, not asked of peers one entry at a time.

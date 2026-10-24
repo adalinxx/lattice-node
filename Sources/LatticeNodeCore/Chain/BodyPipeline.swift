@@ -62,6 +62,12 @@ extension ChainCore {
         return forks + bestWindow.filter { !forks.contains($0) }
     }
 
+    /// The window's blocks whose parent is executed: the ones this level
+    /// can connect next once their bodies arrive.
+    public var nextToConnect: [String] {
+        bodyWindow.filter { index.parent[$0].map(tree.isExecuted(blockHash:)) ?? true }
+    }
+
     /// The best chain's blocks after its executed prefix, up to the count.
     var bestWindow: [String] {
         let prefix = tree.executedPrefix()
@@ -166,12 +172,15 @@ extension ChainCore {
     mutating func scheduleBodies(_ turn: inout Turn) {
         let window = bodyWindow
         let wanted = Set(window)
+        let held = bodies.requested.union(bodies.arrived).union(bodies.parked.keys)
         let mark = BodyPipeline.TreeMark(actOn: actOnTip.hash, window: bestWindow)
         if bodies.seen != mark {
             bodies.seen = mark
             bodies.parked.removeAll()
         }
-        for cid in bodies.requested.subtracting(wanted).sorted() {
+        // Arrived and parked bodies too: the content layer holds them only
+        // while they are wanted.
+        for cid in held.subtracting(wanted).sorted() {
             turn.effects.append(.cancelBody(cid: cid))
         }
         bodies.requested.formIntersection(wanted)
