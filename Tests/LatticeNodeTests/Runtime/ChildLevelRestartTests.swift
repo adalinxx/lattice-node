@@ -70,7 +70,7 @@ final class ChildLevelRestartTests: XCTestCase {
                 return work.contribution.id
             }
         XCTAssertFalse(work.isEmpty)
-        let proofs = await reopened.store.savedProofs(at: alpha, for: [genesisCID])[genesisCID] ?? []
+        let proofs = try await reopened.store.savedProofs(at: alpha, for: [genesisCID])[genesisCID] ?? []
         XCTAssertEqual(Set(proofs.map(\.rootCID)), Set(work))
     }
 
