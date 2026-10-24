@@ -123,10 +123,9 @@ extension NodeStorage {
     }
 
     /// How the operator's own work reads: this store, a block's header
-    /// record, what its earlier reads asked of peers, then peers, whose
-    /// answers are remembered for the next read.
+    /// record, then peers, whose session writes what it fetched here.
     nonisolated func ownReads(through peers: any ContentSource) -> CoalescingFetcher {
-        CoalescingFetcher(CompositeContentSource([workSource, readCache, readCache.remembering(peers)]))
+        CoalescingFetcher(CompositeContentSource([workSource, peers]))
     }
 
     /// Stores a block and pins what was stored: its body is what `fetcher`,
@@ -137,7 +136,15 @@ extension NodeStorage {
     ) async throws -> [String] {
         let storage = NodeImportStorage(storage: broker)
         try await store(storage)
-        try await storage.commit()
+        do {
+            try await storage.commit()
+        } catch BrokerError.conflictingVolume {
+            // A peer sent one of these roots with other members (each
+            // checked against its CID): what was fetched for the block goes,
+            // and the Volumes the block defines, read whole, take its place.
+            await releaseFetched(blockCID)
+            try await storage.commit()
+        }
         let roots = await storage.takeStoredVolumeRoots()
         let body = [blockCID] + (try await NodeRuntime.carriedTransactionIDs(ofBlock: blockCID, fetcher: fetcher))
         try await retainStored(roots, body: body, ofBlock: blockCID, at: path)
@@ -145,8 +152,8 @@ extension NodeStorage {
     }
 
     /// Stores a block execution found valid, as `fetcher` reads it, and pins
-    /// it. None of it is in the store before: a body fetched from peers is
-    /// held in memory until then.
+    /// it. A body fetched from peers is in the store already, held only
+    /// while its block is wanted: here it is pinned under the block's names.
     nonisolated func storeValidBlock(_ cid: String, at path: ChainPath, from fetcher: any Fetcher) async throws {
         let roots = try await storingAndRetaining(cid, at: path, from: fetcher) { storage in
             try await BlockHeader(rawCID: cid).storeBlock(fetcher: fetcher, storer: storage)
@@ -156,9 +163,11 @@ extension NodeStorage {
 
     /// `ChainEffect.fetchBody`: the block's Volume and the nested Volumes its
     /// execution reads, through the content layer (local store first, then
-    /// any overlay provider of the root), read into memory and not stored:
-    /// the block is stored once its execution finds it valid. Returns the
-    /// roots it read.
+    /// any overlay provider of the root). Each Volume is written to the
+    /// store as it verifies, held under the block's fetched scope until the
+    /// block connects, is found invalid or is no longer wanted
+    /// (`releaseFetched`): the connect reads it here. Returns the roots it
+    /// read.
     ///
     /// `bundle` is false on a retry: a bundle is an optimisation, so a block
     /// whose first attempt failed is fetched one Volume at a time, as it
@@ -169,12 +178,10 @@ extension NodeStorage {
     ) async throws -> [String] {
         let capture = IvyRootContentSource.AttributionCapture()
         do {
-            return try await remote.withRootTracing(cid, bundle: bundle, hosts: hosts, capture: capture) { session in
-                // Read into memory, never into the store: what a peer sent is
-                // stored once the block's execution has found it valid. The
-                // session reads whole Volumes, so it is asked before what an
-                // earlier, failed attempt left in memory.
-                let fetcher = CoalescingFetcher(CompositeContentSource([broker, readCache.remembering(session)]))
+            return try await remote.withRootTracing(
+                cid, bundle: bundle, hosts: hosts, store: self, lookAhead: true, keep: true, capture: capture
+            ) { session in
+                let fetcher = CoalescingFetcher(CompositeContentSource([broker, session]))
                 let walked = NodeImportStorage(storage: nil)
                 do {
                     try await BlockHeader(rawCID: cid).storeBlock(fetcher: fetcher, storer: walked)
@@ -186,6 +193,10 @@ extension NodeStorage {
                 return await walked.takeStoredVolumeRoots()
             }.value
         } catch {
+            // The next attempt starts from nothing a peer sent: a Volume
+            // that checks against its CIDs may still lack, or add to, what
+            // its root holds.
+            await releaseFetched(cid)
             // Content this node's own budget declined is named as that, not
             // as content nobody served.
             guard capture.snapshot()?.byteBudgetExceeded == true else { throw error }
@@ -226,7 +237,7 @@ extension NodeStorage {
     ) async throws -> FlatDictionary<BlockHeader> {
         let header = try BlockHeader(node: block)
         guard let remote else { return try await storeMinedBlock(header, block, fetcher: localFetcher) }
-        return try await remote.withRootTracing(header.rawCID, bundle: false) { session in
+        return try await remote.withRootTracing(header.rawCID, bundle: false, store: self) { session in
             let children = try await storeMinedBlock(
                 header, block, fetcher: ownReads(through: session)
             )
@@ -255,7 +266,7 @@ extension NodeStorage {
     ) async throws -> [MinedGrind.Carried] {
         guard let remote else { return try await carriedGrinds(of: root, hosted: hosted, fetcher: localFetcher) }
         let rootCID = try BlockHeader(node: root).rawCID
-        return try await remote.withRootTracing(rootCID, bundle: false) { session in
+        return try await remote.withRootTracing(rootCID, bundle: false, store: self) { session in
             let carried = try await carriedGrinds(
                 of: root, hosted: hosted, fetcher: ownReads(through: session)
             )

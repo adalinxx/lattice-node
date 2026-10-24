@@ -42,7 +42,7 @@ public struct Topology: Codable, Sendable {
         case listen, rpc, webSocket, peers, publicRead, externalAddress
         case publicReadRate, publicReadExpensiveRate, publicReadMaxRate, publicReadFetches
         case publicReadURL, publicSubmit, publicSubmitRate, minRelayFee
-        case servingMaxConcurrent, servingMaxInFlightVolumeBytes, blockBodies, state, finalityWindow, finalityWindows, announceLifetime
+        case servingMaxConcurrent, servingMaxInFlightVolumeBytes, maxAcquisitionBytes, blockBodies, state, finalityWindow, finalityWindows, announceLifetime
         case hostedChains, mine, rpcAllowedOrigins
     }
     public var listen: UInt16
@@ -95,6 +95,9 @@ public struct Topology: Codable, Sendable {
     /// Content-serving limits (`--serving-max-*`). Absent = the node's defaults.
     public var servingMaxConcurrent: Int?
     public var servingMaxInFlightVolumeBytes: Int?
+    /// Bytes of content the node fetches from peers at once, every hosted
+    /// chain together (`--max-acquisition-bytes`). Absent = the node's default.
+    public var maxAcquisitionBytes: Int?
     /// The block bodies kept beyond what the node needs to operate
     /// (`--block-bodies`): `all` or `none`. Absent = `all`.
     public var blockBodies: String?
@@ -234,6 +237,9 @@ public struct Topology: Codable, Sendable {
         if let publicReadURL, !NodeConfiguration.isValidPublicReadURL(publicReadURL) {
             throw CtlError("publicReadURL must be an absolute http(s) URL with a host and no credentials, query or fragment")
         }
+        if let maxAcquisitionBytes, maxAcquisitionBytes <= 0 {
+            throw CtlError("maxAcquisitionBytes must be positive")
+        }
         if let publicReadFetches, publicReadFetches < 0 {
             throw CtlError("publicReadFetches must be nonnegative")
         }
@@ -271,6 +277,7 @@ public struct Topology: Codable, Sendable {
         if let value = servingMaxInFlightVolumeBytes {
             arguments += ["--serving-max-in-flight-volume-bytes", String(value)]
         }
+        if let value = maxAcquisitionBytes { arguments += ["--max-acquisition-bytes", String(value)] }
         if let value = blockBodies { arguments += ["--block-bodies", value] }
         if let value = state { arguments += ["--state", value] }
         if let value = finalityWindow { arguments += ["--finality-window", String(value)] }

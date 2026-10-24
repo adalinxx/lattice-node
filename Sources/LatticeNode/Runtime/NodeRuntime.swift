@@ -367,6 +367,7 @@ public final class NodeRuntime: Sendable {
             for (path, level) in state.core.levels { state.bodyTips[path] = level.snapshot.actOnTip }
             await storage.letGoOfBodies(except: state.bodyTips)
             await storage.letGoOfReads()
+            await storage.letGoOfFetched()
             // Counts describe a state only `tip` keeps; any other run lets
             // that state go, so a later run on `tip` counts afresh.
             if configuration.state != .tip { await storage.forgetStateCounts() }
@@ -557,6 +558,8 @@ extension NodeRuntime {
         /// executed or found invalid this step, whose reads go after it.
         var stateTips: [ChainPath: String] = [:]
         var readsDone: [BodyKey] = []
+        /// Each level's tip templates last read on.
+        var readTips: [ChainPath: String] = [:]
 
         struct BodyKey: Hashable {
             let path: ChainPath
@@ -738,8 +741,9 @@ extension NodeRuntime {
             // A stopped level's body fetches would retry for good: no
             // `cancelBody` comes from a level that is gone. Its RPCs would
             // wait for good: no answer comes from it either.
-            for key in bodies.keys where core.levels[key.path] == nil {
+            for key in Set(bodies.keys).union(bodyRoots.keys) where core.levels[key.path] == nil {
                 bodies.removeValue(forKey: key)?.cancel()
+                await storage.releaseFetched(key.cid)
             }
             bodyRoots = bodyRoots.filter { core.levels[$0.key.path] != nil }
             fetchWaits = fetchWaits.filter { core.levels[$0.key.path] != nil }
@@ -1221,6 +1225,10 @@ extension NodeRuntime {
             }
             await settleBodies()
             await settleState()
+            await settleTemplateReads()
+            // The blocks each chain can connect next take the acquisition
+            // budget before bodies fetched further ahead.
+            await remote.budget.prioritize(Set(core.levels.values.flatMap(\.nextToConnect)))
             // What an executed block read goes once the kept state has
             // counted what of it the tip's state holds.
             for key in readsDone { await storage.releaseReads(key.cid, at: key.path) }
@@ -1386,10 +1394,13 @@ extension NodeRuntime {
                             path, cid: cid, BodyWait(fetchFailure: error), detail: "\(error)"
                         ))
                     }
-                    if let roots { inputs.yield(.bodyStored(path, cid: cid, roots: roots)) }
+                    // No longer wanted: what it wrote while it ran goes.
+                    guard let roots, !Task.isCancelled else { return await storage.releaseFetched(cid) }
+                    inputs.yield(.bodyStored(path, cid: cid, roots: roots))
                 }
             case .cancelBody(let cid):
                 bodies.removeValue(forKey: BodyKey(path: path, cid: cid))?.cancel()
+                await storage.releaseFetched(cid)
                 bodyRoots[BodyKey(path: path, cid: cid)] = nil
                 fetchWaits[BodyKey(path: path, cid: cid)] = nil
             case .verifyProof(let job):
@@ -1558,6 +1569,15 @@ extension NodeRuntime {
                 bodyTips[path] = tip
                 past.removeAll { $0 == tip }
                 if !past.isEmpty { await storage.letGo(ofBodies: past, at: path) }
+            }
+        }
+
+        /// What templates read from peers on a tip goes once it is no
+        /// longer the tip.
+        private mutating func settleTemplateReads() async {
+            for (path, level) in core.levels where readTips[path] != level.snapshot.actOnTip {
+                if let last = readTips[path] { await storage.releaseFetched(last) }
+                readTips[path] = level.snapshot.actOnTip
             }
         }
 

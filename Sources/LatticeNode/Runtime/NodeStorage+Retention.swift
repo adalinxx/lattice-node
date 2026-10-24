@@ -37,6 +37,15 @@ struct RetentionScopes: Sendable {
     /// The Volumes the operator named on the private port.
     var operatorPins: String { chain + ":operator" }
 
+    /// What content sessions for `root` fetched from peers, each under its
+    /// own name: a block's body before it connects, and the node's other
+    /// reads while they run.
+    func fetched(_ root: String) -> String { chain + ":fetched:" + root + ":" }
+
+    func fetched(_ root: String, session: String) -> String { fetched(root) + session }
+
+    var fetchedPrefix: String { chain + ":fetched:" }
+
     func body(_ blockCID: String, at path: ChainPath = ["Nexus"]) -> String {
         bodyPrefix + path.joined(separator: "/") + ":" + blockCID
     }
@@ -113,6 +122,39 @@ extension NodeStorage {
         } catch {
             syncTrace("body of \(blockCID) not released: \(error)")
         }
+    }
+
+    // MARK: - Fetched content
+
+    /// Lets go of what every session for `root` fetched: the block
+    /// connected (what it keeps is pinned under its own names), was found
+    /// invalid, or is no longer wanted. What another scope names stays.
+    nonisolated func releaseFetched(_ root: String) async {
+        do {
+            for scope in try await broker.retainedScopes(prefix: scopes.fetched(root)) {
+                try await releaseScope(scope)
+            }
+        } catch {
+            syncTrace("fetched content of \(root) not released: \(error)")
+        }
+    }
+
+    /// At a start: what an earlier run fetched and did not connect goes;
+    /// it is fetched again if it is still wanted.
+    nonisolated func letGoOfFetched() async {
+        do {
+            for scope in try await broker.retainedScopes(prefix: scopes.fetchedPrefix) {
+                try await releaseScope(scope)
+            }
+        } catch {
+            syncTrace("fetched content not let go of at start: \(error)")
+        }
+    }
+
+    fileprivate nonisolated func releaseScope(_ scope: String) async throws {
+        let roots = try await broker.retainedRoots(scope: scope)
+        guard !roots.isEmpty else { return }
+        try await broker.releaseRetainedRoots(scope: scope, roots: roots)
     }
 
     // MARK: - Block bodies: none
@@ -216,6 +258,40 @@ extension NodeStorage {
         } catch {
             syncTrace("state of \(tip) not kept: \(error)")
         }
+    }
+}
+
+/// A content session writes each Volume that verifies to this store, under
+/// the session's name: it is read from here, never fetched twice, and a
+/// block's body is here when the block connects.
+extension NodeStorage: AcquiredContentStore {
+    nonisolated func storeAcquired(_ volumes: [SerializedVolume], root: String, session: String) async -> Bool {
+        do {
+            try await broker.storeVolumesLocal(volumes)
+            try await broker.mergeRetainedRoots(
+                scope: scopes.fetched(root, session: session), roots: Set(volumes.map(\.root)).sorted()
+            )
+            return true
+        } catch {
+            syncTrace("fetched content of \(root) not stored: \(error)")
+            return false
+        }
+    }
+
+    nonisolated func releaseAcquired(root: String, session: String) async {
+        do {
+            try await releaseScope(scopes.fetched(root, session: session))
+        } catch {
+            syncTrace("fetched content of \(root) not released: \(error)")
+        }
+    }
+
+    nonisolated func localData(_ cids: Set<String>) async -> [String: Data] {
+        await broker.fetchDataLocal(cids: cids)
+    }
+
+    nonisolated func localVolume(_ root: String) async -> SerializedVolume? {
+        await broker.fetchVolumeLocal(root: root)
     }
 }
 

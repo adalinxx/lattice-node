@@ -7,8 +7,20 @@ public struct NodeResourcePolicy: Sendable, Equatable {
     /// fetched with it to validate it.
     public let maximumAcquisitionStorageBytes: Int
 
-    public init(maximumAcquisitionStorageBytes: Int = 64 * 1_024 * 1_024) {
+    /// The bytes of content the node acquires at once, every chain and
+    /// session together (`--max-acquisition-bytes`): requested and not yet
+    /// checked and written to the store. Past it, fetches wait.
+    public let maximumAcquisitionBytes: Int
+
+    public static let defaultMaximumAcquisitionBytes = 256 * 1_024 * 1_024
+
+    public init(
+        maximumAcquisitionStorageBytes: Int = 64 * 1_024 * 1_024,
+        maximumAcquisitionBytes: Int = Self.defaultMaximumAcquisitionBytes
+    ) {
         precondition(maximumAcquisitionStorageBytes > 0)
+        precondition(maximumAcquisitionBytes > 0)
         self.maximumAcquisitionStorageBytes = maximumAcquisitionStorageBytes
+        self.maximumAcquisitionBytes = maximumAcquisitionBytes
     }
 }

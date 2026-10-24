@@ -80,6 +80,9 @@ struct LatticeNodeCommand: AsyncParsableCommand {
     @Option(help: "Bytes of Volumes this node reads or sends to peers at once.")
     var servingMaxInFlightVolumeBytes = IvyConfig.defaultMaxInFlightVolumeBytes
 
+    @Option(help: "Bytes of content this node fetches from peers at once, every hosted chain together: requested and not yet checked against its CIDs and written to the store. Past it, fetches wait (the blocks each chain can connect next first); nothing is declined for it. Each Volume is written to the store once it checks, so a block's body is fetched once.")
+    var maxAcquisitionBytes = NodeResourcePolicy.defaultMaximumAcquisitionBytes
+
     @Option(help: "Which block bodies (a block's own Volume and its transactions') this node keeps beyond the ones it needs to operate: all, or none. It always holds the bodies waiting to execute, each chain's tip, and each genesis block. With none, a body is let go of once another block is the tip, and is no longer served; headers, facts and state stay, so what the node weighs and selects does not change. A node that syncs from genesis needs peers that keep all.")
     var blockBodies = "all"
 
@@ -155,6 +158,9 @@ struct LatticeNodeCommand: AsyncParsableCommand {
         guard publicReadFetches >= 0 else {
             throw ValidationError("--public-read-fetches must be nonnegative")
         }
+        guard maxAcquisitionBytes > 0 else {
+            throw ValidationError("--max-acquisition-bytes must be positive")
+        }
         guard let blockBodies = BlockBodies(rawValue: blockBodies) else {
             throw ValidationError("--block-bodies is all or none")
         }
@@ -221,6 +227,7 @@ struct LatticeNodeCommand: AsyncParsableCommand {
             externalAddress: externalAddress,
             peerSearchInterval: peerSearchInterval,
             announceLifetime: announceLifetime,
+            resourcePolicy: NodeResourcePolicy(maximumAcquisitionBytes: maxAcquisitionBytes),
             blockBodies: blockBodies,
             state: state,
             hostedChildren: hosted.children,

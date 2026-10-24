@@ -112,10 +112,10 @@ actor NodeImportStorage: VolumeStorer {
         roots.insert(volume.root)
     }
 
+    /// What failed to commit stays pending, to commit again.
     func commit() async throws {
-        let volumes = pending
+        try await storage?.storeVolumesLocal(pending)
         pending.removeAll()
-        try await storage?.storeVolumesLocal(volumes)
     }
 
     func takeStoredVolumeRoots() -> [String] {

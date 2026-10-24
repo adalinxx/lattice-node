@@ -97,7 +97,8 @@ public enum ChainEffect: Sendable {
     /// Fetch a block's body Volume by CID through the content layer, and
     /// report `bodyFetched` once it has been read.
     case fetchBody(cid: String)
-    /// The window no longer wants this body: stop fetching it.
+    /// The window no longer wants this body: stop fetching it, and let go
+    /// of what was fetched of it.
     case cancelBody(cid: String)
     /// Run `ChainTree.connect` on this job off the core and report its
     /// verdict as `connected`.
